@@ -1,16 +1,7 @@
-# mori
-
-*mori就是mori，memeto mori!*
-
-这是heat_mem的重置版，因为我不喜欢python，就这么简单。
-
-要求lupa支持luaJIT，因为向量计算余弦近似度我是用FFI强算的
-
-# 可能有用的命令
-
-先退出虚拟环境（如果当前还在里面）
+# 先退出虚拟环境（如果当前还在里面）
 deactivate
 
+# 删除整个 venv 文件夹（最常用、最干净的方式）
 rm -rf .venv
 
 python3 -m venv .venv
@@ -27,8 +18,6 @@ CC=/usr/bin/gcc-14 \
 CXX=/usr/bin/g++-14 \
 FORCE_CMAKE=1 \
 pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir --verbose
-
---这个是我自己的cuda和gcc环境
 
 git clone https://luajit.org/git/luajit-2.0.git luajit
 cd luajit
