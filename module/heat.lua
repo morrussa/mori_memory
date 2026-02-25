@@ -6,10 +6,129 @@ local tool = require("module.tool")
 local HEAT_CFG = config.settings.heat
 local TOTAL_HEAT = HEAT_CFG.total_heat          -- 10M
 local POOL_SIZE = HEAT_CFG.heat_pool_ratio      -- 1M
+local SOFTMAX_ENABLED = HEAT_CFG.softmax == true
+local TARGET_HEAT     = HEAT_CFG.total_heat or 10000000
+local TOLERANCE = HEAT_CFG.tolerance
+
+print(string.format("[Heat] Softmax模式 %s（总热力永远固定为 %d）", 
+      SOFTMAX_ENABLED and "已启用" or "已禁用", TARGET_HEAT))
 local NEW_HEAT = HEAT_CFG.new_memory_heat
 
 M.heat = { indices = {}, values = {} }          -- 热区实时缓存（只存 heat > 0）
-M.pending_cold = {}                             -- 冷区邻居任务缓存
+M.pending_cold = {}                             -- 冷区邻居任务缓存（仅存储记忆行号）
+M.pending_dirty = false                          -- 标记 pending_cold 是否有变动
+
+local pending_file = "memory/pending_cold.txt"   -- 持久化文件
+
+-- ====================== pending_cold 持久化 ======================
+function M.save_pending()
+    if not M.pending_dirty then return end        -- 无变动则跳过
+    local temp = pending_file .. ".tmp"
+    local f = io.open(temp, "w")
+    if not f then return end
+    for _, task in ipairs(M.pending_cold) do
+        f:write(task.line .. "\n")
+    end
+    f:close()
+    os.remove(pending_file)
+    os.rename(temp, pending_file)
+    M.pending_dirty = false
+    print(string.format("[Heat] pending_cold 已保存，共 %d 个任务", #M.pending_cold))
+end
+
+function M.load_pending()
+    if not tool.file_exists(pending_file) then return end
+    local f = io.open(pending_file, "r")
+    if not f then return end
+    M.pending_cold = {}
+    for line in f:lines() do
+        local l = tonumber(line)
+        if l then
+            table.insert(M.pending_cold, { line = l })
+        end
+    end
+    f:close()
+    print(string.format("[Heat] pending_cold 已加载，共 %d 个任务", #M.pending_cold))
+    M.pending_dirty = false   -- 刚加载时视为未变动
+end
+
+-- ====================== Softmax 全局归一化（核心） ======================
+function M.normalize_heat()
+    if not SOFTMAX_ENABLED then return end
+
+    local current_total = M.get_total_heat()
+    if current_total < 100 then return end
+
+    -- 如果已经很接近目标，就不折腾了（避免无谓计算）
+    local tolerance = TOLERANCE
+    if math.abs(current_total - TARGET_HEAT) <= tolerance then
+        return
+    end
+
+    local scale = TARGET_HEAT / current_total
+    local memory = require("module.memory")
+    local cluster = require("module.cluster")
+
+    local new_indices = {}
+    local new_values = {}
+    local final_total = 0
+
+    -- 第一步：四舍五入缩放
+    for i = 1, #M.heat.indices do
+        local line = M.heat.indices[i]
+        local old_h = M.heat.values[i]
+        local scaled = old_h * scale
+        local new_h = math.floor(scaled + 0.5)  -- 四舍五入
+
+        if new_h > 0 then
+            table.insert(new_indices, line)
+            table.insert(new_values, new_h)
+            memory.set_heat(line, new_h)
+            final_total = final_total + new_h
+        else
+            -- 缩放到0或负 → 直接冷掉
+            memory.set_heat(line, 0)
+            cluster.mark_cold(line)
+            print(string.format("[Heat] 记忆 %d 四舍五入后 ≤0，已移入冷区", line))
+        end
+    end
+
+    -- 第二步：微调补差（±1 轮询方式）
+    local diff = TARGET_HEAT - final_total
+    if diff ~= 0 and #new_indices > 0 then
+        local step = diff > 0 and 1 or -1
+        local abs_diff = math.abs(diff)
+        local i = 1
+
+        for _ = 1, abs_diff do
+            -- 防止过度扣减导致负值
+            if step == -1 and new_values[i] <= 1 then
+                -- 如果要扣但值已经很小，就跳过这个记忆
+                i = i + 1
+                if i > #new_indices then i = 1 end
+                goto continue
+            end
+
+            new_values[i] = new_values[i] + step
+            memory.set_heat(new_indices[i], new_values[i])
+
+            ::continue::
+            i = i + 1
+            if i > #new_indices then i = 1 end
+        end
+
+        final_total = M.get_total_heat()  -- 重新计算一次
+    end
+
+    -- 更新热区列表（已经过滤掉0的了）
+    M.heat.indices = new_indices
+    M.heat.values  = new_values
+
+    print(string.format(
+        "[Heat Softmax] 归一化完成 | 目标 %d | 缩放后 %d | 微调后 %d | 热区条目 %d",
+        TARGET_HEAT, current_total, final_total, #M.heat.indices
+    ))
+end
 
 -- ====================== 内存同步辅助 ======================
 local function sync_heat_to_table(line, new_heat)
@@ -43,9 +162,9 @@ function M.is_hot(idx)
     return false
 end
 
--- ====================== LOAD：从 memory.txt 重建热区（唯一权威） ======================
+-- ====================== LOAD：从 memory.txt 重建热区 ======================
 function M.load()
-    local memory = require("module.memory")   -- 延迟加载
+    local memory = require("module.memory")
     M.heat = { indices = {}, values = {} }
     local iter = memory.iterate_all()
     local lineno = 0
@@ -56,13 +175,19 @@ function M.load()
             table.insert(M.heat.values, mem.heat)
         end
     end
-    print(string.format("[Heat] 已从 memory.txt 加载热区，共 %d 条热记忆（唯一权威）", #M.heat.indices))
+    print(string.format("[Heat] 已从 memory.txt 加载热区，共 %d 条热记忆", #M.heat.indices))
+
+    -- 加载未完成的 pending_cold 任务
+    M.load_pending()
 end
 
 -- ====================== 热力回收（全局均减） ======================
 function M.perform_recovery()
     local memory = require("module.memory")
     local cluster = require("module.cluster")
+    if SOFTMAX_ENABLED then 
+        return false 
+    end
     local total = M.get_total_heat()
     if total <= POOL_SIZE then return false end
 
@@ -74,7 +199,6 @@ function M.perform_recovery()
     local excess = total - POOL_SIZE
     local delta = math.ceil(excess / num_hot)
 
-    local new_idx, new_val = {}, {}
     local to_cold = 0
 
     for i = 1, num_hot do
@@ -96,36 +220,32 @@ function M.perform_recovery()
     return true
 end
 
--- ====================== 邻居加热（核心修复：不再自加热） ======================
+-- ====================== 邻居加热 ======================
 function M.neighbors_add_heat(vec, total_turn, target_mem_line)
     local memory = require("module.memory")
     local cluster = require("module.cluster")
-    -- vec 已经是 Lua table，无需转换
     target_mem_line = target_mem_line or memory.get_total_lines()
 
-    -- 冷区缓存
+    -- 冷区缓存：仅存储行号
     if not M.is_hot(target_mem_line) then
-        table.insert(M.pending_cold, {vec = vec, turn = total_turn, line = target_mem_line})
+        table.insert(M.pending_cold, { line = target_mem_line })
+        M.pending_dirty = true
         print(string.format("[Heat] 目标 %d 在冷区，任务已缓存", target_mem_line))
     end
 
-    -- ==================== 关键修复：区分 Lua table / Python list ====================
+    -- 查找相似记忆（逻辑保持不变）
     local cid = cluster.get_cluster_id_for_line(target_mem_line)
     local sim_results
     if cid then
-        sim_results = cluster.find_sim_in_cluster(vec, cid)          -- 已经是完美 Lua table
+        sim_results = cluster.find_sim_in_cluster(vec, cid)
     else
         sim_results = tool.find_sim_all_heat(vec) or {}
-        -- 只取前30个最相似的
         if #sim_results > 30 then
-            for i = 31, #sim_results do
-                table.remove(sim_results, 31)
-            end
+            for i = 31, #sim_results do table.remove(sim_results, 31) end
         end
     end
-    -- =====================================================================
 
-    -- 加权
+    -- 时间加权
     local weighted = {}
     local init_w = config.settings.time.time_boost or 0.2
     local decay = config.settings.time.loss_turn or 50
@@ -136,13 +256,13 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
     end
     table.sort(weighted, function(a,b) return a.weighted > b.weighted end)
 
-    -- 排除自身，避免自加热
+    -- 选取邻居（排除自身）
     local nb_indices = {}
     local max_nb = config.settings.heat.max_neighbors or 5
     local count = 0
     for _, item in ipairs(weighted) do
         if item.index ~= target_mem_line then
-            table.insert(nb_indices, item.index or 0)
+            table.insert(nb_indices, item.index)
             count = count + 1
             if count >= max_nb then break end
         end
@@ -172,6 +292,7 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
     if M.get_total_heat() > TOTAL_HEAT then
         M.perform_recovery()
     end
+    M.normalize_heat()
 end
 
 -- ====================== 冷热交换 ======================
@@ -194,21 +315,25 @@ function M.perform_cold_exchange()
     end
 
     M.pending_cold = {}
+    M.pending_dirty = true   -- 清空后需保存空文件
     cluster.update_hot_status()
-    saver.flush_all()
+    M.normalize_heat()
+    saver.flush_all()        -- 触发完整保存（包括 pending）
 end
 
 -- ====================== 新记忆加入热区 ======================
 function M.add_new_heat(line, heat_value)
     local memory = require("module.memory")
     heat_value = heat_value or NEW_HEAT
-    memory.set_heat(line, heat_value)     -- 只写 memory.txt
+    memory.set_heat(line, heat_value)
     sync_heat_to_table(line, heat_value)
     print(string.format("[Heat] 新记忆 %d 加入热区 (热力=%d)", line, heat_value))
 
     if M.get_total_heat() > TOTAL_HEAT then
         M.perform_recovery()
     end
+    
+    M.normalize_heat()
 end
 
 return M

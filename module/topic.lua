@@ -1,253 +1,385 @@
--- module/topic.lua
--- 二进制全量重写版 TopicSegmenter（与 memory.bin / clusters.bin 100% 一致风格：header + 原子 .tmp 重写）
-
+-- topic.lua
 local M = {}
 local ffi = require("ffi")
 local tool = require("module.tool")
+local config = require("module.config")
+local history_module = require("module.history") -- 依赖 history 进行 rebuild
 local py_pipeline = py_pipeline
 
--- ==================== 配置 ====================
-local SIMILARITY_THRESHOLD = 0.40
-local CONSECUTIVE_LOW_THRESHOLD = 2
-local MIN_TOPIC_LENGTH = 5
-local IDX_FILE = "memory/history.idx"
+-- ==================== 配置读取 ====================
+local T_CONF = config.settings.topic
+local MAKE_CLUSTER1 = T_CONF.make_cluster1 or 3
+local MAKE_CLUSTER2 = T_CONF.make_cluster2 or 3
+local TOPIC_LIMIT = T_CONF.topic_limit or 0.6      -- 全局漂移阈值
+local BREAK_LIMIT = T_CONF.break_limit or 0.45     -- 话语对断裂阈值 (论文核心思想)
+local CONFIRM_LIMIT = T_CONF.confirm_limit or 0.55 -- 话题无关确认阈值
+local MIN_TOPIC_LENGTH = T_CONF.min_topic_length or 2  -- 最小话题长度
+
+local DO_REBUILD = T_CONF.rebuild
+local IDX_FILE = "memory/topic.bin"
 
 -- ==================== 核心状态 ====================
-M.turn_vectors = {}
-M.topics = {}                 -- {{start= , end_= , summary= }, ...}
-M.topics_summary = {}         -- "start-end" -> summary
-M._consecutive_low_count = 0
-M._pending_topic_start = nil
+M.turn_vectors = {}       -- 缓存近期轮次的向量 (只保留必要的)
+M.topics = {}             -- 已完成的话题列表 {{start, end_, summary, centroid}, ...}
+M.dialogues = {}          -- turn -> {user=, ai=}
+
+-- 当前活跃话题状态
+M.active_topic = {
+    start = nil,          -- 起始轮次
+    head_centroid = nil,  -- 头质心
+    vectors = {},         -- 当前话题累积的向量 (用于最后生成 overall centroid)
+    tail_window = {},     -- 尾部滑动窗口
+    last_vec = nil        -- [新增] 记录上一轮的向量，用于计算话语对相似度
+}
+
 M._last_processed_turn = 0
 
-M.dialogues = {}              -- turn -> {user=, ai=}
-
 -- ==================== 二进制读写 ====================
-local function load_summaries()
-    if not tool.file_exists(IDX_FILE) then
-        print("[Topic] history.idx 不存在，将从空开始")
-        return
-    end
 
-    local f = io.open(IDX_FILE, "rb")
-    if not f then return end
-    local data = f:read("*a")
-    f:close()
+-- Header 格式:
+-- Magic(4) + Version(4) + Count(4) + ActiveStart(4) + ActiveTurn(4) + HeadVecBin + TailVecBin + LastVecBin
+-- 如果无活跃话题，ActiveStart=0；LastVecBin 仅在活跃话题时存在
 
-    if #data < 20 or data:sub(1,4) ~= "TOPC" then
-        print("[Topic] 文件头无效（可能是旧 JSON 格式），请删除 history.idx 后重启")
-        return
-    end
-
-    local offset = 20   -- magic(4) + version(4) + count(4) + reserved(8)
-    local count = 0
-
-    while offset < #data do
-        local rec, rec_size = tool.parse_topic_record(data, offset)
-        if not rec then break end
-
-        local key = rec.start .. "-" .. (rec.end_ or "nil")
-        M.topics_summary[key] = rec.summary
-        table.insert(M.topics, {
-            start = rec.start,
-            end_ = rec.end_,
-            summary = rec.summary
-        })
-
-        if rec.end_ and rec.end_ > M._last_processed_turn then
-            M._last_processed_turn = rec.end_
-        end
-
-        count = count + 1
-        offset = offset + rec_size
-    end
-
-    print(string.format("[Topic] 已从二进制加载 %d 个话题记录（header count = %d）", count, count))
-end
-
--- ==================== 全量原子保存（与 memory.bin / clusters.bin 完全一致） ====================
 local function save_to_disk()
     local temp = IDX_FILE .. ".tmp"
     local f = io.open(temp, "wb")
-    if not f then 
-        print("[Topic] 保存失败：无法创建临时文件")
-        return 
-    end
+    if not f then return end
 
-    -- Header: "TOPC" + version(4) + count(4) + reserved(8)
+    -- 1. Header
     f:write("TOPC")
     local count = #M.topics
-    local header = ffi.new("uint32_t[4]", 1, count, 0, 0)
-    f:write(ffi.string(header, 16))
+    local active_start = M.active_topic.start or 0
+    local active_turn = M._last_processed_turn
+    
+    -- 写入基础头部 (20 bytes)
+    local header_base = ffi.new("uint32_t[4]", 1, count, active_start, active_turn)
+    f:write(ffi.string(header_base, 16))
+    
+    -- 写入 Active 状态
+    if active_start > 0 then
+        -- 写入 Head Centroid
+        f:write(tool.vector_to_bin(M.active_topic.head_centroid))
+        
+        -- 写入 Tail Centroid (current)
+        local tail_centroid = tool.average_vectors(M.active_topic.tail_window)
+        f:write(tool.vector_to_bin(tail_centroid))
+        
+        -- [关键修复] 写入 Last Vector
+        if M.active_topic.last_vec then
+            f:write(tool.vector_to_bin(M.active_topic.last_vec))
+        end
+    end
 
+    -- 2. Records
     for _, t in ipairs(M.topics) do
-        local bin = tool.create_topic_record(t.start, t.end_, t.summary or "")
+        local bin = tool.create_topic_record(t.start, t.end_, t.summary or "", t.centroid)
         f:write(bin)
     end
     f:close()
 
     os.remove(IDX_FILE)
     os.rename(temp, IDX_FILE)
-    print(string.format("[Topic] 二进制全量保存完成（%d 个话题）", count))
 end
 
--- 兼容旧追加接口（内部调用全量保存）
-local function save_summary(start, end_, summary)
-    -- 找到或创建对应 topic 条目
-    for _, t in ipairs(M.topics) do
-        if t.start == start and (t.end_ == end_ or (not t.end_ and not end_)) then
-            t.summary = summary
-            break
+local function load_from_disk()
+    if not tool.file_exists(IDX_FILE) then return end
+    local f = io.open(IDX_FILE, "rb")
+    if not f then return end
+    local data = f:read("*a")
+    f:close()
+    if #data < 20 or data:sub(1,4) ~= "TOPC" then return end
+
+    -- Parse Header
+    local p = ffi.cast("const uint8_t*", data)
+    local count = ffi.cast("const uint32_t*", p + 8)[0]
+    local active_start = ffi.cast("const uint32_t*", p + 12)[0]
+    local active_turn = ffi.cast("const uint32_t*", p + 16)[0]
+    
+    M._last_processed_turn = active_turn
+
+    -- Parse Active State
+    local offset = 20
+    if active_start > 0 then
+        -- 读取 Head Vec
+        local head_vec, head_len = tool.bin_to_vector(data, offset)
+        offset = offset + head_len
+        
+        -- 读取 Tail Vec
+        local tail_vec, tail_len = tool.bin_to_vector(data, offset)
+        offset = offset + tail_len
+        
+        -- [关键修复] 尝试读取 Last Vec (兼容旧版本文件)
+        local last_vec = nil
+        if offset < #data then
+            -- 检查剩余长度是否足够容纳一个向量头
+            -- 这里的逻辑是：如果还有剩余字节，且能成功解析，则认为是 last_vec
+            -- 注意：这里简单处理，如果解析失败则忽略
+            local success
+            success, last_vec = pcall(function()
+                local v, l = tool.bin_to_vector(data, offset)
+                offset = offset + l
+                return v
+            end)
+            if not success then last_vec = nil end
+        end
+        
+        M.active_topic.start = active_start
+        M.active_topic.head_centroid = head_vec
+        M.active_topic.tail_window = {tail_vec} 
+        M.active_topic.last_vec = last_vec -- 恢复 last_vec
+        
+        print(string.format("[Topic] 恢复活跃话题: %d - ?, LastVec=%s", active_start, last_vec and "Yes" or "No"))
+    end
+    
+    -- 清空旧 topics
+    M.topics = {}
+    local rec_count = 0
+    while offset < #data do
+        local rec, rec_size = tool.parse_topic_record(data, offset)
+        if not rec then break end
+        table.insert(M.topics, rec)
+        offset = offset + rec_size
+        rec_count = rec_count + 1
+    end
+    print(string.format("[Topic] 加载 %d 个历史话题", rec_count))
+end
+
+-- ==================== 异常恢复与重建 ====================
+
+local function rebuild_active_topic(current_turn)
+    print("[Topic] 触发话题重建...")
+    -- 1. 确定重建起点
+    local start_turn = 1
+    if #M.topics > 0 then
+        start_turn = (M.topics[#M.topics].end_ or 0) + 1
+    end
+    
+    -- 2. 重新嵌入并计算
+    M.active_topic = { start = start_turn, vectors = {}, tail_window = {}, last_vec = nil }
+    
+    print(string.format("[Topic] 正在从 history.txt 重建 Turn %d -> %d 的向量...", start_turn, current_turn))
+    
+    for t = start_turn, current_turn do
+        local user_text = history_module.get_turn_text(t, "user")
+        if user_text then
+            local vec = tool.get_embedding(user_text)
+            M.turn_vectors[t] = vec
+            table.insert(M.active_topic.vectors, vec)
+            
+            -- 维护尾窗口
+            table.insert(M.active_topic.tail_window, vec)
+            if #M.active_topic.tail_window > MAKE_CLUSTER2 then
+                table.remove(M.active_topic.tail_window, 1)
+            end
         end
     end
+    
+    -- 3. 计算头质心
+    local head_vectors = {}
+    for i = 1, math.min(MAKE_CLUSTER1, #M.active_topic.vectors) do
+        table.insert(head_vectors, M.active_topic.vectors[i])
+    end
+    M.active_topic.head_centroid = tool.average_vectors(head_vectors)
+    
+    -- [新增] 设置 last_vec 为最后一个向量
+    if #M.active_topic.vectors > 0 then
+        M.active_topic.last_vec = M.active_topic.vectors[#M.active_topic.vectors]
+    end
+    
+    M._last_processed_turn = current_turn
+    print("[Topic] 话题重建完成")
+end
+
+-- ==================== 核心逻辑 ====================
+
+local function close_current_topic(end_turn)
+    if not M.active_topic.start then return end
+    
+    -- 生成整体质心
+    local overall_centroid = tool.average_vectors(M.active_topic.vectors)
+    
+    -- 获取摘要
+    local key = M.active_topic.start .. "-" .. end_turn
+    local summary = ""
+    
+    local dialog_texts = {}
+    for t = M.active_topic.start, math.min(M.active_topic.start + 4, end_turn) do
+         local d = M.dialogues[t]
+         if d then table.insert(dialog_texts, string.format("第%d轮\n用户：%s\n助手：%s", t, d.user or "", d.ai or "")) end
+    end
+    if #dialog_texts > 0 then
+        local prompt = "请用一句话概括话题：\n" .. table.concat(dialog_texts, "\n")
+        local messages = {{role="user", content=prompt}}
+        summary = py_pipeline:generate_chat_sync(messages, {max_tokens=64, temperature=0.1}) or ""
+        summary = tool.remove_cot(summary):match("^%s*(.-)%s*$")
+    end
+
+    table.insert(M.topics, {
+        start = M.active_topic.start,
+        end_ = end_turn,
+        summary = summary,
+        centroid = overall_centroid
+    })
+    
+    print(string.format("[Topic] 话题结束: %d-%d. 摘要: %s", M.active_topic.start, end_turn, summary))
+    
+    -- 重置状态
+    M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
     save_to_disk()
 end
 
-local function cosine_sim(v1, v2)
-    return tool.cosine_similarity(v1, v2)
-end
-
-local function detect_boundary(turn)
-    if #M.topics == 0 then
-        table.insert(M.topics, {start = turn, end_ = nil})
-        print("[Topic] 开始第一个话题: 第" .. turn .. "轮")
-        return
-    end
-
-    local last = M.topics[#M.topics]
-    if last.end_ ~= nil then
-        table.insert(M.topics, {start = turn, end_ = nil})
-        print("[Topic] 开始新话题: 第" .. turn .. "轮")
-        return
-    end
-
-    if not M.turn_vectors[turn - 1] then
-        last.end_ = turn - 1
-        M:_process_topic(last.start, last.end_)
-        table.insert(M.topics, {start = turn, end_ = nil})
-        print("[Topic] 因缺失向量强制切换话题 " .. last.start .. "-" .. (turn-1))
-        M:_reset_pending()
-        return
-    end
-
-    local sim = cosine_sim(M.turn_vectors[turn-1], M.turn_vectors[turn])
-    print(string.format("[Topic] 第%d↔%d轮 相似度 %.4f", turn-1, turn, sim))
-
-    if sim < SIMILARITY_THRESHOLD then
-        M._consecutive_low_count = M._consecutive_low_count + 1
-        if not M._pending_topic_start then
-            M._pending_topic_start = turn
-        end
-        if M._consecutive_low_count >= CONSECUTIVE_LOW_THRESHOLD then
-            M:_confirm_topic_switch(turn)
-        end
-    else
-        M:_reset_pending()
-    end
-end
-
-function M:_confirm_topic_switch(current_turn)
-    local last = M.topics[#M.topics]
-    local new_start = M._pending_topic_start
-    local end_old = new_start - 1
-
-    last.end_ = end_old
-    M:_process_topic(last.start, end_old)
-
-    table.insert(M.topics, {start = new_start, end_ = nil})
-    print(string.format("[Topic] 话题切换确认！旧 %d-%d → 新从 %d", last.start, end_old, new_start))
-
-    M:_reset_pending()
-end
-
-function M:_reset_pending()
-    M._consecutive_low_count = 0
-    M._pending_topic_start = nil
-end
-
-function M:_process_topic(start, end_)
-    local key = start .. "-" .. (end_ or "nil")
-    if M.topics_summary[key] then return end
-
-    if (end_ or M._last_processed_turn) - start + 1 < MIN_TOPIC_LENGTH then
-        return
-    end
-
-    local dialog_texts = {}
-    for t = start, math.min(start + 4, end_ or M._last_processed_turn) do
-        local d = M.dialogues[t]
-        if d then
-            table.insert(dialog_texts, string.format("第%d轮\n用户：%s\n助手：%s", t, d.user or "", d.ai or ""))
-        end
-    end
-
-    if #dialog_texts == 0 then return end
-
-    local prompt = "请根据以下对话内容，用一句话概括这个话题的主要内容。\n要求：简洁、准确、不超过30个字。\n\n" ..
-                   table.concat(dialog_texts, "\n") .. "\n\n概括："
-
-    local messages = {
-        {role = "system", content = "你是一个极简话题概括专家。用一句话（≤30字）概括核心话题，不要解释，不要列表。"},
-        {role = "user",   content = prompt}
-    }
-    local params = {max_tokens = 512, temperature = 0.25}
-
-    local summary = py_pipeline:generate_chat_sync(messages, params) or ""
-    summary = tool.remove_cot(summary)
-    summary = summary:match("^%s*(.-)%s*$"):gsub('^["\']', ""):gsub('["\']$', ""):gsub("。$", "")
-
-    if #summary > 5 and summary ~= "" then
-        M.topics_summary[key] = summary
-        save_summary(start, end_, summary)
-        print(string.format("[Topic] 话题 %d-%s 摘要：%s", start, end_ or "nil", summary))
-    end
-end
-
 function M.add_turn(turn, user_text, vector)
-    -- 假设 vector 已经是 Lua table（由上层 get_embedding 保证）
-    if not vector or #vector == 0 then 
-        print("[Topic] 警告：第" .. turn .. "轮向量为空或转换失败，跳过")
-        return 
-    end
-
+    -- 1. 存储基础数据
     M.turn_vectors[turn] = vector
-
-    -- 保存用户输入
     M.dialogues[turn] = M.dialogues[turn] or {}
     M.dialogues[turn].user = user_text
-    M._last_processed_turn = math.max(M._last_processed_turn, turn)
-    detect_boundary(turn)
+    M._last_processed_turn = turn
+    
+    -- 2. 初始化或延续话题
+    if not M.active_topic.start then
+        -- 开始新话题
+        M.active_topic.start = turn
+        M.active_topic.vectors = {vector}
+        M.active_topic.tail_window = {vector}
+        M.active_topic.last_vec = vector
+        M.active_topic.head_centroid = nil 
+        print("[Topic] 开启新话题: 第" .. turn .. "轮")
+    else
+        -- ========== 核心优化：基于论文的话语对建模 ==========
+        
+        -- 计算“话语对相似度”：当前轮 vs 上一轮
+        local sim_local = 0.0
+        if M.active_topic.last_vec then
+            sim_local = tool.cosine_similarity(M.active_topic.last_vec, vector)
+        end
+        
+        -- 追加到当前话题缓冲区
+        table.insert(M.active_topic.vectors, vector)
+        table.insert(M.active_topic.tail_window, vector)
+        if #M.active_topic.tail_window > MAKE_CLUSTER2 then
+            table.remove(M.active_topic.tail_window, 1)
+        end
+        
+        -- 3. 构建头质心 (如果尚未完成)
+        if not M.active_topic.head_centroid then
+            if #M.active_topic.vectors >= MAKE_CLUSTER1 then
+                local head_vecs = {}
+                for i = 1, MAKE_CLUSTER1 do table.insert(head_vecs, M.active_topic.vectors[i]) end
+                M.active_topic.head_centroid = tool.average_vectors(head_vecs)
+                print("[Topic] 头质心建立完成")
+            end
+        end
+        
+        -- 4. 分割检测逻辑 (双重验证)
+        local should_split = false
+        
+        -- 情况 A: 话语对断裂检测
+        if sim_local < BREAK_LIMIT then
+            -- 发生了明显的“跳跃”或“断层”
+            if M.active_topic.head_centroid then
+                -- 计算当前向量与“话题开头”的距离
+                local sim_global = tool.cosine_similarity(M.active_topic.head_centroid, vector)
+                
+                if sim_global < CONFIRM_LIMIT then
+                    print(string.format("[Topic] 检测到话题断裂! (Local Sim: %.3f < %.2f, Global Sim: %.3f < %.2f)", 
+                        sim_local, BREAK_LIMIT, sim_global, CONFIRM_LIMIT))
+                    should_split = true
+                else
+                    -- 断层发生，但与开头相关 -> 可能是追问、补充细节，不算新话题
+                    print(string.format("[Topic] 检测到短暂偏移但属于当前话题 (Local: %.3f, Global: %.3f)", sim_local, sim_global))
+                end
+            end
+        end
+        
+        -- 情况 B: 全局漂移兜底
+        if not should_split and M.active_topic.head_centroid and #M.active_topic.tail_window >= MAKE_CLUSTER2 then
+            local tail_centroid = tool.average_vectors(M.active_topic.tail_window)
+            local sim_drift = tool.cosine_similarity(M.active_topic.head_centroid, tail_centroid)
+            
+            if sim_drift < TOPIC_LIMIT then
+                 print(string.format("[Topic] 检测到话题长期漂移! (Drift Sim: %.3f < %.2f)", sim_drift, TOPIC_LIMIT))
+                 should_split = true
+            end
+        end
+        
+        -- 5. 执行分割，但先检查最小话题长度
+        if should_split then
+            local current_len = #M.active_topic.vectors          -- 包含本轮向量的长度
+            local previous_len = current_len - 1                 -- 话题之前已有的轮数（去掉本轮）
+            
+            if previous_len < MIN_TOPIC_LENGTH then
+                print(string.format("[Topic] 话题之前长度 %d < min_topic_length (%d)，暂不分割",
+                                    previous_len, MIN_TOPIC_LENGTH))
+                should_split = false   -- 放弃分割，继续当前话题
+            else
+                -- 分割前，将本轮向量从当前话题中移除（因为它属于新话题）
+                table.remove(M.active_topic.vectors)  -- 移除 vectors 中的最后一个（即本轮向量）
+                if #M.active_topic.tail_window > 0 and
+                   M.active_topic.tail_window[#M.active_topic.tail_window] == vector then
+                    table.remove(M.active_topic.tail_window)  -- 从尾窗口中移除
+                end
+                -- 关闭旧话题（结束于 turn-1）
+                close_current_topic(turn - 1)
+                
+                -- 开启新话题，包含本轮向量
+                M.active_topic.start = turn
+                M.active_topic.vectors = {vector}
+                M.active_topic.tail_window = {vector}
+                M.active_topic.last_vec = vector
+                M.active_topic.head_centroid = nil
+            end
+        end
+        
+        -- 正常延续：更新 last_vec（如果分割被抑制或未检测到分割）
+        if not should_split then
+            M.active_topic.last_vec = vector
+        end
+    end
+    
+    save_to_disk()
 end
 
-function M.update_assistant(turn, assistant_text)
-    if M.dialogues[turn] then
-        M.dialogues[turn].ai = assistant_text
-    end
+function M.update_assistant(turn, text)
+    if M.dialogues[turn] then M.dialogues[turn].ai = text end
 end
 
 function M.get_summary(turn)
     local t = turn or M._last_processed_turn
     for _, topic in ipairs(M.topics) do
-        if topic.end_ and topic.start <= t and t <= topic.end_ then
-            return topic.summary or M.topics_summary[topic.start .. "-" .. topic.end_] or ""
+        if topic.start <= t and t <= (topic.end_ or 999999) then
+            return topic.summary or ""
         end
     end
     return ""
 end
 
 function M.finalize()
-    local last = M.topics[#M.topics]
-    if last and not last.end_ then
-        last.end_ = M._last_processed_turn
-        M:_process_topic(last.start, last.end_)
-        save_to_disk()   -- 确保退出时保存最后一个话题
-    end
-    print("[Topic] 二进制话题持久化完成")
+    close_current_topic(M._last_processed_turn)
+    save_to_disk()
 end
 
 function M.init()
-    load_summaries()
-    print("[Topic] 二进制话题分割模块已启动")
+    load_from_disk()
+    
+    -- 检查是否需要 Rebuild
+    local history_turns = history_module.get_turn() -- 假设 history 模块有该函数
+    if DO_REBUILD and M._last_processed_turn > 0 and history_turns > M._last_processed_turn then
+        print("[Topic] 状态不一致 (Bin=" .. M._last_processed_turn .. ", Hist=" .. history_turns .. ")，执行重建...")
+        rebuild_active_topic(history_turns)
+    elseif M.active_topic.start then
+        -- 如果恢复了活跃话题但头质心未满，尝试补全
+        if not M.active_topic.head_centroid and #M.active_topic.vectors >= MAKE_CLUSTER1 then
+            local head_vecs = {}
+            for i = 1, MAKE_CLUSTER1 do table.insert(head_vecs, M.active_topic.vectors[i]) end
+            M.active_topic.head_centroid = tool.average_vectors(head_vecs)
+        end
+        -- 如果 last_vec 缺失（旧格式文件），用最后一个向量补齐
+        if not M.active_topic.last_vec and #M.active_topic.vectors > 0 then
+            M.active_topic.last_vec = M.active_topic.vectors[#M.active_topic.vectors]
+        end
+    end
+    
+    print("[Topic] 模块初始化完成")
 end
 
 return M

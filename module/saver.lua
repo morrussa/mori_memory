@@ -13,12 +13,16 @@ function M.flush_all(force)
     local memory = require("module.memory")
     local cluster = require("module.cluster")
     local history = require("module.history")
+    local heat = require("module.heat")   -- 延迟加载 heat 模块
 
     print("[Saver] === 开始原子保存 raw 文件 ===")
 
     memory.save_to_disk()
     cluster.save_to_disk()
     history.save_to_disk()
+
+    -- 保存 pending_cold 任务队列
+    heat.save_pending()
 
     py_pipeline:pack_state()
 
@@ -33,7 +37,7 @@ function M.on_exit()
     topic.finalize()
     M.flush_all(true)
     py_pipeline:cleanup_raw_files()
-    print("[Saver] 程序退出完成，仅保留 state.zst")
+    -- print("[Saver] 程序退出完成，仅保留 state.zst")
 end
 
 return M

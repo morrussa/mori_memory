@@ -7,6 +7,18 @@ local config_mem = require("module.config")
 local math = require("math")
 local cluster = require("module.cluster")
 local saver =require("module.saver")
+local recall = require("module.recall")
+
+-- 1. 配置模型路径
+local base = "/home/morusa/AI/mori_lua/model/"
+local config = {
+    large_model = base .. "gpt-oss-20b-UD-Q6_K_XL.gguf",
+    embedding_model = base .. "Qwen3-Embedding-0.6B-Q8_0.gguf"
+}
+
+print("[Lua] large_model path: " .. tostring(config.large_model))
+print("[Lua] embedding_model path: " .. tostring(config.embedding_model))
+py_pipeline:load_models(config.large_model, config.embedding_model)
 
 memory.load()
 cluster.load()
@@ -14,6 +26,7 @@ cluster.update_hot_status()
 heat.load()
 saver.mark_dirty()
 history.load()
+recall.init_all_sentiment_vectors()
 
 print("[Lua] Pipeline started.")
 
@@ -25,34 +38,6 @@ local base_prompt = [[
 你喜欢有趣和有创意的对话，对于用户的提问会尽力给出有帮助的回答。
 当遇到你不确定或觉得信息不足的问题时，你会要求用户提供更多信息，而不是直接拒绝。
 你尊重每一个认真提问的人。
-
-
-【关于你的记忆】
-你有一个非常强大的外部长期记忆库，保存了我们所有真实的对话历史。
-当你需要回忆过去聊过的内容、确认之前的说法、或者回答涉及具体事实（如代码、人名、新闻）时，请使用记忆检索工具。
-
-【工具使用规则】
-要检索记忆，必须严格输出以下单行lua table格式，不要输出任何其他文字：
-{action = "retrieve_memory", query = "搜索关键词"}
-
-【重要示例】
-用户：上次你推荐的那本书叫什么来着？
-你的输出：{action = "retrieve_memory", query = "推荐的书名"}
-
-用户：我们之前讨论过的Python代码怎么写的？
-你的输出：{action = "retrieve_memory", query = {"用户讨论的python代码","python代码"}}
-
-用户：我不记得那个API的参数了，你记得吗？
-你的输出：{action = "retrieve_memory", query = "API参数"}
-
-用户：今天天气怎么样？
-你的输出：(直接回答天气问题，不需要调用工具)
-
-【注意】
-1. 只有在确实需要回忆过去信息时才输出JSON。
-2. 如果是常识问题或新话题，直接正常回答。
-3. 输出lua table后立即停止生成，等待系统返回结果。
-4. 在最终回答时，使用中文。
 ]]
 
 local conversation_history = {
@@ -77,14 +62,7 @@ local function add_to_history(user_msg, assistant_msg)
 end
 -- =================================================================
 
--- 1. 配置模型路径
-local base = "/home/morusa/AI/mori_lua/model/"
-local config = {
-    large_model = base .. "gpt-oss-20b-UD-Q6_K_XL.gguf",
-    embedding_model = base .. "Qwen3-Embedding-4B-Q4_K_M.gguf"
-}
 
-py_pipeline:load_models(config.large_model, config.embedding_model)
 
 -- 3. 测试相似度接口
 print("\n[Lua] Testing Similarity...")
@@ -109,7 +87,6 @@ local messages = {
 local gen_params = { 
     max_tokens = 1024,
     temperature = 0.5,
-    stop = {"<|return|>", "<|call|>", "<|end|>"},
     seed = math.random(114, 514)
 }
 
@@ -142,13 +119,20 @@ while true do
     local user_vec = tool.get_embedding(user_input)
     topic.add_turn(current_turn, user_input, user_vec)
 
+    -- ========== 插入记忆召回逻辑 ==========
+    local memory_context = recall.check_and_retrieve(user_input, user_vec)
     local messages_for_llm = build_conversation_context(user_input)
+    if memory_context and memory_context ~= "" then
+        -- 将召回的记忆作为额外的系统消息插入（紧跟原始系统提示之后）
+        table.insert(messages_for_llm, 2, { role = "system", content = memory_context })
+        print("[Lua] 记忆召回已加入上下文")
+    end
+    -- ====================================
 
     local params = { 
         max_tokens = 1024, 
         temperature = 0.75,
         seed = math.random(1, 2147483647),
-        stop = {"<|return|>", "<|call|>", "<|end|>"}
     }
 
     local function chat_callback(result)
@@ -162,14 +146,12 @@ while true do
         -- ==================== 原子事实提取 ====================
         local assistant_clean = tool.replace(clean_result, "\n", " ")
 
-        -- 【终极铁壁版】fact_prompt —— 全中文 + 极致严格 + few-shot
         local fact_prompt = string.format([[
 你是一个绝对服从指令的原子事实提取器。你**只能**输出一个Lua table，不允许出现任何其他字符、解释、标签、英文、换行、空格、```、<|xxx|>、analysis、We need等内容。
 
 【铁律】
 - 输出必须以 { 开头，以 } 结尾
 - 每条事实不超过25个字，陈述句
-- 不要出现“用户”“AI”“对话”等任何角色词
 - 如果没有任何值得存储的事实，必须严格输出 {"无"}
 
 【正确输出示例1】
@@ -194,25 +176,18 @@ AI：%s
 
         local fact_params = {
             max_tokens = 256,
-            temperature = 0.0,
+            temperature = 0.4,
             seed = 42,
         }
 
         local facts_str = py_pipeline:generate_chat_sync(fact_messages, fact_params)
         
-        -- 【超级清洗】—— 无论模型吐什么，都强行提取第一个完整 {}
-        -- print("原子事实提取原始输出: [" .. facts_str .. "]")
-        
-        -- 1. 去掉所有 <|xxx|> 标签
         facts_str = tool.remove_cot(facts_str)
-        -- 2. 只保留第一个 { ... } 部分
         facts_str = facts_str:match("{.*}") or facts_str
-        -- 3. 如果有多个 } 只取到第一个
         local first_close = facts_str:find("}")
         if first_close then
             facts_str = facts_str:sub(1, first_close)
         end
-        -- 4. 压扁所有空白
         facts_str = facts_str:gsub("%s+", " ")
         facts_str = facts_str:match("^%s*(.-)%s*$")
 

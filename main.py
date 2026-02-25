@@ -13,16 +13,20 @@ class AIPipeline:
         self.llm_large = None   # GPU 大模型（生成用）
         self.llm_embed = None   # GGUF Embedding 模型
 
-    def get_embedding(self, text: str):
-        """将文本转换为向量（embedding），返回 Python list（Lua 中转为 table）"""
+    def get_embedding(self, text: str, mode: str = "query"):
+        """将文本转换为向量"""
         if not self.llm_embed:
             raise RuntimeError("Embedding model not loaded")
         
-        # 推荐传 list，更稳定
+        text = str(text).strip()
+        # Qwen3-Embedding 训练时需要的前缀（query 用于检索，passage 用于存储）
+        if not any(text.startswith(p) for p in ["query: ", "passage: "]):
+            prefix = "query: " if mode == "query" else "passage: "
+            text = prefix + text
+        
         response = self.llm_embed.create_embedding([text])
         embedding = response['data'][0]['embedding']
         
-        # 归一化（保证余弦相似度准确）
         emb_array = np.array(embedding, dtype=np.float32)
         norm = np.linalg.norm(emb_array)
         if norm > 0:
@@ -94,8 +98,9 @@ class AIPipeline:
             self.llm_embed = Llama(
                 model_path=embedding_model_path,
                 embedding=True,
-                n_gpu_layers=10,      # 你可以改成 0（纯CPU）或 99（尽量上GPU）
-                n_ctx=8192,           # Qwen3-Embedding 最大支持 8192
+                logits_all=True,
+                n_gpu_layers=0,
+                n_ctx=8192,
                 verbose=False
             )
 
@@ -107,7 +112,13 @@ class AIPipeline:
             print("[Python] 未找到 state.zst，使用现有 raw 或全新启动")
             return
 
-        raw_files = ["memory/memory.bin", "memory/clusters.bin", "memory/history.txt", "memory/history.idx"]
+        raw_files = [
+            "memory/memory.bin",
+            "memory/clusters.bin",
+            "memory/history.txt",
+            "memory/topic.bin",
+            "memory/pending_cold.txt"
+        ]
 
         if not all(os.path.exists(f) for f in raw_files):
             print("[Python] 检测到归档状态，正在解压 state.zst...")
@@ -137,7 +148,13 @@ class AIPipeline:
         print("[Python] 正在原子打包 state.zst...")
         tar_bytes = io.BytesIO()
         with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
-            for name in ["memory.bin", "clusters.bin", "history.txt", "history.idx"]:
+            for name in [
+                "memory.bin",
+                "clusters.bin",
+                "history.txt",
+                "topic.bin",
+                "pending_cold.txt"
+            ]:
                 path = f"memory/{name}"
                 if os.path.exists(path):
                     tar.add(path, arcname=name)
@@ -152,7 +169,13 @@ class AIPipeline:
 
     def cleanup_raw_files(self):
         print("[Python] 执行最终归档清理：删除所有 raw 文件...")
-        for name in ["memory.bin", "clusters.bin", "history.txt", "history.idx"]:
+        for name in [
+            "memory.bin",
+            "clusters.bin",
+            "history.txt",
+            "topic.bin",
+            "pending_cold.txt"
+        ]:
             path = f"memory/{name}"
             if os.path.exists(path):
                 try:

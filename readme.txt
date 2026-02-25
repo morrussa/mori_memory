@@ -25,3 +25,5 @@ make
 cd ..
 rm -rf build dist lupa.egg-info lupa/*.so lupa/*.c
 pip install lupa --no-binary :all: --verbose --no-cache-dir --force-reinstall
+
+gcc -shared -fPIC -O3 -march=native -o module/simdc_math.so simd_math.c -lm
