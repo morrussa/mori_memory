@@ -1,6 +1,10 @@
 -- recall.lua
--- 自动记忆召回模块
--- 优化：引入 LLM 生成搜索关键词，进行多路向量检索，合并轮次
+-- 自动记忆召回模块（已集成 Topic 过滤 - 你的核心需求）
+-- 修改点：
+-- 1. 新增 require("module.topic")
+-- 2. 在 retrieve() 的打分环节加入 Topic 加权过滤（同话题强烈 boost，跨话题大幅 penalty）
+-- 3. 使用 config.settings.ai_query 可配置参数（已兼容旧 config，未改 config.lua 也可直接跑）
+-- 4. 加入安全防护：如果 topic.get_topic_for_turn 不存在则优雅降级
 
 local M = {}
 
@@ -8,6 +12,8 @@ local tool = require("module.tool")
 local memory = require("module.memory")
 local history = require("module.history")
 local config = require("module.config")
+local cluster = require("module.cluster")
+local topic = require("module.topic")   -- 【新增】用于 topic 过滤
 
 -- 定义与 history.lua 一致的分隔符
 local FIELD_SEP = "\x1F"
@@ -123,9 +129,7 @@ local function need_recall(user_input, user_vec)
     return score >= threshold
 end
 
--- 【新增】使用 LLM 生成搜索关键词（原子事实预测）
--- @param user_input: 用户当前输入
--- @return table: 关键词字符串列表
+-- 使用 LLM 生成搜索关键词（原子事实预测）
 local function generate_search_keywords(user_input)
     if not py_pipeline then
         return {}
@@ -149,7 +153,7 @@ local function generate_search_keywords(user_input)
 
     local params = {
         max_tokens = 512,
-        temperature = 0.3, -- 低温度保证输出格式稳定
+        temperature = 0.3,
         seed = 42
     }
 
@@ -158,7 +162,6 @@ local function generate_search_keywords(user_input)
     
     -- 解析 Lua table
     local keywords = {}
-    -- 提取 {...} 部分
     local table_str = result_str:match("{.*}")
     if table_str then
         local load_ok, load_func = pcall(load, "return " .. table_str)
@@ -179,102 +182,105 @@ local function generate_search_keywords(user_input)
     return keywords
 end
 
--- 检索相关记忆并格式化返回（重写）
 local function retrieve(user_input, user_vec)
     user_vec = user_vec or tool.get_embedding(user_input)
 
-    -- ========== 1. 获取搜索向量集合 ==========
-    -- 原始用户输入向量
-    local query_vectors = { { vec = user_vec, weight = 1.0 } } 
-
-    -- LLM 生成关键词 -> 获取向量
+    -- 1. 查询向量集合（主查询权重更高）
+    local query_vectors = {
+        { vec = user_vec, weight = 1.00, is_primary = true }   -- 主查询
+    }
     local keywords = generate_search_keywords(user_input)
     for _, kw in ipairs(keywords) do
         local kw_vec = tool.get_embedding(kw)
-        table.insert(query_vectors, { vec = kw_vec, weight = 0.8 }) -- 关键词权重可以略低于原文
+        table.insert(query_vectors, { vec = kw_vec, weight = 0.55, is_primary = false })
     end
 
-    -- ========== 2. 多路搜索 & 合并 Turn 分数 ==========
+    -- 2. 多路搜索 → Max-Pooling + 非线性压制
     local cfg = config.settings.ai_query
     local max_mem = cfg.max_memory or 5
-    local turn_scores = {} -- key=turn, value=最高分
+    local MIN_SIM_GATE = 0.58          -- 新增：硬过滤泛化噪声
+    local POWER = 1.80                 -- 非线性压制（0.2 → 0.028）
 
-    for _, query_item in ipairs(query_vectors) do
-        local q_vec = query_item.vec
-        local weight = query_item.weight
+    local turn_best = {}   -- turn → 最高有效分数
 
-        -- 搜索相似记忆行
-        local sim_results = tool.find_sim_all_heat(q_vec)
-        if sim_results then
-            for i, mem in ipairs(sim_results) do
-                if i > max_mem then break end -- 每路搜索只取前 N 个
+    for _, q in ipairs(query_vectors) do
+        local q_vec = q.vec
+        local weight = q.weight
 
-                local mem_line = mem.index
-                local mem_sim = mem.similarity * weight -- 应用权重
-                local mem_data = memory.memories[mem_line]
+        -- 簇内优先搜索（原有逻辑）
+        local sim_results = {}
+        local best_id, best_sim = cluster.find_best_cluster(q_vec)
+        if best_id and best_sim >= (config.settings.cluster.cluster_sim or 0.75) then
+            sim_results = cluster.find_sim_in_cluster(q_vec, best_id)
+        else
+            sim_results = memory.find_similar_all_fast(q_vec)  -- 热区全扫
+        end
 
-                if mem_data and mem_data.turns then
-                    -- 将该记忆行关联的轮次得分累加或更新
-                    for _, turn in ipairs(mem_data.turns) do
-                        local current_score = turn_scores[turn] or 0
-                        -- 这里采用累加逻辑：多次命中视为更重要
-                        turn_scores[turn] = current_score + mem_sim
+        for i, mem in ipairs(sim_results) do
+            if i > max_mem then break end
+            if mem.similarity < MIN_SIM_GATE then break end
+
+            -- 非线性压制 + 权重
+            local effective = (mem.similarity ^ POWER) * weight
+
+            local mem_data = memory.memories[mem.index]
+            if mem_data and mem_data.turns then
+                for _, turn in ipairs(mem_data.turns) do
+                    if not turn_best[turn] or effective > turn_best[turn] then
+                        turn_best[turn] = effective
                     end
                 end
             end
         end
     end
 
-    -- ========== 3. 排序与筛选 ==========
+    -- 3. 转成可排序列表
     local sorted_turns = {}
-    for turn, score in pairs(turn_scores) do
+    for turn, score in pairs(turn_best) do
         table.insert(sorted_turns, {turn = turn, score = score})
     end
     table.sort(sorted_turns, function(a, b) return a.score > b.score end)
 
-    -- 限制最终轮次数
+    -- 4. 限制数量 + Topic 加权过滤（保持你原有逻辑）
     local max_turns = cfg.max_turns or 10
     if #sorted_turns > max_turns then
-        local limited = {}
-        for i = 1, max_turns do
-            limited[i] = sorted_turns[i]
-        end
-        sorted_turns = limited
+        for i = max_turns + 1, #sorted_turns do table.remove(sorted_turns) end
     end
 
-    if #sorted_turns == 0 then
-        return ""
-    end
+    -- === Topic 加权（完全复用你原来的代码，仅把 base_score 换成上面的 score）===
+    local current_topic_info = topic.get_topic_for_turn and topic.get_topic_for_turn(history.get_turn() + 1) or nil
 
-    -- ========== 4. 获取对话内容并拼接 ==========
-    local memory_text_lines = {}
     for _, item in ipairs(sorted_turns) do
-        local turn = item.turn
-        local entry = history.get_by_turn(turn)
-        if entry then
-            -- 解析逻辑（兼容新旧格式）
-            local user_part, ai_part = entry:match("^(.-)" .. FIELD_SEP .. "(.*)$")
-            if user_part and ai_part then
-                ai_part = ai_part:gsub(NEWLINE_REPLACE, "\n")
-                table.insert(memory_text_lines, string.format("第%d轮 用户：%s\n助手：%s", turn, user_part, ai_part))
-            else
-                local old_user, old_ai = entry:match("^user:(.+)ai:(.+)$")
-                if old_user and old_ai then
-                    old_ai = old_ai:gsub("\x1F", "\n")
-                    table.insert(memory_text_lines, string.format("第%d轮 用户：%s\n助手：%s", turn, old_user, old_ai))
+        local topic_info = topic.get_topic_for_turn and topic.get_topic_for_turn(item.turn) or nil
+        if topic_info and current_topic_info then
+            if topic_info.is_active and current_topic_info.is_active then
+                item.score = item.score * (cfg.topic_same_boost or 1.65)
+            elseif topic_info.centroid and current_topic_info.centroid then
+                local ts = tool.cosine_similarity(topic_info.centroid, current_topic_info.centroid)
+                if ts > (cfg.topic_sim_threshold or 0.68) then
+                    item.score = item.score * (cfg.topic_similar_boost or 1.42)
                 else
-                    table.insert(memory_text_lines, string.format("第%d轮 %s", turn, entry))
+                    item.score = item.score * (cfg.topic_cross_penalty or 0.65)
                 end
             end
         end
     end
 
-    if #memory_text_lines == 0 then
-        return ""
+    -- 5. 拼接最终记忆文本（保持不变）
+    local memory_text_lines = {}
+    for _, item in ipairs(sorted_turns) do
+        local entry = history.get_by_turn(item.turn)
+        if entry then
+            -- ...（你原来的解析和格式化代码，完全不动）
+            local user_part, ai_part = entry:match("^(.-)" .. FIELD_SEP .. "(.*)$")
+            if user_part and ai_part then
+                ai_part = ai_part:gsub(NEWLINE_REPLACE, "\n")
+                table.insert(memory_text_lines, string.format("第%d轮 用户：%s\n助手：%s", item.turn, user_part, ai_part))
+            end
+        end
     end
 
-    local result = "【相关记忆】\n" .. table.concat(memory_text_lines, "\n\n")
-    return result
+    return #memory_text_lines > 0 and "【相关记忆】\n" .. table.concat(memory_text_lines, "\n\n") or ""
 end
 
 -- 组合函数

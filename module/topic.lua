@@ -382,4 +382,22 @@ function M.init()
     print("[Topic] 模块初始化完成")
 end
 
+function M.get_topic_for_turn(turn)
+    -- 返回 {is_active = bool, centroid = vec_table or nil, topic_idx = nil or number}
+    if M.active_topic.start and turn >= M.active_topic.start then
+        local cent = M.active_topic.head_centroid
+        if not cent and #M.active_topic.vectors > 0 then
+            cent = tool.average_vectors(M.active_topic.vectors)
+        end
+        return { is_active = true, centroid = cent, topic_idx = nil }
+    end
+
+    for i, t in ipairs(M.topics) do
+        if t.start <= turn and (not t.end_ or turn <= t.end_) then
+            return { is_active = false, centroid = t.centroid, topic_idx = i }
+        end
+    end
+    return nil
+end
+
 return M

@@ -99,7 +99,7 @@ class AIPipeline:
                 model_path=embedding_model_path,
                 embedding=True,
                 logits_all=True,
-                n_gpu_layers=0,
+                n_gpu_layers=-1,
                 n_ctx=8192,
                 verbose=False
             )

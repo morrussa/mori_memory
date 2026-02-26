@@ -1,18 +1,18 @@
+-- heat.lua
 local M = {}
 
 local config = require("module.config")
 local tool = require("module.tool")
 
 local HEAT_CFG = config.settings.heat
-local TOTAL_HEAT = HEAT_CFG.total_heat          -- 10M
-local POOL_SIZE = HEAT_CFG.heat_pool_ratio      -- 1M
 local SOFTMAX_ENABLED = HEAT_CFG.softmax == true
-local TARGET_HEAT     = HEAT_CFG.total_heat or 10000000
-local TOLERANCE = HEAT_CFG.tolerance
+local TARGET_HEAT = HEAT_CFG.total_heat or 10000000
+local TOLERANCE = HEAT_CFG.tolerance or 500
 
 print(string.format("[Heat] Softmax模式 %s（总热力永远固定为 %d）", 
       SOFTMAX_ENABLED and "已启用" or "已禁用", TARGET_HEAT))
-local NEW_HEAT = HEAT_CFG.new_memory_heat
+      
+local NEW_HEAT = HEAT_CFG.new_memory_heat or 43000
 
 M.heat = { indices = {}, values = {} }          -- 热区实时缓存（只存 heat > 0）
 M.pending_cold = {}                             -- 冷区邻居任务缓存（仅存储记忆行号）
@@ -60,8 +60,7 @@ function M.normalize_heat()
     if current_total < 100 then return end
 
     -- 如果已经很接近目标，就不折腾了（避免无谓计算）
-    local tolerance = TOLERANCE
-    if math.abs(current_total - TARGET_HEAT) <= tolerance then
+    if math.abs(current_total - TARGET_HEAT) <= TOLERANCE then
         return
     end
 
@@ -93,26 +92,29 @@ function M.normalize_heat()
         end
     end
 
-    -- 第二步：微调补差（±1 轮询方式）
+    -- 第二步：微调补差（±1 轮询方式，移除了 goto 语法）
     local diff = TARGET_HEAT - final_total
     if diff ~= 0 and #new_indices > 0 then
         local step = diff > 0 and 1 or -1
         local abs_diff = math.abs(diff)
+        local applied = 0
         local i = 1
+        local loop_count = 0
+        local max_loop = #new_indices * 2 -- 安全防护，防止死循环
 
-        for _ = 1, abs_diff do
-            -- 防止过度扣减导致负值
+        while applied < abs_diff do
+            loop_count = loop_count + 1
+            if loop_count > max_loop then break end
+
+            -- 扣减时保护最小值
             if step == -1 and new_values[i] <= 1 then
-                -- 如果要扣但值已经很小，就跳过这个记忆
-                i = i + 1
-                if i > #new_indices then i = 1 end
-                goto continue
+                -- 跳过，寻找下一个目标
+            else
+                new_values[i] = new_values[i] + step
+                memory.set_heat(new_indices[i], new_values[i])
+                applied = applied + 1
             end
-
-            new_values[i] = new_values[i] + step
-            memory.set_heat(new_indices[i], new_values[i])
-
-            ::continue::
+            
             i = i + 1
             if i > #new_indices then i = 1 end
         end
@@ -181,45 +183,6 @@ function M.load()
     M.load_pending()
 end
 
--- ====================== 热力回收（全局均减） ======================
-function M.perform_recovery()
-    local memory = require("module.memory")
-    local cluster = require("module.cluster")
-    if SOFTMAX_ENABLED then 
-        return false 
-    end
-    local total = M.get_total_heat()
-    if total <= POOL_SIZE then return false end
-
-    print(string.format("[Heat Recovery] 热区满 %d > %d，开始全局均减...", total, POOL_SIZE))
-
-    local num_hot = #M.heat.values
-    if num_hot == 0 then return false end
-
-    local excess = total - POOL_SIZE
-    local delta = math.ceil(excess / num_hot)
-
-    local to_cold = 0
-
-    for i = 1, num_hot do
-        local new_h = math.max(0, M.heat.values[i] - delta)
-        local line = M.heat.indices[i]
-
-        memory.set_heat(line, new_h)          -- 只写 memory.txt
-        sync_heat_to_table(line, new_h)
-
-        if new_h == 0 then
-            cluster.mark_cold(line)
-            to_cold = to_cold + 1
-            print(string.format("[Heat] 记忆 %d 热力归零 → 冷区", line))
-        end
-    end
-
-    cluster.update_hot_status()
-    print(string.format("[Heat Recovery] 完成，%d 条进入冷区", to_cold))
-    return true
-end
-
 -- ====================== 邻居加热 ======================
 function M.neighbors_add_heat(vec, total_turn, target_mem_line)
     local memory = require("module.memory")
@@ -233,7 +196,7 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
         print(string.format("[Heat] 目标 %d 在冷区，任务已缓存", target_mem_line))
     end
 
-    -- 查找相似记忆（逻辑保持不变）
+    -- 查找相似记忆
     local cid = cluster.get_cluster_id_for_line(target_mem_line)
     local sim_results
     if cid then
@@ -288,10 +251,7 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
         sync_heat_to_table(nb_indices[1], new_first_h)
     end
 
-    -- 回收检查
-    if M.get_total_heat() > TOTAL_HEAT then
-        M.perform_recovery()
-    end
+    -- 统一由 normalize_heat 处理热力平衡
     M.normalize_heat()
 end
 
@@ -328,11 +288,8 @@ function M.add_new_heat(line, heat_value)
     memory.set_heat(line, heat_value)
     sync_heat_to_table(line, heat_value)
     print(string.format("[Heat] 新记忆 %d 加入热区 (热力=%d)", line, heat_value))
-
-    if M.get_total_heat() > TOTAL_HEAT then
-        M.perform_recovery()
-    end
     
+    -- 统一由 normalize_heat 处理热力平衡
     M.normalize_heat()
 end
 

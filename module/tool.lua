@@ -131,11 +131,22 @@ end
 
 -- ==================== 基础相似度计算（使用 AVX2 float 加速） ====================
 
+-- 在 tool.lua 中找到 cosine_similarity 函数并替换
 function M.cosine_similarity(vec1, vec2)
+    -- 1. 检查是否是 FFI 指针 (来自 memory.iterate_all)
+    if type(vec1) == "table" and vec1.__ptr then
+        -- 直接调用 C 函数，传入指针
+        return simdc.cosine_similarity_avx(vec1.__ptr, vec2, vec1.__dim)
+    end
+    if type(vec2) == "table" and vec2.__ptr then
+        return simdc.cosine_similarity_avx(vec1, vec2.__ptr, vec2.__dim)
+    end
+
+    -- 2. 标准 Lua Table 处理
     if not vec1 or not vec2 then return 0 end
     local n = #vec1
     if n == 0 or n ~= #vec2 then return 0 end
-    -- 创建 float 数组传递给 C
+    
     local p1 = ffi.new("float[?]", n)
     local p2 = ffi.new("float[?]", n)
     for i = 1, n do

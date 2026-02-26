@@ -1,4 +1,3 @@
-
 local M = {}
 
 local tool = require("module.tool")
