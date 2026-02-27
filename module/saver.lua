@@ -8,26 +8,46 @@ function M.mark_dirty()
 end
 
 function M.flush_all(force)
-    if not M.dirty and not force then return end
+    if not M.dirty and not force then return true end
 
     local memory = require("module.memory")
     local cluster = require("module.cluster")
     local history = require("module.history")
     local heat = require("module.heat")   -- 延迟加载 heat 模块
+    local notebook = require("module.notebook")
 
     print("[Saver] === 开始原子保存 raw 文件 ===")
 
-    memory.save_to_disk()
-    cluster.save_to_disk()
-    history.save_to_disk()
+    local function run_save(name, fn)
+        local ok, err = fn()
+        if not ok then
+            M.dirty = true
+            print(string.format("[Saver][ERROR] %s 保存失败: %s", name, tostring(err)))
+            return false
+        end
+        return true
+    end
+
+    if not run_save("memory.bin", memory.save_to_disk) then return false end
+    if not run_save("clusters.bin", cluster.save_to_disk) then return false end
+    if not run_save("history.txt", history.save_to_disk) then return false end
+    if not run_save("notebook.txt", notebook.save_to_disk) then return false end
 
     -- 保存 pending_cold 任务队列
-    heat.save_pending()
+    if not run_save("pending_cold.txt", heat.save_pending) then return false end
 
-    py_pipeline:pack_state()
+    local pack_ok, pack_err = pcall(function()
+        py_pipeline:pack_state()
+    end)
+    if not pack_ok then
+        M.dirty = true
+        print("[Saver][ERROR] pack_state 失败: " .. tostring(pack_err))
+        return false
+    end
 
     M.dirty = false
     print("[Saver] raw 文件 + state.zst 已更新")
+    return true
 end
 
 -- 程序正常退出时自动调用
@@ -35,8 +55,13 @@ function M.on_exit()
     print("[Saver] 正在原子保存并最终归档...")
     local topic = require("module.topic")
     topic.finalize()
-    M.flush_all(true)
+    local ok = M.flush_all(true)
+    if not ok then
+        print("[Saver][ERROR] 退出保存失败，跳过 raw 清理以避免数据丢失")
+        return false
+    end
     py_pipeline:cleanup_raw_files()
+    return true
     -- print("[Saver] 程序退出完成，仅保留 state.zst")
 end
 

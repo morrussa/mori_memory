@@ -16,9 +16,6 @@ local cluster = require("module.cluster")
 local topic = require("module.topic")   -- 【新增】用于 topic 过滤
 
 -- 定义与 history.lua 一致的分隔符
-local FIELD_SEP = "\x1F"
-local NEWLINE_REPLACE = "\x1E"
-
 -- 预定义的概念句子（用于计算语气向量）
 local ANXIETY_SENTENCES = {
     "我很焦虑", "我急死了", "快点", "急急急", "我现在很着急"
@@ -159,18 +156,30 @@ local function generate_search_keywords(user_input)
 
     local result_str = py_pipeline:generate_chat_sync(messages, params)
     result_str = tool.remove_cot(result_str)
-    
-    -- 解析 Lua table
+
     local keywords = {}
-    local table_str = result_str:match("{.*}")
-    if table_str then
-        local load_ok, load_func = pcall(load, "return " .. table_str)
-        if load_ok and load_func then
-            local call_ok, tbl = pcall(load_func)
-            if call_ok and type(tbl) == "table" then
-                keywords = tbl
+    local max_keywords = tonumber(((config.settings or {}).ai_query or {}).max_keywords) or 4
+    if max_keywords < 1 then max_keywords = 4 end
+
+    result_str = tostring(result_str or ""):gsub("%s+", " ")
+    result_str = result_str:match("^%s*(.-)%s*$")
+
+    local parsed, err = tool.parse_lua_string_array_strict(result_str, {
+        max_items = max_keywords,
+        max_item_chars = 64,
+        must_full = true,
+    })
+    if parsed then
+        local seen = {}
+        for _, kw in ipairs(parsed) do
+            local k = tostring(kw or ""):match("^%s*(.-)%s*$")
+            if k ~= "" and k ~= "无" and not seen[k] then
+                seen[k] = true
+                table.insert(keywords, k)
             end
         end
+    else
+        print(string.format("[Recall] 关键词输出格式非法，已丢弃: %s", tostring(err)))
     end
 
     if #keywords > 0 then
@@ -198,8 +207,8 @@ local function retrieve(user_input, user_vec)
     -- 2. 多路搜索 → Max-Pooling + 非线性压制
     local cfg = config.settings.ai_query
     local max_mem = cfg.max_memory or 5
-    local MIN_SIM_GATE = 0.58          -- 新增：硬过滤泛化噪声
-    local POWER = 1.80                 -- 非线性压制（0.2 → 0.028）
+    local MIN_SIM_GATE = cfg.min_sim_gate or 0.58
+    local POWER = cfg.power_suppress or 1.80
 
     local turn_best = {}   -- turn → 最高有效分数
 
@@ -211,7 +220,7 @@ local function retrieve(user_input, user_vec)
         local sim_results = {}
         local best_id, best_sim = cluster.find_best_cluster(q_vec)
         if best_id and best_sim >= (config.settings.cluster.cluster_sim or 0.75) then
-            sim_results = cluster.find_sim_in_cluster(q_vec, best_id)
+            sim_results = cluster.find_sim_in_cluster(q_vec, best_id, { only_hot = true })
         else
             sim_results = memory.find_similar_all_fast(q_vec)  -- 热区全扫
         end
@@ -234,47 +243,111 @@ local function retrieve(user_input, user_vec)
         end
     end
 
-    -- 3. 转成可排序列表
+    -- 3. 转成候选列表（不做 topic 乘分，避免语义自激）
     local sorted_turns = {}
     for turn, score in pairs(turn_best) do
         table.insert(sorted_turns, {turn = turn, score = score})
     end
     table.sort(sorted_turns, function(a, b) return a.score > b.score end)
 
-    -- 4. 限制数量 + Topic 加权过滤（保持你原有逻辑）
-    local max_turns = cfg.max_turns or 10
-    if #sorted_turns > max_turns then
-        for i = max_turns + 1, #sorted_turns do table.remove(sorted_turns) end
+    -- 4. Topic 用作“检索范围约束”：same -> near -> cross
+    local current_topic_info = topic.get_topic_for_turn and topic.get_topic_for_turn(history.get_turn() + 1) or nil
+    local topic_gate = topic.get_topic_for_turn ~= nil and current_topic_info ~= nil
+    local same_topic = {}
+    local near_topic = {}
+    local cross_topic = {}
+
+    local sim_th = cfg.topic_sim_threshold or 0.7
+    local cross_ratio = tonumber(cfg.topic_cross_quota_ratio) or 0.25
+    if cross_ratio < 0 then cross_ratio = 0 end
+    if cross_ratio > 0.5 then cross_ratio = 0.5 end
+
+    local function push_bucket(item)
+        if not topic_gate then
+            table.insert(same_topic, item)
+            return
+        end
+
+        local ti = topic.get_topic_for_turn(item.turn)
+        if not ti then
+            table.insert(cross_topic, item)
+            return
+        end
+
+        if ti.is_active and current_topic_info.is_active then
+            table.insert(same_topic, item)
+            return
+        end
+
+        if (not ti.is_active) and (not current_topic_info.is_active)
+            and ti.topic_idx and current_topic_info.topic_idx
+            and ti.topic_idx == current_topic_info.topic_idx then
+            table.insert(same_topic, item)
+            return
+        end
+
+        if ti.centroid and current_topic_info.centroid then
+            local ts = tool.cosine_similarity(ti.centroid, current_topic_info.centroid)
+            if ts >= sim_th then
+                table.insert(near_topic, item)
+            else
+                table.insert(cross_topic, item)
+            end
+            return
+        end
+
+        table.insert(cross_topic, item)
     end
 
-    -- === Topic 加权（完全复用你原来的代码，仅把 base_score 换成上面的 score）===
-    local current_topic_info = topic.get_topic_for_turn and topic.get_topic_for_turn(history.get_turn() + 1) or nil
-
     for _, item in ipairs(sorted_turns) do
-        local topic_info = topic.get_topic_for_turn and topic.get_topic_for_turn(item.turn) or nil
-        if topic_info and current_topic_info then
-            if topic_info.is_active and current_topic_info.is_active then
-                item.score = item.score * (cfg.topic_same_boost or 1.65)
-            elseif topic_info.centroid and current_topic_info.centroid then
-                local ts = tool.cosine_similarity(topic_info.centroid, current_topic_info.centroid)
-                if ts > (cfg.topic_sim_threshold or 0.68) then
-                    item.score = item.score * (cfg.topic_similar_boost or 1.42)
-                else
-                    item.score = item.score * (cfg.topic_cross_penalty or 0.65)
-                end
+        push_bucket(item)
+    end
+
+    local max_turns = cfg.max_turns or 10
+    local reserved_cross = topic_gate and math.min(#cross_topic, math.floor(max_turns * cross_ratio)) or 0
+    local selected = {}
+    local used = {}
+
+    local function append_until(src, limit)
+        for _, item in ipairs(src) do
+            if #selected >= limit then break end
+            if not used[item.turn] then
+                used[item.turn] = true
+                table.insert(selected, item)
             end
         end
     end
 
-    -- 5. 拼接最终记忆文本（保持不变）
+    local in_topic_budget = max_turns - reserved_cross
+    append_until(same_topic, in_topic_budget)
+    append_until(near_topic, in_topic_budget)
+    append_until(cross_topic, max_turns)
+
+    -- 回填：若某个桶不足，允许其他桶补齐到 max_turns
+    if #selected < max_turns then
+        append_until(near_topic, max_turns)
+        append_until(same_topic, max_turns)
+        append_until(cross_topic, max_turns)
+    end
+
+    table.sort(selected, function(a, b) return a.score > b.score end)
+    if #selected > max_turns then
+        for i = #selected, max_turns + 1, -1 do
+            table.remove(selected, i)
+        end
+    end
+    print(string.format(
+        "[Recall] 候选分桶: same=%d near=%d cross=%d | 选中=%d",
+        #same_topic, #near_topic, #cross_topic, #selected
+    ))
+
+    -- 6. 拼接最终记忆文本（保持不变）
     local memory_text_lines = {}
-    for _, item in ipairs(sorted_turns) do
+    for _, item in ipairs(selected) do
         local entry = history.get_by_turn(item.turn)
         if entry then
-            -- ...（你原来的解析和格式化代码，完全不动）
-            local user_part, ai_part = entry:match("^(.-)" .. FIELD_SEP .. "(.*)$")
-            if user_part and ai_part then
-                ai_part = ai_part:gsub(NEWLINE_REPLACE, "\n")
+            local user_part, ai_part = history.parse_entry(entry)
+            if user_part then
                 table.insert(memory_text_lines, string.format("第%d轮 用户：%s\n助手：%s", item.turn, user_part, ai_part))
             end
         end

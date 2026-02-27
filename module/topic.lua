@@ -3,6 +3,7 @@ local M = {}
 local ffi = require("ffi")
 local tool = require("module.tool")
 local config = require("module.config")
+local persistence = require("module.persistence")
 local history_module = require("module.history") -- 依赖 history 进行 rebuild
 local py_pipeline = py_pipeline
 
@@ -17,6 +18,10 @@ local MIN_TOPIC_LENGTH = T_CONF.min_topic_length or 2  -- 最小话题长度
 
 local DO_REBUILD = T_CONF.rebuild
 local IDX_FILE = "memory/topic.bin"
+local TOPIC_VERSION = 2
+local ACTIVE_HEAD_MASK = 1
+local ACTIVE_TAIL_MASK = 2
+local ACTIVE_LAST_MASK = 4
 
 -- ==================== 核心状态 ====================
 M.turn_vectors = {}       -- 缓存近期轮次的向量 (只保留必要的)
@@ -36,49 +41,78 @@ M._last_processed_turn = 0
 
 -- ==================== 二进制读写 ====================
 
--- Header 格式:
--- Magic(4) + Version(4) + Count(4) + ActiveStart(4) + ActiveTurn(4) + HeadVecBin + TailVecBin + LastVecBin
--- 如果无活跃话题，ActiveStart=0；LastVecBin 仅在活跃话题时存在
+local function has_flag(mask, flag)
+    return (mask % (flag * 2)) >= flag
+end
 
 local function save_to_disk()
-    local temp = IDX_FILE .. ".tmp"
-    local f = io.open(temp, "wb")
-    if not f then return end
-
-    -- 1. Header
-    f:write("TOPC")
     local count = #M.topics
     local active_start = M.active_topic.start or 0
     local active_turn = M._last_processed_turn
-    
-    -- 写入基础头部 (20 bytes)
-    local header_base = ffi.new("uint32_t[4]", 1, count, active_start, active_turn)
-    f:write(ffi.string(header_base, 16))
-    
-    -- 写入 Active 状态
+    local active_mask = 0
+
+    local head_vec = nil
+    local tail_vec = nil
+    local last_vec = nil
     if active_start > 0 then
-        -- 写入 Head Centroid
-        f:write(tool.vector_to_bin(M.active_topic.head_centroid))
-        
-        -- 写入 Tail Centroid (current)
-        local tail_centroid = tool.average_vectors(M.active_topic.tail_window)
-        f:write(tool.vector_to_bin(tail_centroid))
-        
-        -- [关键修复] 写入 Last Vector
-        if M.active_topic.last_vec then
-            f:write(tool.vector_to_bin(M.active_topic.last_vec))
+        head_vec = M.active_topic.head_centroid
+        if M.active_topic.tail_window and #M.active_topic.tail_window > 0 then
+            tail_vec = tool.average_vectors(M.active_topic.tail_window)
         end
+        last_vec = M.active_topic.last_vec
+
+        if head_vec and #head_vec > 0 then active_mask = active_mask + ACTIVE_HEAD_MASK end
+        if tail_vec and #tail_vec > 0 then active_mask = active_mask + ACTIVE_TAIL_MASK end
+        if last_vec and #last_vec > 0 then active_mask = active_mask + ACTIVE_LAST_MASK end
     end
 
-    -- 2. Records
-    for _, t in ipairs(M.topics) do
-        local bin = tool.create_topic_record(t.start, t.end_, t.summary or "", t.centroid)
-        f:write(bin)
-    end
-    f:close()
+    local ok, err = persistence.write_atomic(IDX_FILE, "wb", function(f)
+        local function write_or_fail(chunk)
+            local w_ok, w_err = f:write(chunk)
+            if not w_ok then
+                return false, w_err
+            end
+            return true
+        end
 
-    os.remove(IDX_FILE)
-    os.rename(temp, IDX_FILE)
+        -- 1. Header
+        local w1_ok, w1_err = write_or_fail("TOPC")
+        if not w1_ok then return false, w1_err end
+
+        -- 写入基础头部 (24 bytes = magic(4) + 5*uint32)
+        local header_base = ffi.new("uint32_t[5]", TOPIC_VERSION, count, active_start, active_turn, active_mask)
+        local w2_ok, w2_err = write_or_fail(ffi.string(header_base, 20))
+        if not w2_ok then return false, w2_err end
+
+        -- 写入 Active 状态
+        if active_start > 0 then
+            if has_flag(active_mask, ACTIVE_HEAD_MASK) then
+                local w3_ok, w3_err = write_or_fail(tool.vector_to_bin(head_vec))
+                if not w3_ok then return false, w3_err end
+            end
+            if has_flag(active_mask, ACTIVE_TAIL_MASK) then
+                local w4_ok, w4_err = write_or_fail(tool.vector_to_bin(tail_vec))
+                if not w4_ok then return false, w4_err end
+            end
+            if has_flag(active_mask, ACTIVE_LAST_MASK) then
+                local w5_ok, w5_err = write_or_fail(tool.vector_to_bin(last_vec))
+                if not w5_ok then return false, w5_err end
+            end
+        end
+
+        -- 2. Records
+        for _, t in ipairs(M.topics) do
+            local bin = tool.create_topic_record(t.start, t.end_, t.summary or "", t.centroid)
+            local wb_ok, wb_err = write_or_fail(bin)
+            if not wb_ok then return false, wb_err end
+        end
+        return true
+    end)
+
+    if not ok then
+        return false, err
+    end
+    return true
 end
 
 local function load_from_disk()
@@ -87,48 +121,63 @@ local function load_from_disk()
     if not f then return end
     local data = f:read("*a")
     f:close()
-    if #data < 20 or data:sub(1,4) ~= "TOPC" then return end
+    if #data < 24 or data:sub(1,4) ~= "TOPC" then return end
 
     -- Parse Header
     local p = ffi.cast("const uint8_t*", data)
+    local version = ffi.cast("const uint32_t*", p + 4)[0]
+    if version ~= TOPIC_VERSION then
+        print(string.format("[Topic] 检测到旧版 topic.bin (version=%d)，已跳过加载（仅支持 v%d）", version, TOPIC_VERSION))
+        return
+    end
     local count = ffi.cast("const uint32_t*", p + 8)[0]
     local active_start = ffi.cast("const uint32_t*", p + 12)[0]
     local active_turn = ffi.cast("const uint32_t*", p + 16)[0]
+    local active_mask = ffi.cast("const uint32_t*", p + 20)[0]
     
     M._last_processed_turn = active_turn
 
     -- Parse Active State
-    local offset = 20
+    local offset = 24
     if active_start > 0 then
-        -- 读取 Head Vec
-        local head_vec, head_len = tool.bin_to_vector(data, offset)
-        offset = offset + head_len
-        
-        -- 读取 Tail Vec
-        local tail_vec, tail_len = tool.bin_to_vector(data, offset)
-        offset = offset + tail_len
-        
-        -- [关键修复] 尝试读取 Last Vec (兼容旧版本文件)
-        local last_vec = nil
-        if offset < #data then
-            -- 检查剩余长度是否足够容纳一个向量头
-            -- 这里的逻辑是：如果还有剩余字节，且能成功解析，则认为是 last_vec
-            -- 注意：这里简单处理，如果解析失败则忽略
-            local success
-            success, last_vec = pcall(function()
-                local v, l = tool.bin_to_vector(data, offset)
-                offset = offset + l
-                return v
-            end)
-            if not success then last_vec = nil end
+        local head_vec, tail_vec, last_vec = nil, nil, nil
+
+        if has_flag(active_mask, ACTIVE_HEAD_MASK) then
+            local head_len
+            head_vec, head_len = tool.bin_to_vector(data, offset)
+            if not head_vec or head_len <= 0 then
+                print("[Topic] topic.bin 活跃头质心损坏，已跳过加载")
+                return
+            end
+            offset = offset + head_len
         end
-        
+        if has_flag(active_mask, ACTIVE_TAIL_MASK) then
+            local tail_len
+            tail_vec, tail_len = tool.bin_to_vector(data, offset)
+            if not tail_vec or tail_len <= 0 then
+                print("[Topic] topic.bin 活跃尾质心损坏，已跳过加载")
+                return
+            end
+            offset = offset + tail_len
+        end
+        if has_flag(active_mask, ACTIVE_LAST_MASK) then
+            local last_len
+            last_vec, last_len = tool.bin_to_vector(data, offset)
+            if not last_vec or last_len <= 0 then
+                print("[Topic] topic.bin 活跃 last_vec 损坏，已跳过加载")
+                return
+            end
+            offset = offset + last_len
+        end
+
         M.active_topic.start = active_start
         M.active_topic.head_centroid = head_vec
-        M.active_topic.tail_window = {tail_vec} 
-        M.active_topic.last_vec = last_vec -- 恢复 last_vec
+        M.active_topic.tail_window = tail_vec and {tail_vec} or {}
+        M.active_topic.last_vec = last_vec
         
         print(string.format("[Topic] 恢复活跃话题: %d - ?, LastVec=%s", active_start, last_vec and "Yes" or "No"))
+    else
+        M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
     end
     
     -- 清空旧 topics
@@ -142,6 +191,9 @@ local function load_from_disk()
         rec_count = rec_count + 1
     end
     print(string.format("[Topic] 加载 %d 个历史话题", rec_count))
+    if count ~= rec_count then
+        print(string.format("[Topic] 话题计数不一致：header=%d parsed=%d", count, rec_count))
+    end
 end
 
 -- ==================== 异常恢复与重建 ====================
@@ -162,7 +214,8 @@ local function rebuild_active_topic(current_turn)
     for t = start_turn, current_turn do
         local user_text = history_module.get_turn_text(t, "user")
         if user_text then
-            local vec = tool.get_embedding(user_text)
+            -- local vec = tool.get_embedding(user_text)
+            local vec = tool.get_embedding_passage(user_text)
             M.turn_vectors[t] = vec
             table.insert(M.active_topic.vectors, vec)
             
@@ -188,6 +241,48 @@ local function rebuild_active_topic(current_turn)
     
     M._last_processed_turn = current_turn
     print("[Topic] 话题重建完成")
+end
+
+-- 启动后恢复活跃话题的运行时向量缓存（避免仅恢复 head/tail 导致状态漂移）
+local function hydrate_active_topic_vectors(start_turn, end_turn)
+    if not start_turn or not end_turn or end_turn < start_turn then
+        M.active_topic.vectors = {}
+        M.active_topic.tail_window = {}
+        M.active_topic.last_vec = nil
+        M.active_topic.head_centroid = nil
+        return 0
+    end
+
+    local vectors = {}
+    local tail_window = {}
+
+    for t = start_turn, end_turn do
+        local user_text = history_module.get_turn_text(t, "user")
+        if user_text and user_text ~= "" then
+            local vec = tool.get_embedding_passage(user_text)
+            table.insert(vectors, vec)
+            table.insert(tail_window, vec)
+            if #tail_window > MAKE_CLUSTER2 then
+                table.remove(tail_window, 1)
+            end
+        end
+    end
+
+    M.active_topic.vectors = vectors
+    M.active_topic.tail_window = tail_window
+    M.active_topic.last_vec = vectors[#vectors]
+
+    if #vectors >= MAKE_CLUSTER1 then
+        local head_vecs = {}
+        for i = 1, MAKE_CLUSTER1 do
+            table.insert(head_vecs, vectors[i])
+        end
+        M.active_topic.head_centroid = tool.average_vectors(head_vecs)
+    else
+        M.active_topic.head_centroid = nil
+    end
+
+    return #vectors
 end
 
 -- ==================== 核心逻辑 ====================
@@ -225,7 +320,10 @@ local function close_current_topic(end_turn)
     
     -- 重置状态
     M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
-    save_to_disk()
+    local ok, err = save_to_disk()
+    if not ok then
+        print("[Topic][ERROR] 保存失败: " .. tostring(err))
+    end
 end
 
 function M.add_turn(turn, user_text, vector)
@@ -336,7 +434,10 @@ function M.add_turn(turn, user_text, vector)
         end
     end
     
-    save_to_disk()
+    local ok, err = save_to_disk()
+    if not ok then
+        print("[Topic][ERROR] 保存失败: " .. tostring(err))
+    end
 end
 
 function M.update_assistant(turn, text)
@@ -355,7 +456,10 @@ end
 
 function M.finalize()
     close_current_topic(M._last_processed_turn)
-    save_to_disk()
+    local ok, err = save_to_disk()
+    if not ok then
+        print("[Topic][ERROR] 保存失败: " .. tostring(err))
+    end
 end
 
 function M.init()
@@ -367,16 +471,12 @@ function M.init()
         print("[Topic] 状态不一致 (Bin=" .. M._last_processed_turn .. ", Hist=" .. history_turns .. ")，执行重建...")
         rebuild_active_topic(history_turns)
     elseif M.active_topic.start then
-        -- 如果恢复了活跃话题但头质心未满，尝试补全
-        if not M.active_topic.head_centroid and #M.active_topic.vectors >= MAKE_CLUSTER1 then
-            local head_vecs = {}
-            for i = 1, MAKE_CLUSTER1 do table.insert(head_vecs, M.active_topic.vectors[i]) end
-            M.active_topic.head_centroid = tool.average_vectors(head_vecs)
-        end
-        -- 如果 last_vec 缺失（旧格式文件），用最后一个向量补齐
-        if not M.active_topic.last_vec and #M.active_topic.vectors > 0 then
-            M.active_topic.last_vec = M.active_topic.vectors[#M.active_topic.vectors]
-        end
+        local hydrate_end = math.min(M._last_processed_turn, history_turns)
+        local restored = hydrate_active_topic_vectors(M.active_topic.start, hydrate_end)
+        print(string.format(
+            "[Topic] 活跃话题向量缓存已恢复: start=%d, end=%d, vectors=%d",
+            M.active_topic.start, hydrate_end, restored
+        ))
     end
     
     print("[Topic] 模块初始化完成")
@@ -395,6 +495,19 @@ function M.get_topic_for_turn(turn)
     for i, t in ipairs(M.topics) do
         if t.start <= turn and (not t.end_ or turn <= t.end_) then
             return { is_active = false, centroid = t.centroid, topic_idx = i }
+        end
+    end
+    return nil
+end
+
+function M.get_topic_anchor(turn)
+    local t = turn or M._last_processed_turn
+    if M.active_topic.start and t >= M.active_topic.start then
+        return "A:" .. tostring(M.active_topic.start)
+    end
+    for i, rec in ipairs(M.topics) do
+        if rec.start <= t and (not rec.end_ or t <= rec.end_) then
+            return "C:" .. tostring(i)
         end
     end
     return nil

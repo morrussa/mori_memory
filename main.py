@@ -88,7 +88,7 @@ class AIPipeline:
             self.llm_large = Llama(
                 model_path=large_model_path,
                 n_gpu_layers=-1,
-                n_ctx=4096,
+                n_ctx=40960,
                 verbose=False
             )
 
@@ -100,7 +100,7 @@ class AIPipeline:
                 embedding=True,
                 logits_all=True,
                 n_gpu_layers=-1,
-                n_ctx=8192,
+                n_ctx=2048,
                 verbose=False
             )
 
@@ -117,7 +117,8 @@ class AIPipeline:
             "memory/clusters.bin",
             "memory/history.txt",
             "memory/topic.bin",
-            "memory/pending_cold.txt"
+            "memory/pending_cold.txt",
+            "memory/notebook.txt",
         ]
 
         if not all(os.path.exists(f) for f in raw_files):
@@ -141,8 +142,25 @@ class AIPipeline:
         tar_bytes = dctx.decompress(compressed)
         tar_io = io.BytesIO(tar_bytes)
         with tarfile.open(fileobj=tar_io, mode="r") as tar:
-            tar.extractall("memory/")
+            self._safe_extract_tar(tar, "memory/")
         print(f"[Python] 解压完成（{len(compressed)/1024/1024:.1f} MB → raw）")
+
+    def _safe_extract_tar(self, tar, target_dir):
+        base_dir = os.path.realpath(target_dir)
+        os.makedirs(base_dir, exist_ok=True)
+
+        for member in tar.getmembers():
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"Unsafe archive member (link): {member.name}")
+
+            dest_path = os.path.realpath(os.path.join(base_dir, member.name))
+            if dest_path != base_dir and not dest_path.startswith(base_dir + os.sep):
+                raise RuntimeError(f"Unsafe archive member path: {member.name}")
+
+        try:
+            tar.extractall(base_dir, filter="data")
+        except TypeError:
+            tar.extractall(base_dir)
 
     def pack_state(self):
         print("[Python] 正在原子打包 state.zst...")
@@ -153,7 +171,8 @@ class AIPipeline:
                 "clusters.bin",
                 "history.txt",
                 "topic.bin",
-                "pending_cold.txt"
+                "pending_cold.txt",
+                "notebook.txt",
             ]:
                 path = f"memory/{name}"
                 if os.path.exists(path):
@@ -174,7 +193,8 @@ class AIPipeline:
             "clusters.bin",
             "history.txt",
             "topic.bin",
-            "pending_cold.txt"
+            "pending_cold.txt",
+            "notebook.txt",
         ]:
             path = f"memory/{name}"
             if os.path.exists(path):

@@ -2,6 +2,7 @@ local M = {}
 
 M.settings = {
     merge_limit = 0.95,--两个记忆如果相似度>0.95，则直接合并为一个，并且对应多条记忆。
+    dim = 1024,
     heat = {
         total_heat = 10000000,--总热力池大小
         new_memory_heat = 43000,--新记忆的热力
@@ -9,10 +10,17 @@ M.settings = {
         neighbors_heat = 26000,--邻居分配的热力，是平分的
         softmax = true,--当softmax = true时，自动禁用热力池设定，每一句话和它的邻居更新都触发全局归一化
         tolerance = 500,--softmax的热力归一化以后的容差
+        cold_cluster = {
+            neighbor_multiplier = 2.2,   -- 冷簇时邻居热力倍数（1.8~2.5 都行）
+            wake_multiplier     = 1.8,   -- 冷簇唤醒热力倍数
+            extra_neighbor_heat = 18000, -- 额外给邻居的热力（冷簇专用）
+        },
     },
     cluster = {
         cluster_sim = 0.72,--新记忆首先计算与其他簇的质心的相似度，如果>cluster_sim，那么就进入簇内。如果没有，那么就将这个向量本身作为质心。
-        hot_cluster_ratio = 0.65,--热簇占比超过50%则为热簇，反之为冷簇。
+        hot_cluster_ratio = 0.65,--热簇占比超过hot_cluster_ratio则为热簇，反之为冷簇。
+        cluster_heat_cap = 180000,--簇的热力cap（软cap）
+        cluster_heat_floor = 6500,
     },
     time = {
         loss_turn = 50,--距离失去搜索加权的轮数
@@ -36,10 +44,32 @@ M.settings = {
         topic_similar_boost = 1.02,
         topic_cross_penalty = 0.9,
         topic_sim_threshold = 0.7,
+        topic_cross_quota_ratio = 0.25, -- topic 约束召回时，跨 topic 兜底配额比例（0~0.5）
         max_keywords = 4,
         keyword_weight = 0.55,    -- 关键词权重
         min_sim_gate = 0.58,      -- 硬过滤，直接丢掉泛化噪声
         power_suppress = 1.80,    -- 非线性压制
+    },
+    keyring = {
+        long_term_plan = {
+            max_value_chars = 200,     -- 单条计划 value 最大长度
+            max_evidence_chars = 160,  -- 单条计划 evidence 最大长度
+            bom_max_items = 3,         -- 每轮注入 BOM 的最多条数
+            bom_max_chars = 800,       -- BOM 注入文本最大长度
+        },
+        tool_calling = {
+            upsert_min_confidence = 0.82,   -- upsert 最低置信度
+            upsert_max_per_turn = 1,        -- 每轮最多 upsert 次数
+            query_max_per_turn = 2,         -- 每轮最多 query 次数
+            delete_enabled = false,         -- 4B 默认禁用 delete
+            query_max_types = 3,            -- query types 最多允许几个
+            query_fetch_limit = 18,         -- query 先取较大召回池
+            query_inject_top = 3,           -- 注入前重排后只保留 top N
+            query_inject_max_chars = 800,   -- query 注入文本最大字符数
+            tool_pass_temperature = 0.15,   -- 二阶段工具调用温度
+            tool_pass_max_tokens = 128,     -- 二阶段工具调用长度
+            tool_pass_seed = 42,            -- 二阶段工具调用随机种子
+        },
     },
     topic = {--在退出时，如果topic没有闭合，在topic.bin的第一行写下 current_turn\x1F<topic_head_vec>\x1F<topic_now_vec> ，topic.bin的第一行永远留给这个用途。
         make_cluster1 = 4,--当一个topic建立时，它向前make_cluster1步以建立头质心，
