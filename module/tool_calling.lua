@@ -102,7 +102,11 @@ end
 local function parse_tool_call_line(line)
     local s = trim(line)
     if s == "" then return nil end
-    if not s:match("^%b{}$") then return nil end
+    if not s:match("^%b{}$") then
+        local first = tool.extract_first_lua_table and tool.extract_first_lua_table(s) or s:match("%b{}")
+        if not first then return nil end
+        s = trim(first)
+    end
     if not s:find("act%s*=") then return nil end
 
     local act_raw = parse_field(s, "act")
@@ -478,6 +482,7 @@ local function parse_facts_from_llm(raw_facts_str)
         max_items = 12,
         max_item_chars = 64,
         must_full = true,
+        extract_first_on_fail = true,
     })
     if not parsed then
         print(string.format("[Lua Fact Extract] LLM 输出格式非法，已丢弃: %s", tostring(err)))

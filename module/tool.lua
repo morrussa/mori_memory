@@ -128,6 +128,53 @@ function M.remove_cot(str)
     return result
 end
 
+-- 从任意文本中提取第一段平衡的 Lua table（%b{} 的增强版）
+-- 规则：忽略引号内的大括号，返回 table 文本及其起止位置
+function M.extract_first_lua_table(raw)
+    local text = tostring(raw or "")
+    local n = #text
+    local i = 1
+    local depth = 0
+    local start_pos = nil
+    local quote = nil
+
+    while i <= n do
+        local ch = text:sub(i, i)
+        if quote then
+            if ch == "\\" then
+                i = i + 2
+            elseif ch == quote then
+                quote = nil
+                i = i + 1
+            else
+                i = i + 1
+            end
+        else
+            if ch == "'" or ch == '"' then
+                quote = ch
+                i = i + 1
+            elseif ch == "{" then
+                if depth == 0 then
+                    start_pos = i
+                end
+                depth = depth + 1
+                i = i + 1
+            elseif ch == "}" and depth > 0 then
+                depth = depth - 1
+                if depth == 0 and start_pos then
+                    local end_pos = i
+                    return text:sub(start_pos, end_pos), start_pos, end_pos
+                end
+                i = i + 1
+            else
+                i = i + 1
+            end
+        end
+    end
+
+    return nil, nil, nil
+end
+
 -- 严格解析 Lua 字符串数组：{"a","b"} 或 {'a','b'}
 -- 不执行代码；格式不合法直接返回 nil, reason
 function M.parse_lua_string_array_strict(raw, opts)
@@ -135,6 +182,7 @@ function M.parse_lua_string_array_strict(raw, opts)
     local max_items = tonumber(opts.max_items) or 32
     local max_item_chars = tonumber(opts.max_item_chars) or 200
     local must_full = opts.must_full ~= false
+    local extract_first_on_fail = opts.extract_first_on_fail == true
 
     local function is_space(ch)
         return ch == " " or ch == "\t" or ch == "\r" or ch == "\n"
@@ -172,10 +220,19 @@ function M.parse_lua_string_array_strict(raw, opts)
     local candidate = text
     if must_full then
         if not candidate:match("^%b{}$") then
-            return nil, "not_full_lua_table"
+            if extract_first_on_fail then
+                local first = M.extract_first_lua_table(text)
+                if first then
+                    candidate = first
+                else
+                    return nil, "not_full_lua_table"
+                end
+            else
+                return nil, "not_full_lua_table"
+            end
         end
     else
-        candidate = text:match("%b{}")
+        candidate = M.extract_first_lua_table(text)
         if not candidate then
             return nil, "missing_lua_table"
         end

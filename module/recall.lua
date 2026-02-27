@@ -210,6 +210,7 @@ local function generate_search_keywords(user_input)
         max_items = max_keywords,
         max_item_chars = 64,
         must_full = true,
+        extract_first_on_fail = true,
     })
     if parsed then
         local seen = {}

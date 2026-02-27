@@ -148,6 +148,7 @@ M.settings = {
         break_limit = 0.48, -- 话语对断裂阈值：当前轮与上一轮相似度低于此值，视为发生“断裂”
         confirm_limit = 0.55, -- 话题无关阈值：断裂发生时，当前轮与头质心相似度低于此值，确认为新话题
         min_topic_length =2,--防止话题被切的太碎
+        summary_max_tokens = 192, -- topic 摘要生成的最大输出长度（默认加大，减少截断）。
         rebuild = true,--当异常退出时，如果rebuild为true，那么就找到文件一开始写的current_turn上一个topic的末尾，然后自己根据history.txt的输出自动重建整个topic。这个过程会阻塞主pipeline，因为如果不阻塞就不安全。
     },
 }

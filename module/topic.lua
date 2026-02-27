@@ -15,6 +15,7 @@ local TOPIC_LIMIT = T_CONF.topic_limit or 0.6      -- 全局漂移阈值
 local BREAK_LIMIT = T_CONF.break_limit or 0.45     -- 话语对断裂阈值 (论文核心思想)
 local CONFIRM_LIMIT = T_CONF.confirm_limit or 0.55 -- 话题无关确认阈值
 local MIN_TOPIC_LENGTH = T_CONF.min_topic_length or 2  -- 最小话题长度
+local SUMMARY_MAX_TOKENS = math.max(32, tonumber(T_CONF.summary_max_tokens) or 192)
 
 local DO_REBUILD = T_CONF.rebuild
 local IDX_FILE = "memory/topic.bin"
@@ -198,12 +199,17 @@ end
 
 -- ==================== 异常恢复与重建 ====================
 
-local function rebuild_active_topic(current_turn)
+local function rebuild_active_topic(current_turn, forced_start_turn)
     print("[Topic] 触发话题重建...")
     -- 1. 确定重建起点
-    local start_turn = 1
-    if #M.topics > 0 then
-        start_turn = (M.topics[#M.topics].end_ or 0) + 1
+    local start_turn = tonumber(forced_start_turn)
+    if start_turn and start_turn > 0 then
+        start_turn = math.floor(start_turn)
+    else
+        start_turn = 1
+        if #M.topics > 0 then
+            start_turn = (M.topics[#M.topics].end_ or 0) + 1
+        end
     end
     
     -- 2. 重新嵌入并计算
@@ -304,8 +310,10 @@ local function close_current_topic(end_turn)
     end
     if #dialog_texts > 0 then
         local prompt = "请用一句话概括话题：\n" .. table.concat(dialog_texts, "\n")
+        -- /no_think 为 Qwen 家族特有控制符，直接硬编码
+        prompt = prompt .. "\n/no_think"
         local messages = {{role="user", content=prompt}}
-        summary = py_pipeline:generate_chat_sync(messages, {max_tokens=64, temperature=0.1}) or ""
+        summary = py_pipeline:generate_chat_sync(messages, {max_tokens=SUMMARY_MAX_TOKENS, temperature=0.1}) or ""
         summary = tool.remove_cot(summary):match("^%s*(.-)%s*$")
     end
 
@@ -455,7 +463,14 @@ function M.get_summary(turn)
 end
 
 function M.finalize()
-    close_current_topic(M._last_processed_turn)
+    -- 退出时不主动闭合话题；保留 active 状态，启动时按未完成话题重建
+    if M.active_topic.start then
+        print(string.format(
+            "[Topic] 退出时标记未完成话题: %d-? (last_turn=%d)，下次启动将重建",
+            M.active_topic.start,
+            M._last_processed_turn
+        ))
+    end
     local ok, err = save_to_disk()
     if not ok then
         print("[Topic][ERROR] 保存失败: " .. tostring(err))
@@ -467,7 +482,13 @@ function M.init()
     
     -- 检查是否需要 Rebuild
     local history_turns = history_module.get_turn() -- 假设 history 模块有该函数
-    if DO_REBUILD and M._last_processed_turn > 0 and history_turns > M._last_processed_turn then
+    if DO_REBUILD and M.active_topic.start then
+        print(string.format(
+            "[Topic] 检测到未完成话题 A:%d，执行重建（Hist=%d）...",
+            M.active_topic.start, history_turns
+        ))
+        rebuild_active_topic(history_turns, M.active_topic.start)
+    elseif DO_REBUILD and M._last_processed_turn > 0 and history_turns > M._last_processed_turn then
         print("[Topic] 状态不一致 (Bin=" .. M._last_processed_turn .. ", Hist=" .. history_turns .. ")，执行重建...")
         rebuild_active_topic(history_turns)
     elseif M.active_topic.start then
