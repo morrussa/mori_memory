@@ -15,6 +15,7 @@ function M.flush_all(force)
     local history = require("module.history")
     local heat = require("module.heat")   -- 延迟加载 heat 模块
     local notebook = require("module.notebook")
+    local adaptive = require("module.adaptive")
 
     print("[Saver] === 开始原子保存 raw 文件 ===")
 
@@ -32,6 +33,7 @@ function M.flush_all(force)
     if not run_save("clusters.bin", cluster.save_to_disk) then return false end
     if not run_save("history.txt", history.save_to_disk) then return false end
     if not run_save("notebook.txt", notebook.save_to_disk) then return false end
+    if not run_save("adaptive_state.txt", adaptive.save_to_disk) then return false end
 
     -- 保存 pending_cold 任务队列
     if not run_save("pending_cold.txt", heat.save_pending) then return false end

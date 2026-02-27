@@ -6,6 +6,7 @@ local M = {}
 local tool = require("module.tool")
 local config = require("module.config")
 local cluster = require("module.cluster")
+local adaptive = require("module.adaptive")
 local ffi = require("ffi")
 local saver = require("module.saver")
 local persistence = require("module.persistence")
@@ -236,22 +237,27 @@ function M.add_memory(vec, turn)
     local heat_mod = require("module.heat")
 
     local new_heat = config.settings.heat.new_memory_heat
-    local merge_limit = config.settings.merge_limit or 0.95
+    local merge_limit = adaptive.get_merge_limit(config.settings.merge_limit or 0.95)
     local cluster_sim_th = config.settings.cluster.cluster_sim or 0.75
 
     -- 1. 优先在最佳簇内搜索相似记忆（跳桶）
     local sim_results = {}
-    local best_id, best_sim = cluster.find_best_cluster(vec)
+    local best_id, best_sim = cluster.find_best_cluster(vec, {
+        super_topn = config.settings.cluster.supercluster_topn_add,
+    })
     if best_id and best_sim >= cluster_sim_th then
         -- 簇命中：获取簇内所有成员（已按相似度排序）
-        sim_results = cluster.find_sim_in_cluster(vec, best_id, { only_hot = true })
+        sim_results = cluster.find_sim_in_cluster(vec, best_id, {
+            only_hot = true,
+            max_results = FAST_SCAN_TOPK,
+        })
         -- 如果过滤后没有热记忆，则回退全热区扫描
         if #sim_results == 0 then
-            sim_results = M.find_similar_all_fast(vec, 64)
+            sim_results = M.find_similar_all_fast(vec, FAST_SCAN_TOPK)
         end
     else
         -- 无簇或相似度不足：回退全热区扫描
-        sim_results = M.find_similar_all_fast(vec, 64)
+        sim_results = M.find_similar_all_fast(vec, FAST_SCAN_TOPK)
     end
 
     -- 2. 合并逻辑（保持不变，且此时 sim_results 中的记忆均为热记忆）

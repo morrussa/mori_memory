@@ -3,3 +3,4 @@ agent_memory_sim.py
 memory/
 luajit/
 __pycache__/
+readme.txt

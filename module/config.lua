@@ -21,6 +21,15 @@ M.settings = {
         hot_cluster_ratio = 0.65,--热簇占比超过hot_cluster_ratio则为热簇，反之为冷簇。
         cluster_heat_cap = 180000,--簇的热力cap（软cap）
         cluster_heat_floor = 6500,
+        hierarchical_cluster_enabled = true, -- 开启三层路由（memory -> cluster -> supercluster）；关闭后退回普通簇扫描。
+        supercluster_min_clusters = 64,      -- 只有簇数量达到这个阈值，才启用 supercluster（避免小样本下分层开销反而更大）。
+        supercluster_target_size = 64,       -- 每个 supercluster 期望容纳的簇数（影响分层粒度与召回粗筛强度）。
+        supercluster_sim = 0.52,             -- 新簇挂接到已有 supercluster 的最低相似度；低于该值会新建 supercluster。
+        supercluster_max_size_mult = 1.8,    -- supercluster 最大容量倍率，实际 cap = target_size * 该倍率。
+        supercluster_topn_add = 3,           -- 写入 add_memory 路径：仅在 topN supercluster 里找候选簇。
+        supercluster_topn_query = 4,         -- 查询 recall 路径：仅在 topN supercluster 里找候选簇。
+        supercluster_topn_scale = 0.20,      -- 动态扩展系数：簇越多，topN 会按 log2(cluster_count/min_clusters) 增长。
+        supercluster_rebuild_every = 600,    -- 增量挂接多少新簇后强制重建 supercluster 索引（抑制索引漂移）。
     },
     time = {
         loss_turn = 50,--距离失去搜索加权的轮数
@@ -49,6 +58,67 @@ M.settings = {
         keyword_weight = 0.55,    -- 关键词权重
         min_sim_gate = 0.58,      -- 硬过滤，直接丢掉泛化噪声
         power_suppress = 1.80,    -- 非线性压制
+        -- [实现方法] learning curve：
+        -- recall 每轮根据 progress=lerp(warmup->full) 动态插值 min_gate/power/max_memory/max_turns/keyword_weight/super_topn。
+        learning_curve_enabled = true,      -- 开启查询参数“随轮次收敛”；关闭后直接使用静态参数。
+        learning_warmup_turns = 500,        -- 学习曲线起点（<=该轮视作 progress=0）。
+        learning_full_turns = 12000,        -- 学习曲线终点（>=该轮视作 progress=1）。
+        learning_query_noise_extra = 0.18,  -- 早期额外噪声注入上限：噪声=base+(1-progress)*extra。
+        learning_min_sim_gate_start = 0.42, -- 早期最小相似度门限（后续收敛到 min_sim_gate）。
+        learning_power_suppress_start = 1.15,-- 早期非线性压制指数（后续收敛到 power_suppress）。
+        learning_topic_cross_quota_start = 0.48,-- 早期跨topic配额（后续收敛到 topic_cross_quota_ratio）。
+        learning_max_memory_start = 3,      -- 早期每query扫描 memory 数量起点（后续收敛到 max_memory）。
+        learning_max_turns_start = 14,      -- 早期输出 turn 数量起点（后续收敛到 max_turns）。
+        learning_keyword_weight_start = 0.78,-- 早期关键词子查询权重起点（后续收敛到 keyword_weight）。
+        learning_super_topn_query_start = 2,-- 早期 supercluster 查询 topN 起点（后续收敛到 supercluster_topn_query）。
+
+        -- [实现方法] refinement：
+        -- recall 把候选样本与正/负样本送入 adaptive.update_after_recall，在线更新 learned_min_gate / online_merge_limit / route_score。
+        refinement_enabled = true, -- 启用在线自适应（gate、merge_limit、route bias 都会随着召回反馈调整）。
+        refinement_start_turn = 200, -- 到达该轮才开始更新 adaptive 状态，前面只做静态召回。
+        refinement_sample_mem_topk = 48, -- 每轮用于 refinement 的候选 memory 样本上限（按相似度截断）。
+        refinement_route_lr = 0.10, -- 簇路由分数学习率（越大越快改变 route_score）。
+        refinement_gate_lr = 0.08, -- learned_min_gate 学习率（控制门限收敛速度）。
+        refinement_merge_lr = 0.05, -- online_merge_limit 学习率（控制合并阈值收敛速度）。
+        refinement_route_bias_scale = 0.08, -- route_score 参与簇排序时的偏置强度（0=不使用路由偏置）。
+        refinement_probe_clusters_start = 8, -- 早期每query探测簇数（高探索）。
+        refinement_probe_clusters_end = 2, -- 后期每query探测簇数（高精度）。
+        refinement_probe_per_cluster_limit = 12, -- 单簇最多扫描候选 memory 数（限制大簇成本）。
+
+        -- [实现方法] persistent explore：
+        -- recall 在主召回外随机/周期探测额外簇，避免长期陷入同一路由局部最优。
+        persistent_explore_enabled = true, -- 开启持久探索策略（对抗“只搜热簇”导致的召回盲区）。
+        persistent_explore_epsilon = 0.01, -- 每轮随机触发探索概率（epsilon-greedy）。
+        persistent_explore_period_turns = 0, -- 周期触发间隔；0 表示关闭周期触发，仅保留 epsilon 触发。
+        persistent_explore_extra_clusters = 1, -- 触发探索时，额外补探测的簇数量。
+        persistent_explore_candidate_cap = 32, -- 探索簇单簇扫描上限（防止探索带来过高成本）。
+        uncertain_recency_enabled = true, -- 灰度默认开启
+        uncertain_top1_sim_threshold = 0.62,
+        uncertain_top12_gap_threshold = 0.03,
+        uncertain_min_candidates = 6,
+        uncertain_recency_bonus = 0.035,
+        uncertain_recency_half_life = 120,
+        uncertain_recency_pool_cap = 32,
+
+        -- [实现方法] topic 分桶与预加载：
+        -- recall 先按 same/near/cross 进行桶内选取；当 topic 稳定时可随机预热少量同topic memory 进入 cache 通道。
+        use_topic_buckets = false, -- true=按 same/near/cross 分桶再配额；false=全局分数直接截断。
+        stable_warmup_turns = 6, -- topic 连续稳定轮数阈值（达到后才允许 random lift）。
+        stable_min_pair_sim = 0.72, -- 连续轮 query 向量平均相似度阈值（稳定性判断）。
+        topic_random_lift_interval = 3, -- 每隔多少轮尝试一次随机 lift（>1 时做取模触发）。
+        topic_random_lift_count = 2, -- 每次 lift 放入 cache 的 memory 数量。
+        topic_random_lift_prob = 0.85, -- 满足稳定条件后，本轮实际执行 lift 的概率。
+        topic_random_lift_only_cold = true, -- true=只从冷记忆里挑 lift 候选，避免热区重复。
+        topic_cache_weight = 1.02, -- cache 命中的分数增益系数（用于轻微偏置同topic记忆）。
+
+        -- [实现方法] 查询驱动冷救援（delayed rescue queue）：
+        -- 召回 miss/弱命中时入队冷记忆，按延迟到期后在 maintenance tick 执行唤醒 + 邻居加热。
+        cold_rescue_delay_min = 24, -- 入队后最小延迟轮数（防止即时抖动）。
+        cold_rescue_delay_max = 120, -- 入队后最大延迟轮数（与 min 组成随机延迟区间）。
+        cold_rescue_topn = 3, -- 单次入队最多挑选多少条冷记忆候选。
+        cold_rescue_batch = 24, -- 每次 maintenance tick 最多执行多少条到期救援任务。
+        cold_rescue_on_empty_only = false, -- true=仅空召回时入队；false=命中不足(hits<=0)也会入队。
+        cold_rescue_max_queue = 50000, -- 冷救援队列硬上限，超过后停止入队以保护内存与I/O。
     },
     keyring = {
         long_term_plan = {
@@ -56,21 +126,6 @@ M.settings = {
             max_evidence_chars = 160,  -- 单条计划 evidence 最大长度
             bom_max_items = 3,         -- 每轮注入 BOM 的最多条数
             bom_max_chars = 800,       -- BOM 注入文本最大长度
-        },
-        fact_extraction = {
-            max_items = 16,                -- 单轮最多保留多少条事实（过大容易把 memory 打散）
-            max_item_chars = 96,           -- 单条事实最大字符数
-            primary_max_tokens = 420,      -- 首抽输出长度
-            primary_temperature = 0.18,    -- 首抽温度（覆盖优先）
-            primary_seed = 42,
-            audit_rounds = 2,              -- 漏抽审计轮数
-            audit_max_tokens = 300,        -- 审计输出长度
-            audit_temperature = 0.08,      -- 审计温度（稳定补漏）
-            audit_seed = 43,
-            min_facts = 2,                 -- 质量阈值：最少事实数
-            min_facts_per_sentence = 0.65, -- 质量阈值：每句平均覆盖率
-            quality_retry_max = 1,         -- 质量不达标时的强制重抽次数
-            fallback_sentence_take = 6,    -- LLM 失效时，按句子兜底最多取多少条
         },
         tool_calling = {
             upsert_min_confidence = 0.82,   -- upsert 最低置信度

@@ -25,8 +25,9 @@ local NEW_HEAT = HEAT_CFG.new_memory_heat or 43000
 
 M.heat = { indices = {}, values = {} }          -- 热区实时缓存（只存 heat > 0）
 M.heat_pos = {}                                 -- line -> indices/values 的位置（O(1) 更新）
-M.pending_cold = {}                             -- 冷区邻居任务缓存（仅存储记忆行号）
-M.pending_dirty = false                          -- 标记 pending_cold 是否有变动
+M.pending_cold = {}                             -- 延迟冷救援队列：{ due_turn=number, line=number }
+M.pending_set = {}                              -- 去重：line -> true
+M.pending_dirty = false                         -- 标记 pending_cold 是否有变动
 
 local pending_file = "memory/pending_cold.txt"   -- 持久化文件
 
@@ -44,8 +45,16 @@ end
 function M.save_pending()
     if not M.pending_dirty then return true end
     local ok, err = persistence.write_atomic(pending_file, "w", function(f)
+        table.sort(M.pending_cold, function(a, b)
+            local da = tonumber(a.due_turn) or 0
+            local db = tonumber(b.due_turn) or 0
+            if da ~= db then return da < db end
+            return (tonumber(a.line) or 0) < (tonumber(b.line) or 0)
+        end)
         for _, task in ipairs(M.pending_cold) do
-            local w_ok, w_err = f:write(task.line .. "\n")
+            local due_turn = math.max(0, math.floor(tonumber(task.due_turn) or 0))
+            local line = math.max(1, math.floor(tonumber(task.line) or 0))
+            local w_ok, w_err = f:write(string.format("%d,%d\n", due_turn, line))
             if not w_ok then
                 return false, w_err
             end
@@ -65,12 +74,23 @@ function M.load_pending()
     local f = io.open(pending_file, "r")
     if not f then return end
     M.pending_cold = {}
+    M.pending_set = {}
     local seen = {}
     for line in f:lines() do
-        local l = normalize_line(line)
+        local due_s, line_s = tostring(line or ""):match("^%s*(%-?%d+)%s*,%s*(%-?%d+)%s*$")
+        local l = nil
+        local due_turn = 0
+        if due_s and line_s then
+            l = normalize_line(line_s)
+            due_turn = math.max(0, math.floor(tonumber(due_s) or 0))
+        else
+            -- 兼容旧格式：单列 line
+            l = normalize_line(line)
+        end
         if l and not seen[l] then
             seen[l] = true
-            table.insert(M.pending_cold, { line = l })
+            M.pending_set[l] = true
+            table.insert(M.pending_cold, { due_turn = due_turn, line = l })
         end
     end
     f:close()
@@ -259,20 +279,8 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
         is_cold_cluster = clu and not clu.is_hot_cluster
     end
 
-    -- [修复点] 只有目标冷且在冷簇中，才缓存任务
+    -- 新策略：查询驱动冷救援，不在写入阶段自动挂队列
     if is_cold_cluster and not M.is_hot(target_mem_line) then
-        local already_pending = false
-        for _, task in ipairs(M.pending_cold) do
-            if task.line == target_mem_line then
-                already_pending = true
-                break
-            end
-        end
-        if not already_pending then
-            table.insert(M.pending_cold, { line = target_mem_line })
-            M.pending_dirty = true
-            print(string.format("[Heat] 目标 %d 在冷簇 %d 且为冷记忆，邻居加热任务已缓存", target_mem_line, cid))
-        end
         return
     end
 
@@ -340,57 +348,212 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
     M.normalize_heat()
 end
 
--- ====================== 冷热交换 ======================
-function M.perform_cold_exchange()
+local function topic_relation_to_target(turn, target_info, sim_th)
+    local topic = require("module.topic")
+    local ti = topic.get_topic_for_turn and topic.get_topic_for_turn(turn) or nil
+    if not target_info or not ti then
+        return "cross"
+    end
+
+    if ti.is_active and target_info.is_active then
+        return "same"
+    end
+
+    if (not ti.is_active) and (not target_info.is_active)
+        and ti.topic_idx and target_info.topic_idx
+        and ti.topic_idx == target_info.topic_idx then
+        return "same"
+    end
+
+    if ti.centroid and target_info.centroid then
+        local ts = tool.cosine_similarity(ti.centroid, target_info.centroid)
+        if ts >= sim_th then return "near" end
+    end
+
+    return "cross"
+end
+
+local function find_sim_all_cold(vec, max_results)
+    local memory = require("module.memory")
+    local limit = math.max(1, tonumber(max_results) or 32)
+    local topk = {}
+    for idx = 1, memory.get_total_lines() do
+        if memory.get_heat_by_index(idx) <= 0 then
+            local mem_vec = memory.return_mem_vec(idx)
+            if mem_vec then
+                local sim = tool.cosine_similarity(vec, mem_vec)
+                if #topk < limit then
+                    topk[#topk + 1] = { index = idx, similarity = sim }
+                    local j = #topk
+                    while j > 1 and topk[j].similarity < topk[j - 1].similarity do
+                        topk[j], topk[j - 1] = topk[j - 1], topk[j]
+                        j = j - 1
+                    end
+                elseif sim > topk[1].similarity then
+                    topk[1] = { index = idx, similarity = sim }
+                    local j = 1
+                    while j < #topk and topk[j].similarity > topk[j + 1].similarity do
+                        topk[j], topk[j + 1] = topk[j + 1], topk[j]
+                        j = j + 1
+                    end
+                end
+            end
+        end
+    end
+
+    local out = {}
+    for i = #topk, 1, -1 do
+        out[#out + 1] = topk[i]
+    end
+    return out
+end
+
+function M.enqueue_cold_rescue(query_vec, current_turn, target_topic_info, min_gate)
+    local memory = require("module.memory")
+    local cluster = require("module.cluster")
+    local adaptive = require("module.adaptive")
+    local aq = ((config.settings or {}).ai_query or {})
+    if not query_vec or #query_vec == 0 then return end
+
+    local max_q = math.max(1, tonumber(aq.cold_rescue_max_queue) or 50000)
+    if #M.pending_cold >= max_q then return end
+
+    local gate = tonumber(min_gate) or tonumber(aq.min_sim_gate) or 0.58
+    local topn = math.max(1, tonumber(aq.cold_rescue_topn) or 3)
+    local scan_limit = math.max(topn * 6, 18)
+    local sim_th = tonumber(aq.topic_sim_threshold) or 0.70
+    local cur_turn = math.max(0, math.floor(tonumber(current_turn) or 0))
+    local delay_min = math.max(1, math.floor(tonumber(aq.cold_rescue_delay_min) or 24))
+    local delay_max = math.max(delay_min, math.floor(tonumber(aq.cold_rescue_delay_max) or 120))
+
+    local cluster_sim_th = (((config.settings or {}).cluster or {}).cluster_sim) or 0.72
+    local super_topn = (((config.settings or {}).cluster or {}).supercluster_topn_query) or 4
+    local best_id, best_sim = cluster.find_best_cluster(query_vec, { super_topn = super_topn })
+
+    local candidates = {}
+    if best_id and best_sim >= cluster_sim_th then
+        candidates = cluster.find_sim_in_cluster(query_vec, best_id, {
+            only_cold = true,
+            max_results = scan_limit,
+        })
+    else
+        candidates = find_sim_all_cold(query_vec, scan_limit)
+    end
+
+    local chosen = 0
+    for _, item in ipairs(candidates) do
+        local mem_idx = tonumber(item.index)
+        local sim = tonumber(item.similarity) or 0
+        if sim < gate then
+            break
+        end
+        if mem_idx and sim >= gate and not M.pending_set[mem_idx] then
+            local mem_data = memory.memories[mem_idx]
+            local has_target_turn = target_topic_info == nil
+            if mem_data and mem_data.turns and (not has_target_turn) then
+                for _, t in ipairs(mem_data.turns) do
+                    if topic_relation_to_target(t, target_topic_info, sim_th) == "same" then
+                        has_target_turn = true
+                        break
+                    end
+                end
+            end
+            if has_target_turn then
+                local delay = math.random(delay_min, delay_max)
+                local due_turn = cur_turn + delay
+                M.pending_cold[#M.pending_cold + 1] = { due_turn = due_turn, line = mem_idx }
+                M.pending_set[mem_idx] = true
+                M.pending_dirty = true
+                adaptive.add_counter("cold_rescue_enqueued", 1)
+                chosen = chosen + 1
+                if chosen >= topn or #M.pending_cold >= max_q then
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- ====================== 冷救援执行（兼容旧函数名） ======================
+function M.perform_cold_exchange(current_turn)
     local memory = require("module.memory")
     local cluster = require("module.cluster")
     local saver = require("module.saver")
     local history = require("module.history")
+    local adaptive = require("module.adaptive")
+    local aq = ((config.settings or {}).ai_query or {})
     if #M.pending_cold == 0 then return end
 
-    print(string.format("[Cold Awakening] 执行激进冷热交换，%d 个任务", #M.pending_cold))
+    local now_turn = tonumber(current_turn)
+    if not now_turn then
+        now_turn = history.get_turn()
+    end
+    now_turn = math.max(0, math.floor(now_turn))
 
+    local maintenance = math.max(1, tonumber((config.settings.time or {}).maintenance_task) or 75)
+    if (now_turn % maintenance) ~= 0 then
+        return
+    end
+
+    local batch = math.max(1, tonumber(aq.cold_rescue_batch) or 24)
+    table.sort(M.pending_cold, function(a, b)
+        local da = tonumber(a.due_turn) or 0
+        local db = tonumber(b.due_turn) or 0
+        if da ~= db then return da < db end
+        return (tonumber(a.line) or 0) < (tonumber(b.line) or 0)
+    end)
+
+    local done = 0
+    local remain = {}
     for _, task in ipairs(M.pending_cold) do
         local line = normalize_line(task.line)
-        if not line then
-            print(string.format("[Cold Awakening] 跳过非法任务行号: %s", tostring(task.line)))
+        local due_turn = math.max(0, math.floor(tonumber(task.due_turn) or 0))
+        if (not line) then
+            goto continue
+        end
+        if done >= batch or due_turn > now_turn then
+            remain[#remain + 1] = { due_turn = due_turn, line = line }
             goto continue
         end
 
-        local cid = cluster.get_cluster_id_for_line(line)
-        local clu = cid and cluster.clusters[cid]
-        local is_still_cold = clu and not clu.is_hot_cluster
-
-        local wake_heat = NEW_HEAT / 2
-        if is_still_cold then
-            wake_heat = math.floor(NEW_HEAT * COLD_WAKE_MULT)
-            print(string.format("[ColdBoost] 冷簇%d 记忆 %d 激进唤醒 (热力=%d)", cid, line, wake_heat))
+        if memory.get_heat_by_index(line) > 0 then
+            M.pending_set[line] = nil
+            goto continue
         end
 
-        local old_heat = memory.get_heat_by_index(line) or 0
+        local wake_heat = math.max(NEW_HEAT, math.floor(NEW_HEAT * COLD_WAKE_MULT))
         memory.set_heat(line, wake_heat)
         sync_heat_to_table(line, wake_heat)
-        if old_heat <= 0 then
-            cluster.mark_hot(line)
-        end
+        cluster.mark_hot(line)
 
-        if is_still_cold then
-            local vec = memory.return_mem_vec(line)
-            if vec then
-                local old_nb = config.settings.heat.neighbors_heat
-                config.settings.heat.neighbors_heat = COLD_EXTRA_NB
-                M.neighbors_add_heat(vec, history.get_turn() + 1, line)
-                config.settings.heat.neighbors_heat = old_nb
-            end
+        local old_nb = config.settings.heat.neighbors_heat
+        config.settings.heat.neighbors_heat = math.max(tonumber(old_nb) or 0, COLD_EXTRA_NB)
+        local vec = memory.return_mem_vec(line)
+        if vec then
+            M.neighbors_add_heat(vec, now_turn, line)
         end
+        config.settings.heat.neighbors_heat = old_nb
+
+        done = done + 1
+        M.pending_set[line] = nil
+        adaptive.add_counter("cold_rescue_executed", 1)
         ::continue::
     end
 
-    M.pending_cold = {}
+    M.pending_cold = remain
+    M.pending_set = {}
+    for _, task in ipairs(M.pending_cold) do
+        M.pending_set[task.line] = true
+    end
     M.pending_dirty = true
-    cluster.update_hot_status()
-    M.normalize_heat()
-    saver.flush_all()
+
+    if done > 0 then
+        print(string.format("[Cold Rescue] 本轮执行 %d 个延迟冷救援任务", done))
+        cluster.update_hot_status()
+        M.normalize_heat()
+        saver.mark_dirty()
+        saver.flush_all()
+    end
 end
 
 -- ====================== 新记忆加入热区 ======================

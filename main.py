@@ -119,6 +119,7 @@ class AIPipeline:
             "memory/topic.bin",
             "memory/pending_cold.txt",
             "memory/notebook.txt",
+            "memory/adaptive_state.txt",
         ]
 
         if not all(os.path.exists(f) for f in raw_files):
@@ -173,6 +174,7 @@ class AIPipeline:
                 "topic.bin",
                 "pending_cold.txt",
                 "notebook.txt",
+                "adaptive_state.txt",
             ]:
                 path = f"memory/{name}"
                 if os.path.exists(path):
@@ -195,6 +197,7 @@ class AIPipeline:
             "topic.bin",
             "pending_cold.txt",
             "notebook.txt",
+            "adaptive_state.txt",
         ]:
             path = f"memory/{name}"
             if os.path.exists(path):

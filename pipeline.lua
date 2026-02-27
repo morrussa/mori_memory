@@ -9,6 +9,7 @@ local saver =require("module.saver")
 local recall = require("module.recall")
 local tool_calling = require("module.tool_calling")
 local notebook = require("module.notebook")
+local adaptive = require("module.adaptive")
 local app_config = require("module.config")
 
 -- 1. 配置模型路径
@@ -28,6 +29,7 @@ cluster.update_hot_status()
 heat.load()
 saver.mark_dirty()
 history.load()
+adaptive.load()
 recall.init_all_sentiment_vectors()
 notebook.load()
 
