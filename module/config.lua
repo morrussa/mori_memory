@@ -57,6 +57,21 @@ M.settings = {
             bom_max_items = 3,         -- 每轮注入 BOM 的最多条数
             bom_max_chars = 800,       -- BOM 注入文本最大长度
         },
+        fact_extraction = {
+            max_items = 16,                -- 单轮最多保留多少条事实（过大容易把 memory 打散）
+            max_item_chars = 96,           -- 单条事实最大字符数
+            primary_max_tokens = 420,      -- 首抽输出长度
+            primary_temperature = 0.18,    -- 首抽温度（覆盖优先）
+            primary_seed = 42,
+            audit_rounds = 2,              -- 漏抽审计轮数
+            audit_max_tokens = 300,        -- 审计输出长度
+            audit_temperature = 0.08,      -- 审计温度（稳定补漏）
+            audit_seed = 43,
+            min_facts = 2,                 -- 质量阈值：最少事实数
+            min_facts_per_sentence = 0.65, -- 质量阈值：每句平均覆盖率
+            quality_retry_max = 1,         -- 质量不达标时的强制重抽次数
+            fallback_sentence_take = 6,    -- LLM 失效时，按句子兜底最多取多少条
+        },
         tool_calling = {
             upsert_min_confidence = 0.82,   -- upsert 最低置信度
             upsert_max_per_turn = 1,        -- 每轮最多 upsert 次数

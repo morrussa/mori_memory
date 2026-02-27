@@ -1,0 +1,5 @@
+model/
+agent_memory_sim.py
+memory/
+luajit/
+__pycache__/

@@ -18,7 +18,9 @@ local function clear_pending_system_context()
     M._pending_created_turn = 0
 end
 
-local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
+local KEYRING_CFG = ((config_mem.settings or {}).keyring or {})
+local TOOL_CFG = KEYRING_CFG.tool_calling or {}
+local FACT_CFG = KEYRING_CFG.fact_extraction or {}
 local trim
 
 local function to_bool(v, fallback)
@@ -53,6 +55,24 @@ local function get_tool_policy()
         tool_pass_temperature = cfg_number(TOOL_CFG.tool_pass_temperature, 0.15, 0, 1),
         tool_pass_max_tokens = cfg_number(TOOL_CFG.tool_pass_max_tokens, 128, 32),
         tool_pass_seed = cfg_number(TOOL_CFG.tool_pass_seed, 42),
+    }
+end
+
+local function get_fact_policy()
+    return {
+        max_items = cfg_number(FACT_CFG.max_items, 16, 4, 48),
+        max_item_chars = cfg_number(FACT_CFG.max_item_chars, 96, 16, 240),
+        primary_max_tokens = cfg_number(FACT_CFG.primary_max_tokens, 420, 64, 2048),
+        primary_temperature = cfg_number(FACT_CFG.primary_temperature, 0.18, 0, 1),
+        primary_seed = cfg_number(FACT_CFG.primary_seed, 42),
+        audit_rounds = cfg_number(FACT_CFG.audit_rounds, 2, 0, 4),
+        audit_max_tokens = cfg_number(FACT_CFG.audit_max_tokens, 300, 64, 2048),
+        audit_temperature = cfg_number(FACT_CFG.audit_temperature, 0.08, 0, 1),
+        audit_seed = cfg_number(FACT_CFG.audit_seed, 43),
+        min_facts = cfg_number(FACT_CFG.min_facts, 2, 0, 48),
+        min_facts_per_sentence = cfg_number(FACT_CFG.min_facts_per_sentence, 0.65, 0, 2),
+        quality_retry_max = cfg_number(FACT_CFG.quality_retry_max, 1, 0, 3),
+        fallback_sentence_take = cfg_number(FACT_CFG.fallback_sentence_take, 6, 1, 24),
     }
 end
 
@@ -443,80 +463,308 @@ local function resolve_calls_for_turn(user_input, clean_result, policy)
     return generate_two_step_tool_calls(user_input, clean_result, policy)
 end
 
-local function build_fact_prompt(user_input, assistant_clean)
-    return string.format([[
-你是一个绝对服从指令的原子事实提取器。你**只能**输出一个Lua table，不允许出现任何其他字符、解释、标签、英文、换行、空格、```、<|xxx|>、analysis、We need等内容。
-
-【铁律】
-- 输出必须以 { 开头，以 } 结尾
-- 每条事实不超过25个字，陈述句
-- 如果没有任何值得存储的事实，必须严格输出 {"无"}
-
-【正确输出示例1】
-{"用户喜欢AI", "AI高兴和用户聊天"}
-
-【正确输出示例2】
-{"无"}
-
-【正确输出示例3】
-{"用户熬夜写代码", "写到凌晨两点"}
-
-对话内容：
-用户：%s
-AI：%s
-
-现在立即只输出Lua table，不要任何前缀后缀，不要思考：
-]], user_input, assistant_clean)
+local function utf8_len(s)
+    local n = 0
+    for _ in tostring(s or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        n = n + 1
+    end
+    return n
 end
 
-local function parse_facts_from_llm(raw_facts_str)
+local function normalize_fact_key(s)
+    local v = trim(s):lower()
+    v = v:gsub("%s+", " ")
+    v = v:gsub("^[,，。;；:：]+", "")
+    v = v:gsub("[,，。;；:：]+$", "")
+    return v
+end
+
+local function escape_lua_string(s)
+    s = tostring(s or "")
+    s = s:gsub("\\", "\\\\")
+    s = s:gsub("\"", "\\\"")
+    s = s:gsub("\n", " ")
+    s = s:gsub("\r", " ")
+    return s
+end
+
+local function render_lua_string_table(items)
+    local parts = {}
+    for _, item in ipairs(items or {}) do
+        parts[#parts + 1] = string.format("\"%s\"", escape_lua_string(item))
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
+end
+
+local function merge_fact_lists(base, incoming, max_items, max_item_chars)
+    local out = {}
+    local seen = {}
+    max_items = tonumber(max_items) or 16
+    max_item_chars = tonumber(max_item_chars) or 96
+
+    local function add_one(raw)
+        if #out >= max_items then return end
+        local fact = trim(raw)
+        if fact == "" or fact == "无" then return end
+        fact = fact:gsub("%s+", " ")
+        if utf8_len(fact) > max_item_chars then
+            fact = utf8_take(fact, max_item_chars)
+        end
+        if utf8_len(fact) < 2 then return end
+        local key = normalize_fact_key(fact)
+        if key == "" or seen[key] then return end
+        seen[key] = true
+        out[#out + 1] = fact
+    end
+
+    for _, item in ipairs(base or {}) do add_one(item) end
+    for _, item in ipairs(incoming or {}) do add_one(item) end
+    return out
+end
+
+local function split_into_sentences(text)
+    local out = {}
+    text = tostring(text or "")
+    text = text:gsub("\r", "\n")
+    for seg in text:gmatch("[^。\n！？!?；;%.]+") do
+        local s = trim(seg)
+        if s ~= "" then
+            out[#out + 1] = s
+        end
+    end
+    return out
+end
+
+local function count_dialogue_sentences(user_input, assistant_clean)
+    local count = 0
+    local user_s = split_into_sentences(user_input)
+    local ai_s = split_into_sentences(assistant_clean)
+    count = #user_s + #ai_s
+    if count <= 0 then count = 1 end
+    return count
+end
+
+local function build_fallback_sentence_facts(user_input, assistant_clean, policy)
+    local candidate = {}
+    local seen = {}
+    local max_take = tonumber(policy.fallback_sentence_take) or 6
+    local max_chars = tonumber(policy.max_item_chars) or 96
+
+    local function feed(list)
+        for _, s in ipairs(list or {}) do
+            local fact = trim(s)
+            if fact ~= "" then
+                if utf8_len(fact) > max_chars then
+                    fact = utf8_take(fact, max_chars)
+                end
+                local key = normalize_fact_key(fact)
+                if key ~= "" and not seen[key] then
+                    seen[key] = true
+                    candidate[#candidate + 1] = fact
+                    if #candidate >= max_take then
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    feed(split_into_sentences(user_input))
+    if #candidate < max_take then
+        feed(split_into_sentences(assistant_clean))
+    end
+    if #candidate == 0 then
+        local raw = trim(user_input)
+        if raw == "" then raw = trim(assistant_clean) end
+        if raw ~= "" then
+            candidate[1] = utf8_take(raw, max_chars)
+        end
+    end
+    return candidate
+end
+
+local function build_fact_primary_prompt(user_input, assistant_clean, policy, strict_cover_mode)
+    local strict_line = ""
+    if strict_cover_mode then
+        strict_line = "8. 先逐句核查“用户+助手”每一句是否被覆盖，再输出。"
+    end
+
+    return string.format([[
+你是高召回原子事实抽取器，不是摘要器。
+
+目标：覆盖率优先，宁可冗余也不要遗漏。
+
+硬约束：
+1. 只抽取对话里“明确说出”的事实，不推测。
+2. 禁止压缩、禁止合并、禁止抽象改写。
+3. 一条事实只表达一个谓词（一个动作/状态）。
+4. 并列信息必须拆条，时间/数字/否定词尽量保留。
+5. 不要主动去重，允许近似重复，后处理会去重。
+6. 只输出 Lua 字符串数组，例如 {"事实1","事实2"}。
+7. 无可用事实时输出 {"无"}。
+%s
+
+格式要求：
+- 每条事实长度 <= %d 字。
+- 输出必须以 { 开头，以 } 结尾，不要解释文本。
+
+对话：
+用户：%s
+助手：%s
+
+现在只输出 Lua table：
+]], strict_line, policy.max_item_chars, user_input, assistant_clean)
+end
+
+local function build_fact_audit_prompt(user_input, assistant_clean, existing_facts, policy)
+    local existing = render_lua_string_table(existing_facts or {})
+    if existing == "{}" then
+        existing = "{\"无\"}"
+    end
+
+    return string.format([[
+你在做“漏抽审计”，不是摘要改写。
+
+已提取事实（禁止重复）：
+%s
+
+任务：重新检查对话，只补充“原文明确出现但上面未覆盖”的事实。
+
+硬约束：
+1. 禁止抽象总结，禁止把多条信息合并成一条。
+2. 只输出新增事实；若无新增，输出 {"无"}。
+3. 输出格式必须是 Lua 字符串数组 {"...","..."}。
+4. 每条事实长度 <= %d 字。
+
+对话：
+用户：%s
+助手：%s
+
+现在只输出 Lua table：
+]], existing, policy.max_item_chars, user_input, assistant_clean)
+end
+
+local function parse_facts_from_llm(raw_facts_str, policy)
     local facts_str = strip_cot_safe(raw_facts_str or "")
     facts_str = facts_str:gsub("%s+", " ")
     facts_str = trim(facts_str)
 
     local parsed, err = tool.parse_lua_string_array_strict(facts_str, {
-        max_items = 12,
-        max_item_chars = 64,
+        max_items = policy.max_items,
+        max_item_chars = policy.max_item_chars,
         must_full = true,
     })
+    if not parsed then
+        parsed, err = tool.parse_lua_string_array_strict(facts_str, {
+            max_items = policy.max_items,
+            max_item_chars = policy.max_item_chars,
+            must_full = false,
+        })
+    end
     if not parsed then
         print(string.format("[Lua Fact Extract] LLM 输出格式非法，已丢弃: %s", tostring(err)))
         return {}
     end
 
-    local facts = {}
-    local seen = {}
-    for _, item in ipairs(parsed) do
-        local fact = trim(item)
-        if fact ~= "" and fact ~= "无" and not seen[fact] then
-            seen[fact] = true
-            table.insert(facts, fact)
-        end
-    end
-
-    print(string.format("[Lua Fact Extract] 成功提取 %d 条原子事实", #facts))
+    local facts = merge_fact_lists({}, parsed, policy.max_items, policy.max_item_chars)
+    print(string.format("[Lua Fact Extract] 成功解析 %d 条事实", #facts))
     return facts
 end
 
-function M.extract_atomic_facts(user_input, assistant_text)
-    local assistant_clean = tool.replace(assistant_text or "", "\n", " ")
-    local fact_prompt = build_fact_prompt(user_input, assistant_clean)
-
-    local fact_messages = {
-        { role = "system", content = fact_prompt }
+local function run_fact_extract_pass(user_input, assistant_clean, policy, strict_cover_mode, seed_offset)
+    local prompt = build_fact_primary_prompt(user_input, assistant_clean, policy, strict_cover_mode == true)
+    local messages = {
+        { role = "system", content = prompt }
     }
-    local fact_params = {
-        max_tokens = 256,
-        temperature = 0.4,
-        seed = 42,
+    local params = {
+        max_tokens = policy.primary_max_tokens,
+        temperature = policy.primary_temperature,
+        seed = policy.primary_seed + (tonumber(seed_offset) or 0),
     }
 
-    local facts_str = py_pipeline:generate_chat_sync(fact_messages, fact_params)
-    local facts = parse_facts_from_llm(facts_str)
-    if #facts == 0 then
-        print("[Lua Fact Extract] 未提取到事实，使用原始用户输入兜底")
-        facts = { user_input }
+    local raw = py_pipeline:generate_chat_sync(messages, params)
+    return parse_facts_from_llm(raw, policy)
+end
+
+local function run_fact_audit_rounds(user_input, assistant_clean, base_facts, policy)
+    local merged = merge_fact_lists({}, base_facts, policy.max_items, policy.max_item_chars)
+    if policy.audit_rounds <= 0 then
+        return merged
     end
+
+    for round = 1, policy.audit_rounds do
+        local prompt = build_fact_audit_prompt(user_input, assistant_clean, merged, policy)
+        local messages = {
+            { role = "system", content = prompt }
+        }
+        local params = {
+            max_tokens = policy.audit_max_tokens,
+            temperature = policy.audit_temperature,
+            seed = policy.audit_seed + round,
+        }
+        local raw = py_pipeline:generate_chat_sync(messages, params)
+        local delta = parse_facts_from_llm(raw, policy)
+        local before = #merged
+        merged = merge_fact_lists(merged, delta, policy.max_items, policy.max_item_chars)
+        local added = #merged - before
+        print(string.format("[Lua Fact Extract] 漏抽审计 round=%d 新增 %d 条", round, math.max(0, added)))
+        if added <= 0 then
+            break
+        end
+    end
+    return merged
+end
+
+local function evaluate_fact_quality(facts, user_input, assistant_clean, policy)
+    local sentence_count = count_dialogue_sentences(user_input, assistant_clean)
+    local effective_sentence_count = math.min(sentence_count, policy.max_items)
+    if effective_sentence_count <= 0 then effective_sentence_count = 1 end
+    local ratio = #facts / effective_sentence_count
+    local pass = (#facts >= policy.min_facts) and (ratio >= policy.min_facts_per_sentence)
+    return pass, ratio, sentence_count
+end
+
+function M.extract_atomic_facts(user_input, assistant_text)
+    local policy = get_fact_policy()
+    local assistant_clean = tool.replace(assistant_text or "", "\n", " ")
+
+    local facts = run_fact_extract_pass(user_input, assistant_clean, policy, false, 0)
+    facts = run_fact_audit_rounds(user_input, assistant_clean, facts, policy)
+
+    local pass, ratio, sentence_count = evaluate_fact_quality(facts, user_input, assistant_clean, policy)
+    print(string.format(
+        "[Lua Fact Extract] 质量检查: facts=%d, sentence=%d, ratio=%.2f, pass=%s",
+        #facts,
+        sentence_count,
+        ratio,
+        pass and "yes" or "no"
+    ))
+
+    if (not pass) and policy.quality_retry_max > 0 then
+        for retry = 1, policy.quality_retry_max do
+            print(string.format("[Lua Fact Extract] 覆盖率不足，触发强制重抽 retry=%d", retry))
+            local retry_facts = run_fact_extract_pass(user_input, assistant_clean, policy, true, retry * 11)
+            retry_facts = merge_fact_lists(facts, retry_facts, policy.max_items, policy.max_item_chars)
+            retry_facts = run_fact_audit_rounds(user_input, assistant_clean, retry_facts, policy)
+            facts = retry_facts
+
+            pass, ratio, sentence_count = evaluate_fact_quality(facts, user_input, assistant_clean, policy)
+            print(string.format(
+                "[Lua Fact Extract] 重抽后质量: facts=%d, sentence=%d, ratio=%.2f, pass=%s",
+                #facts,
+                sentence_count,
+                ratio,
+                pass and "yes" or "no"
+            ))
+            if pass then break end
+        end
+    end
+
+    if #facts == 0 then
+        print("[Lua Fact Extract] LLM 未产出可用事实，启用句子兜底")
+        facts = build_fallback_sentence_facts(user_input, assistant_clean, policy)
+    end
+
     return facts
 end
 
@@ -526,13 +774,21 @@ function M.save_turn_memory(facts, mem_turn)
     end
 
     for _, fact in ipairs(facts) do
-        local fact_vec = tool.get_embedding_passage(fact)
-        local affected_line, add_err = memory.add_memory(fact_vec, mem_turn)
-        if affected_line then
-            heat.neighbors_add_heat(fact_vec, mem_turn, affected_line)
-            print(string.format("   → 原子事实存入记忆行 %d: %s", affected_line, fact:sub(1, 60)))
+        local fact_text = ""
+        if type(fact) == "table" then
+            fact_text = trim(fact.fact or fact.value or fact.text)
         else
-            print(string.format("[Memory][WARN] 原子事实写入失败(%s): %s", tostring(add_err), fact:sub(1, 60)))
+            fact_text = trim(fact)
+        end
+        if fact_text ~= "" then
+            local fact_vec = tool.get_embedding_passage(fact_text)
+            local affected_line, add_err = memory.add_memory(fact_vec, mem_turn)
+            if affected_line then
+                heat.neighbors_add_heat(fact_vec, mem_turn, affected_line)
+                print(string.format("   → 原子事实存入记忆行 %d: %s", affected_line, fact_text:sub(1, 60)))
+            else
+                print(string.format("[Memory][WARN] 原子事实写入失败(%s): %s", tostring(add_err), fact_text:sub(1, 60)))
+            end
         end
     end
 
