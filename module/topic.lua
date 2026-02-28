@@ -521,55 +521,6 @@ function M.get_topic_for_turn(turn)
     return nil
 end
 
-function M.get_topic_id_for_turn(turn)
-    local info = M.get_topic_for_turn(turn)
-    if not info then return nil end
-    if info.is_active then
-        return "A:" .. tostring(M.active_topic.start or 0)
-    end
-    return "C:" .. tostring(info.topic_idx or 0)
-end
-
-function M.get_topic_info_by_id(topic_id)
-    local tid = tostring(topic_id or "")
-    if tid == "" then return nil end
-
-    local a_start = tid:match("^A:(%-?%d+)$")
-    if a_start then
-        local s = tonumber(a_start)
-        if s and M.active_topic.start and tonumber(M.active_topic.start) == s then
-            local cent = M.active_topic.head_centroid
-            if not cent and #M.active_topic.vectors > 0 then
-                cent = tool.average_vectors(M.active_topic.vectors)
-            end
-            return {
-                is_active = true,
-                centroid = cent,
-                topic_idx = nil,
-                start = s,
-                id = tid,
-            }
-        end
-        return nil
-    end
-
-    local c_idx = tid:match("^C:(%-?%d+)$")
-    if c_idx then
-        local idx = tonumber(c_idx)
-        local rec = idx and M.topics[idx] or nil
-        if rec then
-            return {
-                is_active = false,
-                centroid = rec.centroid,
-                topic_idx = idx,
-                start = rec.start,
-                id = tid,
-            }
-        end
-    end
-    return nil
-end
-
 function M.get_topic_anchor(turn)
     local t = turn or M._last_processed_turn
     if M.active_topic.start and t >= M.active_topic.start then

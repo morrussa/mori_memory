@@ -158,91 +158,15 @@ end
 local function rebuild_superclusters()
     clear_super_index()
     local ids = sorted_cluster_ids()
-    local cnum = #ids
-    if cnum <= 0 then
+    if #ids <= 0 then
         return
     end
 
-    local cfg = (config.settings or {}).cluster or {}
-    local target_size = math.max(8, tonumber(cfg.supercluster_target_size) or 64)
-    local snum = math.max(1, math.ceil(cnum / target_size))
-
-    local members = {}
-    if snum == 1 then
-        members = { ids }
-    else
-        local seeds = {}
-        if snum <= 1 then
-            seeds[1] = ids[1]
-        else
-            for i = 1, snum do
-                local pos = math.floor(((i - 1) * (cnum - 1)) / (snum - 1) + 0.5) + 1
-                if pos < 1 then pos = 1 end
-                if pos > cnum then pos = cnum end
-                seeds[i] = ids[pos]
-            end
-        end
-
-        local bins = {}
-        for i = 1, snum do bins[i] = {} end
-        for _, cid in ipairs(ids) do
-            local cvec = M.clusters[cid] and M.clusters[cid].centroid
-            if cvec then
-                local best_sid = 1
-                local best_sim = -1
-                for sid = 1, snum do
-                    local seed_id = seeds[sid]
-                    local svec = (M.clusters[seed_id] or {}).centroid
-                    if svec then
-                        local sim = tool.cosine_similarity(cvec, svec)
-                        if sim > best_sim then
-                            best_sim = sim
-                            best_sid = sid
-                        end
-                    end
-                end
-                bins[best_sid][#bins[best_sid] + 1] = cid
-            end
-        end
-
-        for i = 1, #bins do
-            if #bins[i] > 0 then
-                members[#members + 1] = bins[i]
-            end
-        end
-        if #members <= 0 then
-            members = { ids }
-        end
+    for _, cid in ipairs(ids) do
+        attach_cluster_to_super(cid)
     end
 
-    M.super_members = members
-    for sid, lst in ipairs(M.super_members) do
-        local sum = nil
-        local n = 0
-        for _, cid in ipairs(lst) do
-            M.super_of_cluster[cid] = sid
-            local cvec = M.clusters[cid] and M.clusters[cid].centroid
-            if cvec then
-                if not sum then
-                    sum = deepcopy_vec(cvec)
-                else
-                    for i = 1, #sum do
-                        sum[i] = (tonumber(sum[i]) or 0.0) + (tonumber(cvec[i]) or 0.0)
-                    end
-                end
-                n = n + 1
-            end
-        end
-
-        if sum and n > 0 then
-            for i = 1, #sum do
-                sum[i] = (tonumber(sum[i]) or 0.0) / n
-            end
-            M.super_centroids[sid] = normalize_vec(sum)
-        end
-    end
-
-    M.super_indexed_clusters = cnum
+    M.super_indexed_clusters = cluster_count()
     M.super_last_rebuild_clusters = M.super_indexed_clusters
     M.super_rebuild_count = M.super_rebuild_count + 1
 end
@@ -558,12 +482,11 @@ function M.find_sim_in_cluster(vec, cluster_id, opts)
         max_results = nil
     end
 
-    if not M.clusters[cluster_id] then return {}, 0 end
+    if not M.clusters[cluster_id] then return {} end
 
     local results = {}
     local topk = {}
     local use_topk = max_results ~= nil
-    local ops = 0
 
     for _, idx in ipairs(M.clusters[cluster_id].members or {}) do
         local heat = memory.get_heat_by_index(idx)
@@ -577,7 +500,6 @@ function M.find_sim_in_cluster(vec, cluster_id, opts)
         local mem_vec = memory.return_mem_vec(idx)
         if mem_vec then
             local sim = tool.cosine_similarity(vec, mem_vec)
-            ops = ops + 1
             if use_topk then
                 if #topk < max_results then
                     topk[#topk + 1] = { index = idx, similarity = sim }
@@ -605,11 +527,11 @@ function M.find_sim_in_cluster(vec, cluster_id, opts)
         for i = #topk, 1, -1 do
             results[#results + 1] = topk[i]
         end
-        return results, ops
+        return results
     end
 
     table.sort(results, function(a, b) return a.similarity > b.similarity end)
-    return results, ops
+    return results
 end
 
 function M.get_cluster_id_for_line(mem_line)

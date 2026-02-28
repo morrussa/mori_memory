@@ -10,7 +10,6 @@ local recall = require("module.recall")
 local tool_calling = require("module.tool_calling")
 local notebook = require("module.notebook")
 local adaptive = require("module.adaptive")
-local baseline = require("module.baseline")
 local app_config = require("module.config")
 
 -- 1. 配置模型路径
@@ -37,14 +36,6 @@ notebook.load()
 print("[Lua] Pipeline started.")
 
 topic.init()
-
-local baseline_out = os.getenv("MORI_BASELINE_FREEZE_OUT")
-if baseline_out and baseline_out ~= "" then
-    local ok, err_or_snap = baseline.freeze_snapshot(baseline_out)
-    if not ok then
-        print("[Lua][Baseline][ERROR] " .. tostring(err_or_snap))
-    end
-end
 
 -- ====================== 对话历史 + 滑动窗口管理 ======================
 print("[Lua] keyring tool mode: two_step")

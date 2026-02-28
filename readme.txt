@@ -32,10 +32,5 @@ python agent_memory_sim.py --turns 20000 --plot-out memory/sim_trend.png
 
 python agent_memory_sim.py --turns 50000 --plot-out memory/sim_trend.png --supercluster-min-clusters 64
 
-python agent_memory_simub.py \
-  --turns 500000 \
-  --persistent-explore-epsilon 0.01 \
-  --persistent-explore-period-turns 2500 \
-  --persistent-explore-extra-clusters 1 \
-  --persistent-explore-candidate-cap 32 \
-  --plot-out memory/simub_persist_500k.png
+python agent_memory_simub.py --turns 50000
+

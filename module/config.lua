@@ -4,7 +4,7 @@ M.settings = {
     merge_limit = 0.95,--两个记忆如果相似度>0.95，则直接合并为一个，并且对应多条记忆。
     dim = 1024,
     heat = {
-        total_heat = 7500000,--总热力池大小
+        total_heat = 10000000,--总热力池大小
         new_memory_heat = 43000,--新记忆的热力
         max_neighbors = 5,--新记忆存入时，最多平分给几个邻居
         neighbors_heat = 26000,--邻居分配的热力，是平分的
@@ -39,7 +39,6 @@ M.settings = {
     ai_query = {
         max_memory = 5, --基础数字，根据AI搜寻关键词进行精细度查询。如果AI发送了两个关键词query，那么则返回max_memory*2个top
         max_turns = 10,
-        relevant_window = 40, -- 近期召回评估窗口（用于 baseline / 指标对齐）
         expand = 2,--获取所有的命中的top并将每一个memory关联的history turn展开
         flat = false,--如果flat为true，那么每一个和memory关联的history turn则都以1打分，如果flat为false，那么每一个和memory关联的history turn则以它们在自己query内的语义相关度为分数。
         recall_base = 5.3,--总分recall_base时触发回忆
@@ -57,8 +56,6 @@ M.settings = {
         topic_cross_quota_ratio = 0.25, -- topic 约束召回时，跨 topic 兜底配额比例（0~0.5）
         max_keywords = 4,
         keyword_weight = 0.55,    -- 关键词权重
-        keyword_queries = 2,      -- 噪声关键词子查询数量（simub 对齐）
-        keyword_noise_mix = 0.20, -- 噪声关键词向量混合比例（simub 对齐）
         -- [实现方法] keyword 候选聚合防偏：
         -- 关键词只在“主查询召回出的候选池”内重排；若关键词向量与主向量夹角过大则直接跳过，避免 LLM 误生成把结果拖偏。
         keyword_align_reject = 0.1, -- 与主向量相似度低于该值时直接丢弃该关键词查询（硬拒绝）。
@@ -69,8 +66,8 @@ M.settings = {
         -- [实现方法] learning curve：
         -- recall 每轮根据 progress=lerp(warmup->full) 动态插值 min_gate/power/max_memory/max_turns/keyword_weight/super_topn。
         learning_curve_enabled = true,      -- 开启查询参数“随轮次收敛”；关闭后直接使用静态参数。
-        learning_warmup_turns = 500,        -- simub 对齐：学习曲线预热区间。
-        learning_full_turns = 12000,        -- simub 对齐：学习曲线完全收敛轮次。
+        learning_warmup_turns = 100,        -- aggressive 冷启动：更早进入学习插值区间。
+        learning_full_turns = 1600,         -- aggressive 冷启动：更快收敛到稳定参数。
         learning_query_noise_extra = 0.18,  -- 早期额外噪声注入上限：噪声=base+(1-progress)*extra。
         learning_min_sim_gate_start = 0.42, -- 早期最小相似度门限（后续收敛到 min_sim_gate）。
         learning_power_suppress_start = 1.15,-- 早期非线性压制指数（后续收敛到 power_suppress）。
@@ -82,7 +79,7 @@ M.settings = {
 
         -- [实现方法] cold start boost：
         -- 仅在早期 turn 生效：降低 need_recall 阈值、放宽召回门限并提高检索预算；到 cold_start_turns 后自动退场。
-        cold_start_enabled = false,
+        cold_start_enabled = true,
         cold_start_turns = 1600,
         cold_start_recall_base_scale = 0.82, -- 早期 recall_base 缩放下限（越小越容易触发回忆）。
         cold_start_min_gate_drop = 0.04, -- 早期额外下调 min_sim_gate 幅度。
@@ -94,7 +91,7 @@ M.settings = {
         -- [实现方法] refinement：
         -- recall 把候选样本与正/负样本送入 adaptive.update_after_recall，在线更新 learned_min_gate / online_merge_limit / route_score。
         refinement_enabled = true, -- 启用在线自适应（gate、merge_limit、route bias 都会随着召回反馈调整）。
-        refinement_start_turn = 200, -- simub 对齐：更晚开始在线自适应，减少早期过拟合。
+        refinement_start_turn = 80, -- aggressive 冷启动：更早开始在线自适应。
         refinement_sample_mem_topk = 48, -- 每轮用于 refinement 的候选 memory 样本上限（按相似度截断）。
         refinement_route_lr = 0.10, -- 簇路由分数学习率（越大越快改变 route_score）。
         refinement_gate_lr = 0.08, -- learned_min_gate 学习率（控制门限收敛速度）。
@@ -111,15 +108,7 @@ M.settings = {
         persistent_explore_period_turns = 0, -- 周期触发间隔；0 表示关闭周期触发，仅保留 epsilon 触发。
         persistent_explore_extra_clusters = 1, -- 触发探索时，额外补探测的簇数量。
         persistent_explore_candidate_cap = 32, -- 探索簇单簇扫描上限（防止探索带来过高成本）。
-        -- simub 对齐：扫描池裁剪参数（控制检索复杂度）
-        scan_pool_limit_enabled = true,
-        scan_pool_mult = 1.4,
-        scan_pool_min_cap = 20,
-        scan_pool_hot_ratio = 0.55,
-        scan_pool_recent_ratio = 0.35,
-        scan_pool_random_ratio = 0.10,
-
-        uncertain_recency_enabled = false, -- simub 对齐：关闭不确定性时间加权路径
+        uncertain_recency_enabled = true, -- 灰度默认开启
         uncertain_top1_sim_threshold = 0.62,
         uncertain_top12_gap_threshold = 0.03,
         uncertain_min_candidates = 6,

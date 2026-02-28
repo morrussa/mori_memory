@@ -41,82 +41,17 @@ local function normalize_line(line)
     return n
 end
 
-local function task_less(a, b)
-    local da = tonumber((a or {}).due_turn) or 0
-    local db = tonumber((b or {}).due_turn) or 0
-    if da ~= db then return da < db end
-    return (tonumber((a or {}).line) or 0) < (tonumber((b or {}).line) or 0)
-end
-
-local function heap_swap(heap, i, j)
-    heap[i], heap[j] = heap[j], heap[i]
-end
-
-local function heap_push(heap, item)
-    heap[#heap + 1] = item
-    local i = #heap
-    while i > 1 do
-        local p = math.floor(i / 2)
-        if task_less(heap[p], heap[i]) then break end
-        heap_swap(heap, p, i)
-        i = p
-    end
-end
-
-local function heap_peek(heap)
-    return heap[1]
-end
-
-local function heap_pop(heap)
-    local n = #heap
-    if n <= 0 then return nil end
-    local root = heap[1]
-    if n == 1 then
-        heap[1] = nil
-        return root
-    end
-
-    heap[1] = heap[n]
-    heap[n] = nil
-    n = n - 1
-
-    local i = 1
-    while true do
-        local l = i * 2
-        local r = l + 1
-        local m = i
-        if l <= n and task_less(heap[l], heap[m]) then m = l end
-        if r <= n and task_less(heap[r], heap[m]) then m = r end
-        if m == i then break end
-        heap_swap(heap, i, m)
-        i = m
-    end
-    return root
-end
-
-local function heap_from_list(list)
-    local heap = {}
-    for _, item in ipairs(list or {}) do
-        heap_push(heap, item)
-    end
-    return heap
-end
-
 -- ====================== pending_cold 持久化 ======================
 function M.save_pending()
     if not M.pending_dirty then return true end
     local ok, err = persistence.write_atomic(pending_file, "w", function(f)
-        local ordered = {}
-        for i = 1, #M.pending_cold do
-            ordered[i] = M.pending_cold[i]
-        end
-        table.sort(ordered, function(a, b)
+        table.sort(M.pending_cold, function(a, b)
             local da = tonumber(a.due_turn) or 0
             local db = tonumber(b.due_turn) or 0
             if da ~= db then return da < db end
             return (tonumber(a.line) or 0) < (tonumber(b.line) or 0)
         end)
-        for _, task in ipairs(ordered) do
+        for _, task in ipairs(M.pending_cold) do
             local due_turn = math.max(0, math.floor(tonumber(task.due_turn) or 0))
             local line = math.max(1, math.floor(tonumber(task.line) or 0))
             local w_ok, w_err = f:write(string.format("%d,%d\n", due_turn, line))
@@ -140,6 +75,7 @@ function M.load_pending()
     if not f then return end
     M.pending_cold = {}
     M.pending_set = {}
+    local seen = {}
     for line in f:lines() do
         local due_s, line_s = tostring(line or ""):match("^%s*(%-?%d+)%s*,%s*(%-?%d+)%s*$")
         local l = nil
@@ -151,9 +87,10 @@ function M.load_pending()
             -- 兼容旧格式：单列 line
             l = normalize_line(line)
         end
-        if l and not M.pending_set[l] then
+        if l and not seen[l] then
+            seen[l] = true
             M.pending_set[l] = true
-            heap_push(M.pending_cold, { due_turn = due_turn, line = l })
+            table.insert(M.pending_cold, { due_turn = due_turn, line = l })
         end
     end
     f:close()
@@ -438,12 +375,6 @@ end
 
 local function find_sim_all_cold(vec, max_results)
     local memory = require("module.memory")
-    if memory.find_similar_all_cold_fast then
-        local fast = memory.find_similar_all_cold_fast(vec, max_results)
-        if type(fast) == "table" then
-            return fast
-        end
-    end
     local limit = math.max(1, tonumber(max_results) or 32)
     local topk = {}
     for idx = 1, memory.get_total_lines() do
@@ -530,7 +461,7 @@ function M.enqueue_cold_rescue(query_vec, current_turn, target_topic_info, min_g
             if has_target_turn then
                 local delay = math.random(delay_min, delay_max)
                 local due_turn = cur_turn + delay
-                heap_push(M.pending_cold, { due_turn = due_turn, line = mem_idx })
+                M.pending_cold[#M.pending_cold + 1] = { due_turn = due_turn, line = mem_idx }
                 M.pending_set[mem_idx] = true
                 M.pending_dirty = true
                 adaptive.add_counter("cold_rescue_enqueued", 1)
@@ -565,25 +496,28 @@ function M.perform_cold_exchange(current_turn)
     end
 
     local batch = math.max(1, tonumber(aq.cold_rescue_batch) or 24)
-    local done = 0
-    while done < batch and #M.pending_cold > 0 do
-        local task = heap_peek(M.pending_cold)
-        local due_turn = math.max(0, math.floor(tonumber((task or {}).due_turn) or 0))
-        if due_turn > now_turn then
-            break
-        end
+    table.sort(M.pending_cold, function(a, b)
+        local da = tonumber(a.due_turn) or 0
+        local db = tonumber(b.due_turn) or 0
+        if da ~= db then return da < db end
+        return (tonumber(a.line) or 0) < (tonumber(b.line) or 0)
+    end)
 
-        task = heap_pop(M.pending_cold)
-        local raw_line = math.floor(tonumber((task or {}).line) or -1)
-        if raw_line > 0 then
-            M.pending_set[raw_line] = nil
+    local done = 0
+    local remain = {}
+    for _, task in ipairs(M.pending_cold) do
+        local line = normalize_line(task.line)
+        local due_turn = math.max(0, math.floor(tonumber(task.due_turn) or 0))
+        if (not line) then
+            goto continue
         end
-        local line = normalize_line(raw_line)
-        if not line then
+        if done >= batch or due_turn > now_turn then
+            remain[#remain + 1] = { due_turn = due_turn, line = line }
             goto continue
         end
 
         if memory.get_heat_by_index(line) > 0 then
+            M.pending_set[line] = nil
             goto continue
         end
 
@@ -601,10 +535,16 @@ function M.perform_cold_exchange(current_turn)
         config.settings.heat.neighbors_heat = old_nb
 
         done = done + 1
+        M.pending_set[line] = nil
         adaptive.add_counter("cold_rescue_executed", 1)
         ::continue::
     end
 
+    M.pending_cold = remain
+    M.pending_set = {}
+    for _, task in ipairs(M.pending_cold) do
+        M.pending_set[task.line] = true
+    end
     M.pending_dirty = true
 
     if done > 0 then
