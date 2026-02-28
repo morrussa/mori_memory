@@ -60,11 +60,143 @@ local function copy_vec_to_pool(line_idx, vec_table)
     end
 end
 
+local function get_scan_pool_cfg()
+    local aq = ((config.settings or {}).ai_query or {})
+    return {
+        enabled = aq.scan_pool_limit_enabled ~= false,
+        mult = math.max(1.0, tonumber(aq.scan_pool_mult) or 1.4),
+        min_cap = math.max(4, math.floor(tonumber(aq.scan_pool_min_cap) or 20)),
+        hot_ratio = math.max(0.0, tonumber(aq.scan_pool_hot_ratio) or 0.55),
+        recent_ratio = math.max(0.0, tonumber(aq.scan_pool_recent_ratio) or 0.35),
+        random_ratio = math.max(0.0, tonumber(aq.scan_pool_random_ratio) or 0.10),
+    }
+end
+
+local function effective_scan_cap(max_results)
+    local cfg = get_scan_pool_cfg()
+    if cfg.enabled ~= true then return nil end
+    local base = tonumber(max_results)
+    if not base or base <= 0 then return nil end
+    base = math.max(1, math.floor(base))
+    local cap = math.ceil(base * cfg.mult)
+    cap = math.max(base, cap, cfg.min_cap)
+    return cap
+end
+
+local function normalize_mix()
+    local cfg = get_scan_pool_cfg()
+    local hot = cfg.hot_ratio
+    local recent = cfg.recent_ratio
+    local rnd = cfg.random_ratio
+    local s = hot + recent + rnd
+    if s <= 1e-9 then
+        return 0.55, 0.35, 0.10
+    end
+    return hot / s, recent / s, rnd / s
+end
+
+local function trim_scan_indices(indices, max_results)
+    local total = #indices
+    local cap = effective_scan_cap(max_results)
+    if (not cap) or total <= cap then
+        return indices
+    end
+
+    cap = math.max(1, math.min(total, math.floor(cap)))
+    local hot_ratio, recent_ratio = normalize_mix()
+    local hot_n = math.max(0, math.floor(cap * hot_ratio + 0.5))
+    local recent_n = math.max(0, math.floor(cap * recent_ratio + 0.5))
+    hot_n = math.min(cap, hot_n)
+    recent_n = math.min(cap - hot_n, recent_n)
+
+    local selected = {}
+    local used = {}
+
+    if recent_n > 0 then
+        for i = total - recent_n + 1, total do
+            local idx = indices[i]
+            if idx and not used[idx] then
+                used[idx] = true
+                selected[#selected + 1] = idx
+            end
+        end
+    end
+
+    if hot_n > 0 then
+        local scored = {}
+        for _, idx in ipairs(indices) do
+            scored[#scored + 1] = { idx = idx, heat = tonumber(M.heat_pool[idx - 1]) or 0.0 }
+        end
+        table.sort(scored, function(a, b) return a.heat > b.heat end)
+        for i = 1, math.min(hot_n, #scored) do
+            local idx = scored[i].idx
+            if idx and not used[idx] then
+                used[idx] = true
+                selected[#selected + 1] = idx
+            end
+        end
+    end
+
+    if #selected < cap then
+        local remain = {}
+        for _, idx in ipairs(indices) do
+            if not used[idx] then
+                remain[#remain + 1] = idx
+            end
+        end
+        for i = #remain, 2, -1 do
+            local j = math.random(i)
+            remain[i], remain[j] = remain[j], remain[i]
+        end
+        local need = cap - #selected
+        for i = 1, math.min(need, #remain) do
+            local idx = remain[i]
+            used[idx] = true
+            selected[#selected + 1] = idx
+        end
+    end
+
+    if #selected < cap then
+        for _, idx in ipairs(indices) do
+            if not used[idx] then
+                used[idx] = true
+                selected[#selected + 1] = idx
+                if #selected >= cap then break end
+            end
+        end
+    end
+
+    return selected
+end
+
+local function compute_similarity(query_vec_table, q_norm, mem_ptr, q_ptr)
+    if simdc_lib then
+        local qp = q_ptr
+        if not qp then
+            qp = ffi.new("float[?]", VECTOR_DIM)
+            for i = 0, VECTOR_DIM - 1 do
+                qp[i] = query_vec_table[i + 1] or 0.0
+            end
+        end
+        return simdc_lib.cosine_similarity_avx(qp, mem_ptr, VECTOR_DIM)
+    end
+
+    local dot = 0.0
+    local m_norm_sq = 0.0
+    for j = 0, VECTOR_DIM - 1 do
+        local qv = query_vec_table[j + 1] or 0.0
+        local mv = mem_ptr[j]
+        dot = dot + qv * mv
+        m_norm_sq = m_norm_sq + mv * mv
+    end
+    if m_norm_sq <= 0 then return 0.0 end
+    return dot / (q_norm * math.sqrt(m_norm_sq))
+end
+
 -- ====================== 核心检索：极速模式 ======================
 function M.find_similar_all_fast(query_vec_table, max_results)
     if not M.vec_pool then
-        -- 极端降级：没有向量池时，走旧版兼容路径
-        return tool.find_sim_all_heat(query_vec_table) 
+        return tool.find_sim_all_heat(query_vec_table), 0
     end
 
     local use_full_sort = false
@@ -79,17 +211,23 @@ function M.find_similar_all_fast(query_vec_table, max_results)
     local results = {}
     local topk = {}
     local total = next_line - 1
+    local sim_ops = 0
 
-    -- 1. 预计算 query 范数（纯 LuaJIT fallback 会用到）
+    local hot_indices = {}
+    for i = 1, total do
+        if M.heat_pool[i - 1] > 0 then
+            hot_indices[#hot_indices + 1] = i
+        end
+    end
+    hot_indices = trim_scan_indices(hot_indices, max_results)
+
     local q_norm_sq = 0.0
     for i = 1, VECTOR_DIM do
         local q = query_vec_table[i] or 0.0
         q_norm_sq = q_norm_sq + q * q
     end
-    if q_norm_sq <= 0 then return results end
+    if q_norm_sq <= 0 then return {}, 0 end
     local q_norm = math.sqrt(q_norm_sq)
-
-    -- SIMD 可用时准备查询向量指针
     local q_ptr = nil
     if simdc_lib then
         q_ptr = ffi.new("float[?]", VECTOR_DIM)
@@ -98,53 +236,27 @@ function M.find_similar_all_fast(query_vec_table, max_results)
         end
     end
 
-    -- 2. 遍历 FFI 内存池
-    for i = 1, total do
-        -- 直接从 FFI 热力池读取，比读取 Lua Table 快得多
-        local h = M.heat_pool[i-1] -- FFI 是 0-based
-        
-        if h > 0 then -- 只检索热记忆
-            local mem_ptr = M.vec_pool + (i - 1) * VECTOR_DIM
+    for _, idx in ipairs(hot_indices) do
+        local mem_ptr = M.vec_pool + (idx - 1) * VECTOR_DIM
+        local score = compute_similarity(query_vec_table, q_norm, mem_ptr, q_ptr)
+        sim_ops = sim_ops + 1
 
-            local score = 0.0
-            if simdc_lib then
-                -- C 函数计算相似度
-                score = simdc_lib.cosine_similarity_avx(q_ptr, mem_ptr, VECTOR_DIM)
-            else
-                -- 纯 LuaJIT fallback：循环点积+范数
-                local dot = 0.0
-                local m_norm_sq = 0.0
-                for j = 0, VECTOR_DIM - 1 do
-                    local qv = query_vec_table[j + 1] or 0.0
-                    local mv = mem_ptr[j]
-                    dot = dot + qv * mv
-                    m_norm_sq = m_norm_sq + mv * mv
+        if use_full_sort then
+            results[#results + 1] = { index = idx, similarity = score }
+        else
+            if #topk < max_results then
+                topk[#topk + 1] = { index = idx, similarity = score }
+                local j = #topk
+                while j > 1 and topk[j].similarity < topk[j - 1].similarity do
+                    topk[j], topk[j - 1] = topk[j - 1], topk[j]
+                    j = j - 1
                 end
-                if m_norm_sq > 0 then
-                    score = dot / (q_norm * math.sqrt(m_norm_sq))
-                end
-            end
-            
-            -- 简单的预过滤，减少 Lua Table 插入开销
-            if score > 0.5 then 
-                if use_full_sort then
-                    table.insert(results, {index = i, similarity = score})
-                else
-                    if #topk < max_results then
-                        table.insert(topk, {index = i, similarity = score})
-                        local j = #topk
-                        while j > 1 and topk[j].similarity < topk[j - 1].similarity do
-                            topk[j], topk[j - 1] = topk[j - 1], topk[j]
-                            j = j - 1
-                        end
-                    elseif score > topk[1].similarity then
-                        topk[1] = {index = i, similarity = score}
-                        local j = 1
-                        while j < #topk and topk[j].similarity > topk[j + 1].similarity do
-                            topk[j], topk[j + 1] = topk[j + 1], topk[j]
-                            j = j + 1
-                        end
-                    end
+            elseif score > topk[1].similarity then
+                topk[1] = { index = idx, similarity = score }
+                local j = 1
+                while j < #topk and topk[j].similarity > topk[j + 1].similarity do
+                    topk[j], topk[j + 1] = topk[j + 1], topk[j]
+                    j = j + 1
                 end
             end
         end
@@ -154,12 +266,67 @@ function M.find_similar_all_fast(query_vec_table, max_results)
         for i = #topk, 1, -1 do
             results[#results + 1] = topk[i]
         end
-        return results
+        return results, sim_ops
     end
 
-    -- 3. 全量排序（仅在显式 max_results<=0 时）
     table.sort(results, function(a, b) return a.similarity > b.similarity end)
-    return results
+    return results, sim_ops
+end
+
+function M.find_similar_all_cold_fast(query_vec_table, max_results)
+    if not M.vec_pool then return {}, 0 end
+
+    local limit = tonumber(max_results) or 32
+    if limit <= 0 then limit = 32 end
+
+    local total = next_line - 1
+    local results = {}
+    local topk = {}
+    local sim_ops = 0
+
+    local q_norm_sq = 0.0
+    for i = 1, VECTOR_DIM do
+        local q = query_vec_table[i] or 0.0
+        q_norm_sq = q_norm_sq + q * q
+    end
+    if q_norm_sq <= 0 then return {}, 0 end
+    local q_norm = math.sqrt(q_norm_sq)
+    local q_ptr = nil
+    if simdc_lib then
+        q_ptr = ffi.new("float[?]", VECTOR_DIM)
+        for i = 0, VECTOR_DIM - 1 do
+            q_ptr[i] = query_vec_table[i + 1] or 0.0
+        end
+    end
+
+    for i = 1, total do
+        if M.heat_pool[i - 1] <= 0 then
+            local mem_ptr = M.vec_pool + (i - 1) * VECTOR_DIM
+            local score = compute_similarity(query_vec_table, q_norm, mem_ptr, q_ptr)
+            sim_ops = sim_ops + 1
+
+            if #topk < limit then
+                topk[#topk + 1] = { index = i, similarity = score }
+                local j = #topk
+                while j > 1 and topk[j].similarity < topk[j - 1].similarity do
+                    topk[j], topk[j - 1] = topk[j - 1], topk[j]
+                    j = j - 1
+                end
+            elseif score > topk[1].similarity then
+                topk[1] = { index = i, similarity = score }
+                local j = 1
+                while j < #topk and topk[j].similarity > topk[j + 1].similarity do
+                    topk[j], topk[j + 1] = topk[j + 1], topk[j]
+                    j = j + 1
+                end
+            end
+        end
+    end
+
+    for i = #topk, 1, -1 do
+        results[#results + 1] = topk[i]
+    end
+    return results, sim_ops
 end
 
 -- ====================== LOAD：从二进制加载 ======================

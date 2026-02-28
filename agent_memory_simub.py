@@ -91,7 +91,7 @@ class SimParams:
     max_neighbors: int = 5
     new_memory_heat: int = 43000
     neighbors_heat: int = 26000
-    total_heat: int = 10000000
+    total_heat: int = 7500000
     softmax: bool = True
     tolerance: int = 500
     cold_neighbor_multiplier: float = 2.2
@@ -112,6 +112,13 @@ class SimParams:
 
     # Search pool size for add-memory merge check
     fast_scan_topk: int = 64
+    # Bound similarity scan pool to avoid long-horizon complexity blow-up.
+    scan_pool_limit_enabled: bool = True
+    scan_pool_mult: float = 1.4
+    scan_pool_min_cap: int = 20
+    scan_pool_hot_ratio: float = 0.55
+    scan_pool_recent_ratio: float = 0.35
+    scan_pool_random_ratio: float = 0.10
     hierarchical_cluster_enabled: bool = True
     supercluster_min_clusters: int = 64
     supercluster_target_size: int = 64
@@ -517,6 +524,71 @@ class AgentMemorySim:
         i = int(np.argmax(sims))
         return int(cand[i]), float(sims[i]), ops0 + int(cand.size)
 
+    def _effective_scan_cap(self, max_results: Optional[int]) -> Optional[int]:
+        if not self.p.scan_pool_limit_enabled:
+            return None
+        if max_results is None or max_results <= 0:
+            return None
+        base = max(1, int(max_results))
+        cap = int(math.ceil(base * max(1.0, float(self.p.scan_pool_mult))))
+        cap = max(base, cap, max(4, int(self.p.scan_pool_min_cap)))
+        return cap
+
+    def _scan_mix(self) -> Tuple[float, float, float]:
+        hot = max(0.0, float(self.p.scan_pool_hot_ratio))
+        recent = max(0.0, float(self.p.scan_pool_recent_ratio))
+        rnd = max(0.0, float(self.p.scan_pool_random_ratio))
+        s = hot + recent + rnd
+        if s <= 1e-9:
+            return 0.55, 0.35, 0.10
+        return hot / s, recent / s, rnd / s
+
+    def _trim_scan_indices(self, indices: np.ndarray, max_results: Optional[int]) -> np.ndarray:
+        cap = self._effective_scan_cap(max_results)
+        total = int(indices.size)
+        if total <= 0 or cap is None or total <= cap:
+            return indices
+
+        cap = min(total, max(1, int(cap)))
+        hot_ratio, recent_ratio, _ = self._scan_mix()
+        hot_n = max(0, int(round(cap * hot_ratio)))
+        recent_n = max(0, int(round(cap * recent_ratio)))
+        hot_n = min(cap, hot_n)
+        recent_n = min(cap - hot_n, recent_n)
+
+        mask = np.zeros(total, dtype=bool)
+        if recent_n > 0:
+            mask[total - recent_n :] = True
+
+        if hot_n > 0:
+            heats = self.heat_pool[indices]
+            if hot_n >= total:
+                mask[:] = True
+            else:
+                keep = np.argpartition(heats, -hot_n)[-hot_n:]
+                mask[keep] = True
+
+        chosen = int(np.sum(mask))
+        need = cap - chosen
+        if need > 0:
+            remain = np.flatnonzero(~mask)
+            if remain.size > 0:
+                take = min(need, int(remain.size))
+                if take >= remain.size:
+                    mask[remain] = True
+                else:
+                    picked = self.rng.choice(remain, size=take, replace=False)
+                    mask[np.asarray(picked, dtype=np.int32)] = True
+
+        chosen = int(np.sum(mask))
+        if chosen < cap:
+            remain = np.flatnonzero(~mask)
+            take = min(cap - chosen, int(remain.size))
+            if take > 0:
+                mask[remain[-take:]] = True
+
+        return indices[mask]
+
     def _find_sim_in_indices(
         self,
         vec: np.ndarray,
@@ -525,6 +597,7 @@ class AgentMemorySim:
     ) -> Tuple[List[Tuple[int, float]], int]:
         if indices.size == 0:
             return [], 0
+        indices = self._trim_scan_indices(indices, max_results=max_results)
         sims = self.vec_pool[indices] @ vec
         ops = int(indices.size)
         if max_results is not None and max_results > 0 and sims.size > max_results:
@@ -2229,6 +2302,12 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--topic-random-lift-prob", type=float, default=0.85)
     parser.add_argument("--topic-random-lift-include-hot", action="store_true")
     parser.add_argument("--topic-cache-weight", type=float, default=1.02)
+    parser.add_argument("--disable-scan-pool-limit", action="store_true")
+    parser.add_argument("--scan-pool-mult", type=float, default=1.4)
+    parser.add_argument("--scan-pool-min-cap", type=int, default=20)
+    parser.add_argument("--scan-pool-hot-ratio", type=float, default=0.55)
+    parser.add_argument("--scan-pool-recent-ratio", type=float, default=0.35)
+    parser.add_argument("--scan-pool-random-ratio", type=float, default=0.10)
     parser.add_argument("--disable-hierarchical-cluster", action="store_true")
     parser.add_argument("--supercluster-min-clusters", type=int, default=64)
     parser.add_argument("--supercluster-target-size", type=int, default=64)
@@ -2349,6 +2428,12 @@ def main() -> None:
         topic_random_lift_prob=min(1.0, max(0.0, args.topic_random_lift_prob)),
         topic_random_lift_only_cold=(not args.topic_random_lift_include_hot),
         topic_cache_weight=max(0.5, args.topic_cache_weight),
+        scan_pool_limit_enabled=(not args.disable_scan_pool_limit),
+        scan_pool_mult=max(1.0, args.scan_pool_mult),
+        scan_pool_min_cap=max(4, args.scan_pool_min_cap),
+        scan_pool_hot_ratio=max(0.0, args.scan_pool_hot_ratio),
+        scan_pool_recent_ratio=max(0.0, args.scan_pool_recent_ratio),
+        scan_pool_random_ratio=max(0.0, args.scan_pool_random_ratio),
         hierarchical_cluster_enabled=(not args.disable_hierarchical_cluster),
         supercluster_min_clusters=max(8, args.supercluster_min_clusters),
         supercluster_target_size=max(8, args.supercluster_target_size),
