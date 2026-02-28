@@ -20,7 +20,7 @@ import csv
 import heapq
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -1847,6 +1847,324 @@ def save_plot(
     return True, ""
 
 
+DEFAULT_STABILITY_METRICS: Tuple[str, ...] = (
+    "learned_min_sim_gate",
+    "online_merge_limit",
+    "target_recall_recent",
+    "target_hit_rate",
+)
+
+
+def parse_metrics_arg(raw: str) -> List[str]:
+    out: List[str] = []
+    for part in str(raw or "").split(","):
+        key = part.strip()
+        if key and key not in out:
+            out.append(key)
+    if not out:
+        out = list(DEFAULT_STABILITY_METRICS)
+    return out
+
+
+def _first_consecutive_true(
+    flags: Sequence[bool],
+    turns: np.ndarray,
+    consecutive: int,
+) -> Tuple[Optional[int], Optional[int]]:
+    need = max(1, int(consecutive))
+    run = 0
+    for i, flag in enumerate(flags):
+        if flag:
+            run += 1
+        else:
+            run = 0
+        if run >= need:
+            start_i = i - need + 1
+            return int(turns[start_i]), int(turns[i])
+    return None, None
+
+
+def estimate_stability(
+    rows: List[Dict[str, float]],
+    metrics: Sequence[str],
+    window_turns: int,
+    min_turn: int,
+    slope_tol: float,
+    rel_std_tol: float,
+    abs_std_tol: float,
+    consecutive: int,
+    min_points: int,
+) -> Dict[str, object]:
+    if not rows:
+        return {
+            "stable_start_turn": None,
+            "stable_turn": None,
+            "available_metrics": [],
+            "missing_metrics": list(metrics),
+            "reason": "no snapshots",
+            "per_metric": {},
+        }
+
+    turns = np.asarray([int(float(r.get("turn", 0))) for r in rows], dtype=np.int32)
+    available = [m for m in metrics if m in rows[0]]
+    missing = [m for m in metrics if m not in rows[0]]
+    if not available:
+        return {
+            "stable_start_turn": None,
+            "stable_turn": None,
+            "available_metrics": [],
+            "missing_metrics": missing,
+            "reason": "metrics not present in snapshots",
+            "per_metric": {},
+        }
+
+    n = int(turns.size)
+    per_metric: Dict[str, Dict[str, object]] = {}
+    by_metric_flags: Dict[str, List[bool]] = {}
+
+    for metric in available:
+        vals = np.asarray([float(r.get(metric, 0.0)) for r in rows], dtype=np.float64)
+        flags = [False] * n
+        last_stats = {"slope": 0.0, "std": 0.0, "rel_std": 0.0}
+
+        for i in range(n):
+            turn_i = int(turns[i])
+            if turn_i < min_turn:
+                continue
+
+            left_turn = turn_i - max(1, int(window_turns))
+            j = int(np.searchsorted(turns, left_turn, side="left"))
+            if (i - j + 1) < max(3, int(min_points)):
+                continue
+
+            t_seg = turns[j : i + 1].astype(np.float64)
+            x_seg = vals[j : i + 1]
+
+            t_centered = t_seg - float(np.mean(t_seg))
+            x_centered = x_seg - float(np.mean(x_seg))
+            denom = float(np.dot(t_centered, t_centered))
+            slope = float(np.dot(t_centered, x_centered) / denom) if denom > 1e-12 else 0.0
+            std = float(np.std(x_seg))
+            mean_abs = abs(float(np.mean(x_seg)))
+            rel_std = std / max(mean_abs, 1e-6)
+
+            stable = (abs(slope) <= slope_tol) and ((rel_std <= rel_std_tol) or (std <= abs_std_tol))
+            flags[i] = stable
+            last_stats = {"slope": slope, "std": std, "rel_std": rel_std}
+
+        start_turn, end_turn = _first_consecutive_true(flags, turns, consecutive)
+        per_metric[metric] = {
+            "stable_start_turn": start_turn,
+            "stable_turn": end_turn,
+            "latest_slope": float(last_stats["slope"]),
+            "latest_std": float(last_stats["std"]),
+            "latest_rel_std": float(last_stats["rel_std"]),
+        }
+        by_metric_flags[metric] = flags
+
+    joint_flags = [all(by_metric_flags[m][i] for m in available) for i in range(n)]
+    stable_start_turn, stable_turn = _first_consecutive_true(joint_flags, turns, consecutive)
+
+    return {
+        "stable_start_turn": stable_start_turn,
+        "stable_turn": stable_turn,
+        "available_metrics": available,
+        "missing_metrics": missing,
+        "config": {
+            "window_turns": int(window_turns),
+            "min_turn": int(min_turn),
+            "slope_tol": float(slope_tol),
+            "rel_std_tol": float(rel_std_tol),
+            "abs_std_tol": float(abs_std_tol),
+            "consecutive": int(consecutive),
+            "min_points": int(min_points),
+        },
+        "per_metric": per_metric,
+    }
+
+
+def estimate_gain_threshold(
+    rows: List[Dict[str, float]],
+    metrics: Sequence[str],
+    window_turns: int,
+    min_turn: int,
+    delta_tol: float,
+    consecutive: int,
+    min_points: int,
+) -> Dict[str, object]:
+    if not rows:
+        return {
+            "gain_start_turn": None,
+            "gain_turn": None,
+            "available_metrics": [],
+            "missing_metrics": list(metrics),
+            "reason": "no snapshots",
+            "per_metric": {},
+        }
+
+    turns = np.asarray([int(float(r.get("turn", 0))) for r in rows], dtype=np.int32)
+    available = [m for m in metrics if m in rows[0]]
+    missing = [m for m in metrics if m not in rows[0]]
+    if not available:
+        return {
+            "gain_start_turn": None,
+            "gain_turn": None,
+            "available_metrics": [],
+            "missing_metrics": missing,
+            "reason": "metrics not present in snapshots",
+            "per_metric": {},
+        }
+
+    n = int(turns.size)
+    per_metric: Dict[str, Dict[str, object]] = {}
+    by_metric_flags: Dict[str, List[bool]] = {}
+
+    for metric in available:
+        vals = np.asarray([float(r.get(metric, 0.0)) for r in rows], dtype=np.float64)
+        flags = [False] * n
+        last_gain = 0.0
+        for i in range(n):
+            turn_i = int(turns[i])
+            if turn_i < min_turn:
+                continue
+            left_turn = turn_i - max(1, int(window_turns))
+            j = int(np.searchsorted(turns, left_turn, side="left"))
+            if (i - j + 1) < max(3, int(min_points)):
+                continue
+            gain = float(vals[i] - vals[j])
+            flags[i] = gain <= delta_tol
+            last_gain = gain
+
+        start_turn, end_turn = _first_consecutive_true(flags, turns, consecutive)
+        per_metric[metric] = {
+            "gain_start_turn": start_turn,
+            "gain_turn": end_turn,
+            "latest_window_gain": last_gain,
+        }
+        by_metric_flags[metric] = flags
+
+    joint_flags = [all(by_metric_flags[m][i] for m in available) for i in range(n)]
+    gain_start_turn, gain_turn = _first_consecutive_true(joint_flags, turns, consecutive)
+
+    return {
+        "gain_start_turn": gain_start_turn,
+        "gain_turn": gain_turn,
+        "available_metrics": available,
+        "missing_metrics": missing,
+        "config": {
+            "window_turns": int(window_turns),
+            "min_turn": int(min_turn),
+            "delta_tol": float(delta_tol),
+            "consecutive": int(consecutive),
+            "min_points": int(min_points),
+        },
+        "per_metric": per_metric,
+    }
+
+
+def run_stability_sweep(base_params: SimParams, args: argparse.Namespace) -> Dict[str, object]:
+    search_min = max(200, int(args.stable_search_min_turns))
+    search_max = max(search_min, int(args.stable_search_max_turns))
+    search_step = max(50, int(args.stable_search_step))
+    runs = max(1, int(args.stable_search_runs))
+    pass_ratio = min(1.0, max(0.0, float(args.stable_search_pass_ratio)))
+    stability_metrics = parse_metrics_arg(args.stability_metrics)
+    gain_metrics = parse_metrics_arg(args.gain_metrics)
+    mode = str(args.stable_search_mode or "both").strip().lower()
+    if mode not in {"stability", "gain", "both"}:
+        mode = "both"
+
+    rows: List[Dict[str, float]] = []
+    recommended_turn: Optional[int] = None
+
+    for turns in range(search_min, search_max + 1, search_step):
+        stable_count = 0
+        threshold_turns: List[int] = []
+
+        for offset in range(runs):
+            run_params = replace(base_params, turns=turns, seed=base_params.seed + offset)
+            sim = AgentMemorySim(run_params)
+            run_result = sim.run()
+            stability = estimate_stability(
+                run_result["snapshots"],  # type: ignore[arg-type]
+                metrics=stability_metrics,
+                window_turns=args.stability_window_turns,
+                min_turn=args.stability_min_turn,
+                slope_tol=args.stability_slope_tol,
+                rel_std_tol=args.stability_rel_std_tol,
+                abs_std_tol=args.stability_abs_std_tol,
+                consecutive=args.stability_consecutive,
+                min_points=args.stability_min_points,
+            )
+            gain = estimate_gain_threshold(
+                run_result["snapshots"],  # type: ignore[arg-type]
+                metrics=gain_metrics,
+                window_turns=args.gain_window_turns,
+                min_turn=args.gain_min_turn,
+                delta_tol=args.gain_delta_tol,
+                consecutive=args.gain_consecutive,
+                min_points=args.gain_min_points,
+            )
+
+            stable_turn = stability.get("stable_turn")
+            gain_turn = gain.get("gain_turn")
+            stable_ok = isinstance(stable_turn, int)
+            gain_ok = isinstance(gain_turn, int)
+            if mode == "stability":
+                run_ok = stable_ok
+            elif mode == "gain":
+                run_ok = gain_ok
+            else:
+                run_ok = stable_ok and gain_ok
+
+            if run_ok:
+                stable_count += 1
+                if mode == "stability":
+                    threshold_turns.append(int(stable_turn))
+                elif mode == "gain":
+                    threshold_turns.append(int(gain_turn))
+                else:
+                    threshold_turns.append(max(int(stable_turn), int(gain_turn)))
+
+        pass_rate = stable_count / float(runs)
+        passed = pass_rate >= pass_ratio
+        median_threshold_turn = (
+            float(np.median(np.asarray(threshold_turns, dtype=np.float64))) if threshold_turns else float("nan")
+        )
+
+        rows.append(
+            {
+                "turn_budget": float(turns),
+                "runs": float(runs),
+                "stable_runs": float(stable_count),
+                "stable_pass_rate": pass_rate,
+                "median_threshold_turn": median_threshold_turn,
+                "passed": 1.0 if passed else 0.0,
+            }
+        )
+        print(
+            f"[Sweep] turns={turns} stable_runs={stable_count}/{runs} "
+            f"pass_rate={pass_rate:.3f} median_threshold_turn={median_threshold_turn if threshold_turns else 'nan'}"
+        )
+
+        if passed and recommended_turn is None:
+            recommended_turn = turns
+
+    return {
+        "sweep_type": "find_stable_turn",
+        "search_min_turns": search_min,
+        "search_max_turns": search_max,
+        "search_step": search_step,
+        "runs": runs,
+        "pass_ratio": pass_ratio,
+        "mode": mode,
+        "stability_metrics": stability_metrics,
+        "gain_metrics": gain_metrics,
+        "recommended_turn": recommended_turn,
+        "rows": rows,
+    }
+
+
 def build_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Agent-memory long-run simplified simulator")
     parser.add_argument("--turns", type=int, default=20000)
@@ -1925,6 +2243,46 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--no-plot", action="store_true", help="Disable png dashboard generation")
     parser.add_argument("--plot-out", type=str, default="", help="Output png path (default: out-csv with .png)")
     parser.add_argument("--plot-dpi", type=int, default=160)
+    parser.add_argument(
+        "--stability-metrics",
+        type=str,
+        default="learned_min_sim_gate,online_merge_limit,target_recall_recent,target_hit_rate",
+        help="Comma-separated metrics for parameter-stability detection",
+    )
+    parser.add_argument("--stability-window-turns", type=int, default=800)
+    parser.add_argument("--stability-min-turn", type=int, default=1200)
+    parser.add_argument("--stability-slope-tol", type=float, default=1.5e-5)
+    parser.add_argument("--stability-rel-std-tol", type=float, default=0.03)
+    parser.add_argument("--stability-abs-std-tol", type=float, default=0.01)
+    parser.add_argument("--stability-consecutive", type=int, default=3)
+    parser.add_argument("--stability-min-points", type=int, default=6)
+    parser.add_argument(
+        "--gain-metrics",
+        type=str,
+        default="target_recall_recent,target_hit_rate,target_mrr",
+        help="Comma-separated metrics for marginal-gain threshold detection",
+    )
+    parser.add_argument("--gain-window-turns", type=int, default=800)
+    parser.add_argument("--gain-min-turn", type=int, default=1000)
+    parser.add_argument("--gain-delta-tol", type=float, default=0.01)
+    parser.add_argument("--gain-consecutive", type=int, default=3)
+    parser.add_argument("--gain-min-points", type=int, default=6)
+    parser.add_argument(
+        "--find-stable-turn",
+        action="store_true",
+        help="Sweep turn budget and estimate minimum turn where threshold is reached",
+    )
+    parser.add_argument("--stable-search-min-turns", type=int, default=1200)
+    parser.add_argument("--stable-search-max-turns", type=int, default=5000)
+    parser.add_argument("--stable-search-step", type=int, default=200)
+    parser.add_argument("--stable-search-runs", type=int, default=3)
+    parser.add_argument("--stable-search-pass-ratio", type=float, default=0.67)
+    parser.add_argument(
+        "--stable-search-mode",
+        type=str,
+        default="both",
+        help="One of: stability, gain, both",
+    )
     return parser.parse_args()
 
 
@@ -1935,7 +2293,7 @@ def main() -> None:
         dim=max(32, args.dim),
         seed=args.seed,
         query_prob=min(1.0, max(0.0, args.query_prob)),
-        report_every=max(100, args.report_every),
+        report_every=max(20, args.report_every),
         keyword_queries=max(0, args.keyword_queries),
         turn_noise_mix=min(0.9, max(0.01, args.turn_noise_mix)),
         switch_prob=min(1.0, max(0.0, args.switch_prob)),
@@ -2009,11 +2367,55 @@ def main() -> None:
     if p.learning_full_turns <= p.learning_warmup_turns:
         p.learning_full_turns = p.learning_warmup_turns + 1
 
-    sim = AgentMemorySim(p)
-    result = sim.run()
-
     out_csv = Path(args.out_csv)
     out_json = Path(args.out_json)
+    if args.find_stable_turn:
+        sweep = run_stability_sweep(p, args)
+        save_csv(out_csv, sweep["rows"])  # type: ignore[arg-type]
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        with out_json.open("w", encoding="utf-8") as f:
+            json.dump(sweep, f, ensure_ascii=False, indent=2)
+        rec = sweep.get("recommended_turn")
+        print("=== Stable Turn Sweep ===")
+        print(f"sweep_type: {sweep.get('sweep_type')}")
+        print(f"mode: {sweep.get('mode')}")
+        print(f"search_min_turns: {int(sweep.get('search_min_turns', 0))}")
+        print(f"search_max_turns: {int(sweep.get('search_max_turns', 0))}")
+        print(f"search_step: {int(sweep.get('search_step', 0))}")
+        print(f"runs_per_point: {int(sweep.get('runs', 0))}")
+        print(f"pass_ratio: {float(sweep.get('pass_ratio', 0.0)):.2f}")
+        print(f"recommended_turn: {rec if rec is not None else 'not found in range'}")
+        print(f"sweep_csv: {out_csv}")
+        print(f"sweep_json: {out_json}")
+        if not args.no_plot:
+            print("snapshot_plot: skipped (find-stable-turn mode)")
+        return
+
+    sim = AgentMemorySim(p)
+    result = sim.run()
+    stability = estimate_stability(
+        result["snapshots"],  # type: ignore[arg-type]
+        metrics=parse_metrics_arg(args.stability_metrics),
+        window_turns=args.stability_window_turns,
+        min_turn=args.stability_min_turn,
+        slope_tol=args.stability_slope_tol,
+        rel_std_tol=args.stability_rel_std_tol,
+        abs_std_tol=args.stability_abs_std_tol,
+        consecutive=args.stability_consecutive,
+        min_points=args.stability_min_points,
+    )
+    gain = estimate_gain_threshold(
+        result["snapshots"],  # type: ignore[arg-type]
+        metrics=parse_metrics_arg(args.gain_metrics),
+        window_turns=args.gain_window_turns,
+        min_turn=args.gain_min_turn,
+        delta_tol=args.gain_delta_tol,
+        consecutive=args.gain_consecutive,
+        min_points=args.gain_min_points,
+    )
+    result["stability"] = stability
+    result["gain_threshold"] = gain
+
     save_csv(out_csv, result["snapshots"])
     out_json.parent.mkdir(parents=True, exist_ok=True)
     with out_json.open("w", encoding="utf-8") as f:
@@ -2063,6 +2465,16 @@ def main() -> None:
     print(f"heat_gini_end: {summary['heat_gini_end']:.4f}")
     print(f"heat_gini_delta: {summary['heat_gini_delta']:.4f}")
     print(f"heat_gini_max: {summary['heat_gini_max']:.4f}")
+
+    stable_turn = stability.get("stable_turn")
+    gain_turn = gain.get("gain_turn")
+    stable_text = str(stable_turn) if isinstance(stable_turn, int) else "not reached"
+    gain_text = str(gain_turn) if isinstance(gain_turn, int) else "not reached"
+    print(f"stability_turn: {stable_text}")
+    print(f"gain_threshold_turn: {gain_text}")
+    if isinstance(stable_turn, int) and isinstance(gain_turn, int):
+        print(f"recommended_turn_budget: {max(stable_turn, gain_turn)}")
+
     print(f"snapshot_csv: {out_csv}")
     print(f"summary_json: {out_json}")
 

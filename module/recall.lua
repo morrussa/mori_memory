@@ -161,11 +161,37 @@ local function compute_recall_score(user_input, user_vec)
     return score
 end
 
-local function need_recall(user_input, user_vec)
+local function cold_start_strength(turn)
+    local cfg = ai_cfg()
+    if cfg.cold_start_enabled ~= true then
+        return 0.0
+    end
+    local end_t = math.max(1, tonumber(cfg.cold_start_turns) or tonumber(cfg.learning_full_turns) or 1600)
+    local t = math.max(1, tonumber(turn) or 1)
+    if t >= end_t then
+        return 0.0
+    end
+    local s = 1.0 - ((t - 1) / math.max(1, end_t - 1))
+    return clamp(s, 0.0, 1.0)
+end
+
+local function need_recall(user_input, user_vec, current_turn)
     user_vec = user_vec or tool.get_embedding_query(user_input)
     local score = compute_recall_score(user_input, user_vec)
-    local threshold = ai_cfg().recall_base or 5.3
-    print(string.format("[Recall] 回忆分数 = %.2f (阈值 %.2f)", score, threshold))
+    local cfg = ai_cfg()
+    local threshold = cfg.recall_base or 5.3
+
+    local cs = cold_start_strength(current_turn)
+    if cs > 0 then
+        local min_scale = clamp(tonumber(cfg.cold_start_recall_base_scale) or 0.82, 0.30, 1.00)
+        local scale = 1.0 - cs * (1.0 - min_scale)
+        threshold = threshold * scale
+    end
+
+    print(string.format(
+        "[Recall] 回忆分数 = %.2f (阈值 %.2f, cold_start=%.2f)",
+        score, threshold, cs
+    ))
     return score >= threshold
 end
 
@@ -287,9 +313,24 @@ local function effective_retrieval_knobs(turn)
         min_gate = adaptive.get_min_sim_gate(min_gate)
     end
 
+    local cs = cold_start_strength(turn)
+    if cs > 0 then
+        local gate_drop = math.max(0.0, tonumber(cfg.cold_start_min_gate_drop) or 0.04)
+        local power_drop = math.max(0.0, tonumber(cfg.cold_start_power_drop) or 0.18)
+        local mem_boost = math.max(0, tonumber(cfg.cold_start_max_memory_boost) or 2)
+        local turns_boost = math.max(0, tonumber(cfg.cold_start_max_turns_boost) or 2)
+        local probe_boost = math.max(0, tonumber(cfg.cold_start_probe_clusters_boost) or 2)
+
+        min_gate = min_gate - gate_drop * cs
+        power = power - power_drop * cs
+        max_memory = max_memory + math.floor(mem_boost * cs + 0.5)
+        max_turns = max_turns + math.floor(turns_boost * cs + 0.5)
+        super_q = super_q + math.floor(probe_boost * cs + 0.5)
+    end
+
     return {
         progress = prog,
-        min_sim_gate = min_gate,
+        min_sim_gate = clamp(min_gate, 0.05, 0.95),
         power_suppress = math.max(1.0, power),
         topic_cross_quota_ratio = clamp(cross, 0.0, 0.5),
         keyword_weight = math.max(0.0, kw_weight),
@@ -1004,7 +1045,7 @@ function M.check_and_retrieve(user_input, user_vec)
     local stable_ready = update_topic_stability(current_anchor, user_vec)
     topic_random_lift(current_turn, current_anchor, current_info, stable_ready)
 
-    if need_recall(user_input, user_vec) then
+    if need_recall(user_input, user_vec, current_turn) then
         return retrieve(user_input, user_vec, current_turn, current_info, current_anchor)
     end
 

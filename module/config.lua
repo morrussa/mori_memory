@@ -66,8 +66,8 @@ M.settings = {
         -- [实现方法] learning curve：
         -- recall 每轮根据 progress=lerp(warmup->full) 动态插值 min_gate/power/max_memory/max_turns/keyword_weight/super_topn。
         learning_curve_enabled = true,      -- 开启查询参数“随轮次收敛”；关闭后直接使用静态参数。
-        learning_warmup_turns = 500,        -- 学习曲线起点（<=该轮视作 progress=0）。
-        learning_full_turns = 12000,        -- 学习曲线终点（>=该轮视作 progress=1）。
+        learning_warmup_turns = 100,        -- aggressive 冷启动：更早进入学习插值区间。
+        learning_full_turns = 1600,         -- aggressive 冷启动：更快收敛到稳定参数。
         learning_query_noise_extra = 0.18,  -- 早期额外噪声注入上限：噪声=base+(1-progress)*extra。
         learning_min_sim_gate_start = 0.42, -- 早期最小相似度门限（后续收敛到 min_sim_gate）。
         learning_power_suppress_start = 1.15,-- 早期非线性压制指数（后续收敛到 power_suppress）。
@@ -77,10 +77,21 @@ M.settings = {
         learning_keyword_weight_start = 0.78,-- 早期关键词子查询权重起点（后续收敛到 keyword_weight）。
         learning_super_topn_query_start = 2,-- 早期 supercluster 查询 topN 起点（后续收敛到 supercluster_topn_query）。
 
+        -- [实现方法] cold start boost：
+        -- 仅在早期 turn 生效：降低 need_recall 阈值、放宽召回门限并提高检索预算；到 cold_start_turns 后自动退场。
+        cold_start_enabled = true,
+        cold_start_turns = 1600,
+        cold_start_recall_base_scale = 0.82, -- 早期 recall_base 缩放下限（越小越容易触发回忆）。
+        cold_start_min_gate_drop = 0.04, -- 早期额外下调 min_sim_gate 幅度。
+        cold_start_power_drop = 0.18, -- 早期额外下调 power_suppress 幅度。
+        cold_start_max_memory_boost = 2, -- 早期额外增加 max_memory。
+        cold_start_max_turns_boost = 2, -- 早期额外增加 max_turns。
+        cold_start_probe_clusters_boost = 2, -- 早期额外增加 supercluster_topn_query / 探测簇预算。
+
         -- [实现方法] refinement：
         -- recall 把候选样本与正/负样本送入 adaptive.update_after_recall，在线更新 learned_min_gate / online_merge_limit / route_score。
         refinement_enabled = true, -- 启用在线自适应（gate、merge_limit、route bias 都会随着召回反馈调整）。
-        refinement_start_turn = 200, -- 到达该轮才开始更新 adaptive 状态，前面只做静态召回。
+        refinement_start_turn = 80, -- aggressive 冷启动：更早开始在线自适应。
         refinement_sample_mem_topk = 48, -- 每轮用于 refinement 的候选 memory 样本上限（按相似度截断）。
         refinement_route_lr = 0.10, -- 簇路由分数学习率（越大越快改变 route_score）。
         refinement_gate_lr = 0.08, -- learned_min_gate 学习率（控制门限收敛速度）。
