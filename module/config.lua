@@ -63,6 +63,24 @@ M.settings = {
         keyword_align_gamma = 1.4,  -- 对齐度权重曲线指数，越大越保守（中低对齐关键词被压得更狠）。
         min_sim_gate = 0.58,      -- 硬过滤，直接丢掉泛化噪声
         power_suppress = 1.80,    -- 非线性压制
+        -- [实现方法] Smart Preload + EnhancedWeak：
+        smart_preload_enabled = true,
+        preload_budget_per_query = 5,
+        preload_heat_amount = 25000,
+        preload_topic_confidence = 0.50,
+        preload_use_vector_prediction = true,
+        preload_max_io_per_turn = 8,
+        preload_low_hot_ratio_threshold = 0.15,
+        soft_gate_enabled = true,
+        soft_gate_margin = 0.10,
+        expected_recall_enabled = true,
+        cluster_hit_rate_alpha = 0.10,
+        route_score_bonus_scale = 0.15,
+        empty_gate_decay = 0.98,
+        empty_gate_decay_aggressive = 0.95,
+        hit_gate_boost = 1.002,
+        min_gate_floor = 0.25,
+        max_gate_ceiling = 0.85,
         -- [实现方法] learning curve：
         -- recall 每轮根据 progress=lerp(warmup->full) 动态插值 min_gate/power/max_memory/max_turns/keyword_weight/super_topn。
         learning_curve_enabled = true,      -- 开启查询参数“随轮次收敛”；关闭后直接使用静态参数。
@@ -166,6 +184,11 @@ M.settings = {
         min_topic_length =2,--防止话题被切的太碎
         summary_max_tokens = 192, -- topic 摘要生成的最大输出长度（默认加大，减少截断）。
         rebuild = true,--当异常退出时，如果rebuild为true，那么就找到文件一开始写的current_turn上一个topic的末尾，然后自己根据history.txt的输出自动重建整个topic。这个过程会阻塞主pipeline，因为如果不阻塞就不安全。
+    },
+    storage_v3 = {
+        root = "memory/v3",
+        cluster_cache_cap = 24,
+        enable_lru = true,
     },
 }
 

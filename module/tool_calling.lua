@@ -599,11 +599,7 @@ function M.extract_atomic_facts(user_input, assistant_text)
     end
 
     if #facts == 0 then
-        print("[Lua Fact Extract] 未提取到事实，使用原始用户输入兜底")
-        facts = sanitize_facts({ user_input }, 1)
-        if #facts == 0 then
-            facts = { "用户本轮提出需求" }
-        end
+        print("[Lua Fact Extract] 未提取到有效原子事实，本轮不写入 memory")
     end
     return facts
 end
@@ -613,15 +609,20 @@ function M.save_turn_memory(facts, mem_turn)
         print(string.format("[WARN] history turn mismatch: history=%d, current=%d", history.get_turn(), mem_turn))
     end
 
+    local saved = 0
     for _, fact in ipairs(facts) do
         local fact_vec = tool.get_embedding_passage(fact)
         local affected_line, add_err = memory.add_memory(fact_vec, mem_turn)
         if affected_line then
             heat.neighbors_add_heat(fact_vec, mem_turn, affected_line)
             print(string.format("   → 原子事实存入记忆行 %d: %s", affected_line, fact:sub(1, 60)))
+            saved = saved + 1
         else
             print(string.format("[Memory][WARN] 原子事实写入失败(%s): %s", tostring(add_err), fact:sub(1, 60)))
         end
+    end
+    if saved == 0 then
+        print("[ToolCalling] 本轮无原子事实写入 memory")
     end
 
     if mem_turn % config_mem.settings.time.maintenance_task == 0 then

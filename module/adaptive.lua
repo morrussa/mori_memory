@@ -52,6 +52,7 @@ local function make_default_state()
         topic_lift_executed = 0,
         topic_cache_unload_count = 0,
         topic_cache_selected_turns_total = 0,
+        full_scan_guard_violations = 0,
     }
 end
 
@@ -97,6 +98,7 @@ local SCALAR_KEYS = {
     "topic_lift_executed",
     "topic_cache_unload_count",
     "topic_cache_selected_turns_total",
+    "full_scan_guard_violations",
 }
 
 local function scalar_key_set()

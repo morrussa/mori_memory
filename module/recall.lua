@@ -1,5 +1,5 @@
--- recall.lua
--- 召回主链：learning/refinement/persistent-explore/topic-cache/cold-rescue
+-- recall.lua (V3)
+-- simub-style retrieval chain: top-probe-clusters + soft-gate + expected-recall + smart-preload
 
 local M = {}
 
@@ -35,6 +35,12 @@ M._streak_sim_sum = 0.0
 M._streak_sim_count = 0
 M._topic_cache_anchor = nil
 M._topic_cache_mem = {}
+M._consecutive_empty_count = 0
+M._soft_gate_pass_count = 0
+
+M._cluster_visit_counts = {}
+M._cluster_hit_counts = {}
+M._cluster_hit_rate_ema = {}
 
 local function ai_cfg()
     return ((config.settings or {}).ai_query or {})
@@ -46,19 +52,53 @@ local function clamp(v, lo, hi)
     return v
 end
 
-local function shallow_copy_array(src)
-    local out = {}
-    for i = 1, #(src or {}) do
-        out[i] = src[i]
-    end
-    return out
-end
-
 local function shuffle_inplace(arr)
     for i = #arr, 2, -1 do
         local j = math.random(i)
         arr[i], arr[j] = arr[j], arr[i]
     end
+end
+
+local function topic_key_for_turn(turn)
+    local t = tonumber(turn)
+    if not t then return nil end
+
+    local ti = topic.get_topic_for_turn and topic.get_topic_for_turn(t) or nil
+    if not ti then
+        return topic.get_topic_anchor and topic.get_topic_anchor(t) or nil
+    end
+
+    if ti.is_active then
+        local start_turn = topic.active_topic and topic.active_topic.start
+        if start_turn then
+            return "S:" .. tostring(start_turn)
+        end
+        return topic.get_topic_anchor and topic.get_topic_anchor(t) or nil
+    end
+
+    if ti.topic_idx and topic.topics and topic.topics[ti.topic_idx] then
+        local rec = topic.topics[ti.topic_idx]
+        if rec and rec.start then
+            return "S:" .. tostring(rec.start)
+        end
+    end
+
+    return topic.get_topic_anchor and topic.get_topic_anchor(t) or nil
+end
+
+local function topic_key_for_current(current_turn, current_info)
+    if current_info and current_info.is_active then
+        local start_turn = topic.active_topic and topic.active_topic.start
+        if start_turn then
+            return "S:" .. tostring(start_turn)
+        end
+    elseif current_info and current_info.topic_idx and topic.topics and topic.topics[current_info.topic_idx] then
+        local rec = topic.topics[current_info.topic_idx]
+        if rec and rec.start then
+            return "S:" .. tostring(rec.start)
+        end
+    end
+    return topic_key_for_turn(current_turn)
 end
 
 local function topic_relation(current_info, ti, sim_th)
@@ -195,68 +235,6 @@ local function need_recall(user_input, user_vec, current_turn)
     return score >= threshold
 end
 
-local function generate_search_keywords(user_input)
-    if not py_pipeline then
-        return {}
-    end
-
-    local prompt = string.format([[
-用户提问：%s
-请推测用户想要回忆起过去的哪些具体内容。输出3-5个最可能的原子事实关键词。
-要求：
-1. 关键词要具体（如"Python爬虫"、"讨厌香菜"），不要宽泛（如"代码"、"食物"）。
-2. 严格输出Lua table格式：{"关键词1", "关键词2", ...}
-3. 不要输出任何其他解释。
-
-输出：
-]], user_input)
-
-    local messages = {
-        { role = "system", content = "你是一个记忆检索助手，擅长生成精准的搜索关键词。" },
-        { role = "user", content = prompt }
-    }
-
-    local params = {
-        max_tokens = 256,
-        temperature = 0.3,
-        seed = 42
-    }
-
-    local result_str = py_pipeline:generate_chat_sync(messages, params)
-    result_str = tool.remove_cot(result_str)
-
-    local keywords = {}
-    local max_keywords = tonumber(ai_cfg().max_keywords) or 4
-    if max_keywords < 1 then max_keywords = 4 end
-
-    result_str = tostring(result_str or ""):gsub("%s+", " ")
-    result_str = result_str:match("^%s*(.-)%s*$")
-
-    local parsed, err = tool.parse_lua_string_array_strict(result_str, {
-        max_items = max_keywords,
-        max_item_chars = 64,
-        must_full = true,
-        extract_first_on_fail = true,
-    })
-    if parsed then
-        local seen = {}
-        for _, kw in ipairs(parsed) do
-            local k = tostring(kw or ""):match("^%s*(.-)%s*$")
-            if k ~= "" and k ~= "无" and not seen[k] then
-                seen[k] = true
-                keywords[#keywords + 1] = k
-            end
-        end
-    else
-        print(string.format("[Recall] 关键词输出格式非法，已丢弃: %s", tostring(err)))
-    end
-
-    if #keywords > 0 then
-        print("[Recall] LLM 生成的搜索关键词: " .. table.concat(keywords, ", "))
-    end
-    return keywords
-end
-
 local function lerp(a, b, t)
     return a + (b - a) * t
 end
@@ -328,17 +306,103 @@ local function effective_retrieval_knobs(turn)
         super_q = super_q + math.floor(probe_boost * cs + 0.5)
     end
 
+    local gate_floor = tonumber(cfg.min_gate_floor) or 0.25
+    local gate_ceiling = tonumber(cfg.max_gate_ceiling) or 0.85
+    min_gate = clamp(min_gate, gate_floor, gate_ceiling)
+
     return {
-        progress = prog,
-        min_sim_gate = clamp(min_gate, 0.05, 0.95),
+        min_sim_gate = min_gate,
         power_suppress = math.max(1.0, power),
         topic_cross_quota_ratio = clamp(cross, 0.0, 0.5),
-        keyword_weight = math.max(0.0, kw_weight),
         max_memory = math.max(1, max_memory),
         max_turns = math.max(1, max_turns),
+        keyword_weight = kw_weight,
         supercluster_topn_query = math.max(1, super_q),
         probe_clusters = math.max(1, effective_probe_clusters(turn)),
     }
+end
+
+local function estimate_cluster_expected_recall(cid)
+    local cfg = ai_cfg()
+    local visits = tonumber(M._cluster_visit_counts[cid]) or 0.0
+    local hits = tonumber(M._cluster_hit_counts[cid]) or 0.0
+    if visits <= 0 then
+        return 0.5
+    end
+
+    local ema = tonumber(M._cluster_hit_rate_ema[cid]) or 0.5
+    local direct = hits / math.max(1e-6, visits)
+    local alpha = clamp(tonumber(cfg.cluster_hit_rate_alpha) or 0.10, 0.01, 0.99)
+    return alpha * direct + (1.0 - alpha) * ema
+end
+
+local function update_cluster_hit_rate(cid, hit)
+    if not cid then return end
+    local cfg = ai_cfg()
+    local alpha = clamp(tonumber(cfg.cluster_hit_rate_alpha) or 0.10, 0.01, 0.99)
+
+    M._cluster_visit_counts[cid] = (tonumber(M._cluster_visit_counts[cid]) or 0) + 1
+    if hit then
+        M._cluster_hit_counts[cid] = (tonumber(M._cluster_hit_counts[cid]) or 0) + 1
+    end
+
+    local visits = tonumber(M._cluster_visit_counts[cid]) or 0
+    local hits = tonumber(M._cluster_hit_counts[cid]) or 0
+    local current_rate = (visits > 0) and (hits / visits) or 0.0
+    local old_ema = tonumber(M._cluster_hit_rate_ema[cid]) or 0.5
+    M._cluster_hit_rate_ema[cid] = alpha * current_rate + (1.0 - alpha) * old_ema
+end
+
+local function soft_gate_filter(sim, min_gate)
+    local cfg = ai_cfg()
+    if sim >= min_gate then
+        return true
+    end
+    if cfg.soft_gate_enabled ~= true then
+        return false
+    end
+
+    local margin = clamp(tonumber(cfg.soft_gate_margin) or 0.10, 0.01, 0.95)
+    local threshold = min_gate * (1.0 - margin)
+    if sim < threshold then
+        return false
+    end
+
+    local den = math.max(1e-6, min_gate - threshold)
+    local prob = clamp((sim - threshold) / den, 0.0, 1.0)
+    if math.random() < prob then
+        M._soft_gate_pass_count = M._soft_gate_pass_count + 1
+        return true
+    end
+    return false
+end
+
+local function adjust_gate_on_result(hit)
+    local cfg = ai_cfg()
+    local gate_floor = tonumber(cfg.min_gate_floor) or 0.25
+    local gate_ceiling = tonumber(cfg.max_gate_ceiling) or 0.85
+    if not adaptive.state then
+        return
+    end
+
+    local cur = adaptive.get_min_sim_gate(tonumber(cfg.min_sim_gate) or 0.58)
+    if hit then
+        local boost = tonumber(cfg.hit_gate_boost) or 1.002
+        local nxt = clamp(cur * boost, gate_floor, gate_ceiling)
+        adaptive.state.learned_min_gate = nxt
+        M._consecutive_empty_count = 0
+    else
+        M._consecutive_empty_count = M._consecutive_empty_count + 1
+        local decay = tonumber(cfg.empty_gate_decay) or 0.98
+        local decay_aggr = tonumber(cfg.empty_gate_decay_aggressive) or 0.95
+        local used = decay
+        if M._consecutive_empty_count >= 3 then
+            used = decay_aggr
+        end
+        local nxt = clamp(cur * used, gate_floor, gate_ceiling)
+        adaptive.state.learned_min_gate = nxt
+    end
+    adaptive.mark_dirty()
 end
 
 local function top_probe_clusters(vec, probe_clusters, super_topn, turn)
@@ -353,6 +417,9 @@ local function top_probe_clusters(vec, probe_clusters, super_topn, turn)
         route_scale = (tonumber(cfg.refinement_route_bias_scale) or 0.08) * refinement_progress(turn)
     end
 
+    local use_expected = cfg.expected_recall_enabled == true
+    local bonus_scale = tonumber(cfg.route_score_bonus_scale) or 0.15
+
     local scored = {}
     local ops = ops0
     for _, cid in ipairs(cand) do
@@ -360,11 +427,13 @@ local function top_probe_clusters(vec, probe_clusters, super_topn, turn)
         if clu and clu.centroid then
             local sim = tool.cosine_similarity(vec, clu.centroid)
             ops = ops + 1
-            local adjusted = sim
-            if route_scale > 0 then
-                adjusted = adjusted + route_scale * adaptive.get_route_score(cid)
+            if use_expected then
+                sim = sim + estimate_cluster_expected_recall(cid) * bonus_scale
             end
-            scored[#scored + 1] = { cid = cid, adjusted = adjusted }
+            if route_scale > 0 then
+                sim = sim + route_scale * adaptive.get_route_score(cid)
+            end
+            scored[#scored + 1] = { cid = cid, adjusted = sim }
         end
     end
 
@@ -397,6 +466,180 @@ local function top_probe_clusters(vec, probe_clusters, super_topn, turn)
     return out, ops
 end
 
+local function collect_topic_centroids(current_turn, current_key, current_info)
+    local out = {}
+    local seen = {}
+
+    local function add_item(key, centroid)
+        if not key or key == "" or not centroid or #centroid == 0 then return end
+        if seen[key] then return end
+        seen[key] = true
+        out[#out + 1] = { key = key, centroid = centroid }
+    end
+
+    if current_key and current_info and current_info.centroid then
+        add_item(current_key, current_info.centroid)
+    end
+
+    for _, rec in ipairs(topic.topics or {}) do
+        local key = rec.start and ("S:" .. tostring(rec.start)) or nil
+        add_item(key, rec.centroid)
+    end
+
+    return out
+end
+
+local function predict_topic_key(query_vec, current_turn, current_key, current_info)
+    local candidates = collect_topic_centroids(current_turn, current_key, current_info)
+    if #candidates <= 0 then
+        return nil, 0.0
+    end
+
+    local qptr = tool.to_ptr_vec(query_vec) or query_vec
+    local scored = {}
+    for _, item in ipairs(candidates) do
+        local sim = tool.cosine_similarity(qptr, item.centroid)
+        scored[#scored + 1] = { key = item.key, sim = sim }
+    end
+
+    table.sort(scored, function(a, b) return a.sim > b.sim end)
+    local best = scored[1]
+    if not best then return nil, 0.0 end
+
+    local margin = 0.0
+    if #scored >= 2 then
+        margin = (tonumber(best.sim) or 0.0) - (tonumber(scored[2].sim) or 0.0)
+    end
+
+    local conf = clamp((tonumber(best.sim) or 0.0) * (1.0 + margin), -1.0, 1.0)
+    return best.key, conf
+end
+
+local function topic_hot_ratio(topic_key)
+    local lines = memory.iter_topic_lines(topic_key, false)
+    if #lines <= 0 then
+        return 0.0
+    end
+
+    local hot = 0
+    for _, line in ipairs(lines) do
+        if memory.get_heat_by_index(line) > 0 then
+            hot = hot + 1
+        end
+    end
+    return hot / #lines
+end
+
+local function pick_top_lines_by_sim(query_vec, lines, budget)
+    local qptr = tool.to_ptr_vec(query_vec) or query_vec
+    local scored = {}
+    for _, line in ipairs(lines) do
+        local vec = memory.return_mem_vec(line)
+        if vec then
+            local sim = tool.cosine_similarity(qptr, vec)
+            scored[#scored + 1] = { line = line, sim = sim }
+        end
+    end
+    table.sort(scored, function(a, b) return a.sim > b.sim end)
+
+    local out = {}
+    for i = 1, math.min(budget, #scored) do
+        out[#out + 1] = scored[i].line
+    end
+    return out
+end
+
+local function smart_preload_cold_memories(query_vec, current_turn, current_key, current_info, candidate_clusters)
+    local cfg = ai_cfg()
+    if cfg.smart_preload_enabled ~= true then
+        return 0
+    end
+
+    local preload_budget = math.max(0, tonumber(cfg.preload_budget_per_query) or 5)
+    local preload_max_io = math.max(0, tonumber(cfg.preload_max_io_per_turn) or 8)
+    if preload_budget <= 0 or preload_max_io <= 0 then
+        return 0
+    end
+
+    local io_granted = memory.reserve_preload_io(preload_budget, preload_max_io)
+    if io_granted <= 0 then
+        return 0
+    end
+
+    local hot_ratio_th = clamp(tonumber(cfg.preload_low_hot_ratio_threshold) or 0.15, 0.0, 1.0)
+    local conf_th = tonumber(cfg.preload_topic_confidence) or 0.50
+
+    local topics_to_preload = {}
+    local topic_seen = {}
+
+    local function try_add_topic(key)
+        if not key or topic_seen[key] then return end
+        local ratio = topic_hot_ratio(key)
+        if ratio < hot_ratio_th then
+            topic_seen[key] = true
+            topics_to_preload[#topics_to_preload + 1] = key
+        end
+    end
+
+    try_add_topic(current_key)
+
+    if cfg.preload_use_vector_prediction ~= false then
+        local pred_key, conf = predict_topic_key(query_vec, current_turn, current_key, current_info)
+        if pred_key and conf >= conf_th then
+            try_add_topic(pred_key)
+        end
+    end
+
+    if #topics_to_preload <= 0 then
+        return 0
+    end
+
+    local cluster_allow = {}
+    for _, cid in ipairs(candidate_clusters or {}) do
+        cluster_allow[tonumber(cid)] = true
+    end
+
+    local budget_left = io_granted
+    local preloaded = 0
+    local preload_heat = math.max(1, tonumber(cfg.preload_heat_amount) or 25000)
+
+    for _, topic_key in ipairs(topics_to_preload) do
+        if budget_left <= 0 then break end
+
+        local candidates = memory.iter_topic_lines(topic_key, true)
+        if #candidates > 0 then
+            local local_lines = {}
+            for _, line in ipairs(candidates) do
+                local cid = cluster.get_cluster_id_for_line(line)
+                if cid and cluster_allow[cid] then
+                    local_lines[#local_lines + 1] = line
+                end
+            end
+
+            if #local_lines > 0 then
+                local picked = pick_top_lines_by_sim(query_vec, local_lines, budget_left)
+                for _, line in ipairs(picked) do
+                    if budget_left <= 0 then break end
+                    local old_heat = memory.get_heat_by_index(line)
+                    if old_heat <= 0 then
+                        memory.set_heat(line, preload_heat)
+                        heat.sync_line(line)
+                        cluster.mark_hot(line)
+                        preloaded = preloaded + 1
+                        budget_left = budget_left - 1
+                    end
+                end
+            end
+        end
+    end
+
+    if preloaded > 0 then
+        heat.normalize_heat()
+    end
+
+    return preloaded
+end
+
 local function unload_topic_cache()
     if next(M._topic_cache_mem) ~= nil then
         adaptive.add_counter("topic_cache_unload_count", 1)
@@ -406,13 +649,12 @@ local function unload_topic_cache()
 end
 
 local function update_topic_stability(current_anchor, query_vec)
-    local cfg = ai_cfg()
-    local stable_warm = math.max(1, tonumber(cfg.stable_warmup_turns) or 6)
-    local stable_sim = clamp(tonumber(cfg.stable_min_pair_sim) or 0.72, 0.0, 1.0)
+    local stable_warm = math.max(1, tonumber(ai_cfg().stable_warmup_turns) or 6)
+    local stable_sim = tonumber(ai_cfg().stable_min_pair_sim) or 0.72
 
     if current_anchor and current_anchor == M._last_topic_anchor then
         M._same_topic_streak = M._same_topic_streak + 1
-        if M._prev_query_vec and #M._prev_query_vec > 0 and query_vec and #query_vec > 0 then
+        if M._prev_query_vec and query_vec and #query_vec > 0 then
             local sim = tool.cosine_similarity(M._prev_query_vec, query_vec)
             M._streak_sim_sum = M._streak_sim_sum + sim
             M._streak_sim_count = M._streak_sim_count + 1
@@ -424,7 +666,7 @@ local function update_topic_stability(current_anchor, query_vec)
     end
 
     M._last_topic_anchor = current_anchor
-    M._prev_query_vec = shallow_copy_array(query_vec or {})
+    M._prev_query_vec = query_vec
 
     local avg_pair = 1.0
     if M._streak_sim_count > 0 then
@@ -434,20 +676,9 @@ local function update_topic_stability(current_anchor, query_vec)
     return (M._same_topic_streak >= stable_warm) and (avg_pair >= stable_sim)
 end
 
-local function memory_matches_current_topic(mem_idx, current_info, sim_th)
-    local mem = memory.memories[mem_idx]
-    if not mem or not mem.turns then return false end
-    for _, t in ipairs(mem.turns) do
-        if topic_relation_for_turn(t, current_info, sim_th) == "same" then
-            return true
-        end
-    end
-    return false
-end
-
-local function topic_random_lift(turn, current_anchor, current_info, stable_ready)
+local function topic_random_lift(turn, current_anchor, stable_ready)
     local cfg = ai_cfg()
-    if not current_anchor or not current_info then return end
+    if not current_anchor then return end
     if not stable_ready then return end
 
     local interval = math.max(1, tonumber(cfg.topic_random_lift_interval) or 3)
@@ -456,17 +687,8 @@ local function topic_random_lift(turn, current_anchor, current_info, stable_read
     local prob = clamp(tonumber(cfg.topic_random_lift_prob) or 0.85, 0.0, 1.0)
     if math.random() > prob then return end
 
-    local sim_th = tonumber(cfg.topic_sim_threshold) or 0.70
     local only_cold = cfg.topic_random_lift_only_cold ~= false
-
-    local candidates = {}
-    for idx = 1, memory.get_total_lines() do
-        if memory_matches_current_topic(idx, current_info, sim_th) then
-            if (not only_cold) or (not heat.is_hot(idx)) then
-                candidates[#candidates + 1] = idx
-            end
-        end
-    end
+    local candidates = memory.iter_topic_lines(current_anchor, only_cold)
     if #candidates <= 0 then return end
 
     adaptive.add_counter("topic_lift_attempted", 1)
@@ -485,54 +707,6 @@ local function topic_random_lift(turn, current_anchor, current_info, stable_read
         M._topic_cache_mem[idx] = true
     end
     adaptive.add_counter("topic_lift_executed", #picked)
-end
-
-local function build_query_vectors(user_input, user_vec, keyword_weight)
-    local out = {
-        { vec = user_vec, weight = 1.0, is_primary = true }
-    }
-
-    local keywords = generate_search_keywords(user_input)
-    if #keywords <= 0 then
-        return out
-    end
-
-    local ok_batch, kw_vecs = pcall(function()
-        return tool.get_embeddings_query(keywords)
-    end)
-
-    if ok_batch and type(kw_vecs) == "table" and #kw_vecs > 0 then
-        for i, kw_vec in ipairs(kw_vecs) do
-            if type(kw_vec) == "table" and #kw_vec > 0 then
-                out[#out + 1] = {
-                    vec = kw_vec,
-                    weight = keyword_weight,
-                    is_primary = false,
-                }
-            else
-                local kw = keywords[i]
-                if kw and kw ~= "" then
-                    local single_vec = tool.get_embedding_query(kw)
-                    out[#out + 1] = {
-                        vec = single_vec,
-                        weight = keyword_weight,
-                        is_primary = false,
-                    }
-                end
-            end
-        end
-    else
-        for _, kw in ipairs(keywords) do
-            local kw_vec = tool.get_embedding_query(kw)
-            out[#out + 1] = {
-                vec = kw_vec,
-                weight = keyword_weight,
-                is_primary = false,
-            }
-        end
-    end
-
-    return out
 end
 
 local function to_sorted_pairs(turn_best)
@@ -571,24 +745,22 @@ local function apply_refinement(turn, hits_all, candidate_samples, selected_memo
     local pos_set = {}
     local neg_set = {}
     for _, mem_idx in ipairs(selected_memories or {}) do
-        local mem = memory.memories[mem_idx]
-        if mem and mem.turns then
-            local has_same = false
-            local has_near = false
-            for _, t in ipairs(mem.turns) do
-                local rel = topic_relation_for_turn(t, current_info, sim_th)
-                if rel == "same" then
-                    has_same = true
-                    break
-                elseif rel == "near" then
-                    has_near = true
-                end
+        local turns = memory.get_turns(mem_idx)
+        local has_same = false
+        local has_near = false
+        for _, t in ipairs(turns) do
+            local rel = topic_relation_for_turn(t, current_info, sim_th)
+            if rel == "same" then
+                has_same = true
+                break
+            elseif rel == "near" then
+                has_near = true
             end
-            if has_same then
-                pos_set[mem_idx] = true
-            elseif has_near then
-                neg_set[mem_idx] = true
-            end
+        end
+        if has_same then
+            pos_set[mem_idx] = true
+        elseif has_near then
+            neg_set[mem_idx] = true
         end
     end
 
@@ -615,6 +787,8 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         return ""
     end
 
+    memory.begin_turn(current_turn)
+
     local cfg = ai_cfg()
     local knobs = effective_retrieval_knobs(current_turn)
     local min_gate = tonumber(knobs.min_sim_gate) or (cfg.min_sim_gate or 0.58)
@@ -624,12 +798,30 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local query_topn = math.max(1, tonumber(knobs.supercluster_topn_query) or 4)
     local probe_clusters = math.max(1, tonumber(knobs.probe_clusters) or 2)
     local cross_quota_ratio = clamp(tonumber(knobs.topic_cross_quota_ratio) or 0.25, 0.0, 0.5)
-    local keyword_weight = math.max(0.0, tonumber(knobs.keyword_weight) or 0.55)
     local sim_th = tonumber(cfg.topic_sim_threshold) or 0.70
 
     local per_cluster_limit = math.max(2, tonumber(cfg.refinement_probe_per_cluster_limit) or 12)
     local base_scan_limit = math.max(per_cluster_limit, max_memory)
     local persistent_cap = math.max(1, tonumber(cfg.persistent_explore_candidate_cap) or 32)
+
+    local current_topic_key = topic_key_for_current(current_turn, current_info)
+
+    local turn_best = {}
+    local turn_src = {}
+    local turn_mem = {}
+    local mem_best_sim = {}
+    local mem_best_cluster = {}
+    local mem_best_effective = {}
+    local persistent_probe_clusters_query = {}
+
+    local query_vectors = {
+        { vec = user_vec, weight = 1.0, is_primary = true }
+    }
+    local primary = query_vectors[1]
+    if (not primary) or type(primary.vec) ~= "table" or #primary.vec == 0 then
+        return ""
+    end
+    local primary_qptr = tool.to_ptr_vec(primary.vec) or primary.vec
 
     local persistent_extra_budget = 0
     if cfg.persistent_explore_enabled == true and cluster.cluster_count() > 1 then
@@ -644,43 +836,12 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
-    local turn_best = {}
-    local turn_src = {}
-    local turn_mem = {}
-    local mem_best_sim = {}
-    local mem_best_cluster = {}
-    local mem_best_effective = {}
-    local persistent_probe_clusters_query = {}
-    local candidate_mem_set = {}
-    local candidate_mem_src = {}
-    local candidate_mem_cluster = {}
-    local candidate_mem_list = {}
-
-    local query_vectors = build_query_vectors(user_input, user_vec, keyword_weight)
-    local primary = query_vectors[1]
-    if (not primary) or type(primary.vec) ~= "table" or #primary.vec == 0 then
-        return ""
-    end
-
-    local function mark_candidate(mem_idx, src_label, cid)
-        mem_idx = tonumber(mem_idx)
-        if not mem_idx then return end
-        if not candidate_mem_set[mem_idx] then
-            candidate_mem_set[mem_idx] = true
-            candidate_mem_list[#candidate_mem_list + 1] = mem_idx
-            candidate_mem_src[mem_idx] = src_label or "hot"
-            candidate_mem_cluster[mem_idx] = tonumber(cid) or (cluster.get_cluster_id_for_line(mem_idx) or -1)
-        elseif src_label == "explore" then
-            candidate_mem_src[mem_idx] = "explore"
-        elseif src_label == "cache" and candidate_mem_src[mem_idx] ~= "explore" then
-            candidate_mem_src[mem_idx] = "cache"
-        end
-    end
+    local cluster_ids_for_preload, _ = top_probe_clusters(primary_qptr, probe_clusters, query_topn, current_turn)
+    local preloaded = smart_preload_cold_memories(primary_qptr, current_turn, current_topic_key, current_info, cluster_ids_for_preload)
 
     local function push_turn_score(mem_idx, effective, src_label)
-        local mem_data = memory.memories[mem_idx]
-        if not mem_data or not mem_data.turns then return end
-        for _, t in ipairs(mem_data.turns) do
+        local turns = memory.get_turns(mem_idx)
+        for _, t in ipairs(turns) do
             if (not turn_best[t]) or effective > turn_best[t] then
                 turn_best[t] = effective
                 turn_src[t] = src_label or "hot"
@@ -699,14 +860,14 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
-    -- Stage A: 只用主 query 召回候选池（降低关键词数量对检索耗时的线性放大）
-    do
-        local qv = primary.vec
-        local weight = primary.weight or 1.0
-        local cluster_ids, _ = top_probe_clusters(qv, probe_clusters, query_topn, current_turn)
+    for q_idx, q in ipairs(query_vectors) do
+        local qv = q.vec
+        local qptr = tool.to_ptr_vec(qv) or qv
+        local weight = q.weight or 1.0
+        local cluster_ids, _ = top_probe_clusters(qptr, probe_clusters, query_topn, current_turn)
         local persistent_probe_clusters_vec = {}
 
-        if persistent_extra_budget > 0 and #cluster_ids > 0 then
+        if q_idx == 1 and persistent_extra_budget > 0 and #cluster_ids > 0 then
             local picked = {}
             for _, cid in ipairs(cluster_ids) do picked[cid] = true end
             local pool = {}
@@ -728,7 +889,6 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             end
         end
 
-        local scanned_any = false
         for _, cid in ipairs(cluster_ids) do
             local scan_limit = base_scan_limit
             local src_label = "hot"
@@ -737,46 +897,31 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 src_label = "explore"
             end
 
-            local sim_results = cluster.find_sim_in_cluster(qv, cid, {
+            local sim_results = cluster.find_sim_in_cluster(qptr, cid, {
                 only_hot = true,
                 max_results = scan_limit,
             })
-            if #sim_results > 0 then
-                scanned_any = true
-            end
 
             for _, mem in ipairs(sim_results) do
                 local mem_idx = mem.index
                 local sim = mem.similarity
-                mark_candidate(mem_idx, src_label, cid)
                 update_mem_best(mem_idx, sim, weight, cid)
-                if sim >= min_gate then
-                    local effective = (sim ^ power) * weight
-                    push_turn_score(mem_idx, effective, src_label)
+
+                if not soft_gate_filter(sim, min_gate) then
+                    break
                 end
+
+                local effective = (sim ^ power) * weight
+                push_turn_score(mem_idx, effective, src_label)
             end
         end
 
-        if not scanned_any then
-            local fallback = memory.find_similar_all_fast(qv, max_memory * 2)
-            for _, mem in ipairs(fallback) do
-                local mem_idx = mem.index
-                local sim = mem.similarity
-                mark_candidate(mem_idx, "hot", cluster.get_cluster_id_for_line(mem_idx) or -1)
-                update_mem_best(mem_idx, sim, weight, cluster.get_cluster_id_for_line(mem_idx) or -1)
-                if sim >= min_gate then
-                    local effective = (sim ^ power) * weight
-                    push_turn_score(mem_idx, effective, "hot")
-                end
-            end
-        end
-
-        if current_anchor and M._topic_cache_anchor == current_anchor and next(M._topic_cache_mem) ~= nil then
+        if current_topic_key and M._topic_cache_anchor == current_topic_key and next(M._topic_cache_mem) ~= nil then
             local cache_scored = {}
             for mem_idx, _ in pairs(M._topic_cache_mem) do
                 local mem_vec = memory.return_mem_vec(mem_idx)
                 if mem_vec then
-                    local sim = tool.cosine_similarity(qv, mem_vec)
+                    local sim = tool.cosine_similarity(qptr, mem_vec)
                     cache_scored[#cache_scored + 1] = { mem_idx = mem_idx, sim = sim }
                 end
             end
@@ -784,89 +929,11 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             for _, item in ipairs(cache_scored) do
                 local sim = item.sim
                 local mem_idx = item.mem_idx
-                mark_candidate(mem_idx, "cache", cluster.get_cluster_id_for_line(mem_idx) or -1)
                 update_mem_best(mem_idx, sim, weight, cluster.get_cluster_id_for_line(mem_idx) or -1)
                 if sim >= min_gate then
                     local effective = (sim ^ power) * weight * (tonumber(cfg.topic_cache_weight) or 1.02)
                     push_turn_score(mem_idx, effective, "cache")
                 end
-            end
-        end
-    end
-
-    -- Stage B: 关键词仅在候选池内重排；夹角过大自动降权或跳过，避免“错向量”拖偏
-    do
-        local kw_total = math.max(0, #query_vectors - 1)
-        if kw_total > 0 and #candidate_mem_list > 0 then
-            local align_reject = tonumber(cfg.keyword_align_reject) or 0.05
-            local align_floor = tonumber(cfg.keyword_align_floor) or 0.20
-            local align_gamma = tonumber(cfg.keyword_align_gamma) or 1.25
-            local candidate_cap = math.max(96, max_turns * 24)
-            local kw_used = 0
-            local kw_skipped = 0
-
-            if #candidate_mem_list > candidate_cap then
-                table.sort(candidate_mem_list, function(a, b)
-                    return (tonumber(mem_best_sim[a]) or -1) > (tonumber(mem_best_sim[b]) or -1)
-                end)
-                while #candidate_mem_list > candidate_cap do
-                    local drop = table.remove(candidate_mem_list)
-                    if drop then
-                        candidate_mem_set[drop] = nil
-                        candidate_mem_src[drop] = nil
-                        candidate_mem_cluster[drop] = nil
-                    end
-                end
-            end
-
-            local candidate_vec = {}
-            for _, mem_idx in ipairs(candidate_mem_list) do
-                candidate_vec[mem_idx] = memory.return_mem_vec(mem_idx)
-            end
-
-            local function align_scale(aln)
-                if aln <= align_floor then return 0.0 end
-                local t = (aln - align_floor) / math.max(1e-6, (1.0 - align_floor))
-                if t < 0 then t = 0 end
-                if t > 1 then t = 1 end
-                return t ^ align_gamma
-            end
-
-            for i = 2, #query_vectors do
-                local q = query_vectors[i]
-                local qv = q.vec
-                if type(qv) == "table" and #qv > 0 then
-                    local alignment = tool.cosine_similarity(primary.vec, qv)
-                    if alignment < align_reject then
-                        kw_skipped = kw_skipped + 1
-                    else
-                        local scale = align_scale(alignment)
-                        if scale > 0 then
-                            kw_used = kw_used + 1
-                            local weight = (q.weight or keyword_weight) * scale
-                            for _, mem_idx in ipairs(candidate_mem_list) do
-                                local mem_vec = candidate_vec[mem_idx]
-                                if mem_vec then
-                                    local sim = tool.cosine_similarity(qv, mem_vec)
-                                    update_mem_best(mem_idx, sim, weight, candidate_mem_cluster[mem_idx])
-                                    if sim >= min_gate then
-                                        local effective = (sim ^ power) * weight
-                                        push_turn_score(mem_idx, effective, candidate_mem_src[mem_idx] or "hot")
-                                    end
-                                end
-                            end
-                        else
-                            kw_skipped = kw_skipped + 1
-                        end
-                    end
-                end
-            end
-
-            if kw_total > 0 then
-                print(string.format(
-                    "[Recall] keyword聚合重排: total=%d used=%d skipped=%d candidate_mem=%d",
-                    kw_total, kw_used, kw_skipped, #candidate_mem_list
-                ))
             end
         end
     end
@@ -877,6 +944,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local selected = {}
     local ranked = to_sorted_pairs(turn_best)
     if #ranked <= 0 then
+        adjust_gate_on_result(false)
         heat.enqueue_cold_rescue(user_vec, current_turn, current_info, min_gate)
         return ""
     end
@@ -966,6 +1034,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             cache_contrib = cache_contrib + 1
         end
     end
+
     if cache_contrib > 0 then
         adaptive.add_counter("topic_cache_selected_turns_total", cache_contrib)
     end
@@ -998,6 +1067,18 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
+    local hit_flag = hits_all > 0
+    local clusters_seen = {}
+    for _, sample in ipairs(candidate_samples) do
+        local cid = tonumber(sample.cid)
+        if cid and cid >= 0 and not clusters_seen[cid] then
+            update_cluster_hit_rate(cid, hit_flag)
+            clusters_seen[cid] = true
+        end
+    end
+
+    adjust_gate_on_result(hit_flag)
+
     apply_refinement(current_turn, hits_all, candidate_samples, selected_memories, current_info, sim_th)
 
     local need_rescue = (#selected_turns == 0)
@@ -1009,8 +1090,8 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     end
 
     print(string.format(
-        "[Recall] 选中 %d 条 turn（hits_same=%d, gate=%.3f, max_turns=%d）",
-        #selected_turns, hits_all, min_gate, max_turns
+        "[Recall] 选中 %d 条 turn（hits_same=%d, gate=%.3f, max_turns=%d, preloaded=%d）",
+        #selected_turns, hits_all, min_gate, max_turns, preloaded
     ))
 
     local memory_text_lines = {}
@@ -1035,18 +1116,18 @@ function M.check_and_retrieve(user_input, user_vec)
     user_vec = user_vec or tool.get_embedding_query(user_input)
 
     local current_turn = history.get_turn() + 1
-    local current_anchor = topic.get_topic_anchor and topic.get_topic_anchor(current_turn) or nil
     local current_info = topic.get_topic_for_turn and topic.get_topic_for_turn(current_turn) or nil
+    local current_key = topic_key_for_current(current_turn, current_info)
 
-    if M._last_topic_anchor and current_anchor ~= M._last_topic_anchor then
+    if M._last_topic_anchor and current_key ~= M._last_topic_anchor then
         unload_topic_cache()
     end
 
-    local stable_ready = update_topic_stability(current_anchor, user_vec)
-    topic_random_lift(current_turn, current_anchor, current_info, stable_ready)
+    local stable_ready = update_topic_stability(current_key, user_vec)
+    topic_random_lift(current_turn, current_key, stable_ready)
 
     if need_recall(user_input, user_vec, current_turn) then
-        return retrieve(user_input, user_vec, current_turn, current_info, current_anchor)
+        return retrieve(user_input, user_vec, current_turn, current_info, current_key)
     end
 
     return ""

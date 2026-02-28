@@ -1,5 +1,6 @@
 ---@diagnostic disable: deprecated
--- cluster.lua （含 supercluster 路由版）
+-- cluster.lua (V3 cluster index + shard-aware retrieval)
+
 local M = {}
 
 local tool = require("module.tool")
@@ -7,7 +8,12 @@ local config = require("module.config")
 local ffi = require("ffi")
 local persistence = require("module.persistence")
 
-local file_path = "memory/clusters.bin"
+local STORAGE_CFG = (config.settings or {}).storage_v3 or {}
+local ROOT_DIR = STORAGE_CFG.root or "memory/v3"
+local file_path = ROOT_DIR .. "/cluster_index.bin"
+
+local CLUSTER_MAGIC = "CID3"
+local CLUSTER_VERSION = 1
 
 M.clusters = {}
 M.line_to_cluster = {}
@@ -20,12 +26,136 @@ M.super_indexed_clusters = 0
 M.super_last_rebuild_clusters = 0
 M.super_rebuild_count = 0
 
+local function ensure_dir(path)
+    os.execute(string.format('mkdir -p "%s"', tostring(path):gsub('"', '\\"')))
+end
+
 local function refresh_hot_flag(id, clu)
     local c = clu or M.clusters[id]
     if not c then return end
     local total = (c.hot_count or 0) + (c.cold_count or 0)
     local ratio = (total > 0) and ((c.hot_count or 0) / total) or 0
     c.is_hot_cluster = ratio >= (config.settings.cluster.hot_cluster_ratio or 0.65)
+end
+
+local function ensure_member_tables(c)
+    if not c then return end
+    c.hot_members = c.hot_members or {}
+    c.cold_members = c.cold_members or {}
+    c._hot_pos = c._hot_pos or {}
+    c._cold_pos = c._cold_pos or {}
+
+    if next(c._hot_pos) == nil and #c.hot_members > 0 then
+        for i, line in ipairs(c.hot_members) do
+            c._hot_pos[line] = i
+        end
+    end
+    if next(c._cold_pos) == nil and #c.cold_members > 0 then
+        for i, line in ipairs(c.cold_members) do
+            c._cold_pos[line] = i
+        end
+    end
+end
+
+local function remove_member(arr, pos_map, line)
+    local pos = pos_map[line]
+    if not pos then return false end
+
+    local last = #arr
+    if pos ~= last then
+        local moved = arr[last]
+        arr[pos] = moved
+        pos_map[moved] = pos
+    end
+    arr[last] = nil
+    pos_map[line] = nil
+    return true
+end
+
+local function add_member(arr, pos_map, line)
+    if pos_map[line] then return false end
+    arr[#arr + 1] = line
+    pos_map[line] = #arr
+    return true
+end
+
+local function sync_counts(c)
+    c.hot_count = #(c.hot_members or {})
+    c.cold_count = #(c.cold_members or {})
+end
+
+local function set_member_hot_state(c, line, to_hot)
+    ensure_member_tables(c)
+    line = tonumber(line)
+    if not line or line <= 0 then return false end
+
+    local changed = false
+    if to_hot then
+        if remove_member(c.cold_members, c._cold_pos, line) then
+            changed = true
+        end
+        if add_member(c.hot_members, c._hot_pos, line) then
+            changed = true
+        end
+    else
+        if remove_member(c.hot_members, c._hot_pos, line) then
+            changed = true
+        end
+        if add_member(c.cold_members, c._cold_pos, line) then
+            changed = true
+        end
+    end
+
+    if changed then
+        sync_counts(c)
+        refresh_hot_flag(nil, c)
+    end
+    return changed
+end
+
+local function rebuild_cluster_member_views(c)
+    if not c then return end
+
+    local ok_mem, memory = pcall(require, "module.memory")
+    if not ok_mem or not memory then
+        c.hot_members = {}
+        c.cold_members = {}
+        c._hot_pos = {}
+        c._cold_pos = {}
+        sync_counts(c)
+        refresh_hot_flag(nil, c)
+        return
+    end
+
+    c.hot_members = {}
+    c.cold_members = {}
+    c._hot_pos = {}
+    c._cold_pos = {}
+
+    local dedup_members = {}
+    local seen = {}
+    for _, raw in ipairs(c.members or {}) do
+        local line = tonumber(raw)
+        if line and line > 0 and (not seen[line]) then
+            seen[line] = true
+            dedup_members[#dedup_members + 1] = line
+            if (memory.get_heat_by_index(line) or 0) > 0 then
+                add_member(c.hot_members, c._hot_pos, line)
+            else
+                add_member(c.cold_members, c._cold_pos, line)
+            end
+        end
+    end
+    c.members = dedup_members
+
+    sync_counts(c)
+    refresh_hot_flag(nil, c)
+end
+
+local function rebuild_all_member_views()
+    for _, c in pairs(M.clusters) do
+        rebuild_cluster_member_views(c)
+    end
 end
 
 local function deepcopy_vec(vec)
@@ -215,6 +345,8 @@ local function ensure_supercluster_index()
 end
 
 function M.load()
+    ensure_dir(ROOT_DIR)
+
     M.clusters = {}
     M.line_to_cluster = {}
     next_cluster_id = 1
@@ -224,15 +356,23 @@ function M.load()
 
     local f = io.open(file_path, "rb")
     if not f then
-        print("[Cluster] clusters.bin 不存在 → 首次运行将自动创建")
+        print("[Cluster] cluster_index.bin 不存在 → 首次运行将自动创建")
         return
     end
 
     local data = f:read("*a")
     f:close()
 
-    if #data < 20 or data:sub(1,4) ~= "CLUS" then
-        print("[Cluster] 文件头无效（可能是旧格式），请删除 clusters.bin 后重启")
+    if #data < 20 or data:sub(1, 4) ~= CLUSTER_MAGIC then
+        print("[Cluster] V3 cluster_index.bin 头无效，已忽略")
+        return
+    end
+
+    local p = ffi.cast("const uint8_t*", data)
+    local header = ffi.cast("const uint32_t*", p + 4)
+    local version = tonumber(header[0]) or 0
+    if version ~= CLUSTER_VERSION then
+        print(string.format("[Cluster] V3 版本不匹配，got=%d expect=%d", version, CLUSTER_VERSION))
         return
     end
 
@@ -241,11 +381,11 @@ function M.load()
         local clu, record_size = tool.parse_cluster_record(data, offset)
         if clu then
             M.clusters[clu.id] = {
-                centroid       = clu.centroid,
-                members        = clu.members,
-                heat           = clu.heat,
-                hot_count      = clu.hot_count,
-                cold_count     = clu.cold_count,
+                centroid = clu.centroid,
+                members = clu.members,
+                heat = clu.heat,
+                hot_count = clu.hot_count,
+                cold_count = clu.cold_count,
                 is_hot_cluster = clu.is_hot_cluster
             }
             for _, m in ipairs(clu.members or {}) do
@@ -260,11 +400,22 @@ function M.load()
         end
     end
 
-    print(string.format("[Cluster] 已从二进制加载 %d 个语义簇，下一个ID = %d", cluster_count_loaded, next_cluster_id))
+    local ok_mem, memory = pcall(require, "module.memory")
+    if ok_mem and memory and memory.set_cluster_id then
+        for line, cid in pairs(M.line_to_cluster) do
+            memory.set_cluster_id(line, cid)
+        end
+    end
+
+    rebuild_all_member_views()
+
+    print(string.format("[Cluster] V3 加载完成: %d 个语义簇，下一个ID = %d", cluster_count_loaded, next_cluster_id))
     M.update_hot_status()
 end
 
 function M.save_to_disk()
+    ensure_dir(ROOT_DIR)
+
     local count = 0
     for _ in pairs(M.clusters) do count = count + 1 end
 
@@ -277,14 +428,16 @@ function M.save_to_disk()
             return true
         end
 
-        local w1_ok, w1_err = write_or_fail("CLUS")
+        local w1_ok, w1_err = write_or_fail(CLUSTER_MAGIC)
         if not w1_ok then return false, w1_err end
 
-        local header = ffi.new("uint32_t[4]", 1, count, 0, 0)
+        local header = ffi.new("uint32_t[4]", CLUSTER_VERSION, count, 0, 0)
         local w2_ok, w2_err = write_or_fail(ffi.string(header, 16))
         if not w2_ok then return false, w2_err end
 
-        for id, c in pairs(M.clusters) do
+        local ids = sorted_cluster_ids()
+        for _, id in ipairs(ids) do
+            local c = M.clusters[id]
             if c and c.centroid then
                 local bin = tool.create_cluster_record(
                     id,
@@ -306,7 +459,7 @@ function M.save_to_disk()
         return false, err
     end
 
-    print(string.format("[Cluster] 二进制原子保存完成（%d 个簇）", count))
+    print(string.format("[Cluster] V3 索引保存完成（%d 个簇）", count))
     return true
 end
 
@@ -386,26 +539,33 @@ end
 
 function M.add(vec, mem_index)
     local saver = require("module.saver")
+    local memory = require("module.memory")
     if #vec == 0 then
         print("[Cluster] Error: 收到空向量")
-        return
+        return nil
     end
 
     local th = config.settings.cluster.cluster_sim or 0.75
     local best_id, sim = M.find_best_cluster(vec, { super_topn = config.settings.cluster.supercluster_topn_add })
 
+    local assigned
     if best_id and sim >= th then
         local c = M.clusters[best_id]
+        ensure_member_tables(c)
         table.insert(c.members, mem_index)
-        c.hot_count = (c.hot_count or 0) + 1
-        refresh_hot_flag(best_id, c)
+        set_member_hot_state(c, mem_index, true)
         M.line_to_cluster[mem_index] = best_id
+        assigned = best_id
         print(string.format("【簇匹配】记忆行 %d → 簇 %d (sim=%.4f)", mem_index, best_id, sim))
     else
         local id = next_cluster_id
         M.clusters[id] = {
             centroid = deepcopy_vec(vec),
             members = {mem_index},
+            hot_members = {mem_index},
+            cold_members = {},
+            _hot_pos = { [mem_index] = 1 },
+            _cold_pos = {},
             hot_count = 1,
             cold_count = 0,
             heat = 0,
@@ -415,9 +575,13 @@ function M.add(vec, mem_index)
         M.line_to_cluster[mem_index] = id
         next_cluster_id = id + 1
         M.super_indexed_clusters = 0
+        assigned = id
         print(string.format("【新簇创建】记忆行 %d 成为簇 %d 质心（固定）", mem_index, id))
     end
+
+    memory.set_cluster_id(mem_index, assigned)
     saver.mark_dirty()
+    return assigned
 end
 
 function M.mark_cold(mem_line)
@@ -425,10 +589,9 @@ function M.mark_cold(mem_line)
     local id = M.line_to_cluster[mem_line]
     local c = id and M.clusters[id] or nil
     if c then
-        c.cold_count = (c.cold_count or 0) + 1
-        c.hot_count = math.max(0, (c.hot_count or 1) - 1)
-        refresh_hot_flag(id, c)
-        saver.mark_dirty()
+        if set_member_hot_state(c, mem_line, false) then
+            saver.mark_dirty()
+        end
         return id
     end
 end
@@ -438,12 +601,32 @@ function M.mark_hot(mem_line)
     local id = M.line_to_cluster[mem_line]
     local c = id and M.clusters[id] or nil
     if c then
-        c.hot_count = (c.hot_count or 0) + 1
-        c.cold_count = math.max(0, (c.cold_count or 0) - 1)
-        refresh_hot_flag(id, c)
-        saver.mark_dirty()
+        if set_member_hot_state(c, mem_line, true) then
+            saver.mark_dirty()
+        end
         return id
     end
+end
+
+function M.on_memory_heat_change(mem_line, old_heat, new_heat)
+    local saver = require("module.saver")
+    local id = M.line_to_cluster[mem_line]
+    local c = id and M.clusters[id] or nil
+    if not c then
+        return nil, false
+    end
+
+    local was_hot = (tonumber(old_heat) or 0) > 0
+    local now_hot = (tonumber(new_heat) or 0) > 0
+    if was_hot == now_hot then
+        return id, false
+    end
+
+    local changed = set_member_hot_state(c, mem_line, now_hot)
+    if changed then
+        saver.mark_dirty()
+    end
+    return id, changed
 end
 
 function M.get_hot_ratio(id)
@@ -455,19 +638,19 @@ end
 
 function M.update_hot_status()
     for id, c in pairs(M.clusters) do
+        ensure_member_tables(c)
+        sync_counts(c)
         refresh_hot_flag(id, c)
     end
 end
 
 function M.get_cold_members(cid)
-    local memory = require("module.memory")
     local c = M.clusters[cid]
     if not c then return {} end
     local out = {}
-    for _, idx in ipairs(c.members or {}) do
-        if memory.get_heat_by_index(idx) <= 0 then
-            out[#out + 1] = idx
-        end
+    ensure_member_tables(c)
+    for i = 1, #(c.cold_members or {}) do
+        out[#out + 1] = c.cold_members[i]
     end
     return out
 end
@@ -484,22 +667,33 @@ function M.find_sim_in_cluster(vec, cluster_id, opts)
 
     if not M.clusters[cluster_id] then return {} end
 
+    local qv = tool.to_ptr_vec(vec)
+    if not qv then return {} end
+
+    local shard = memory.get_cluster_shard(cluster_id)
+    if not shard then return {} end
+
+    if only_hot and only_cold then
+        return {}
+    end
+
+    local c = M.clusters[cluster_id]
+    ensure_member_tables(c)
+    local scan_members = c.members or {}
+    if only_hot then
+        scan_members = c.hot_members or {}
+    elseif only_cold then
+        scan_members = c.cold_members or {}
+    end
+
     local results = {}
     local topk = {}
     local use_topk = max_results ~= nil
 
-    for _, idx in ipairs(M.clusters[cluster_id].members or {}) do
-        local heat = memory.get_heat_by_index(idx)
-        if only_hot and heat <= 0 then
-            goto continue
-        end
-        if only_cold and heat > 0 then
-            goto continue
-        end
-
-        local mem_vec = memory.return_mem_vec(idx)
+    for _, idx in ipairs(scan_members) do
+        local mem_vec = shard.ptr_by_line and shard.ptr_by_line[idx] or nil
         if mem_vec then
-            local sim = tool.cosine_similarity(vec, mem_vec)
+            local sim = tool.cosine_similarity(qv, mem_vec)
             if use_topk then
                 if #topk < max_results then
                     topk[#topk + 1] = { index = idx, similarity = sim }
@@ -520,7 +714,6 @@ function M.find_sim_in_cluster(vec, cluster_id, opts)
                 results[#results + 1] = { index = idx, similarity = sim }
             end
         end
-        ::continue::
     end
 
     if use_topk then

@@ -19,6 +19,20 @@ ffi.cdef[[
     float cosine_similarity_avx(const float* v1, const float* v2, size_t n);
 ]]
 
+local simdc_scratch_a = {}
+local simdc_scratch_b = {}
+
+local function get_scratch_buf(pool, n)
+    local k = tonumber(n) or 0
+    if k <= 0 then return nil end
+    local buf = pool[k]
+    if not buf then
+        buf = ffi.new("float[?]", k)
+        pool[k] = buf
+    end
+    return buf
+end
+
 -- ==================== 核心转换函数 ====================
 
 function M.get_embedding(text, mode)
@@ -148,6 +162,24 @@ function M.py_results_to_lua(obj)
         end
     end
     return results
+end
+
+function M.to_ptr_vec(vec)
+    if type(vec) == "table" and vec.__ptr then
+        return vec
+    end
+    if type(vec) ~= "table" then
+        return nil
+    end
+    local n = #vec
+    if n <= 0 then
+        return nil
+    end
+    local buf = ffi.new("float[?]", n)
+    for i = 1, n do
+        buf[i - 1] = tonumber(vec[i]) or 0.0
+    end
+    return { __ptr = buf, __dim = n }
 end
 
 -- ==================== 字符串工具 ====================
@@ -430,21 +462,25 @@ function M.cosine_similarity(vec1, vec2)
             return cosine_ptr_ptr(vec1.__ptr, vec2.__ptr, n)
         end
         if simdc then
-            local p2 = ffi.new("float[?]", vec1.__dim)
-            for i = 1, vec1.__dim do
+            local n = tonumber(vec1.__dim) or 0
+            if n <= 0 then return 0 end
+            local p2 = get_scratch_buf(simdc_scratch_b, n)
+            for i = 1, n do
                 p2[i - 1] = vec2[i] or 0.0
             end
-            return simdc.cosine_similarity_avx(vec1.__ptr, p2, vec1.__dim)
+            return simdc.cosine_similarity_avx(vec1.__ptr, p2, n)
         end
         return cosine_ptr_table(vec1.__ptr, vec2, vec1.__dim)
     end
     if type(vec2) == "table" and vec2.__ptr then
         if simdc then
-            local p1 = ffi.new("float[?]", vec2.__dim)
-            for i = 1, vec2.__dim do
+            local n = tonumber(vec2.__dim) or 0
+            if n <= 0 then return 0 end
+            local p1 = get_scratch_buf(simdc_scratch_a, n)
+            for i = 1, n do
                 p1[i - 1] = vec1[i] or 0.0
             end
-            return simdc.cosine_similarity_avx(p1, vec2.__ptr, vec2.__dim)
+            return simdc.cosine_similarity_avx(p1, vec2.__ptr, n)
         end
         return cosine_ptr_table(vec2.__ptr, vec1, vec2.__dim)
     end
@@ -455,8 +491,8 @@ function M.cosine_similarity(vec1, vec2)
     if n == 0 or n ~= #vec2 then return 0 end
 
     if simdc then
-        local p1 = ffi.new("float[?]", n)
-        local p2 = ffi.new("float[?]", n)
+        local p1 = get_scratch_buf(simdc_scratch_a, n)
+        local p2 = get_scratch_buf(simdc_scratch_b, n)
         for i = 1, n do
             p1[i-1] = vec1[i]
             p2[i-1] = vec2[i]

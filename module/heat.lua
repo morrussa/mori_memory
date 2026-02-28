@@ -250,15 +250,14 @@ function M.load()
     local memory = require("module.memory")
     M.heat = { indices = {}, values = {} }
     M.heat_pos = {}
-    local iter = memory.iterate_all()
-    local lineno = 0
-    for mem in iter do
-        lineno = lineno + 1
-        if mem and mem.heat and mem.heat > 0 then
-            sync_heat_to_table(lineno, mem.heat)
+    local total = memory.get_total_lines()
+    for lineno = 1, total do
+        local h = memory.get_heat_by_index(lineno)
+        if h and h > 0 then
+            sync_heat_to_table(lineno, h)
         end
     end
-    print(string.format("[Heat] 已从 memory.txt 加载热区，共 %d 条热记忆", #M.heat.indices))
+    print(string.format("[Heat] 已从 V3 memory_index 加载热区，共 %d 条热记忆", #M.heat.indices))
     M.load_pending()
 end
 
@@ -286,14 +285,9 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
 
     -- ========== 立即执行邻居加热（目标热或簇热） ==========
     -- 查找相似记忆（簇内优先）
-    local sim_results
+    local sim_results = {}
     if cid then
-        sim_results = cluster.find_sim_in_cluster(vec, cid, { only_hot = true })
-    else
-        sim_results = tool.find_sim_all_heat(vec) or {}
-        if #sim_results > 30 then
-            for i = 31, #sim_results do table.remove(sim_results, 31) end
-        end
+        sim_results = cluster.find_sim_in_cluster(vec, cid, { only_hot = true, max_results = 30 })
     end
 
     -- 时间加权
@@ -373,41 +367,6 @@ local function topic_relation_to_target(turn, target_info, sim_th)
     return "cross"
 end
 
-local function find_sim_all_cold(vec, max_results)
-    local memory = require("module.memory")
-    local limit = math.max(1, tonumber(max_results) or 32)
-    local topk = {}
-    for idx = 1, memory.get_total_lines() do
-        if memory.get_heat_by_index(idx) <= 0 then
-            local mem_vec = memory.return_mem_vec(idx)
-            if mem_vec then
-                local sim = tool.cosine_similarity(vec, mem_vec)
-                if #topk < limit then
-                    topk[#topk + 1] = { index = idx, similarity = sim }
-                    local j = #topk
-                    while j > 1 and topk[j].similarity < topk[j - 1].similarity do
-                        topk[j], topk[j - 1] = topk[j - 1], topk[j]
-                        j = j - 1
-                    end
-                elseif sim > topk[1].similarity then
-                    topk[1] = { index = idx, similarity = sim }
-                    local j = 1
-                    while j < #topk and topk[j].similarity > topk[j + 1].similarity do
-                        topk[j], topk[j + 1] = topk[j + 1], topk[j]
-                        j = j + 1
-                    end
-                end
-            end
-        end
-    end
-
-    local out = {}
-    for i = #topk, 1, -1 do
-        out[#out + 1] = topk[i]
-    end
-    return out
-end
-
 function M.enqueue_cold_rescue(query_vec, current_turn, target_topic_info, min_gate)
     local memory = require("module.memory")
     local cluster = require("module.cluster")
@@ -437,7 +396,9 @@ function M.enqueue_cold_rescue(query_vec, current_turn, target_topic_info, min_g
             max_results = scan_limit,
         })
     else
-        candidates = find_sim_all_cold(query_vec, scan_limit)
+        -- V3: 禁止全量冷区扫描 fallback
+        adaptive.add_counter("full_scan_guard_violations", 1)
+        return
     end
 
     local chosen = 0
@@ -448,10 +409,10 @@ function M.enqueue_cold_rescue(query_vec, current_turn, target_topic_info, min_g
             break
         end
         if mem_idx and sim >= gate and not M.pending_set[mem_idx] then
-            local mem_data = memory.memories[mem_idx]
+            local mem_turns = memory.get_turns(mem_idx)
             local has_target_turn = target_topic_info == nil
-            if mem_data and mem_data.turns and (not has_target_turn) then
-                for _, t in ipairs(mem_data.turns) do
+            if mem_turns and #mem_turns > 0 and (not has_target_turn) then
+                for _, t in ipairs(mem_turns) do
                     if topic_relation_to_target(t, target_topic_info, sim_th) == "same" then
                         has_target_turn = true
                         break

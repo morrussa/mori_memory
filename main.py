@@ -6,6 +6,7 @@ import zstandard as zstd
 import os
 import io
 import tarfile
+import shutil
 
 
 class AIPipeline:
@@ -167,9 +168,9 @@ class AIPipeline:
             print("[Python] 未找到 state.zst，使用现有 raw 或全新启动")
             return
 
+        v3_manifest = "memory/v3/manifest.txt"
         raw_files = [
-            "memory/memory.bin",
-            "memory/clusters.bin",
+            v3_manifest,
             "memory/history.txt",
             "memory/topic.bin",
             "memory/pending_cold.txt",
@@ -180,6 +181,7 @@ class AIPipeline:
         if not all(os.path.exists(f) for f in raw_files):
             print("[Python] 检测到归档状态，正在解压 state.zst...")
             self._do_decompress(zst_path)
+            self._ensure_v3_state(zst_path)
             return
 
         zst_mtime = os.path.getmtime(zst_path)
@@ -187,8 +189,25 @@ class AIPipeline:
         if zst_mtime > raw_mtime + 3:
             print("[Python] zst 比 raw 更新 → 强制解压覆盖")
             self._do_decompress(zst_path)
+            self._ensure_v3_state(zst_path)
         else:
             print("[Python] raw 文件已是最新的，直接使用")
+            self._ensure_v3_state(zst_path)
+
+    def _ensure_v3_state(self, zst_path):
+        v3_manifest = "memory/v3/manifest.txt"
+        if os.path.exists(v3_manifest):
+            return True
+
+        print("[Python] 检测到旧时代 state.zst（无 V3 manifest）→ 执行断代清理")
+        self._cleanup_legacy_raw_files(remove_v3=True)
+        if os.path.exists(zst_path):
+            try:
+                os.remove(zst_path)
+                print("[Python] 已作废旧 state.zst")
+            except Exception as e:
+                print(f"[Python][WARN] 删除旧 state.zst 失败: {e}")
+        return False
 
     def _do_decompress(self, zst_path):
         print("[Python] 正在解压 state.zst → raw files...")
@@ -220,11 +239,10 @@ class AIPipeline:
 
     def pack_state(self):
         print("[Python] 正在原子打包 state.zst...")
+        os.makedirs("memory", exist_ok=True)
         tar_bytes = io.BytesIO()
         with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
             for name in [
-                "memory.bin",
-                "clusters.bin",
                 "history.txt",
                 "topic.bin",
                 "pending_cold.txt",
@@ -234,6 +252,14 @@ class AIPipeline:
                 path = f"memory/{name}"
                 if os.path.exists(path):
                     tar.add(path, arcname=name)
+
+            v3_root = "memory/v3"
+            if os.path.isdir(v3_root):
+                for root, _, files in os.walk(v3_root):
+                    for fname in files:
+                        full_path = os.path.join(root, fname)
+                        arcname = os.path.relpath(full_path, "memory")
+                        tar.add(full_path, arcname=arcname)
         tar_bytes.seek(0)
         cctx = zstd.ZstdCompressor(level=5)
         compressed = cctx.compress(tar_bytes.read())
@@ -242,6 +268,31 @@ class AIPipeline:
             f.write(compressed)
         os.replace(temp, "memory/state.zst")
         print(f"[Python] 状态已打包完成（{len(compressed)/1024/1024:.1f} MB）")
+
+    def _cleanup_legacy_raw_files(self, remove_v3=False):
+        for name in [
+            "memory.bin",
+            "clusters.bin",
+            "history.txt",
+            "topic.bin",
+            "pending_cold.txt",
+            "notebook.txt",
+            "adaptive_state.txt",
+        ]:
+            path = f"memory/{name}"
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    print(f"[Python][WARN] 删除 {name} 失败: {e}")
+
+        if remove_v3:
+            v3_root = "memory/v3"
+            if os.path.isdir(v3_root):
+                try:
+                    shutil.rmtree(v3_root)
+                except Exception as e:
+                    print(f"[Python][WARN] 删除 v3 目录失败: {e}")
 
     def cleanup_raw_files(self):
         print("[Python] 执行最终归档清理：删除所有 raw 文件...")
@@ -261,6 +312,14 @@ class AIPipeline:
                     print(f"   已删除 {name}")
                 except Exception as e:
                     print(f"   删除 {name} 失败: {e}")
+
+        v3_root = "memory/v3"
+        if os.path.isdir(v3_root):
+            try:
+                shutil.rmtree(v3_root)
+                print("   已删除 v3/")
+            except Exception as e:
+                print(f"   删除 v3/ 失败: {e}")
         print("[Python] 归档完成！仅保留 state.zst")
 
     def get_similarity(self, text1: str, text2: str) -> float:

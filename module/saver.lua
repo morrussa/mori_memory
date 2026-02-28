@@ -29,8 +29,9 @@ function M.flush_all(force)
         return true
     end
 
-    if not run_save("memory.bin", memory.save_to_disk) then return false end
-    if not run_save("clusters.bin", cluster.save_to_disk) then return false end
+    if not run_save("memory_index.bin", memory.save_index_to_disk) then return false end
+    if not run_save("cluster_index.bin", cluster.save_to_disk) then return false end
+    if not run_save("cluster_shards", memory.save_dirty_shards) then return false end
     if not run_save("history.txt", history.save_to_disk) then return false end
     if not run_save("notebook.txt", notebook.save_to_disk) then return false end
     if not run_save("adaptive_state.txt", adaptive.save_to_disk) then return false end
