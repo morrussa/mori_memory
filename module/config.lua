@@ -56,6 +56,11 @@ M.settings = {
         topic_cross_quota_ratio = 0.25, -- topic 约束召回时，跨 topic 兜底配额比例（0~0.5）
         max_keywords = 4,
         keyword_weight = 0.55,    -- 关键词权重
+        -- [实现方法] keyword 候选聚合防偏：
+        -- 关键词只在“主查询召回出的候选池”内重排；若关键词向量与主向量夹角过大则直接跳过，避免 LLM 误生成把结果拖偏。
+        keyword_align_reject = 0.1, -- 与主向量相似度低于该值时直接丢弃该关键词查询（硬拒绝）。
+        keyword_align_floor = 0.3,  -- 通过硬拒绝后，低于该值仍按 0 权重处理；高于该值才进入平滑降权。
+        keyword_align_gamma = 1.4,  -- 对齐度权重曲线指数，越大越保守（中低对齐关键词被压得更狠）。
         min_sim_gate = 0.58,      -- 硬过滤，直接丢掉泛化噪声
         power_suppress = 1.80,    -- 非线性压制
         -- [实现方法] learning curve：

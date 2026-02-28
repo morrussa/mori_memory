@@ -13,6 +13,14 @@ class AIPipeline:
         self.llm_large = None   # GPU 大模型（生成用）
         self.llm_embed = None   # GGUF Embedding 模型
 
+    @staticmethod
+    def _normalize_embedding_vec(embedding):
+        emb_array = np.array(embedding, dtype=np.float32)
+        norm = np.linalg.norm(emb_array)
+        if norm > 0:
+            emb_array = emb_array / norm
+        return emb_array.tolist()
+
     def get_embedding(self, text: str, mode: str = "query"):
         """将文本转换为向量"""
         if not self.llm_embed:
@@ -26,12 +34,59 @@ class AIPipeline:
         
         response = self.llm_embed.create_embedding([text])
         embedding = response['data'][0]['embedding']
-        
-        emb_array = np.array(embedding, dtype=np.float32)
-        norm = np.linalg.norm(emb_array)
-        if norm > 0:
-            emb_array = emb_array / norm
-        return emb_array.tolist()
+        return self._normalize_embedding_vec(embedding)
+
+    def get_embeddings(self, texts, mode: str = "query"):
+        """批量文本转向量，返回 list[list[float]]"""
+        if not self.llm_embed:
+            raise RuntimeError("Embedding model not loaded")
+
+        seq = []
+        if texts is None:
+            return seq
+
+        try:
+            n = len(texts)
+        except Exception:
+            n = None
+
+        if n is not None:
+            try:
+                for i in range(1, n + 1):
+                    seq.append(str(texts[i] or "").strip())
+            except Exception:
+                seq = []
+
+            if not seq:
+                try:
+                    for i in range(0, n):
+                        seq.append(str(texts[i] or "").strip())
+                except Exception:
+                    seq = []
+        else:
+            seq = [str(texts).strip()]
+
+        prefixed = []
+        for text in seq:
+            if text == "":
+                continue
+            if not any(text.startswith(p) for p in ["query: ", "passage: "]):
+                prefix = "query: " if mode == "query" else "passage: "
+                text = prefix + text
+            prefixed.append(text)
+
+        if not prefixed:
+            return []
+
+        response = self.llm_embed.create_embedding(prefixed)
+        data = response.get("data") or []
+        out = []
+        for item in data:
+            emb = item.get("embedding") if isinstance(item, dict) else None
+            if emb is None:
+                continue
+            out.append(self._normalize_embedding_vec(emb))
+        return out
 
     def generate_chat_sync(self, messages, params):
         """同步版本：直接返回生成文本（供原子事实提取使用）"""

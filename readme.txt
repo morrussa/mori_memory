@@ -33,9 +33,9 @@ python agent_memory_sim.py --turns 20000 --plot-out memory/sim_trend.png
 python agent_memory_sim.py --turns 50000 --plot-out memory/sim_trend.png --supercluster-min-clusters 64
 
 .venv/bin/python agent_memory_simub.py \
-  --turns 50000 \
+  --turns 1000000 \
   --persistent-explore-epsilon 0.01 \
-  --persistent-explore-period-turns 800 \
+  --persistent-explore-period-turns 2500 \
   --persistent-explore-extra-clusters 1 \
   --persistent-explore-candidate-cap 32 \
-  --plot-out memory/simub_persist_50k.png
+  --plot-out memory/simub_persist_1m.png

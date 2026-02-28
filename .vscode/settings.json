@@ -1,3 +1,6 @@
 {
-    "git.enabled": true
+    "git.enabled": true,
+    "Lua.diagnostics.globals": [
+        "py_pipeline"
+    ]
 }

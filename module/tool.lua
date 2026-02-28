@@ -35,6 +35,56 @@ function M.get_embedding_query(text)
     return M.get_embedding(text, "query")
 end
 
+function M._force_nested_to_table(py_obj)
+    local out = {}
+    if py_obj == nil then return out end
+
+    if type(py_obj) == "table" and #py_obj > 0 and type(py_obj[1]) == "table" then
+        for i = 1, #py_obj do
+            out[#out + 1] = M._force_to_table(py_obj[i])
+        end
+        return out
+    end
+
+    local has_zero = false
+    local ok0, v0 = pcall(function() return py_obj[0] end)
+    if ok0 and v0 ~= nil then
+        has_zero = true
+    end
+    if has_zero then
+        local i = 0
+        while true do
+            local ok_idx, item = pcall(function() return py_obj[i] end)
+            if not ok_idx or item == nil then break end
+            out[#out + 1] = M._force_to_table(item)
+            i = i + 1
+        end
+        return out
+    end
+
+    local ok_len1, len1 = pcall(function() return #py_obj end)
+    if ok_len1 and tonumber(len1) and len1 > 0 then
+        for i = 1, len1 do
+            out[#out + 1] = M._force_to_table(py_obj[i])
+        end
+    end
+    return out
+end
+
+function M.get_embeddings(texts, mode)
+    mode = mode or "query"
+    local py_vecs = py_pipeline:get_embeddings(texts, mode)
+    return M._force_nested_to_table(py_vecs)
+end
+
+function M.get_embeddings_passage(texts)
+    return M.get_embeddings(texts, "passage")
+end
+
+function M.get_embeddings_query(texts)
+    return M.get_embeddings(texts, "query")
+end
+
 function M._force_to_table(py_obj)
     local t = {}
     if py_obj == nil then return t end
