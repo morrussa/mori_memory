@@ -40,10 +40,37 @@ M._preload_cache_clusters = {}
 M._preload_cache_mem = {}
 M._consecutive_empty_count = 0
 M._soft_gate_pass_count = 0
+M._last_recall_attempt_turn = nil
 
 M._cluster_visit_counts = {}
 M._cluster_hit_counts = {}
 M._cluster_hit_rate_ema = {}
+
+local RECALL_HISTORY_KEYWORDS = {
+    "之前", "上次", "以前", "过去", "曾经", "recall", "remember", "earlier", "previously"
+}
+
+local RECALL_EXPLICIT_KEYWORDS = {
+    "你还记得", "还记得", "记不记得", "我们聊过", "我说过", "我提过", "提到过",
+    "回顾", "复盘", "历史记录", "旧记录", "之前提到", "上回", "上一次"
+}
+
+local RECALL_CONTEXT_KEYWORDS = {
+    "继续", "接着", "延续", "刚才", "刚刚", "上面", "前面", "前文", "那个方案", "这件事"
+}
+
+local RECALL_NEW_TASK_KEYWORDS = {
+    "帮我写", "写一个", "生成", "介绍", "解释", "翻译", "推荐", "教程", "是什么", "怎么"
+}
+
+local RECALL_SUPPRESS_KEYWORDS = {
+    "不用回忆", "不需要回忆", "别回忆", "不要回忆", "无需回忆",
+    "不查记忆", "别查记忆", "don't recall", "do not recall", "no memory search"
+}
+
+local TECH_KEYWORDS = {
+    "代码", "函数", "api", "算法", "编程", "python", "lua", "配置", "参数"
+}
 
 local function ai_cfg()
     return ((config.settings or {}).ai_query or {})
@@ -53,6 +80,66 @@ local function clamp(v, lo, hi)
     if v < lo then return lo end
     if v > hi then return hi end
     return v
+end
+
+local function utf8_len(text)
+    local s = tostring(text or "")
+    local _, n = s:gsub("[^\128-\193]", "")
+    return n
+end
+
+local function contains_any_keyword(text, text_lower, keywords)
+    for _, kw in ipairs(keywords) do
+        local token = tostring(kw or "")
+        if token ~= "" then
+            if text:find(token, 1, true) then
+                return true, token
+            end
+            local token_lower = token:lower()
+            if token_lower ~= token and text_lower:find(token_lower, 1, true) then
+                return true, token
+            end
+        end
+    end
+    return false, nil
+end
+
+local function append_component(breakdown, name, delta)
+    local v = tonumber(delta) or 0.0
+    if v == 0.0 then
+        return 0.0
+    end
+    breakdown[name] = (tonumber(breakdown[name]) or 0.0) + v
+    return v
+end
+
+local function format_breakdown(breakdown)
+    local keys = {}
+    for k, _ in pairs(breakdown or {}) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+        local v = tonumber(breakdown[k]) or 0.0
+        parts[#parts + 1] = string.format("%s=%+.2f", k, v)
+    end
+    return table.concat(parts, ", ")
+end
+
+local function resolve_semantic_similarity(override_val, user_vec, target_vec, disable_embeddings)
+    local ov = tonumber(override_val)
+    if ov ~= nil then
+        return clamp(ov, -1.0, 1.0)
+    end
+    if disable_embeddings then
+        return 0.0
+    end
+    if user_vec and #user_vec > 0 and target_vec and #target_vec > 0 then
+        local sim = tool.cosine_similarity(user_vec, target_vec)
+        return clamp(sim, -1.0, 1.0)
+    end
+    return 0.0
 end
 
 local function shuffle_inplace(arr)
@@ -219,41 +306,134 @@ function M.init_all_sentiment_vectors()
     return anxiety_vec, help_cry_vec, past_talk_vec
 end
 
-local function compute_recall_score(user_input, user_vec)
-    local score = 0
+local function extract_recall_trigger_features(user_input, user_vec, opts)
+    opts = opts or {}
+    local text = tostring(user_input or "")
+    local text_lower = text:lower()
+    local override = opts.sim_override or {}
+    local disable_embeddings = opts.disable_embeddings == true
+
+    local has_history_keyword, _ = contains_any_keyword(text, text_lower, RECALL_HISTORY_KEYWORDS)
+    local has_explicit_keyword, _ = contains_any_keyword(text, text_lower, RECALL_EXPLICIT_KEYWORDS)
+    local has_context_keyword, _ = contains_any_keyword(text, text_lower, RECALL_CONTEXT_KEYWORDS)
+    local has_new_task_keyword, _ = contains_any_keyword(text, text_lower, RECALL_NEW_TASK_KEYWORDS)
+    local has_suppress_keyword, _ = contains_any_keyword(text, text_lower, RECALL_SUPPRESS_KEYWORDS)
+    local has_tech_keyword, _ = contains_any_keyword(text, text_lower, TECH_KEYWORDS)
+
+    local sim_anxiety = resolve_semantic_similarity(
+        override.anxiety_sim or override.anxiety,
+        user_vec,
+        anxiety_vec,
+        disable_embeddings
+    )
+    local sim_help_cry = resolve_semantic_similarity(
+        override.help_cry_sim or override.help_cry or override.help,
+        user_vec,
+        help_cry_vec,
+        disable_embeddings
+    )
+    local sim_past_talk = resolve_semantic_similarity(
+        override.past_talk_sim or override.past_talk or override.past,
+        user_vec,
+        past_talk_vec,
+        disable_embeddings
+    )
+
+    return {
+        text = text,
+        char_len = utf8_len(text),
+        has_history_keyword = has_history_keyword,
+        has_explicit_keyword = has_explicit_keyword,
+        has_context_keyword = has_context_keyword,
+        has_new_task_keyword = has_new_task_keyword,
+        has_suppress_keyword = has_suppress_keyword,
+        has_tech_keyword = has_tech_keyword,
+        sim_anxiety = sim_anxiety,
+        sim_help_cry = sim_help_cry,
+        sim_past_talk = sim_past_talk,
+    }
+end
+
+local function compute_recall_score(user_input, user_vec, opts)
+    opts = opts or {}
     local cfg = ai_cfg()
+    local features = extract_recall_trigger_features(user_input, user_vec, opts)
+    local breakdown = {}
+    local score = 0.0
 
-    local past_keywords = {"之前", "上次", "以前", "过去", "曾经", "recall", "remember"}
-    for _, kw in ipairs(past_keywords) do
-        if user_input:find(kw, 1, true) then
-            score = score + (cfg.history_search_bonus or 0)
-            break
-        end
-    end
+    local explicit_signal = (features.has_history_keyword or features.has_explicit_keyword)
+    local contextual_signal = (explicit_signal or features.has_context_keyword)
 
-    local tech_keywords = {"代码", "函数", "API", "算法", "编程", "Python", "Lua", "配置", "参数"}
-    for _, kw in ipairs(tech_keywords) do
-        if user_input:find(kw, 1, true) then
-            score = score + (cfg.technical_term_bonus or 0)
-            break
-        end
+    if features.has_history_keyword then
+        score = score + append_component(breakdown, "history_keyword_bonus", tonumber(cfg.history_search_bonus) or 0.0)
     end
 
-    if #user_input >= (cfg.length_limit or 20) then
-        score = score + (cfg.length_bonus or 0)
+    if features.has_explicit_keyword then
+        score = score + append_component(
+            breakdown,
+            "explicit_recall_bonus",
+            tonumber(cfg.explicit_recall_bonus) or 2.2
+        )
     end
 
-    if anxiety_vec and #anxiety_vec > 0 and user_vec and #user_vec > 0 then
-        score = score + tool.cosine_similarity(user_vec, anxiety_vec) * (cfg.anxiety_multi or 0)
-    end
-    if help_cry_vec and #help_cry_vec > 0 and user_vec and #user_vec > 0 then
-        score = score + tool.cosine_similarity(user_vec, help_cry_vec) * (cfg.help_cry_multi or 0)
-    end
-    if past_talk_vec and #past_talk_vec > 0 and user_vec and #user_vec > 0 then
-        score = score + tool.cosine_similarity(user_vec, past_talk_vec) * (cfg.past_talk_multi or 0)
+    if features.has_context_keyword then
+        score = score + append_component(
+            breakdown,
+            "context_link_bonus",
+            tonumber(cfg.context_link_bonus) or 1.1
+        )
     end
 
-    return score
+    if features.has_tech_keyword then
+        local base = tonumber(cfg.technical_term_bonus) or 0.0
+        local no_intent_scale = clamp(tonumber(cfg.technical_bonus_scale_when_no_recall_intent) or 0.30, 0.0, 1.0)
+        local scale = contextual_signal and 1.0 or no_intent_scale
+        score = score + append_component(breakdown, "technical_term_bonus", base * scale)
+    end
+
+    local length_limit = math.max(1, math.floor(tonumber(cfg.length_limit) or 20))
+    if features.char_len >= length_limit then
+        local base = tonumber(cfg.length_bonus) or 0.0
+        local no_intent_scale = clamp(tonumber(cfg.length_bonus_scale_when_no_recall_intent) or 0.35, 0.0, 1.0)
+        local scale = contextual_signal and 1.0 or no_intent_scale
+        score = score + append_component(breakdown, "length_bonus", base * scale)
+    end
+
+    local short_penalty_len = math.max(1, math.floor(tonumber(cfg.short_query_penalty_len) or 8))
+    if features.char_len <= short_penalty_len and not contextual_signal then
+        local penalty = math.abs(tonumber(cfg.short_query_penalty) or 0.65)
+        score = score + append_component(breakdown, "short_query_penalty", -penalty)
+    end
+
+    if features.has_new_task_keyword and not contextual_signal then
+        local penalty = math.abs(tonumber(cfg.fresh_task_penalty) or 1.6)
+        score = score + append_component(breakdown, "fresh_task_penalty", -penalty)
+    end
+
+    if features.has_suppress_keyword then
+        local penalty = math.abs(tonumber(cfg.suppress_recall_penalty) or 8.0)
+        score = score + append_component(breakdown, "suppress_recall_penalty", -penalty)
+    end
+
+    score = score + append_component(
+        breakdown,
+        "anxiety_similarity",
+        features.sim_anxiety * (tonumber(cfg.anxiety_multi) or 0.0)
+    )
+    score = score + append_component(
+        breakdown,
+        "help_cry_similarity",
+        features.sim_help_cry * (tonumber(cfg.help_cry_multi) or 0.0)
+    )
+
+    local past_multi = tonumber(cfg.past_talk_multi) or 0.0
+    if explicit_signal and past_multi < 0.0 then
+        local explicit_scale = clamp(tonumber(cfg.past_talk_multi_explicit_scale) or 0.65, 0.0, 2.0)
+        past_multi = math.abs(past_multi) * explicit_scale
+    end
+    score = score + append_component(breakdown, "past_talk_similarity", features.sim_past_talk * past_multi)
+
+    return score, breakdown, features
 end
 
 local function cold_start_strength(turn)
@@ -270,24 +450,234 @@ local function cold_start_strength(turn)
     return clamp(s, 0.0, 1.0)
 end
 
-local function need_recall(user_input, user_vec, current_turn)
-    user_vec = user_vec or tool.get_embedding_query(user_input)
-    local score = compute_recall_score(user_input, user_vec)
+local function compute_recall_threshold(current_turn, features)
     local cfg = ai_cfg()
-    local threshold = cfg.recall_base or 5.3
-
+    local threshold = tonumber(cfg.recall_base) or 5.3
     local cs = cold_start_strength(current_turn)
+
     if cs > 0 then
         local min_scale = clamp(tonumber(cfg.cold_start_recall_base_scale) or 0.82, 0.30, 1.00)
         local scale = 1.0 - cs * (1.0 - min_scale)
         threshold = threshold * scale
     end
 
-    print(string.format(
-        "[Recall] 回忆分数 = %.2f (阈值 %.2f, cold_start=%.2f)",
-        score, threshold, cs
-    ))
-    return score >= threshold
+    local explicit_signal = features and (features.has_history_keyword or features.has_explicit_keyword)
+    local context_signal = features and (features.has_context_keyword == true)
+
+    if explicit_signal then
+        local scale = clamp(tonumber(cfg.explicit_recall_threshold_scale) or 0.72, 0.40, 1.00)
+        threshold = threshold * scale
+    elseif context_signal then
+        local scale = clamp(tonumber(cfg.context_recall_threshold_scale) or 0.88, 0.50, 1.20)
+        threshold = threshold * scale
+    end
+
+    local cooldown_applied = false
+    local since_last = nil
+    local cooldown_turns = math.max(0, math.floor(tonumber(cfg.recall_cooldown_turns) or 1))
+    if cooldown_turns > 0 and M._last_recall_attempt_turn and not explicit_signal then
+        since_last = (tonumber(current_turn) or 0) - (tonumber(M._last_recall_attempt_turn) or 0)
+        if since_last > 0 and since_last <= cooldown_turns then
+            local mult = math.max(1.0, tonumber(cfg.recall_cooldown_threshold_mult) or 1.18)
+            threshold = threshold * mult
+            cooldown_applied = true
+        end
+    end
+
+    return threshold, cs, cooldown_applied, since_last
+end
+
+local function evaluate_recall_trigger(user_input, user_vec, current_turn, opts)
+    opts = opts or {}
+    local turn = math.max(1, tonumber(current_turn) or 1)
+    if opts.disable_embeddings ~= true and (not user_vec or #user_vec == 0) then
+        user_vec = tool.get_embedding_query(user_input)
+    end
+
+    local score, breakdown, features = compute_recall_score(user_input, user_vec, opts)
+    local threshold, cs, cooldown_applied, since_last = compute_recall_threshold(turn, features)
+    local explicit_signal = (features.has_history_keyword or features.has_explicit_keyword)
+    local contextual_signal = (explicit_signal or features.has_context_keyword)
+
+    local should_recall = (score >= threshold)
+    if features.has_suppress_keyword then
+        should_recall = false
+    end
+
+    return should_recall, {
+        score = score,
+        threshold = threshold,
+        cold_start_strength = cs,
+        cooldown_applied = cooldown_applied,
+        since_last_recall = since_last,
+        explicit_signal = explicit_signal,
+        contextual_signal = contextual_signal,
+        breakdown = breakdown,
+        features = features,
+        turn = turn,
+    }
+end
+
+local function need_recall(user_input, user_vec, current_turn, opts)
+    opts = opts or {}
+    local should_recall, detail = evaluate_recall_trigger(user_input, user_vec, current_turn, opts)
+    local cfg = ai_cfg()
+    if opts.silent ~= true then
+        print(string.format(
+            "[Recall] 回忆分数 = %.2f (阈值 %.2f, cold_start=%.2f, explicit=%s, context=%s, cooldown=%s)",
+            detail.score,
+            detail.threshold,
+            detail.cold_start_strength,
+            detail.explicit_signal and "Y" or "N",
+            detail.contextual_signal and "Y" or "N",
+            detail.cooldown_applied and "Y" or "N"
+        ))
+        if cfg.recall_trigger_debug == true then
+            print("[RecallTrigger] " .. format_breakdown(detail.breakdown))
+        end
+    end
+    return should_recall, detail
+end
+
+function M.explain_recall_trigger(user_input, current_turn, opts)
+    opts = opts or {}
+    local silent = opts.silent
+    if silent == nil then
+        silent = true
+    end
+    local should_recall, detail = need_recall(
+        user_input,
+        opts.user_vec,
+        current_turn or (history.get_turn() + 1),
+        {
+            disable_embeddings = opts.disable_embeddings,
+            sim_override = opts.sim_override,
+            silent = silent,
+        }
+    )
+    detail.should_recall = should_recall
+    return detail
+end
+
+function M.simulate_recall_trigger(cases, opts)
+    opts = opts or {}
+    local items = cases or {}
+    local results = {}
+    local tp, fp, tn, fn = 0, 0, 0, 0
+    local labeled_count = 0
+    local apply_state = (opts.apply_recall_state ~= false)
+
+    local old_last = M._last_recall_attempt_turn
+    if opts.reset_recall_state ~= false then
+        M._last_recall_attempt_turn = nil
+    end
+
+    for idx, case in ipairs(items) do
+        local input = tostring(case.input or case.text or "")
+        local turn = math.max(1, tonumber(case.turn or case.current_turn or idx) or idx)
+        local disable_embeddings = case.disable_embeddings
+        if disable_embeddings == nil then
+            if opts.disable_embeddings ~= nil then
+                disable_embeddings = opts.disable_embeddings
+            else
+                disable_embeddings = true
+            end
+        end
+
+        local should_recall, detail = evaluate_recall_trigger(
+            input,
+            case.user_vec,
+            turn,
+            {
+                disable_embeddings = disable_embeddings,
+                sim_override = case.sim_override or case.sim,
+            }
+        )
+
+        if should_recall and apply_state then
+            M._last_recall_attempt_turn = turn
+        end
+
+        local expected = nil
+        if case.expected ~= nil then
+            expected = (case.expected == true)
+            labeled_count = labeled_count + 1
+            if should_recall and expected then
+                tp = tp + 1
+            elseif should_recall and (not expected) then
+                fp = fp + 1
+            elseif (not should_recall) and expected then
+                fn = fn + 1
+            else
+                tn = tn + 1
+            end
+        end
+
+        local row = {
+            idx = idx,
+            id = case.id or ("case_" .. tostring(idx)),
+            input = input,
+            expected = expected,
+            should_recall = should_recall,
+            score = detail.score,
+            threshold = detail.threshold,
+            explicit_signal = detail.explicit_signal,
+            contextual_signal = detail.contextual_signal,
+            breakdown = detail.breakdown,
+            features = detail.features,
+            turn = turn,
+        }
+        results[#results + 1] = row
+
+        if opts.print_details == true then
+            local exp_str = "-"
+            if expected ~= nil then
+                exp_str = expected and "T" or "F"
+            end
+            print(string.format(
+                "[RecallSim][%02d] id=%s turn=%d pred=%s exp=%s score=%.2f th=%.2f",
+                idx,
+                tostring(row.id),
+                turn,
+                should_recall and "T" or "F",
+                exp_str,
+                row.score,
+                row.threshold
+            ))
+            if opts.print_breakdown == true then
+                print("  " .. format_breakdown(row.breakdown))
+            end
+        end
+    end
+
+    if opts.reset_recall_state ~= false then
+        M._last_recall_attempt_turn = old_last
+    end
+
+    local precision = ((tp + fp) > 0) and (tp / (tp + fp)) or 0.0
+    local recall_rate = ((tp + fn) > 0) and (tp / (tp + fn)) or 0.0
+    local accuracy = ((tp + tn + fp + fn) > 0) and ((tp + tn) / (tp + tn + fp + fn)) or 0.0
+    local f1 = ((precision + recall_rate) > 0) and (2.0 * precision * recall_rate / (precision + recall_rate)) or 0.0
+
+    return {
+        results = results,
+        metrics = {
+            total = #results,
+            labeled = labeled_count,
+            tp = tp,
+            fp = fp,
+            tn = tn,
+            fn = fn,
+            precision = precision,
+            recall = recall_rate,
+            accuracy = accuracy,
+            f1 = f1,
+        }
+    }
+end
+
+function M.reset_recall_trigger_state()
+    M._last_recall_attempt_turn = nil
 end
 
 local function lerp(a, b, t)
@@ -1405,7 +1795,9 @@ function M.check_and_retrieve(user_input, user_vec)
     local stable_ready = update_topic_stability(current_key, user_vec)
     topic_random_lift(current_turn, current_key, stable_ready)
 
-    if need_recall(user_input, user_vec, current_turn) then
+    local should_recall, _ = need_recall(user_input, user_vec, current_turn)
+    if should_recall then
+        M._last_recall_attempt_turn = current_turn
         return retrieve(user_input, user_vec, current_turn, current_info, current_key)
     end
 
