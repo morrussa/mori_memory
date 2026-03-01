@@ -35,6 +35,9 @@ M._streak_sim_sum = 0.0
 M._streak_sim_count = 0
 M._topic_cache_anchor = nil
 M._topic_cache_mem = {}
+M._preload_cache_anchor = nil
+M._preload_cache_clusters = {}
+M._preload_cache_mem = {}
 M._consecutive_empty_count = 0
 M._soft_gate_pass_count = 0
 
@@ -57,6 +60,58 @@ local function shuffle_inplace(arr)
         local j = math.random(i)
         arr[i], arr[j] = arr[j], arr[i]
     end
+end
+
+local function normalize_vec(vec)
+    if type(vec) ~= "table" or #vec == 0 then
+        return {}
+    end
+    local out = {}
+    local norm2 = 0.0
+    for i = 1, #vec do
+        local v = tonumber(vec[i]) or 0.0
+        out[i] = v
+        norm2 = norm2 + v * v
+    end
+    local norm = math.sqrt(norm2)
+    if norm > 0.0 then
+        for i = 1, #out do
+            out[i] = out[i] / norm
+        end
+    end
+    return out
+end
+
+local function query_vectors(base_vec, keyword_weight)
+    local cfg = ai_cfg()
+    local out = {
+        { vec = base_vec, weight = 1.0, is_primary = true }
+    }
+    local query_n = math.max(1, math.floor(tonumber(cfg.keyword_queries) or 2))
+    if query_n <= 1 then
+        return out
+    end
+
+    local base = normalize_vec(base_vec)
+    local dim = #base
+    if dim <= 0 then
+        return out
+    end
+    local mix = clamp(tonumber(cfg.keyword_noise_mix) or 0.20, 0.0, 1.0)
+    for _ = 2, query_n do
+        local noise = {}
+        for i = 1, dim do
+            noise[i] = math.random() * 2.0 - 1.0
+        end
+        noise = normalize_vec(noise)
+        local qv = {}
+        for i = 1, dim do
+            qv[i] = (1.0 - mix) * base[i] + mix * (noise[i] or 0.0)
+        end
+        qv = normalize_vec(qv)
+        out[#out + 1] = { vec = qv, weight = keyword_weight or 1.0, is_primary = false }
+    end
+    return out
 end
 
 local function topic_key_for_turn(turn)
@@ -550,6 +605,7 @@ local function pick_top_lines_by_sim(query_vec, lines, budget)
 end
 
 local function smart_preload_cold_memories(query_vec, current_turn, current_key, current_info, candidate_clusters)
+    _ = current_turn
     local cfg = ai_cfg()
     if cfg.smart_preload_enabled ~= true then
         return 0
@@ -600,44 +656,99 @@ local function smart_preload_cold_memories(query_vec, current_turn, current_key,
     end
 
     local budget_left = io_granted
-    local preloaded = 0
-    local preload_heat = math.max(1, tonumber(cfg.preload_heat_amount) or 25000)
+    if budget_left <= 0 then
+        return 0
+    end
+    local qptr = tool.to_ptr_vec(query_vec) or query_vec
+    local preload_vec_cache = {}
+    local function preload_mem_vec(mem_idx)
+        local cached = preload_vec_cache[mem_idx]
+        if cached == nil then
+            local vec = memory.return_mem_vec(mem_idx)
+            if vec then
+                preload_vec_cache[mem_idx] = vec
+                return vec
+            end
+            preload_vec_cache[mem_idx] = false
+            return nil
+        end
+        if cached == false then
+            return nil
+        end
+        return cached
+    end
+    local scored_clusters = {}
+    local scored_seen = {}
 
     for _, topic_key in ipairs(topics_to_preload) do
         if budget_left <= 0 then break end
 
-        local candidates = memory.iter_topic_lines(topic_key, true)
+        local candidates = memory.iter_topic_lines(topic_key, false)
         if #candidates > 0 then
-            local local_lines = {}
+            local cluster_members = {}
             for _, line in ipairs(candidates) do
                 local cid = cluster.get_cluster_id_for_line(line)
                 if cid and cluster_allow[cid] then
-                    local_lines[#local_lines + 1] = line
+                    local bucket = cluster_members[cid]
+                    if not bucket then
+                        bucket = {}
+                        cluster_members[cid] = bucket
+                    end
+                    bucket[#bucket + 1] = line
                 end
             end
 
-            if #local_lines > 0 then
-                local picked = pick_top_lines_by_sim(query_vec, local_lines, budget_left)
-                for _, line in ipairs(picked) do
-                    if budget_left <= 0 then break end
-                    local old_heat = memory.get_heat_by_index(line)
-                    if old_heat <= 0 then
-                        memory.set_heat(line, preload_heat)
-                        heat.sync_line(line)
-                        cluster.mark_hot(line)
-                        preloaded = preloaded + 1
-                        budget_left = budget_left - 1
+            for cid, members in pairs(cluster_members) do
+                if (not scored_seen[cid]) and (not M._preload_cache_clusters[cid]) then
+                    local best_sim = -1.0
+                    for _, mem_idx in ipairs(members) do
+                        local mem_vec = preload_mem_vec(mem_idx)
+                        if mem_vec then
+                            local sim = tool.cosine_similarity(qptr, mem_vec)
+                            if sim > best_sim then
+                                best_sim = sim
+                            end
+                        end
+                    end
+                    if best_sim > -1.0 then
+                        scored_seen[cid] = true
+                        scored_clusters[#scored_clusters + 1] = { cid = cid, sim = best_sim }
                     end
                 end
             end
         end
     end
 
-    if preloaded > 0 then
-        heat.normalize_heat()
+    table.sort(scored_clusters, function(a, b) return a.sim > b.sim end)
+
+    local total_lines = memory.get_total_lines()
+    local loaded_clusters = 0
+    for _, item in ipairs(scored_clusters) do
+        if loaded_clusters >= budget_left then break end
+        local cid = tonumber(item.cid)
+        local clu = cid and cluster.clusters[cid] or nil
+        if clu then
+            M._preload_cache_clusters[cid] = true
+            for _, raw in ipairs(clu.members or {}) do
+                local idx = math.floor(tonumber(raw) or -1)
+                if idx >= 1 and idx <= total_lines then
+                    M._preload_cache_mem[idx] = true
+                end
+            end
+            loaded_clusters = loaded_clusters + 1
+        end
     end
 
-    return preloaded
+    if loaded_clusters > 0 then
+        M._preload_cache_anchor = current_key or topics_to_preload[1]
+    end
+    return loaded_clusters
+end
+
+local function unload_preload_cache()
+    M._preload_cache_anchor = nil
+    M._preload_cache_clusters = {}
+    M._preload_cache_mem = {}
 end
 
 local function unload_topic_cache()
@@ -646,6 +757,7 @@ local function unload_topic_cache()
     end
     M._topic_cache_mem = {}
     M._topic_cache_anchor = nil
+    unload_preload_cache()
 end
 
 local function update_topic_stability(current_anchor, query_vec)
@@ -796,8 +908,11 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local max_memory = math.max(1, tonumber(knobs.max_memory) or 5)
     local max_turns = math.max(1, tonumber(knobs.max_turns) or 10)
     local query_topn = math.max(1, tonumber(knobs.supercluster_topn_query) or 4)
+    local keyword_weight = tonumber(knobs.keyword_weight) or tonumber(cfg.keyword_weight) or 0.55
     local probe_clusters = math.max(1, tonumber(knobs.probe_clusters) or 2)
     local cross_quota_ratio = clamp(tonumber(knobs.topic_cross_quota_ratio) or 0.25, 0.0, 0.5)
+    local memory_drop_sim = tonumber(cfg.memory_drop_sim)
+    if memory_drop_sim == nil then memory_drop_sim = 0.60 end
     local sim_th = tonumber(cfg.topic_sim_threshold) or 0.70
 
     local per_cluster_limit = math.max(2, tonumber(cfg.refinement_probe_per_cluster_limit) or 12)
@@ -812,12 +927,77 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local mem_best_sim = {}
     local mem_best_cluster = {}
     local mem_best_effective = {}
+    local mem_best_source = {}
     local persistent_probe_clusters_query = {}
+    local keyword_perf_mode = tostring(cfg.keyword_perf_mode or "lossless")
+    if keyword_perf_mode ~= "near_lossless" then
+        keyword_perf_mode = "lossless"
+    end
+    local near_lossless_mode = (keyword_perf_mode == "near_lossless")
+    local near_min_primary_candidates = math.max(1, math.floor(
+        tonumber(cfg.near_lossless_min_primary_candidates) or (max_memory * 8)
+    ))
+    local near_secondary_cap = math.max(0, math.floor(tonumber(cfg.near_lossless_secondary_cap) or 0))
+    local secondary_near_mode_used = false
 
-    local query_vectors = {
-        { vec = user_vec, weight = 1.0, is_primary = true }
-    }
-    local primary = query_vectors[1]
+    local mem_vec_cache = {}
+    local mem_cluster_cache = {}
+    local q_sim_cache = {}
+    local primary_candidates = nil
+
+    local function get_mem_vec_cached(mem_idx)
+        local cached = mem_vec_cache[mem_idx]
+        if cached == nil then
+            local vec = memory.return_mem_vec(mem_idx)
+            if vec then
+                mem_vec_cache[mem_idx] = vec
+                return vec
+            end
+            mem_vec_cache[mem_idx] = false
+            return nil
+        end
+        if cached == false then
+            return nil
+        end
+        return cached
+    end
+
+    local function get_mem_cluster_cached(mem_idx)
+        local cid = mem_cluster_cache[mem_idx]
+        if cid == nil then
+            cid = cluster.get_cluster_id_for_line(mem_idx) or -1
+            mem_cluster_cache[mem_idx] = cid
+        end
+        return cid
+    end
+
+    local function get_sim_cached(q_idx, qptr, mem_idx)
+        local qcache = q_sim_cache[q_idx]
+        if not qcache then
+            qcache = {}
+            q_sim_cache[q_idx] = qcache
+        end
+
+        local cached = qcache[mem_idx]
+        if cached ~= nil then
+            if cached == false then
+                return nil
+            end
+            return cached
+        end
+
+        local mem_vec = get_mem_vec_cached(mem_idx)
+        if not mem_vec then
+            qcache[mem_idx] = false
+            return nil
+        end
+        local sim = tool.cosine_similarity(qptr, mem_vec)
+        qcache[mem_idx] = sim
+        return sim
+    end
+
+    local query_vecs = query_vectors(user_vec, keyword_weight)
+    local primary = query_vecs[1]
     if (not primary) or type(primary.vec) ~= "table" or #primary.vec == 0 then
         return ""
     end
@@ -837,113 +1017,211 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     end
 
     local cluster_ids_for_preload, _ = top_probe_clusters(primary_qptr, probe_clusters, query_topn, current_turn)
-    local preloaded = smart_preload_cold_memories(primary_qptr, current_turn, current_topic_key, current_info, cluster_ids_for_preload)
+    local preloaded_clusters = smart_preload_cold_memories(primary_qptr, current_turn, current_topic_key, current_info, cluster_ids_for_preload)
 
-    local function push_turn_score(mem_idx, effective, src_label)
-        local turns = memory.get_turns(mem_idx)
-        for _, t in ipairs(turns) do
-            if (not turn_best[t]) or effective > turn_best[t] then
-                turn_best[t] = effective
-                turn_src[t] = src_label or "hot"
-                turn_mem[t] = mem_idx
-            end
-        end
-    end
-
-    local function update_mem_best(mem_idx, sim, weight, cid)
-        local sim_pos = math.max(0.0, sim)
+    local function update_mem_best(mem_idx, sim, effective, cid, source)
         local prev_sim = mem_best_sim[mem_idx]
         if (not prev_sim) or sim > prev_sim then
             mem_best_sim[mem_idx] = sim
-            mem_best_cluster[mem_idx] = tonumber(cid) or (cluster.get_cluster_id_for_line(mem_idx) or -1)
-            mem_best_effective[mem_idx] = (sim_pos ^ power) * weight
+            mem_best_cluster[mem_idx] = tonumber(cid) or get_mem_cluster_cached(mem_idx)
+            mem_best_effective[mem_idx] = effective
+            mem_best_source[mem_idx] = source or "hot"
         end
     end
 
-    for q_idx, q in ipairs(query_vectors) do
+    local function build_primary_candidates()
+        local items = {}
+        for mem_idx, sim in pairs(mem_best_sim) do
+            items[#items + 1] = {
+                mem_idx = mem_idx,
+                sim = tonumber(sim) or -1.0
+            }
+        end
+        table.sort(items, function(a, b) return a.sim > b.sim end)
+
+        local cap = #items
+        if near_secondary_cap > 0 and near_secondary_cap < cap then
+            cap = near_secondary_cap
+        end
+
+        local out = {}
+        for i = 1, cap do
+            out[#out + 1] = items[i].mem_idx
+        end
+        return out
+    end
+
+    for q_idx, q in ipairs(query_vecs) do
         local qv = q.vec
         local qptr = tool.to_ptr_vec(qv) or qv
         local weight = q.weight or 1.0
-        local cluster_ids, _ = top_probe_clusters(qptr, probe_clusters, query_topn, current_turn)
-        local persistent_probe_clusters_vec = {}
-
-        if q_idx == 1 and persistent_extra_budget > 0 and #cluster_ids > 0 then
-            local picked = {}
-            for _, cid in ipairs(cluster_ids) do picked[cid] = true end
-            local pool = {}
-            for _, cid in ipairs(cluster.get_cluster_ids()) do
-                if not picked[cid] then
-                    pool[#pool + 1] = cid
-                end
+        local run_secondary_near = false
+        if near_lossless_mode and q_idx > 1 then
+            if not primary_candidates then
+                primary_candidates = build_primary_candidates()
             end
-            if #pool > 0 then
-                shuffle_inplace(pool)
-                local take = math.min(persistent_extra_budget, #pool)
-                for i = 1, take do
-                    local cid = pool[i]
-                    cluster_ids[#cluster_ids + 1] = cid
-                    persistent_probe_clusters_vec[cid] = true
-                    persistent_probe_clusters_query[cid] = true
-                end
-                adaptive.add_counter("persistent_explore_cluster_probes", take)
+            if #primary_candidates >= near_min_primary_candidates then
+                run_secondary_near = true
+                secondary_near_mode_used = true
             end
         end
 
-        for _, cid in ipairs(cluster_ids) do
-            local scan_limit = base_scan_limit
-            local src_label = "hot"
-            if persistent_probe_clusters_vec[cid] then
-                scan_limit = math.min(scan_limit, persistent_cap)
-                src_label = "explore"
+        if run_secondary_near then
+            for _, mem_idx in ipairs(primary_candidates) do
+                local sim = get_sim_cached(q_idx, qptr, mem_idx)
+                if sim then
+                    local sim_pos = math.max(0.0, sim)
+                    local effective = (sim_pos ^ power) * weight
+                    local cid = mem_best_cluster[mem_idx] or get_mem_cluster_cached(mem_idx)
+                    local src = mem_best_source[mem_idx] or "hot"
+                    update_mem_best(mem_idx, sim, effective, cid, src)
+                end
+            end
+        else
+            local cluster_ids, _ = top_probe_clusters(qptr, probe_clusters, query_topn, current_turn)
+            local persistent_probe_clusters_vec = {}
+
+            if q_idx == 1 and persistent_extra_budget > 0 and #cluster_ids > 0 then
+                local picked = {}
+                for _, cid in ipairs(cluster_ids) do picked[cid] = true end
+                local pool = {}
+                for _, cid in ipairs(cluster.get_cluster_ids()) do
+                    if not picked[cid] then
+                        pool[#pool + 1] = cid
+                    end
+                end
+                if #pool > 0 then
+                    shuffle_inplace(pool)
+                    local take = math.min(persistent_extra_budget, #pool)
+                    for i = 1, take do
+                        local cid = pool[i]
+                        cluster_ids[#cluster_ids + 1] = cid
+                        persistent_probe_clusters_vec[cid] = true
+                        persistent_probe_clusters_query[cid] = true
+                    end
+                    adaptive.add_counter("persistent_explore_cluster_probes", take)
+                end
             end
 
-            local sim_results = cluster.find_sim_in_cluster(qptr, cid, {
-                only_hot = true,
-                max_results = scan_limit,
-            })
+            local qcache = q_sim_cache[q_idx]
+            if not qcache then
+                qcache = {}
+                q_sim_cache[q_idx] = qcache
+            end
 
-            for _, mem in ipairs(sim_results) do
-                local mem_idx = mem.index
-                local sim = mem.similarity
-                update_mem_best(mem_idx, sim, weight, cid)
-
-                if not soft_gate_filter(sim, min_gate) then
-                    break
+            for _, cid in ipairs(cluster_ids) do
+                local scan_limit = base_scan_limit
+                local src_label = "hot"
+                if persistent_probe_clusters_vec[cid] then
+                    scan_limit = math.min(scan_limit, persistent_cap)
+                    src_label = "explore"
                 end
 
-                local effective = (sim ^ power) * weight
-                push_turn_score(mem_idx, effective, src_label)
+                local sim_results = cluster.find_sim_in_cluster(qptr, cid, {
+                    only_hot = true,
+                    max_results = scan_limit,
+                })
+
+                for _, mem in ipairs(sim_results) do
+                    local mem_idx = mem.index
+                    local sim = mem.similarity
+                    if qcache[mem_idx] == nil then
+                        qcache[mem_idx] = sim
+                    end
+
+                    local sim_pos = math.max(0.0, sim)
+                    local effective = (sim_pos ^ power) * weight
+                    update_mem_best(mem_idx, sim, effective, cid, src_label)
+
+                    if not soft_gate_filter(sim, min_gate) then
+                        break
+                    end
+                end
             end
         end
 
         if current_topic_key and M._topic_cache_anchor == current_topic_key and next(M._topic_cache_mem) ~= nil then
-            local cache_scored = {}
             for mem_idx, _ in pairs(M._topic_cache_mem) do
-                local mem_vec = memory.return_mem_vec(mem_idx)
-                if mem_vec then
-                    local sim = tool.cosine_similarity(qptr, mem_vec)
-                    cache_scored[#cache_scored + 1] = { mem_idx = mem_idx, sim = sim }
-                end
-            end
-            table.sort(cache_scored, function(a, b) return a.sim > b.sim end)
-            for _, item in ipairs(cache_scored) do
-                local sim = item.sim
-                local mem_idx = item.mem_idx
-                update_mem_best(mem_idx, sim, weight, cluster.get_cluster_id_for_line(mem_idx) or -1)
-                if sim >= min_gate then
-                    local effective = (sim ^ power) * weight * (tonumber(cfg.topic_cache_weight) or 1.02)
-                    push_turn_score(mem_idx, effective, "cache")
+                local sim = get_sim_cached(q_idx, qptr, mem_idx)
+                if sim then
+                    local sim_pos = math.max(0.0, sim)
+                    local effective = (sim_pos ^ power) * weight
+                    if sim >= min_gate then
+                        effective = effective * (tonumber(cfg.topic_cache_weight) or 1.02)
+                    end
+                    update_mem_best(mem_idx, sim, effective, get_mem_cluster_cached(mem_idx), "cache")
                 end
             end
         end
+
+        if next(M._preload_cache_mem) ~= nil then
+            local preload_scored = {}
+            for mem_idx, _ in pairs(M._preload_cache_mem) do
+                local sim = get_sim_cached(q_idx, qptr, mem_idx)
+                if sim then
+                    preload_scored[#preload_scored + 1] = { mem_idx = mem_idx, sim = sim }
+                end
+            end
+            table.sort(preload_scored, function(a, b) return a.sim > b.sim end)
+            for _, item in ipairs(preload_scored) do
+                local sim = item.sim
+                if not soft_gate_filter(sim, min_gate) then
+                    break
+                end
+                local mem_idx = item.mem_idx
+                local sim_pos = math.max(0.0, sim)
+                local effective = (sim_pos ^ power) * weight
+                update_mem_best(mem_idx, sim, effective, get_mem_cluster_cached(mem_idx), "preload_cluster")
+            end
+        end
+
+        if q_idx == 1 and near_lossless_mode and not primary_candidates then
+            primary_candidates = build_primary_candidates()
+        end
+    end
+
+    local kept_memories = {}
+    local dropped_by_memory_gate = 0
+    for mem_idx, sim in pairs(mem_best_sim) do
+        if sim >= memory_drop_sim then
+            kept_memories[#kept_memories + 1] = mem_idx
+            local effective = tonumber(mem_best_effective[mem_idx]) or 0.0
+            if effective > 0.0 then
+                local src_label = mem_best_source[mem_idx] or "hot"
+                local turns = memory.get_turns(mem_idx)
+                for _, t in ipairs(turns) do
+                    if (not turn_best[t]) or effective > turn_best[t] then
+                        turn_best[t] = effective
+                        turn_src[t] = src_label
+                        turn_mem[t] = mem_idx
+                    end
+                end
+            end
+        else
+            dropped_by_memory_gate = dropped_by_memory_gate + 1
+        end
+    end
+
+    local kept_best_sim = {}
+    local kept_best_cluster = {}
+    local kept_best_effective = {}
+    for _, mem_idx in ipairs(kept_memories) do
+        kept_best_sim[mem_idx] = mem_best_sim[mem_idx]
+        kept_best_cluster[mem_idx] = mem_best_cluster[mem_idx]
+        kept_best_effective[mem_idx] = mem_best_effective[mem_idx]
     end
 
     local sample_limit = math.max(1, tonumber(cfg.refinement_sample_mem_topk) or 48)
-    local candidate_samples = collect_candidate_samples(mem_best_sim, mem_best_cluster, mem_best_effective, sample_limit)
+    local candidate_samples = collect_candidate_samples(kept_best_sim, kept_best_cluster, kept_best_effective, sample_limit)
 
     local selected = {}
     local ranked = to_sorted_pairs(turn_best)
     if #ranked <= 0 then
+        print(string.format(
+            "[Recall] 空召回（preloaded_clusters=%d, kept_memories=%d, dropped_by_memory_gate=%d, keyword_mode=%s）",
+            preloaded_clusters, #kept_memories, dropped_by_memory_gate,
+            secondary_near_mode_used and "near_lossless" or keyword_perf_mode
+        ))
         adjust_gate_on_result(false)
         heat.enqueue_cold_rescue(user_vec, current_turn, current_info, min_gate)
         return ""
@@ -1090,8 +1368,9 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     end
 
     print(string.format(
-        "[Recall] 选中 %d 条 turn（hits_same=%d, gate=%.3f, max_turns=%d, preloaded=%d）",
-        #selected_turns, hits_all, min_gate, max_turns, preloaded
+        "[Recall] 选中 %d 条 turn（hits_same=%d, gate=%.3f, max_turns=%d, preloaded_clusters=%d, kept_memories=%d, dropped_by_memory_gate=%d, keyword_mode=%s）",
+        #selected_turns, hits_all, min_gate, max_turns, preloaded_clusters, #kept_memories, dropped_by_memory_gate,
+        secondary_near_mode_used and "near_lossless" or keyword_perf_mode
     ))
 
     local memory_text_lines = {}

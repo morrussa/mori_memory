@@ -19,6 +19,7 @@ local function clear_pending_system_context()
 end
 
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
+local FACT_CFG = ((config_mem.settings or {}).keyring or {}).fact_extractor or {}
 local trim
 
 local function to_bool(v, fallback)
@@ -40,6 +41,16 @@ local function cfg_number(v, fallback, min_v, max_v)
     return n
 end
 
+local function cfg_string(v, fallback)
+    if type(v) == "string" then
+        local s = tostring(v):gsub("^%s*(.-)%s*$", "%1")
+        if s ~= "" then
+            return s
+        end
+    end
+    return tostring(fallback or "")
+end
+
 local function get_tool_policy()
     return {
         upsert_min_confidence = cfg_number(TOOL_CFG.upsert_min_confidence, 0.82, 0, 1),
@@ -53,6 +64,27 @@ local function get_tool_policy()
         tool_pass_temperature = cfg_number(TOOL_CFG.tool_pass_temperature, 0.15, 0, 1),
         tool_pass_max_tokens = cfg_number(TOOL_CFG.tool_pass_max_tokens, 128, 32),
         tool_pass_seed = cfg_number(TOOL_CFG.tool_pass_seed, 42),
+    }
+end
+
+local function get_fact_policy()
+    local style = cfg_string(FACT_CFG.prompt_style, "high_recall_v1")
+    local default_extract_tokens = (style == "high_recall_v1") and 320 or 256
+    return {
+        prompt_style = style,
+        verify_pass = to_bool(FACT_CFG.verify_pass, true),
+        max_facts = cfg_number(FACT_CFG.max_facts, 8, 1, 16),
+        max_parse_items = cfg_number(FACT_CFG.max_parse_items, 12, 1, 24),
+        max_item_chars = cfg_number(FACT_CFG.max_item_chars, 64, 8, 256),
+        extract_max_tokens = cfg_number(FACT_CFG.extract_max_tokens, default_extract_tokens, 64, 1024),
+        extract_temperature = cfg_number(FACT_CFG.extract_temperature, 0.15, 0, 1),
+        extract_seed = cfg_number(FACT_CFG.extract_seed, 42),
+        repair_max_tokens = cfg_number(FACT_CFG.repair_max_tokens, 192, 64, 512),
+        repair_temperature = cfg_number(FACT_CFG.repair_temperature, 0.0, 0, 1),
+        repair_seed = cfg_number(FACT_CFG.repair_seed, 43),
+        verify_max_tokens = cfg_number(FACT_CFG.verify_max_tokens, 192, 64, 512),
+        verify_temperature = cfg_number(FACT_CFG.verify_temperature, 0.0, 0, 1),
+        verify_seed = cfg_number(FACT_CFG.verify_seed, 46),
     }
 end
 
@@ -447,41 +479,199 @@ local function resolve_calls_for_turn(user_input, clean_result, policy)
     return generate_two_step_tool_calls(user_input, clean_result, policy)
 end
 
-local function build_fact_prompt(user_input, assistant_clean)
-    return string.format([[
-你是记忆系统的“原子事实提取器”。
-任务：从下面一轮对话提取可长期存储的事实，输出 Lua 字符串数组。
+local function build_fact_prompt(user_input, assistant_clean, style)
+    style = trim(style or "high_recall_v1")
+    if style == "baseline" then
+        return string.format([[
+You are an atomic fact extractor for long-term memory.
+Task: extract reusable long-term facts from one dialogue turn.
 
-硬性输出格式（只能二选一）：
+Output format (exactly one Lua string array):
+1) {"fact1","fact2"}
+2) {"none"}
+
+Hard rules:
+- Output only one Lua table. No prefix, no explanation, no markdown.
+- Each fact must be an independent statement.
+- Prefer: preference, constraint, identity, long-term plan, persistent need.
+- Ignore small talk and one-off context.
+- No meta phrasing like 'user said' or 'assistant said'.
+
+User: %s
+Assistant: %s
+]], user_input, assistant_clean)
+    end
+    if style == "balanced_en_v1" then
+        return string.format([[
+You are an atomic memory fact extractor.
+Task: extract reusable facts from this turn.
+
+Output format (strict, choose one):
+1) {"fact1","fact2"}
+2) {"none"}
+
+Rules:
+- Output exactly one Lua string array, and nothing else.
+- Each fact must be one atomic claim (single proposition).
+- Fact must be directly supported by the current turn.
+- Prefer reusable preferences, constraints, goals, commitments,
+  capability limits, and durable needs.
+- Medium-term reusable facts are allowed (not only permanent traits).
+- Ignore small talk, one-off filler, and meta wording.
+- Do not include phrases like 'user said' or 'assistant said'.
+
+User: %s
+Assistant: %s
+]], user_input, assistant_clean)
+    end
+    if style == "high_recall_v1" then
+        return string.format([[
+You are an atomic memory fact extractor.
+Goal: maximize recall while keeping controllable noise.
+Extract as many valid reusable facts as possible from this turn.
+
+Output format (strict, choose one):
+1) {"fact1","fact2","fact3"}
+2) {"none"}
+
+Rules:
+- Output exactly one Lua string array and nothing else.
+- Each fact must be one atomic claim (single proposition).
+- Fact must be directly supported by current turn text.
+- Allowed reusable scope: long-term and medium-term facts,
+  including preferences, constraints, goals, commitments,
+  stable abilities/limitations, planned actions.
+- Prefer concise, factual statements; avoid meta wording.
+- Use {"none"} only when no concrete reusable fact exists.
+
+User: %s
+Assistant: %s
+]], user_input, assistant_clean)
+    end
+    if style == "balanced_v3" then
+        return string.format([[
+你是“原子事实提取器”，只输出 Lua 字符串数组。
+任务：从本轮对话提取可复用事实（优先未来多轮可用）。
+
+输出格式（只能二选一）：
 1) {"事实1","事实2"}
 2) {"无"}
 
-硬性规则：
-- 只能输出一个 Lua table，禁止任何解释、前后缀、代码块标记、标签。
-- 每条事实 6~28 字，必须是可独立复用的陈述句。
-- 优先提取：偏好、约束、身份、长期计划、持续需求；忽略寒暄/一次性上下文。
-- 不要输出“用户说/助手说/这轮对话”等元话术。
-- 没有可存事实时只能输出 {"无"}。
+规则：
+- 只能输出一个 Lua table，本体外任何字符都禁止。
+- 每条事实必须单原子断言，不要并列多结论。
+- 事实必须由当前对话直接支持；不确定就不要写。
+- 优先：偏好、约束、目标、承诺、能力边界、可持续需求。
+- 可接受“短中期可复用”事实，不必强制永久事实。
+- 忽略纯寒暄、无信息重复、情绪口头语。
+- 禁止“用户说/助手说/本轮对话”等元话术。
 
-输入：
 用户：%s
 助手：%s
+]], user_input, assistant_clean)
+    end
+    return string.format([[
+你是“长期记忆原子事实提取器”，只输出 Lua 字符串数组。
+任务：从本轮对话抽取可长期复用、可直接验证的原子事实。
 
-请使用 /no_think 模式推理；但输出中只能包含 Lua table 本体
+输出格式（只能二选一）：
+1) {"事实1","事实2"}
+2) {"无"}
+
+硬规则：
+- 只能输出一个 Lua table，本体之外任何字符都禁止。
+- 每条事实只允许一个主断言（单原子），不得出现并列多断言。
+- 必须可由当前对话直接支持，禁止猜测、补全背景、引入外部信息。
+- 优先提取：稳定偏好、长期约束、身份信息、长期计划、持续需求。
+- 忽略一次性寒暄、短期动作、情绪感叹。
+- 禁止“用户说/助手说/本轮对话”等元话术。
+
+用户：%s
+助手：%s
 ]], user_input, assistant_clean)
 end
 
-local function build_fact_repair_prompt(raw_output)
+local function build_fact_repair_prompt(raw_output, style)
+    style = trim(style or "high_recall_v1")
+    if style == "baseline" then
+        return string.format([[
+Repair the text into exactly one Lua string array.
+Allowed:
+{"fact1","fact2"} or {"none"}
+Forbidden: any extra characters.
+Raw text:
+%s
+]], tostring(raw_output or ""))
+    end
     return string.format([[
-把下面文本修复为**仅一个** Lua 字符串数组：
-允许输出：
-{"事实1","事实2"} 或 {"无"}
-禁止任何其他字符。
+把下面文本修复为且仅为一个 Lua 字符串数组。
+允许输出：{"事实1","事实2"} 或 {"无"}
+禁止任何解释、前后缀、代码块标记。
 原始文本：
 %s
-
-请使用 /no_think 模式推理；但输出中只能包含修复后的 Lua table 本体
 ]], tostring(raw_output or ""))
+end
+
+local function build_fact_verify_prompt(user_input, assistant_clean, candidates, style)
+    style = trim(style or "high_recall_v1")
+    local packed = {}
+    for _, c in ipairs(candidates or {}) do
+        local s = trim(c)
+        if s ~= "" then
+            packed[#packed + 1] = s
+        end
+    end
+    local joined = table.concat(packed, " | ")
+    if style == "high_recall_v1" then
+        return string.format([[
+You are an atomic fact quality gate for high recall mode.
+Filter and lightly rewrite candidates.
+Keep facts that satisfy:
+1) directly supported by the turn,
+2) one atomic claim,
+3) reusable in future turns (long-term or medium-term).
+Remove only clearly noisy/meta/unsupported items.
+Keep top 1-4 facts.
+
+Output exactly one Lua string array:
+{"fact1","fact2"} or {"none"}
+No explanation.
+
+User: %s
+Assistant: %s
+Candidates: %s
+]], user_input, assistant_clean, joined)
+    end
+    if style == "balanced_en_v1" or style == "baseline" then
+        return string.format([[
+You are an atomic fact quality checker.
+Filter and lightly rewrite candidate facts.
+Keep only facts that satisfy all conditions:
+1) directly supported by the turn,
+2) one atomic claim,
+3) reusable for future turns.
+
+Output exactly one Lua string array:
+{"fact1","fact2"} or {"none"}
+No explanation.
+
+User: %s
+Assistant: %s
+Candidates: %s
+]], user_input, assistant_clean, joined)
+    end
+    return string.format([[
+你是“原子事实质检器”。
+请对候选事实做筛选与轻量改写，只保留同时满足以下条件的事实：
+1) 能被当前对话直接支持；2) 单原子断言；3) 具中长期复用价值。
+
+输出格式只能是 Lua 字符串数组：{"事实1","事实2"} 或 {"无"}
+禁止任何解释。
+
+用户：%s
+助手：%s
+候选事实：%s
+]], user_input, assistant_clean, joined)
 end
 
 local function normalize_fact(fact)
@@ -489,6 +679,8 @@ local function normalize_fact(fact)
     fact = fact:gsub("[%c]+", " ")
     fact = fact:gsub("%s+", " ")
     fact = trim(fact)
+    fact = fact:gsub("^[Uu][Ss][Ee][Rr]%s*[:：]%s*", "")
+    fact = fact:gsub("^[Aa][Ss][Ss][Ii][Ss][Tt][Aa][Nn][Tt]%s*[:：]%s*", "")
     fact = fact:gsub("^用户[:：]?", "")
     fact = fact:gsub("^助手[:：]?", "")
     fact = trim(fact)
@@ -498,12 +690,17 @@ end
 local function is_bad_fact(fact)
     local n = #fact
     if n < 6 or n > 64 then return true end
-    if fact == "无" then return true end
-    if fact:find("[{}]") then return true end
     local low = fact:lower()
+    if fact == "无" or low == "none" or low == "null" or low == "n/a" then return true end
+    if fact:find("[{}]") then return true end
     if low:find("lua table", 1, true) then return true end
     if low:find("analysis", 1, true) then return true end
+    if low:find("assistant", 1, true) or low:find("user", 1, true) then return true end
+    if low:find("response", 1, true) or low:find("statement", 1, true) then return true end
+    if low:find("dialogue", 1, true) or low:find("conversation", 1, true) then return true end
+    if low:find("user said", 1, true) or low:find("assistant said", 1, true) then return true end
     if fact:find("用户说", 1, true) or fact:find("助手说", 1, true) then return true end
+    if fact:find("?", 1, true) or fact:find("？", 1, true) then return true end
     return false
 end
 
@@ -513,8 +710,9 @@ local function sanitize_facts(candidates, max_items)
     max_items = tonumber(max_items) or 8
     for _, item in ipairs(candidates or {}) do
         local fact = normalize_fact(item)
-        if fact ~= "" and (not is_bad_fact(fact)) and (not seen[fact]) then
-            seen[fact] = true
+        local key = fact:lower()
+        if fact ~= "" and (not is_bad_fact(fact)) and (not seen[key]) then
+            seen[key] = true
             out[#out + 1] = fact
             if #out >= max_items then break end
         end
@@ -537,62 +735,102 @@ local function parse_quoted_candidates(text, max_items)
     return out
 end
 
-local function parse_facts_from_llm(raw_facts_str)
+local function run_fact_chat_once(prompt, max_tokens, temperature, seed)
+    local messages = {
+        { role = "system", content = prompt }
+    }
+    local params = {
+        max_tokens = max_tokens,
+        temperature = temperature,
+        seed = seed,
+    }
+    return py_pipeline:generate_chat_sync(messages, params)
+end
+
+local function parse_facts_from_llm(raw_facts_str, fact_policy, stage_name)
     local facts_str = strip_cot_safe(raw_facts_str or "")
     facts_str = trim(facts_str)
+    stage_name = trim(stage_name or "extract")
 
     local parsed, err = tool.parse_lua_string_array_strict(facts_str, {
-        max_items = 12,
-        max_item_chars = 64,
+        max_items = fact_policy.max_parse_items,
+        max_item_chars = fact_policy.max_item_chars,
         must_full = true,
         extract_first_on_fail = true,
     })
     if not parsed then
-        local quoted = parse_quoted_candidates(facts_str, 12)
-        local recovered = sanitize_facts(quoted, 8)
+        local quoted = parse_quoted_candidates(facts_str, fact_policy.max_parse_items)
+        local recovered = sanitize_facts(quoted, fact_policy.max_facts)
         if #recovered > 0 then
-            print(string.format("[Lua Fact Extract] strict 解析失败(%s)，已从引号内容恢复 %d 条", tostring(err), #recovered))
+            print(string.format("[Lua Fact Extract][%s] strict 解析失败(%s)，已从引号内容恢复 %d 条", stage_name, tostring(err), #recovered))
             return recovered
         end
-        print(string.format("[Lua Fact Extract] LLM 输出格式非法，已丢弃: %s", tostring(err)))
+        print(string.format("[Lua Fact Extract][%s] LLM 输出格式非法，已丢弃: %s", stage_name, tostring(err)))
         return {}
     end
 
-    local facts = sanitize_facts(parsed, 8)
-
-    print(string.format("[Lua Fact Extract] 成功提取 %d 条原子事实", #facts))
+    local facts = sanitize_facts(parsed, fact_policy.max_facts)
+    if #facts > 0 then
+        print(string.format("[Lua Fact Extract][%s] 成功提取 %d 条原子事实", stage_name, #facts))
+    end
     return facts
 end
 
+local function verify_facts(user_input, assistant_clean, candidates, fact_policy)
+    if #candidates <= 0 then return {} end
+    local verify_prompt = build_fact_verify_prompt(
+        user_input,
+        assistant_clean,
+        candidates,
+        fact_policy.prompt_style
+    )
+    local raw = run_fact_chat_once(
+        verify_prompt,
+        fact_policy.verify_max_tokens,
+        fact_policy.verify_temperature,
+        fact_policy.verify_seed
+    )
+    return parse_facts_from_llm(raw, fact_policy, "verify")
+end
+
 function M.extract_atomic_facts(user_input, assistant_text)
+    local fact_policy = get_fact_policy()
     local assistant_clean = tool.replace(assistant_text or "", "\n", " ")
-    local fact_prompt = build_fact_prompt(user_input, assistant_clean)
+    local fact_prompt = build_fact_prompt(user_input, assistant_clean, fact_policy.prompt_style)
+    local facts_str = run_fact_chat_once(
+        fact_prompt,
+        fact_policy.extract_max_tokens,
+        fact_policy.extract_temperature,
+        fact_policy.extract_seed
+    )
+    local facts = parse_facts_from_llm(facts_str, fact_policy, "extract")
 
-    local fact_messages = {
-        { role = "system", content = fact_prompt }
-    }
-    local fact_params = {
-        max_tokens = 256,
-        temperature = 0.15,
-        seed = 42,
-    }
-
-    local facts = {}
-    local facts_str = py_pipeline:generate_chat_sync(fact_messages, fact_params)
-    facts = parse_facts_from_llm(facts_str)
+    if #facts > 0 and fact_policy.verify_pass then
+        local checked = verify_facts(user_input, assistant_clean, facts, fact_policy)
+        if #checked > 0 then
+            facts = checked
+            print(string.format("[Lua Fact Extract] verify 通过，保留 %d 条", #facts))
+        end
+    end
 
     if #facts == 0 then
-        local repair_prompt = build_fact_repair_prompt(facts_str)
-        local repair_messages = {
-            { role = "system", content = repair_prompt }
-        }
-        local repair_params = {
-            max_tokens = 192,
-            temperature = 0.0,
-            seed = 43,
-        }
-        local repaired = py_pipeline:generate_chat_sync(repair_messages, repair_params)
-        facts = parse_facts_from_llm(repaired)
+        local repair_prompt = build_fact_repair_prompt(facts_str, fact_policy.prompt_style)
+        local repaired = run_fact_chat_once(
+            repair_prompt,
+            fact_policy.repair_max_tokens,
+            fact_policy.repair_temperature,
+            fact_policy.repair_seed
+        )
+        facts = parse_facts_from_llm(repaired, fact_policy, "repair")
+
+        if #facts > 0 and fact_policy.verify_pass then
+            local checked2 = verify_facts(user_input, assistant_clean, facts, fact_policy)
+            if #checked2 > 0 then
+                facts = checked2
+                print(string.format("[Lua Fact Extract] repair+verify 通过，保留 %d 条", #facts))
+            end
+        end
+
         if #facts > 0 then
             print(string.format("[Lua Fact Extract] repair 模式恢复成功：%d 条", #facts))
         end

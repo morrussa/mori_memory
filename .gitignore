@@ -4,3 +4,4 @@ memory/
 luajit/
 __pycache__/
 readme.txt
+simu/

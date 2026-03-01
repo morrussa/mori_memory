@@ -31,7 +31,7 @@ import json
 import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Set
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 
@@ -98,10 +98,10 @@ class SimParams:
     # Enable smart preloading of cold memories based on query intent
     smart_preload_enabled: bool = True
     
-    # Maximum cold memories to preload per query (IO budget)
+    # Maximum clusters to preload per query (IO budget in clusters)
     preload_budget_per_query: int = 5
     
-    # Heat to give preloaded memories
+    # Legacy compatibility: kept but unused by cluster-level preload
     preload_heat_amount: int = 25000
     
     # Minimum confidence to trigger preload (topic similarity threshold)
@@ -110,7 +110,7 @@ class SimParams:
     # Use query vector to predict target topic
     preload_use_vector_prediction: bool = True
     
-    # Maximum preload operations per turn (simulate IO bandwidth)
+    # Maximum preload cluster operations per turn (simulate IO bandwidth)
     preload_max_io_per_turn: int = 8
     
     # Preload when topic has low hot memory ratio
@@ -160,6 +160,7 @@ class SimParams:
     keyword_weight: float = 0.55
     keyword_queries: int = 2
     keyword_noise_mix: float = 0.20
+    memory_drop_sim: float = 0.60
     topic_sim_threshold: float = 0.70
     topic_cross_quota_ratio: float = 0.25
     use_topic_buckets: bool = False
@@ -309,6 +310,13 @@ class AgentMemorySim:
         self.p = p
         self.rng = np.random.default_rng(p.seed)
         self.topic = TopicStream(p, self.rng)
+        self.executed_turns = int(p.turns)
+        self.external_mode = False
+        self.external_turn_vectors: Optional[np.ndarray] = None
+        self.external_turn_topics: List[int] = []
+        self.external_topic_vectors: Optional[np.ndarray] = None
+        self.external_topic_sim: Optional[np.ndarray] = None
+        self.external_topic_count = 0
 
         self.max_memories = p.turns
         self.vec_pool = np.zeros((self.max_memories, p.dim), dtype=np.float32)
@@ -354,9 +362,14 @@ class AgentMemorySim:
         # Statistics
         self.preload_attempts = 0
         self.preload_successes = 0
+        # Compatibility metric: now counts preload-cache memory loads, not heat writes.
         self.preload_memories_heated = 0
+        self.preload_clusters_loaded = 0
         self.preload_topic_predictions = 0
         self.preload_correct_predictions = 0
+        self.preload_cache_topic: Optional[int] = None
+        self.preload_cache_clusters: Set[int] = set()
+        self.preload_cache_mem: Set[int] = set()
         # ====================================================================
 
         self.turn_topics: List[int] = []
@@ -404,6 +417,8 @@ class AgentMemorySim:
         self.topic_lift_executed = 0
         self.topic_cache_unload_count = 0
         self.topic_cache_selected_turns_total = 0
+        self.preload_cache_unload_count = 0
+        self.preload_cache_selected_turns_total = 0
         self.learned_min_gate = float(
             min(
                 self.p.learning_min_sim_gate_start * 0.78,
@@ -417,6 +432,84 @@ class AgentMemorySim:
         self.persistent_explore_turn_hits = 0
 
         self.snapshots: List[Dict[str, float]] = []
+
+    def set_external_stream(
+        self,
+        turn_vectors: np.ndarray,
+        turn_topics: Sequence[int],
+        topic_vectors: Optional[np.ndarray] = None,
+    ) -> None:
+        vec = np.asarray(turn_vectors, dtype=np.float32)
+        if vec.ndim != 2 or vec.shape[0] <= 0:
+            raise ValueError("turn_vectors must be a non-empty 2D array")
+        if vec.shape[1] != self.p.dim:
+            raise ValueError(f"turn_vectors dim mismatch: expected {self.p.dim}, got {vec.shape[1]}")
+        topics = [int(t) for t in turn_topics]
+        if len(topics) != vec.shape[0]:
+            raise ValueError("turn_topics length must match turn_vectors rows")
+        if not topics:
+            raise ValueError("turn_topics cannot be empty")
+
+        if topic_vectors is None:
+            tnum = max(topics) + 1
+            tv = np.zeros((tnum, self.p.dim), dtype=np.float32)
+            cnt = np.zeros(tnum, dtype=np.float32)
+            for i, tid in enumerate(topics):
+                if tid < 0:
+                    continue
+                tv[tid] += vec[i]
+                cnt[tid] += 1.0
+            for tid in range(tnum):
+                if cnt[tid] > 0:
+                    tv[tid] = unit(tv[tid])
+            topic_vectors = tv
+        else:
+            topic_vectors = np.asarray(topic_vectors, dtype=np.float32)
+
+        self.external_mode = True
+        self.external_turn_vectors = vec
+        self.external_turn_topics = topics
+        self.external_topic_vectors = np.asarray(topic_vectors, dtype=np.float32)
+        if self.external_topic_vectors.ndim != 2 or self.external_topic_vectors.shape[1] != self.p.dim:
+            raise ValueError("external topic_vectors shape mismatch")
+        self.external_topic_count = int(self.external_topic_vectors.shape[0])
+        self.external_topic_sim = self.external_topic_vectors @ self.external_topic_vectors.T
+
+    def _topic_vectors_matrix(self) -> np.ndarray:
+        if self.external_mode and self.external_topic_vectors is not None and self.external_topic_vectors.size > 0:
+            return self.external_topic_vectors
+        return self.topic.topic_vectors
+
+    def _topic_similarity(self, a: int, b: int) -> float:
+        if self.external_mode and self.external_topic_sim is not None:
+            if a < 0 or b < 0:
+                return -1.0
+            if a >= self.external_topic_sim.shape[0] or b >= self.external_topic_sim.shape[1]:
+                return -1.0
+            return float(self.external_topic_sim[a, b])
+        return self.topic.topic_similarity(a, b)
+
+    def _external_query_vector(self, target_topic: int, current_turn: int, noise_mix: float) -> np.ndarray:
+        if self.external_turn_vectors is None or self.external_turn_vectors.shape[0] <= 0:
+            noise = unit(self.rng.normal(size=self.p.dim).astype(np.float32))
+            return noise.astype(np.float32)
+
+        bucket = self.turns_by_topic.get(int(target_topic), [])
+        prev_turns = [t for t in bucket if t < current_turn]
+        if prev_turns:
+            if self.rng.random() < 0.65:
+                anchor_turn = prev_turns[-1]
+            else:
+                anchor_turn = int(prev_turns[int(self.rng.integers(0, len(prev_turns)))])
+        else:
+            anchor_turn = max(1, current_turn - 1)
+
+        anchor_turn = min(anchor_turn, self.external_turn_vectors.shape[0])
+        base = self.external_turn_vectors[anchor_turn - 1]
+        noise = unit(self.rng.normal(size=self.p.dim).astype(np.float32))
+        nm = min(0.95, max(0.01, float(noise_mix)))
+        vec = unit((1.0 - nm) * base + nm * noise)
+        return vec.astype(np.float32)
 
     def _refresh_hot_flag(self, cid: int) -> None:
         c = self.clusters[cid]
@@ -1001,11 +1094,19 @@ class AgentMemorySim:
         )
         return stable, avg_pair
 
+    def _unload_preload_cache(self) -> None:
+        if self.preload_cache_clusters or self.preload_cache_mem:
+            self.preload_cache_unload_count += 1
+        self.preload_cache_topic = None
+        self.preload_cache_clusters = set()
+        self.preload_cache_mem = set()
+
     def _unload_topic_cache(self) -> None:
         if self.topic_cache_mem:
             self.topic_cache_unload_count += 1
         self.topic_cache_mem = set()
         self.topic_cache_topic = None
+        self._unload_preload_cache()
 
     def _topic_random_lift(self, turn: int, current_topic: int, stable_ready: bool) -> None:
         if not stable_ready:
@@ -1116,7 +1217,10 @@ class AgentMemorySim:
     # ========================================================================
     def _predict_target_topic(self, query_vec: np.ndarray) -> Tuple[Optional[int], float]:
         """Predict the target topic of a query based on vector similarity."""
-        sims = self.topic.topic_vectors @ query_vec
+        topic_vectors = self._topic_vectors_matrix()
+        if topic_vectors.size <= 0:
+            return None, 0.0
+        sims = topic_vectors @ query_vec
         best_topic = int(np.argmax(sims))
         best_sim = float(sims[best_topic])
         
@@ -1138,90 +1242,116 @@ class AgentMemorySim:
         hot_count = sum(1 for m in mem_set if m < self.mem_count and self.heat_pool[m] > 0.0)
         return hot_count / len(mem_set) if mem_set else 0.0
     
-    def _smart_preload_cold_memories(self, query_vec: np.ndarray, target_topic: Optional[int], 
-                                      current_turn: int) -> int:
-        """Intelligently preload cold memories based on predicted query intent.
-        
-        Returns: number of memories preloaded
+    def _smart_preload_cold_memories(
+        self,
+        query_vec: np.ndarray,
+        target_topic: Optional[int],
+        current_turn: int,
+        candidate_clusters: Optional[Sequence[int]] = None,
+    ) -> int:
+        """Preload query-hit clusters into dedicated preload cache.
+
+        Returns: number of clusters preloaded.
         """
+        _ = current_turn
         if not self.p.smart_preload_enabled:
             return 0
-            
+
         self.preload_attempts += 1
-        
-        # Check IO budget for this turn
         if self.preload_io_count >= self.p.preload_max_io_per_turn:
             return 0
-        
-        # Determine which topic(s) to preload for
+
         topics_to_preload: List[Tuple[int, float]] = []
-        
         if target_topic is not None:
             hot_ratio = self._get_topic_hot_ratio(target_topic)
             if hot_ratio < self.p.preload_low_hot_ratio_threshold:
                 topics_to_preload.append((target_topic, 1.0))
-        
+
         if self.p.preload_use_vector_prediction:
-            # Also predict from query vector
             predicted_topic, confidence = self._predict_target_topic(query_vec)
             self.preload_topic_predictions += 1
-            
             if predicted_topic is not None and confidence >= self.p.preload_topic_confidence:
                 hot_ratio = self._get_topic_hot_ratio(predicted_topic)
                 if hot_ratio < self.p.preload_low_hot_ratio_threshold:
-                    # Add if not already in list
                     if not any(t == predicted_topic for t, _ in topics_to_preload):
                         topics_to_preload.append((predicted_topic, confidence))
-        
+
         if not topics_to_preload:
             return 0
-        
-        # Preload cold memories for the predicted topics
-        preloaded = 0
-        budget = min(self.p.preload_budget_per_query, 
-                     self.p.preload_max_io_per_turn - self.preload_io_count)
-        
-        for topic_id, confidence in topics_to_preload:
-            if preloaded >= budget:
+
+        if not candidate_clusters:
+            return 0
+        cluster_allow = {
+            int(cid)
+            for cid in candidate_clusters
+            if isinstance(cid, (int, np.integer)) and 0 <= int(cid) < len(self.clusters)
+        }
+        if not cluster_allow:
+            return 0
+
+        budget = min(
+            int(self.p.preload_budget_per_query),
+            int(self.p.preload_max_io_per_turn) - int(self.preload_io_count),
+        )
+        if budget <= 0:
+            return 0
+
+        preloaded_clusters = 0
+        preloaded_memories = 0
+
+        for topic_id, _confidence in topics_to_preload:
+            if preloaded_clusters >= budget:
                 break
-                
-            # Get cold memories for this topic
-            cold_memories = self.topic_to_cold_mem.get(topic_id, set())
-            if not cold_memories:
+            mem_set = self.topic_to_mem.get(topic_id, set())
+            if not mem_set:
                 continue
-            
-            # Select top cold memories by vector similarity
-            cold_list = [m for m in cold_memories if m < self.mem_count]
-            if not cold_list:
+
+            topic_cluster_ids = set()
+            for mem_idx in mem_set:
+                if mem_idx < 0 or mem_idx >= self.mem_count:
+                    continue
+                cid = int(self.cluster_of[mem_idx])
+                if cid >= 0 and cid in cluster_allow:
+                    topic_cluster_ids.add(cid)
+            if not topic_cluster_ids:
                 continue
-            
-            cold_idx = np.asarray(cold_list, dtype=np.int32)
-            cold_sims = self.vec_pool[cold_idx] @ query_vec
-            
-            # Select top-k by similarity
-            k = min(budget - preloaded, len(cold_list))
-            if k >= len(cold_list):
-                top_idx = np.argsort(cold_sims)[::-1]
-            else:
-                top_idx = np.argpartition(cold_sims, -k)[-k:]
-                top_idx = top_idx[np.argsort(cold_sims[top_idx])[::-1]]
-            
-            # Heat up selected cold memories (simulate loading from disk)
-            for idx in top_idx[:k]:
-                mem_idx = int(cold_idx[idx])
-                self._set_heat(mem_idx, float(self.p.preload_heat_amount))
-                preloaded += 1
+
+            scored_clusters: List[Tuple[int, float, List[int]]] = []
+            for cid in topic_cluster_ids:
+                members = [m for m in self.clusters[cid].members if 0 <= m < self.mem_count]
+                if not members:
+                    continue
+                mem_idx = np.asarray(members, dtype=np.int32)
+                sims = self.vec_pool[mem_idx] @ query_vec
+                best_sim = float(np.max(sims)) if sims.size > 0 else -1.0
+                scored_clusters.append((cid, best_sim, members))
+
+            scored_clusters.sort(key=lambda it: it[1], reverse=True)
+            for cid, _score, members in scored_clusters:
+                if preloaded_clusters >= budget:
+                    break
+                if cid in self.preload_cache_clusters:
+                    continue
+                self.preload_cache_clusters.add(int(cid))
+                added = 0
+                for mem_idx in members:
+                    if mem_idx not in self.preload_cache_mem:
+                        self.preload_cache_mem.add(int(mem_idx))
+                        added += 1
                 self.preload_io_count += 1
-                
-                # Remove from cold mapping
-                self.topic_to_cold_mem[topic_id].discard(mem_idx)
-        
-        if preloaded > 0:
+                self.preload_clusters_loaded += 1
+                preloaded_clusters += 1
+                preloaded_memories += added
+
+        if preloaded_clusters > 0:
             self.preload_successes += 1
-            self.preload_memories_heated += preloaded
-            self._normalize_heat_if_needed()
-        
-        return preloaded
+            self.preload_memories_heated += preloaded_memories
+            if target_topic is not None:
+                self.preload_cache_topic = int(target_topic)
+            elif topics_to_preload:
+                self.preload_cache_topic = int(topics_to_preload[0][0])
+
+        return preloaded_clusters
     # ========================================================================
 
     # ========================================================================
@@ -1405,14 +1535,6 @@ class AgentMemorySim:
         if self.mem_count <= 0:
             return [], 0, {"candidate_samples": [], "selected_memories": [], "evidence_memories": []}
 
-        # Smart Preloading: Preload cold memories before retrieval
-        preloaded = 0
-        if target_topic is not None and self.p.smart_preload_enabled:
-            preloaded = self._smart_preload_cold_memories(query_vec, target_topic, current_turn or 0)
-
-        turn_best: Dict[int, float] = {}
-        turn_src: Dict[int, str] = {}
-        turn_mem: Dict[int, int] = {}
         sim_ops = 0
         query_turn = current_turn if current_turn is not None else self.p.turns
         knobs = self._effective_retrieval_knobs(query_turn)
@@ -1441,9 +1563,39 @@ class AgentMemorySim:
                 persistent_extra_budget = max(1, int(self.p.persistent_explore_extra_clusters))
                 self.persistent_explore_events += 1
 
+        # Smart preloading at cluster granularity, independent from heat competition.
+        preloaded = 0
+        if target_topic is not None and self.p.smart_preload_enabled:
+            preload_cluster_ids, ops0 = self._top_probe_clusters(
+                query_vec,
+                probe_clusters=max(1, probe_clusters),
+                super_topn=query_topn,
+                turn=query_turn,
+            )
+            sim_ops += ops0
+            preloaded = self._smart_preload_cold_memories(
+                query_vec,
+                target_topic,
+                query_turn,
+                candidate_clusters=preload_cluster_ids,
+            )
+
         mem_best_sim: Dict[int, float] = {}
         mem_best_cluster: Dict[int, int] = {}
         mem_best_effective: Dict[int, float] = {}
+        mem_best_source: Dict[int, str] = {}
+        turn_best: Dict[int, float] = {}
+        turn_src: Dict[int, str] = {}
+        turn_mem: Dict[int, int] = {}
+
+        def update_mem_best(mem_idx: int, sim: float, effective: float, cid: int, source: str) -> None:
+            prev = mem_best_sim.get(mem_idx)
+            if prev is None or sim > prev:
+                mem_best_sim[mem_idx] = sim
+                mem_best_cluster[mem_idx] = cid
+                mem_best_effective[mem_idx] = effective
+                mem_best_source[mem_idx] = source
+
         persistent_probe_clusters_query = set()
         for q_idx, (qv, weight) in enumerate(self._query_vectors(query_vec, keyword_weight=keyword_weight)):
             cluster_ids, ops = self._top_probe_clusters(
@@ -1487,46 +1639,26 @@ class AgentMemorySim:
 
                 for mem_idx, sim in sim_results:
                     sim_pos = max(0.0, sim)
-                    prev_sim = mem_best_sim.get(mem_idx)
-                    if prev_sim is None or sim > prev_sim:
-                        mem_best_sim[mem_idx] = sim
-                        mem_best_cluster[mem_idx] = cid
-                        mem_best_effective[mem_idx] = (sim_pos ** power) * weight
+                    effective = (sim_pos ** power) * weight
+                    source = "explore" if cid in persistent_probe_clusters_vec else "hot"
+                    update_mem_best(mem_idx, sim, effective, cid, source)
 
                     # EnhancedWeak: Use soft gate filter
                     if not self._soft_gate_filter(sim, min_gate):
                         break
-                    
-                    effective = (sim ** power) * weight
-                    for t in self.mem_turns[mem_idx]:
-                        prev = turn_best.get(t)
-                        if prev is None or effective > prev:
-                            turn_best[t] = effective
-                            turn_src[t] = "explore" if cid in persistent_probe_clusters_vec else "hot"
-                            turn_mem[t] = mem_idx
 
             if not scanned_any:
                 fallback, ops2 = self._find_sim_all_hot(qv, max_results=max_memory * 2)
                 sim_ops += ops2
                 for mem_idx, sim in fallback:
                     sim_pos = max(0.0, sim)
-                    prev_sim = mem_best_sim.get(mem_idx)
-                    if prev_sim is None or sim > prev_sim:
-                        mem_best_sim[mem_idx] = sim
-                        mem_best_cluster[mem_idx] = int(self.cluster_of[mem_idx])
-                        mem_best_effective[mem_idx] = (sim_pos ** power) * weight
-                    
+                    cid = int(self.cluster_of[mem_idx])
+                    effective = (sim_pos ** power) * weight
+                    update_mem_best(mem_idx, sim, effective, cid, "hot")
+
                     # EnhancedWeak: Use soft gate filter
                     if not self._soft_gate_filter(sim, min_gate):
                         break
-                    
-                    effective = (sim ** power) * weight
-                    for t in self.mem_turns[mem_idx]:
-                        prev = turn_best.get(t)
-                        if prev is None or effective > prev:
-                            turn_best[t] = effective
-                            turn_src[t] = "hot"
-                            turn_mem[t] = mem_idx
 
             # Topic cache candidates do not participate in heat competition.
             if current_topic is not None and self.topic_cache_topic == current_topic and self.topic_cache_mem:
@@ -1544,22 +1676,55 @@ class AgentMemorySim:
                         if sim < min_gate:
                             break
                         mem_idx = int(cache_idx[oi])
-                        prev_sim = mem_best_sim.get(mem_idx)
-                        if prev_sim is None or sim > prev_sim:
-                            mem_best_sim[mem_idx] = sim
-                            mem_best_cluster[mem_idx] = int(self.cluster_of[mem_idx])
-                            mem_best_effective[mem_idx] = (sim_pos ** power) * weight
                         effective = (sim ** power) * weight * self.p.topic_cache_weight
-                        for t in self.mem_turns[mem_idx]:
-                            prev = turn_best.get(t)
-                            if prev is None or effective > prev:
-                                turn_best[t] = effective
-                                turn_src[t] = "cache"
-                                turn_mem[t] = mem_idx
+                        cid = int(self.cluster_of[mem_idx])
+                        update_mem_best(mem_idx, sim, effective, cid, "cache")
+
+            # Preloaded clusters are scored independently and bypass hot-pool competition.
+            if self.preload_cache_mem:
+                preload_idx = np.asarray(
+                    [idx for idx in self.preload_cache_mem if 0 <= idx < self.mem_count],
+                    dtype=np.int32,
+                )
+                if preload_idx.size > 0:
+                    preload_sims = self.vec_pool[preload_idx] @ qv
+                    sim_ops += int(preload_idx.size)
+                    order = np.argsort(preload_sims)[::-1]
+                    for oi in order:
+                        sim = float(preload_sims[oi])
+                        if not self._soft_gate_filter(sim, min_gate):
+                            break
+                        mem_idx = int(preload_idx[oi])
+                        cid = int(self.cluster_of[mem_idx])
+                        sim_pos = max(0.0, sim)
+                        effective = (sim_pos ** power) * weight
+                        update_mem_best(mem_idx, sim, effective, cid, "preload_cluster")
+
+        # Stage 2: turn expansion only for memories that pass hard similarity gate.
+        kept_memories = [
+            mem_idx
+            for mem_idx, sim in mem_best_sim.items()
+            if float(sim) >= float(self.p.memory_drop_sim)
+        ]
+        for mem_idx in kept_memories:
+            effective = float(mem_best_effective.get(mem_idx, 0.0))
+            if effective <= 0.0:
+                continue
+            source = mem_best_source.get(mem_idx, "hot")
+            for t in self.mem_turns[mem_idx]:
+                prev = turn_best.get(t)
+                if prev is None or effective > prev:
+                    turn_best[t] = effective
+                    turn_src[t] = source
+                    turn_mem[t] = mem_idx
 
         sample_limit = max(1, int(self.p.refinement_sample_mem_topk))
-        if mem_best_sim:
-            mem_items = sorted(mem_best_sim.items(), key=lambda it: it[1], reverse=True)
+        if kept_memories:
+            mem_items = sorted(
+                ((mem_idx, mem_best_sim[mem_idx]) for mem_idx in kept_memories),
+                key=lambda it: it[1],
+                reverse=True,
+            )
             candidate_samples = [
                 (
                     int(mem_idx),
@@ -1600,6 +1765,9 @@ class AgentMemorySim:
                         selected.sort(key=lambda it: it[1], reverse=True)
             selected_turns = [t for t, _ in selected]
             self.topic_cache_selected_turns_total += sum(1 for t in selected_turns if turn_src.get(t) == "cache")
+            self.preload_cache_selected_turns_total += sum(
+                1 for t in selected_turns if turn_src.get(t) == "preload_cluster"
+            )
             selected_memories = [turn_mem[t] for t in selected_turns if t in turn_mem]
             if persistent_probe_clusters_query:
                 self.persistent_explore_turn_hits += sum(
@@ -1631,7 +1799,7 @@ class AgentMemorySim:
             topic_id = self.turn_topics[turn - 1]
             if topic_id == current_topic:
                 same.append((turn, score))
-            elif self.topic.topic_similarity(topic_id, current_topic) >= self.p.topic_sim_threshold:
+            elif self._topic_similarity(topic_id, current_topic) >= self.p.topic_sim_threshold:
                 near.append((turn, score))
             else:
                 cross.append((turn, score))
@@ -1664,6 +1832,9 @@ class AgentMemorySim:
         selected = selected[:max_turns]
         selected_turns = [t for t, _ in selected]
         self.topic_cache_selected_turns_total += sum(1 for t in selected_turns if turn_src.get(t) == "cache")
+        self.preload_cache_selected_turns_total += sum(
+            1 for t in selected_turns if turn_src.get(t) == "preload_cluster"
+        )
         selected_memories = [turn_mem[t] for t in selected_turns if t in turn_mem]
         if persistent_probe_clusters_query:
             self.persistent_explore_turn_hits += sum(
@@ -1794,9 +1965,10 @@ class AgentMemorySim:
         return float(g)
 
     def _summary(self) -> Dict[str, float]:
+        total_turns = max(1, int(self.executed_turns))
         hot_count = int(np.sum(self.heat_pool[: self.mem_count] > 0.0))
         hot_ratio = (hot_count / self.mem_count) if self.mem_count > 0 else 0.0
-        merge_rate = self.merge_count / max(1, self.p.turns)
+        merge_rate = self.merge_count / float(total_turns)
         eval_n = max(1, self.eval_count)
         target_p = self.target_precision_sum / eval_n
         target_r_recent = self.target_recall_recent_sum / eval_n
@@ -1805,7 +1977,7 @@ class AgentMemorySim:
         target_recent_hit = self.target_recent_hit_sum / eval_n
         target_mrr = self.target_mrr_sum / eval_n
         avg_returned = self.returned_turns_sum / eval_n
-        avg_add_ops = self.sim_ops_add_total / max(1, self.p.turns)
+        avg_add_ops = self.sim_ops_add_total / float(total_turns)
         avg_query_ops = self.sim_ops_query_total / max(1, self.query_turns)
         avg_turn_ops = float(np.mean(self.turn_sim_ops)) if self.turn_sim_ops else 0.0
         p95_turn_ops = float(np.quantile(self.turn_sim_ops, 0.95)) if self.turn_sim_ops else 0.0
@@ -1813,7 +1985,7 @@ class AgentMemorySim:
         super_count = len(self.super_members)
         empty_rate = (self.empty_query_count / max(1, self.query_turns))
         empty_target_rate = (self.empty_target_query_count / max(1, self.query_turns))
-        learning_progress_end = self._learning_progress(self.p.turns)
+        learning_progress_end = self._learning_progress(total_turns)
         route_vals = self.cluster_route_score[: len(self.clusters)] if self.clusters else np.asarray([], dtype=np.float32)
         route_abs_mean = float(np.mean(np.abs(route_vals))) if route_vals.size > 0 else 0.0
         route_pos = float(np.sum(route_vals > 0.0)) if route_vals.size > 0 else 0.0
@@ -1821,13 +1993,16 @@ class AgentMemorySim:
         route_seen = self.cluster_route_seen[: len(self.clusters)] if self.clusters else np.asarray([], dtype=np.float32)
         route_seen_avg = float(np.mean(route_seen)) if route_seen.size > 0 else 0.0
         persistent_hit_ratio = self.persistent_explore_turn_hits / max(1, self.returned_turns_sum)
+        preload_cache_contrib_ratio = self.preload_cache_selected_turns_total / max(1, self.returned_turns_sum)
 
         # Smart Preloading stats
         preload_success_rate = self.preload_successes / max(1, self.preload_attempts)
         preload_prediction_accuracy = self.preload_correct_predictions / max(1, self.preload_topic_predictions)
 
         return {
-            "turns": float(self.p.turns),
+            "turns": float(total_turns),
+            "external_mode": 1.0 if self.external_mode else 0.0,
+            "external_topic_count": float(self.external_topic_count),
             "query_turns": float(self.query_turns),
             "memory_count": float(self.mem_count),
             "hot_memory_count": float(hot_count),
@@ -1847,12 +2022,14 @@ class AgentMemorySim:
             "target_recall_recent": target_r_recent,
             "target_recall_all": target_r_all,
             "target_hit_rate": target_hit,
+            # Alias for consistency with external embedding-eval reports.
+            "aggregated_hit_rate": target_hit,
             "target_recent_hit_rate": target_recent_hit,
             "target_mrr": target_mrr,
             "empty_query_rate": empty_rate,
             "empty_target_query_rate": empty_target_rate,
             "learning_progress_end": learning_progress_end,
-            "refinement_progress_end": self._refinement_progress(self.p.turns),
+            "refinement_progress_end": self._refinement_progress(total_turns),
             "refinement_events": float(self.refinement_events),
             "learned_min_sim_gate": float(self.learned_min_gate),
             "online_merge_limit": float(self.online_merge_limit),
@@ -1860,7 +2037,7 @@ class AgentMemorySim:
             "route_positive_clusters": route_pos,
             "route_negative_clusters": route_neg,
             "route_seen_avg": route_seen_avg,
-            "effective_probe_clusters_end": float(self._effective_probe_clusters(self.p.turns)),
+            "effective_probe_clusters_end": float(self._effective_probe_clusters(total_turns)),
             "persistent_explore_events": float(self.persistent_explore_events),
             "persistent_explore_cluster_probes": float(self.persistent_explore_cluster_probes),
             "persistent_explore_turn_hits": float(self.persistent_explore_turn_hits),
@@ -1876,6 +2053,11 @@ class AgentMemorySim:
             "topic_cache_size": float(len(self.topic_cache_mem)),
             "topic_cache_unload_count": float(self.topic_cache_unload_count),
             "topic_cache_contrib_ratio": (self.topic_cache_selected_turns_total / max(1, self.returned_turns_sum)),
+            "preload_cache_topic": float(self.preload_cache_topic if self.preload_cache_topic is not None else -1),
+            "preload_cache_size": float(len(self.preload_cache_mem)),
+            "preload_cache_cluster_size": float(len(self.preload_cache_clusters)),
+            "preload_cache_unload_count": float(self.preload_cache_unload_count),
+            "preload_cache_contrib_ratio": preload_cache_contrib_ratio,
             "avg_returned_turns": avg_returned,
             "avg_sim_ops_add_per_turn": avg_add_ops,
             "avg_sim_ops_query_per_query": avg_query_ops,
@@ -1889,6 +2071,7 @@ class AgentMemorySim:
             "preload_successes": float(self.preload_successes),
             "preload_success_rate": preload_success_rate,
             "preload_memories_heated": float(self.preload_memories_heated),
+            "preload_clusters_loaded": float(self.preload_clusters_loaded),
             "preload_topic_predictions": float(self.preload_topic_predictions),
             "preload_correct_predictions": float(self.preload_correct_predictions),
             "preload_prediction_accuracy": preload_prediction_accuracy,
@@ -1979,20 +2162,42 @@ class AgentMemorySim:
         self._normalize_heat_if_needed()
 
     def run(self) -> Dict[str, object]:
-        current_topic = self.topic.initial_topic()
+        total_turns = int(self.p.turns)
+        if self.external_mode:
+            if self.external_turn_vectors is None or not self.external_turn_topics:
+                raise RuntimeError("external_mode enabled but external stream not initialized")
+            total_turns = min(total_turns, int(self.external_turn_vectors.shape[0]), len(self.external_turn_topics))
+            if total_turns <= 0:
+                self.executed_turns = 0
+                summary = self._summary()
+                summary = self._finalize_summary(summary)
+                return {"summary": summary, "snapshots": self.snapshots}
+            current_topic = int(self.external_turn_topics[0])
+        else:
+            current_topic = self.topic.initial_topic()
+        self.executed_turns = total_turns
 
-        for turn in range(1, self.p.turns + 1):
+        for turn in range(1, total_turns + 1):
             # Reset IO budget for new turn
             self.preload_io_count = 0
-            
-            if turn > 1:
-                next_topic = self.topic.next_topic(current_topic)
-                if next_topic != current_topic:
+
+            if self.external_mode:
+                next_topic = int(self.external_turn_topics[turn - 1])
+                if turn > 1 and next_topic != current_topic:
                     self.prev_topic_for_shift = current_topic
                     self.last_switch_turn = turn
                     self._unload_topic_cache()
                 current_topic = next_topic
-            turn_vec = self.topic.turn_vector(current_topic)
+                turn_vec = self.external_turn_vectors[turn - 1]
+            else:
+                if turn > 1:
+                    next_topic = self.topic.next_topic(current_topic)
+                    if next_topic != current_topic:
+                        self.prev_topic_for_shift = current_topic
+                        self.last_switch_turn = turn
+                        self._unload_topic_cache()
+                    current_topic = next_topic
+                turn_vec = self.topic.turn_vector(current_topic)
 
             query_ops = 0
             query_prob = self.p.query_prob
@@ -2016,7 +2221,10 @@ class AgentMemorySim:
                     noise_mix = min(0.95, noise_mix + (1.0 - prog) * self.p.learning_query_noise_extra)
                 if in_shift_window:
                     noise_mix = min(0.95, noise_mix + self.p.shift_query_noise_boost)
-                query_vec = self.topic.query_vector(target_topic, noise_mix)
+                if self.external_mode:
+                    query_vec = self._external_query_vector(target_topic, turn, noise_mix)
+                else:
+                    query_vec = self.topic.query_vector(target_topic, noise_mix)
 
                 selected, query_ops, debug = self.retrieve(
                     query_vec,
@@ -2060,7 +2268,7 @@ class AgentMemorySim:
             add_ops = self.sim_ops_add_total - add_ops_before
             self.turn_sim_ops.append(int(add_ops + query_ops))
 
-            if turn % self.p.report_every == 0 or turn == self.p.turns:
+            if turn % self.p.report_every == 0 or turn == total_turns:
                 self._record_snapshot(turn)
 
         summary = self._summary()
@@ -2068,8 +2276,180 @@ class AgentMemorySim:
         return {"summary": summary, "snapshots": self.snapshots}
 
 
-def run_experiment(params: SimParams) -> Dict[str, object]:
+def _embed_texts_with_gguf(
+    texts: Sequence[str],
+    model_path: str,
+    mode: str,
+    batch_size: int,
+    n_gpu_layers: int,
+) -> np.ndarray:
+    try:
+        from llama_cpp import Llama
+    except Exception as exc:  # pragma: no cover - runtime dependency check
+        raise RuntimeError(f"llama_cpp unavailable for external embedding stream: {exc}") from exc
+
+    llm = Llama(
+        model_path=str(model_path),
+        embedding=True,
+        logits_all=True,
+        n_gpu_layers=int(n_gpu_layers),
+        n_ctx=2048,
+        verbose=False,
+    )
+
+    prefixed = []
+    for t in texts:
+        s = str(t or "").strip()
+        if not s:
+            continue
+        if not s.startswith(("query: ", "passage: ")):
+            s = f"{mode}: {s}"
+        prefixed.append(s)
+
+    def _norm(v: np.ndarray) -> np.ndarray:
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            return (v / n).astype(np.float32)
+        return v.astype(np.float32)
+
+    def _embed_chunk(chunk: List[str]) -> List[np.ndarray]:
+        try:
+            resp = llm.create_embedding(chunk)
+            data = sorted(resp.get("data", []), key=lambda d: int(d.get("index", 0)))
+            out: List[np.ndarray] = []
+            for item in data:
+                vec = np.asarray(item["embedding"], dtype=np.float32)
+                out.append(_norm(vec))
+            return out
+        except RuntimeError:
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                return _embed_chunk(chunk[:mid]) + _embed_chunk(chunk[mid:])
+            short = chunk[0][:512]
+            resp = llm.create_embedding([short])
+            data = resp.get("data", [])
+            if not data:
+                return []
+            vec = np.asarray(data[0]["embedding"], dtype=np.float32)
+            return [_norm(vec)]
+
+    out: List[np.ndarray] = []
+    bs = max(1, int(batch_size))
+    for i in range(0, len(prefixed), bs):
+        out.extend(_embed_chunk(prefixed[i : i + bs]))
+
+    if not out:
+        return np.zeros((0, 0), dtype=np.float32)
+    return np.vstack(out).astype(np.float32)
+
+
+def load_external_atomic_stream(
+    atomic_facts_path: Path,
+    embedding_model_path: str,
+    max_events: int = 0,
+    min_chain_len: int = 4,
+    embed_batch_size: int = 64,
+    embed_n_gpu_layers: int = 0,
+) -> Dict[str, Any]:
+    rows: List[Tuple[int, int, int, str, str]] = []
+    min_len = max(2, int(min_chain_len))
+    with atomic_facts_path.open("r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                rec = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            txt = str(rec.get("fact_text", "")).strip()
+            if not txt:
+                continue
+            date_added = int(rec.get("date_added", 0) or 0)
+            rid = int(rec.get("idx", lineno))
+            chain_pos = int(rec.get("chain_pos", -1))
+            chain_id = int(rec.get("chain_id", -1))
+            chain_len = int(rec.get("chain_len", 0))
+
+            topic_key = ""
+            if chain_id >= 0 and chain_len >= min_len:
+                topic_key = f"chain:{chain_id}"
+            else:
+                actor1 = str(rec.get("actor1", "")).strip()
+                actor2 = str(rec.get("actor2", "")).strip()
+                country = str(rec.get("action_country", "NA")).strip() or "NA"
+                if actor1 and actor2:
+                    topic_key = f"pair:{actor1}|{actor2}|{country}"
+            if not topic_key:
+                continue
+            rows.append((date_added, rid, chain_pos, topic_key, txt))
+
+    if not rows:
+        raise RuntimeError("No eligible atomic facts for external continuous-topic stream")
+
+    key_counts: Dict[str, int] = {}
+    for _, _, _, k, _ in rows:
+        key_counts[k] = key_counts.get(k, 0) + 1
+    rows = [r for r in rows if key_counts.get(r[3], 0) >= min_len]
+    if not rows:
+        raise RuntimeError("No topic chain reaches min_chain_len in external atomic facts")
+
+    rows.sort(key=lambda it: (it[0], it[1], it[2], it[3]))
+    if max_events > 0 and len(rows) > int(max_events):
+        rows = rows[-int(max_events) :]
+    key_counts = {}
+    for _, _, _, k, _ in rows:
+        key_counts[k] = key_counts.get(k, 0) + 1
+    rows = [r for r in rows if key_counts.get(r[3], 0) >= min_len]
+    if not rows:
+        raise RuntimeError("No external events remain after max_events cut and min_chain_len filter")
+
+    old_topics = sorted({r[3] for r in rows})
+    topic_remap = {old: i for i, old in enumerate(old_topics)}
+    topics = [int(topic_remap[r[3]]) for r in rows]
+    texts = [r[4] for r in rows]
+
+    turn_vectors = _embed_texts_with_gguf(
+        texts=texts,
+        model_path=embedding_model_path,
+        mode="passage",
+        batch_size=max(1, int(embed_batch_size)),
+        n_gpu_layers=int(embed_n_gpu_layers),
+    )
+    if turn_vectors.shape[0] != len(topics):
+        raise RuntimeError(
+            f"embedded vector count mismatch: got {turn_vectors.shape[0]}, expected {len(topics)}"
+        )
+
+    topic_count = max(topics) + 1
+    topic_vectors = np.zeros((topic_count, turn_vectors.shape[1]), dtype=np.float32)
+    topic_counts = np.zeros(topic_count, dtype=np.float32)
+    for i, tid in enumerate(topics):
+        topic_vectors[tid] += turn_vectors[i]
+        topic_counts[tid] += 1.0
+    for tid in range(topic_count):
+        if topic_counts[tid] > 0.0:
+            topic_vectors[tid] = unit(topic_vectors[tid])
+
+    return {
+        "vectors": turn_vectors.astype(np.float32),
+        "topics": topics,
+        "topic_vectors": topic_vectors.astype(np.float32),
+        "turns": int(turn_vectors.shape[0]),
+        "dim": int(turn_vectors.shape[1]),
+        "topic_count": int(topic_count),
+        "source": str(atomic_facts_path),
+    }
+
+
+def run_experiment(params: SimParams, external_stream: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
     sim = AgentMemorySim(params)
+    if external_stream is not None:
+        sim.set_external_stream(
+            turn_vectors=np.asarray(external_stream["vectors"], dtype=np.float32),
+            turn_topics=[int(x) for x in external_stream["topics"]],
+            topic_vectors=np.asarray(external_stream["topic_vectors"], dtype=np.float32),
+        )
     return sim.run()
 
 
@@ -2096,6 +2476,7 @@ def save_plot(
     precision = col("target_precision_at_k")
     recall_recent = col("target_recall_recent")
     hit_rate = col("target_hit_rate")
+    agg_hit_rate = col("aggregated_hit_rate")
     memory_count = col("memory_count")
     hot_count = col("hot_memory_count")
     hot_ratio = col("hot_memory_ratio")
@@ -2121,6 +2502,16 @@ def save_plot(
     ax.plot(turns, precision, marker="o", linewidth=2.0, label="target_precision@k")
     ax.plot(turns, recall_recent, marker="o", linewidth=2.0, label="target_recall_recent")
     ax.plot(turns, hit_rate, marker="o", linewidth=2.0, label="target_hit_rate")
+    # Aggregated hit rate is shown as a stable reference line.
+    if agg_hit_rate:
+        agg_ref = float(summary.get("aggregated_hit_rate", agg_hit_rate[-1]))
+        ax.axhline(
+            agg_ref,
+            color="#d62728",
+            linestyle="--",
+            linewidth=1.8,
+            label=f"aggregated_hit_rate={agg_ref:.3f}",
+        )
     ax.plot(turns, empty_target_rate, marker="o", linestyle="--", linewidth=1.8, label="empty_target_rate")
     ax.set_title("Recall Quality")
     ax.set_xlabel("Turn")
@@ -2172,7 +2563,7 @@ def main():
     parser.add_argument("--turns", type=int, default=20000, help="Number of simulation turns")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--report-every", type=int, default=1000, help="Report interval")
-    parser.add_argument("--output", type=str, default="sim_results.json", help="Output file")
+    parser.add_argument("--output", type=str, default="simu/results/sim_results.json", help="Output file")
     parser.add_argument("--no-plot", action="store_true", help="Disable png dashboard generation")
     parser.add_argument("--plot-out", type=str, default="", help="Output png path (default: output with .png)")
     parser.add_argument("--plot-dpi", type=int, default=160)
@@ -2180,32 +2571,84 @@ def main():
     # Smart Preloading parameters
     parser.add_argument("--preload-enabled", type=lambda x: x.lower() == 'true', default=True, 
                         help="Enable smart preloading (true/false)")
-    parser.add_argument("--preload-budget", type=int, default=5, help="Preload budget per query")
-    parser.add_argument("--preload-max-io", type=int, default=8, help="Max IO operations per turn")
+    parser.add_argument("--preload-budget", type=int, default=5, help="Preload cluster budget per query")
+    parser.add_argument("--preload-max-io", type=int, default=8, help="Max preload clusters per turn")
+    parser.add_argument("--memory-drop-sim", type=float, default=0.60,
+                        help="Hard drop threshold for memory expansion")
     
     # EnhancedWeak parameters
     parser.add_argument("--soft-gate-enabled", type=lambda x: x.lower() == 'true', default=True,
                         help="Enable soft gate filtering (true/false)")
     parser.add_argument("--adaptive-gate-enabled", type=lambda x: x.lower() == 'true', default=True,
                         help="Enable adaptive gate adjustment (true/false)")
+    parser.add_argument(
+        "--external-atomic-facts",
+        type=str,
+        default="",
+        help="Path to atomic_facts.jsonl to drive continuous-topic turns with real embeddings",
+    )
+    parser.add_argument(
+        "--external-embedding-model",
+        type=str,
+        default="model/Qwen3-Embedding-0.6B-Q8_0.gguf",
+        help="GGUF embedding model path for external atomic stream mode",
+    )
+    parser.add_argument("--external-max-events", type=int, default=0, help="Max external events to load (0=all)")
+    parser.add_argument("--external-min-chain-len", type=int, default=4, help="Min chain_len filter for external facts")
+    parser.add_argument("--external-embed-batch", type=int, default=64, help="Batch size for external embeddings")
+    parser.add_argument("--external-embed-ngl", type=int, default=0, help="n_gpu_layers for external embeddings")
     
     args = parser.parse_args()
-    
+
+    external_stream: Optional[Dict[str, Any]] = None
+    requested_turns = int(args.turns)
+    resolved_turns = requested_turns
+    resolved_dim = 256
+    if args.external_atomic_facts:
+        facts_path = Path(args.external_atomic_facts)
+        if not facts_path.exists():
+            raise FileNotFoundError(f"external atomic facts file not found: {facts_path}")
+        print(f"Loading external atomic stream from: {facts_path}")
+        external_stream = load_external_atomic_stream(
+            atomic_facts_path=facts_path,
+            embedding_model_path=args.external_embedding_model,
+            max_events=max(0, int(args.external_max_events)),
+            min_chain_len=max(2, int(args.external_min_chain_len)),
+            embed_batch_size=max(1, int(args.external_embed_batch)),
+            embed_n_gpu_layers=int(args.external_embed_ngl),
+        )
+        resolved_turns = min(resolved_turns, int(external_stream["turns"]))
+        resolved_dim = int(external_stream["dim"])
+        if resolved_turns <= 0:
+            raise RuntimeError("No external turns available after filtering")
+        if resolved_turns < requested_turns:
+            print(
+                "[warn] requested turns reduced by external stream availability: "
+                f"requested={requested_turns}, available={external_stream['turns']}, run={resolved_turns}"
+            )
+
     params = SimParams(
-        turns=args.turns,
+        turns=resolved_turns,
+        dim=resolved_dim,
         seed=args.seed,
         report_every=args.report_every,
         smart_preload_enabled=args.preload_enabled,
         preload_budget_per_query=args.preload_budget,
         preload_max_io_per_turn=args.preload_max_io,
+        memory_drop_sim=max(-1.0, min(1.0, float(args.memory_drop_sim))),
         soft_gate_enabled=args.soft_gate_enabled,
     )
     
-    print(f"Running simulation with {args.turns} turns...")
+    print(f"Running simulation with {params.turns} turns...")
     print(f"Smart preloading: {'enabled' if args.preload_enabled else 'disabled'}")
     print(f"Soft gate: {'enabled' if args.soft_gate_enabled else 'disabled'}")
+    if external_stream is not None:
+        print(
+            "External continuous-topic mode: enabled "
+            f"(events={external_stream['turns']}, topics={external_stream['topic_count']}, dim={external_stream['dim']})"
+        )
     
-    result = run_experiment(params)
+    result = run_experiment(params, external_stream=external_stream)
     
     summary = result["summary"]
     print("\n" + "="*60)
@@ -2220,7 +2663,8 @@ def main():
     if args.preload_enabled:
         print(f"\nSmart Preloading Stats:")
         print(f"  Preload success rate: {summary.get('preload_success_rate', 0):.4f}")
-        print(f"  Preload memories heated: {summary.get('preload_memories_heated', 0):.0f}")
+        print(f"  Preload memories cached: {summary.get('preload_memories_heated', 0):.0f}")
+        print(f"  Preload clusters loaded: {summary.get('preload_clusters_loaded', 0):.0f}")
     
     print(f"\nEnhancedWeak Stats:")
     print(f"  Soft gate passes: {summary.get('enhanced_soft_gate_pass_count', 0):.0f}")
@@ -2228,6 +2672,7 @@ def main():
     
     if args.output:
         output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump({"summary": summary, "snapshots": result["snapshots"]}, f, indent=2)
         print(f"\nResults saved to {output_path}")
@@ -2239,6 +2684,7 @@ def main():
             plot_out = Path(args.output).with_suffix(".png")
         else:
             plot_out = Path("sim_results.png")
+        plot_out.parent.mkdir(parents=True, exist_ok=True)
         ok, reason = save_plot(plot_out, result["snapshots"], summary, dpi=args.plot_dpi)
         if ok:
             print(f"Snapshot plot saved to {plot_out}")

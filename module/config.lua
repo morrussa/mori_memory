@@ -56,20 +56,26 @@ M.settings = {
         topic_cross_quota_ratio = 0.25, -- topic 约束召回时，跨 topic 兜底配额比例（0~0.5）
         max_keywords = 4,
         keyword_weight = 0.55,    -- 关键词权重
+        keyword_queries = 2,      -- 每轮 query 展开的检索向量数量（含主向量）
+        keyword_noise_mix = 0.20, -- 派生 query 向量的噪声混合比例
+        keyword_perf_mode = "lossless", -- lossless=零损优化；near_lossless=近零损（次查询优先重排主查询候选）
+        near_lossless_min_primary_candidates = 64, -- near_lossless 触发阈值：主查询候选数达到该值才启用
+        near_lossless_secondary_cap = 256, -- near_lossless 次查询重排候选上限；0 表示不封顶
         -- [实现方法] keyword 候选聚合防偏：
         -- 关键词只在“主查询召回出的候选池”内重排；若关键词向量与主向量夹角过大则直接跳过，避免 LLM 误生成把结果拖偏。
         keyword_align_reject = 0.1, -- 与主向量相似度低于该值时直接丢弃该关键词查询（硬拒绝）。
         keyword_align_floor = 0.3,  -- 通过硬拒绝后，低于该值仍按 0 权重处理；高于该值才进入平滑降权。
         keyword_align_gamma = 1.4,  -- 对齐度权重曲线指数，越大越保守（中低对齐关键词被压得更狠）。
+        memory_drop_sim = 0.60,   -- memory 展开前硬阈值；sim < 阈值的 memory 整条丢弃
         min_sim_gate = 0.58,      -- 硬过滤，直接丢掉泛化噪声
         power_suppress = 1.80,    -- 非线性压制
         -- [实现方法] Smart Preload + EnhancedWeak：
         smart_preload_enabled = true,
-        preload_budget_per_query = 5,
-        preload_heat_amount = 25000,
+        preload_budget_per_query = 5, -- 每次 query 预加载簇数预算
+        preload_heat_amount = 25000, -- 旧逻辑兼容字段（簇缓存模式不使用）
         preload_topic_confidence = 0.50,
         preload_use_vector_prediction = true,
-        preload_max_io_per_turn = 8,
+        preload_max_io_per_turn = 8, -- 每回合最多预加载簇数
         preload_low_hot_ratio_threshold = 0.15,
         soft_gate_enabled = true,
         soft_gate_margin = 0.10,
@@ -173,6 +179,23 @@ M.settings = {
             tool_pass_temperature = 0.15,   -- 二阶段工具调用温度
             tool_pass_max_tokens = 128,     -- 二阶段工具调用长度
             tool_pass_seed = 42,            -- 二阶段工具调用随机种子
+        },
+        fact_extractor = {
+            -- 默认对齐 simu/dialog_hf_realflow_pipeline.py 的 high_recall_v1 + verify pass。
+            prompt_style = "high_recall_v1", -- 可选：high_recall_v1 / strict_v2 / balanced_v3 / balanced_en_v1 / baseline
+            verify_pass = true,              -- 开启二次质检，控制噪声
+            max_facts = 8,                   -- 单轮最多入库原子事实数
+            max_parse_items = 12,            -- 单次解析最多保留候选数量
+            max_item_chars = 64,             -- 单条事实长度上限
+            extract_max_tokens = 320,        -- 首轮抽取长度
+            extract_temperature = 0.15,
+            extract_seed = 42,
+            repair_max_tokens = 192,         -- 修复轮长度
+            repair_temperature = 0.0,
+            repair_seed = 43,
+            verify_max_tokens = 192,         -- 质检轮长度
+            verify_temperature = 0.0,
+            verify_seed = 46,
         },
     },
     topic = {--在退出时，如果topic没有闭合，在topic.bin的第一行写下 current_turn\x1F<topic_head_vec>\x1F<topic_now_vec> ，topic.bin的第一行永远留给这个用途。

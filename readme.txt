@@ -34,3 +34,11 @@ python agent_memory_sim.py --turns 50000 --plot-out memory/sim_trend.png --super
 
 python agent_memory_simub.py --turns 50000 --plot-out memory/sim_trend.png
 
+python agent_memory_simub.py \
+  --turns 50000 \
+  --external-atomic-facts simu/gdelt/atomic_facts.jsonl \
+  --external-embedding-model model/Qwen3-Embedding-0.6B-Q8_0.gguf \
+  --external-max-events 60000 \
+  --external-min-chain-len 4 \
+  --output simu/results/sim_results_50k.json \
+  --plot-out simu/results/sim_results_50k.png
