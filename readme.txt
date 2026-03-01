@@ -32,5 +32,5 @@ python agent_memory_sim.py --turns 20000 --plot-out memory/sim_trend.png
 
 python agent_memory_sim.py --turns 50000 --plot-out memory/sim_trend.png --supercluster-min-clusters 64
 
-python agent_memory_simub.py --turns 50000
+python agent_memory_simub.py --turns 50000 --plot-out memory/sim_trend.png
 

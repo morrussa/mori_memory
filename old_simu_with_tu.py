@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Complete Agent Memory Simulator with Smart Preloading and EnhancedWeak Strategy.
-
-This is the fully integrated version combining:
-1. Original simulator core behaviors
-2. EnhancedWeak strategy (soft gate, adaptive gate adjustment)
-3. Smart Preloading (intelligent cold memory preheating)
-
-Key Optimizations:
-- EnhancedWeak: Achieved 81.5% reduction in empty_query_rate
-- Smart Preloading: Achieved 98% reduction in empty_target_query_rate
+"""Simplified long-run simulator for the current agent-memory design.
 
 Core behaviors aligned with the Lua project:
 - memory merge threshold (`merge_limit`)
@@ -31,7 +22,7 @@ import json
 import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Set
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -92,51 +83,6 @@ class SimParams:
     persistent_explore_extra_clusters: int = 1
     persistent_explore_candidate_cap: int = 32
 
-    # ========================================================================
-    # Smart Preloading Parameters (NEW)
-    # ========================================================================
-    # Enable smart preloading of cold memories based on query intent
-    smart_preload_enabled: bool = True
-    
-    # Maximum cold memories to preload per query (IO budget)
-    preload_budget_per_query: int = 5
-    
-    # Heat to give preloaded memories
-    preload_heat_amount: int = 25000
-    
-    # Minimum confidence to trigger preload (topic similarity threshold)
-    preload_topic_confidence: float = 0.50
-    
-    # Use query vector to predict target topic
-    preload_use_vector_prediction: bool = True
-    
-    # Maximum preload operations per turn (simulate IO bandwidth)
-    preload_max_io_per_turn: int = 8
-    
-    # Preload when topic has low hot memory ratio
-    preload_low_hot_ratio_threshold: float = 0.15
-    # ========================================================================
-
-    # ========================================================================
-    # EnhancedWeak Strategy Parameters (NEW)
-    # ========================================================================
-    # Soft gate filtering
-    soft_gate_enabled: bool = True
-    soft_gate_margin: float = 0.10  # Candidates within min_gate * (1 - margin) are borderline
-    
-    # Expected recall estimation
-    expected_recall_enabled: bool = True
-    cluster_hit_rate_alpha: float = 0.10  # EMA coefficient for cluster hit rate
-    route_score_bonus_scale: float = 0.15  # Scale for route score bonus in cluster selection
-    
-    # Adaptive gate adjustment
-    empty_gate_decay: float = 0.98  # Multiply gate by this on empty result
-    empty_gate_decay_aggressive: float = 0.95  # More aggressive decay for consecutive empties
-    hit_gate_boost: float = 1.002  # Multiply gate by this on good hit
-    min_gate_floor: float = 0.25  # Minimum allowed gate value
-    max_gate_ceiling: float = 0.85  # Maximum allowed gate value
-    # ========================================================================
-
     # Project-aligned config defaults (from module/config.lua)
     merge_limit: float = 0.95
     cluster_sim: float = 0.72
@@ -153,7 +99,7 @@ class SimParams:
     loss_turn: int = 50
     time_boost: float = 0.2
 
-    max_memory: int = 20
+    max_memory: int = 5
     max_turns: int = 10
     min_sim_gate: float = 0.58
     power_suppress: float = 1.80
@@ -328,37 +274,6 @@ class AgentMemorySim:
         self.cluster_route_score = np.zeros(self.max_memories, dtype=np.float32)
         self.cluster_route_seen = np.zeros(self.max_memories, dtype=np.float32)
 
-        # ====================================================================
-        # EnhancedWeak Strategy State (NEW)
-        # ====================================================================
-        # Cluster hit rate tracking for expected recall estimation
-        self.cluster_visit_counts = np.zeros(self.max_memories, dtype=np.float64)
-        self.cluster_hit_counts = np.zeros(self.max_memories, dtype=np.float64)
-        self.cluster_hit_rate_ema = np.zeros(self.max_memories, dtype=np.float64)
-        
-        # Consecutive empty tracking for aggressive gate adjustment
-        self.consecutive_empty_count = 0
-        self.total_empty_queries = 0
-        self.soft_gate_pass_count = 0  # Track how many borderline candidates passed
-        # ====================================================================
-
-        # ====================================================================
-        # Smart Preloading State (NEW)
-        # ====================================================================
-        # Topic -> cold memories mapping (for smart preloading)
-        self.topic_to_cold_mem: Dict[int, Set[int]] = {}
-        
-        # Track IO operations per turn (simulate IO bandwidth)
-        self.preload_io_count = 0
-        
-        # Statistics
-        self.preload_attempts = 0
-        self.preload_successes = 0
-        self.preload_memories_heated = 0
-        self.preload_topic_predictions = 0
-        self.preload_correct_predictions = 0
-        # ====================================================================
-
         self.turn_topics: List[int] = []
         self.turns_by_topic: Dict[int, List[int]] = {}
         self.topic_to_mem: Dict[int, set] = {}
@@ -450,27 +365,6 @@ class AgentMemorySim:
             clu.cold_count += 1
             clu.hot_count = max(0, clu.hot_count - 1)
         self._refresh_hot_flag(cid)
-        
-        # Smart Preloading: Update topic -> cold memory mapping
-        self._update_topic_cold_mapping(mem_idx, old_hot, new_hot)
-
-    def _update_topic_cold_mapping(self, mem_idx: int, was_hot: bool, is_hot: bool) -> None:
-        """Update the topic -> cold memory mapping when memory heat changes."""
-        if mem_idx < 0 or mem_idx >= len(self.mem_topic_counts):
-            return
-        dominant_topic = self._dominant_memory_topic(mem_idx)
-        if dominant_topic is None:
-            return
-            
-        if was_hot and not is_hot:
-            # Memory became cold - add to cold mapping
-            if dominant_topic not in self.topic_to_cold_mem:
-                self.topic_to_cold_mem[dominant_topic] = set()
-            self.topic_to_cold_mem[dominant_topic].add(mem_idx)
-        elif not was_hot and is_hot:
-            # Memory became hot - remove from cold mapping
-            if dominant_topic in self.topic_to_cold_mem:
-                self.topic_to_cold_mem[dominant_topic].discard(mem_idx)
 
     def _use_superclusters(self) -> bool:
         return bool(
@@ -789,9 +683,6 @@ class AgentMemorySim:
             clu.cold_count += 1
             clu.hot_count = max(0, clu.hot_count - 1)
             self._refresh_hot_flag(cid)
-            
-            # Smart Preloading: Update cold memory mapping
-            self._update_topic_cold_mapping(int(mem_idx), was_hot=True, is_hot=False)
 
         self.normalize_events += 1
 
@@ -1111,198 +1002,6 @@ class AgentMemorySim:
                 best_n = int(n)
         return best_topic
 
-    # ========================================================================
-    # Smart Preloading Methods (NEW)
-    # ========================================================================
-    def _predict_target_topic(self, query_vec: np.ndarray) -> Tuple[Optional[int], float]:
-        """Predict the target topic of a query based on vector similarity."""
-        sims = self.topic.topic_vectors @ query_vec
-        best_topic = int(np.argmax(sims))
-        best_sim = float(sims[best_topic])
-        
-        # Confidence is based on similarity margin
-        sorted_sims = np.sort(sims)[::-1]
-        if len(sorted_sims) >= 2:
-            margin = sorted_sims[0] - sorted_sims[1]
-            confidence = min(1.0, best_sim * (1.0 + margin))
-        else:
-            confidence = best_sim
-            
-        return best_topic, confidence
-    
-    def _get_topic_hot_ratio(self, topic_id: int) -> float:
-        """Calculate the ratio of hot memories for a topic."""
-        mem_set = self.topic_to_mem.get(topic_id, set())
-        if not mem_set:
-            return 0.0
-        hot_count = sum(1 for m in mem_set if m < self.mem_count and self.heat_pool[m] > 0.0)
-        return hot_count / len(mem_set) if mem_set else 0.0
-    
-    def _smart_preload_cold_memories(self, query_vec: np.ndarray, target_topic: Optional[int], 
-                                      current_turn: int) -> int:
-        """Intelligently preload cold memories based on predicted query intent.
-        
-        Returns: number of memories preloaded
-        """
-        if not self.p.smart_preload_enabled:
-            return 0
-            
-        self.preload_attempts += 1
-        
-        # Check IO budget for this turn
-        if self.preload_io_count >= self.p.preload_max_io_per_turn:
-            return 0
-        
-        # Determine which topic(s) to preload for
-        topics_to_preload: List[Tuple[int, float]] = []
-        
-        if target_topic is not None:
-            hot_ratio = self._get_topic_hot_ratio(target_topic)
-            if hot_ratio < self.p.preload_low_hot_ratio_threshold:
-                topics_to_preload.append((target_topic, 1.0))
-        
-        if self.p.preload_use_vector_prediction:
-            # Also predict from query vector
-            predicted_topic, confidence = self._predict_target_topic(query_vec)
-            self.preload_topic_predictions += 1
-            
-            if predicted_topic is not None and confidence >= self.p.preload_topic_confidence:
-                hot_ratio = self._get_topic_hot_ratio(predicted_topic)
-                if hot_ratio < self.p.preload_low_hot_ratio_threshold:
-                    # Add if not already in list
-                    if not any(t == predicted_topic for t, _ in topics_to_preload):
-                        topics_to_preload.append((predicted_topic, confidence))
-        
-        if not topics_to_preload:
-            return 0
-        
-        # Preload cold memories for the predicted topics
-        preloaded = 0
-        budget = min(self.p.preload_budget_per_query, 
-                     self.p.preload_max_io_per_turn - self.preload_io_count)
-        
-        for topic_id, confidence in topics_to_preload:
-            if preloaded >= budget:
-                break
-                
-            # Get cold memories for this topic
-            cold_memories = self.topic_to_cold_mem.get(topic_id, set())
-            if not cold_memories:
-                continue
-            
-            # Select top cold memories by vector similarity
-            cold_list = [m for m in cold_memories if m < self.mem_count]
-            if not cold_list:
-                continue
-            
-            cold_idx = np.asarray(cold_list, dtype=np.int32)
-            cold_sims = self.vec_pool[cold_idx] @ query_vec
-            
-            # Select top-k by similarity
-            k = min(budget - preloaded, len(cold_list))
-            if k >= len(cold_list):
-                top_idx = np.argsort(cold_sims)[::-1]
-            else:
-                top_idx = np.argpartition(cold_sims, -k)[-k:]
-                top_idx = top_idx[np.argsort(cold_sims[top_idx])[::-1]]
-            
-            # Heat up selected cold memories (simulate loading from disk)
-            for idx in top_idx[:k]:
-                mem_idx = int(cold_idx[idx])
-                self._set_heat(mem_idx, float(self.p.preload_heat_amount))
-                preloaded += 1
-                self.preload_io_count += 1
-                
-                # Remove from cold mapping
-                self.topic_to_cold_mem[topic_id].discard(mem_idx)
-        
-        if preloaded > 0:
-            self.preload_successes += 1
-            self.preload_memories_heated += preloaded
-            self._normalize_heat_if_needed()
-        
-        return preloaded
-    # ========================================================================
-
-    # ========================================================================
-    # EnhancedWeak Strategy Methods (NEW)
-    # ========================================================================
-    def _soft_gate_filter(self, sim: float, min_gate: float) -> bool:
-        """Soft gate filter with probabilistic passage for borderline candidates."""
-        if sim >= min_gate:
-            return True
-        if not self.p.soft_gate_enabled:
-            return False
-        
-        # Borderline: within margin of gate
-        threshold = min_gate * (1.0 - self.p.soft_gate_margin)
-        if sim >= threshold:
-            # Probabilistic passage based on how close to gate
-            prob = (sim - threshold) / (min_gate - threshold)
-            if self.rng.random() < prob:
-                self.soft_gate_pass_count += 1
-                return True
-        return False
-
-    def _estimate_cluster_expected_recall(self, cid: int) -> float:
-        """Estimate expected recall for a cluster based on historical performance."""
-        if cid < 0 or cid >= len(self.clusters):
-            return 0.5
-        
-        visits = float(self.cluster_visit_counts[cid])
-        hits = float(self.cluster_hit_counts[cid])
-        
-        if visits <= 0:
-            return 0.5
-        
-        # Use EMA for smoother estimation
-        ema_rate = float(self.cluster_hit_rate_ema[cid])
-        direct_rate = hits / visits
-        
-        # Blend EMA with direct rate
-        alpha = self.p.cluster_hit_rate_alpha
-        return alpha * direct_rate + (1.0 - alpha) * ema_rate
-
-    def _update_cluster_hit_rate(self, cid: int, hit: bool) -> None:
-        """Update cluster hit rate tracking."""
-        if cid < 0 or cid >= len(self.clusters):
-            return
-        
-        self.cluster_visit_counts[cid] += 1
-        if hit:
-            self.cluster_hit_counts[cid] += 1
-        
-        # Update EMA
-        current_rate = float(self.cluster_hit_counts[cid]) / float(self.cluster_visit_counts[cid])
-        alpha = self.p.cluster_hit_rate_alpha
-        self.cluster_hit_rate_ema[cid] = alpha * current_rate + (1.0 - alpha) * self.cluster_hit_rate_ema[cid]
-
-    def _adjust_gate_on_result(self, hit: bool) -> None:
-        """Adjust min_sim_gate based on query results."""
-        if hit:
-            # Good hit - slightly raise gate
-            self.learned_min_gate = min(
-                self.p.max_gate_ceiling,
-                self.learned_min_gate * self.p.hit_gate_boost
-            )
-            self.consecutive_empty_count = 0
-        else:
-            # Empty result - lower gate
-            self.consecutive_empty_count += 1
-            if self.consecutive_empty_count >= 3:
-                # Aggressive decay for consecutive empties
-                self.learned_min_gate = max(
-                    self.p.min_gate_floor,
-                    self.learned_min_gate * self.p.empty_gate_decay_aggressive
-                )
-            else:
-                self.learned_min_gate = max(
-                    self.p.min_gate_floor,
-                    self.learned_min_gate * self.p.empty_gate_decay
-                )
-            self.total_empty_queries += 1
-    # ========================================================================
-
     def _top_probe_clusters(
         self,
         vec: np.ndarray,
@@ -1323,14 +1022,6 @@ class AgentMemorySim:
         route_scale = 0.0
         if self.p.refinement_enabled and turn >= self.p.refinement_start_turn:
             route_scale = float(self.p.refinement_route_bias_scale) * self._refinement_progress(turn)
-        
-        # EnhancedWeak: Add expected recall bonus
-        if self.p.expected_recall_enabled:
-            recall_bonus = np.zeros_like(sims)
-            for i, cid in enumerate(cand):
-                recall_bonus[i] = self._estimate_cluster_expected_recall(int(cid)) * self.p.route_score_bonus_scale
-            sims = sims + recall_bonus
-        
         if route_scale > 0.0:
             route_bias = self.cluster_route_score[cand].astype(np.float64)
             adjusted = sims.astype(np.float64) + route_scale * route_bias
@@ -1376,23 +1067,220 @@ class AgentMemorySim:
             "min_sim_gate": min_gate,
             "power_suppress": max(1.0, power),
             "topic_cross_quota_ratio": min(0.5, max(0.0, cross)),
-            "max_memory": max_memory,
-            "max_turns": max_turns,
-            "keyword_weight": kw_weight,
-            "supercluster_topn_query": super_topn_q,
-            "probe_clusters": probe_clusters,
+            "keyword_weight": max(0.0, kw_weight),
+            "max_memory": max(1, max_memory),
+            "max_turns": max(1, max_turns),
+            "supercluster_topn_query": max(1, super_topn_q),
+            "probe_clusters": max(1, probe_clusters),
         }
 
-    def _query_vectors(self, base_vec: np.ndarray, keyword_weight: float) -> List[Tuple[np.ndarray, float]]:
-        out: List[Tuple[np.ndarray, float]] = [(base_vec, 1.0)]
-        if self.p.keyword_queries <= 1:
-            return out
-        for _ in range(self.p.keyword_queries - 1):
-            noise = self.rng.normal(size=self.p.dim).astype(np.float32)
-            noise = unit(noise)
-            mix = self.p.keyword_noise_mix
-            qv = unit((1.0 - mix) * base_vec + mix * noise)
-            out.append((qv, keyword_weight))
+    def _apply_refinement(
+        self,
+        turn: int,
+        target_topic: int,
+        hits_all: int,
+        candidate_samples: Sequence[Tuple[int, int, float, float]],
+        selected_memories: Sequence[int],
+        evidence_memories: Sequence[int],
+    ) -> None:
+        if not self.p.refinement_enabled:
+            return
+        if turn < max(0, int(self.p.refinement_start_turn)):
+            return
+        if not candidate_samples:
+            return
+
+        refine_prog = self._refinement_progress(turn)
+        route_lr = max(0.0, float(self.p.refinement_route_lr)) * (0.18 + 0.82 * refine_prog)
+        gate_lr = max(0.0, float(self.p.refinement_gate_lr)) * (refine_prog ** 1.6)
+        merge_lr = max(0.0, float(self.p.refinement_merge_lr)) * (0.12 + 0.88 * refine_prog)
+
+        evidence_set = set(int(i) for i in evidence_memories)
+        selected_set = set(int(i) for i in selected_memories)
+        pos_sims: List[float] = []
+        neg_sims: List[float] = []
+        clu_pos: Dict[int, float] = {}
+        clu_neg: Dict[int, float] = {}
+        sampled = 0
+
+        for mem_idx, cid, sim, eff in candidate_samples:
+            if mem_idx < 0 or mem_idx >= self.mem_count:
+                continue
+            if cid < 0 or cid >= len(self.clusters):
+                continue
+            sampled += 1
+            score = max(0.0, float(eff))
+            simf = float(sim)
+            is_pos = mem_idx in evidence_set
+            if not is_pos:
+                topic_count = self.mem_topic_counts[mem_idx].get(target_topic, 0)
+                is_pos = topic_count > 0 and mem_idx in selected_set and simf >= self.learned_min_gate
+
+            is_neg = False
+            if not is_pos:
+                dom_topic = self._dominant_memory_topic(mem_idx)
+                if dom_topic is not None:
+                    same_band = self.topic.topic_similarity(dom_topic, target_topic) >= self.p.topic_sim_threshold
+                    if same_band and (mem_idx in selected_set or simf >= self.learned_min_gate * 0.92):
+                        is_neg = True
+
+            if is_pos:
+                pos_sims.append(simf)
+                clu_pos[cid] = clu_pos.get(cid, 0.0) + max(1e-6, score)
+                old_u = float(self.mem_useful_score[mem_idx])
+                old_r = float(self.mem_redundant_score[mem_idx])
+                self.mem_useful_score[mem_idx] = (1.0 - route_lr) * old_u + route_lr
+                self.mem_redundant_score[mem_idx] = (1.0 - 0.5 * route_lr) * old_r
+            elif is_neg:
+                neg_sims.append(simf)
+                clu_neg[cid] = clu_neg.get(cid, 0.0) + max(1e-6, score)
+                old_r = float(self.mem_redundant_score[mem_idx])
+                self.mem_redundant_score[mem_idx] = (1.0 - route_lr) * old_r + route_lr
+
+        if sampled <= 0:
+            return
+
+        route_decay = 1.0 - min(0.12, route_lr * 0.22)
+        for cid in set(list(clu_pos.keys()) + list(clu_neg.keys())):
+            p_w = clu_pos.get(cid, 0.0)
+            n_w = clu_neg.get(cid, 0.0)
+            total = p_w + n_w
+            if total <= 0.0:
+                continue
+            signal = (p_w - n_w) / total
+            prev = float(self.cluster_route_score[cid])
+            nxt = prev * route_decay + route_lr * signal
+            self.cluster_route_score[cid] = float(np.clip(nxt, -2.0, 2.0))
+            self.cluster_route_seen[cid] += 1.0
+
+        gate_target = self.learned_min_gate
+        if pos_sims and neg_sims:
+            pos_floor = float(np.quantile(np.asarray(pos_sims, dtype=np.float32), 0.20))
+            neg_ceil = float(np.quantile(np.asarray(neg_sims, dtype=np.float32), 0.80))
+            gate_target = 0.5 * (pos_floor + neg_ceil)
+        elif neg_sims:
+            gate_target = self.learned_min_gate + (0.035 if hits_all <= 0 else 0.018)
+        elif pos_sims:
+            gate_target = self.learned_min_gate - (0.020 if hits_all <= 0 else 0.008)
+
+        gate_lo = max(0.05, min(self.p.learning_min_sim_gate_start, self.p.min_sim_gate) - 0.22)
+        gate_hi = min(0.90, self.p.min_sim_gate + 0.08)
+        gate_target = float(np.clip(gate_target, gate_lo, gate_hi))
+        self.learned_min_gate = float(self.learned_min_gate + gate_lr * (gate_target - self.learned_min_gate))
+
+        pos_n = len(pos_sims)
+        neg_n = len(neg_sims)
+        neg_ratio = float(neg_n / max(1, pos_n + neg_n))
+        merge_target = self.p.merge_limit
+        if neg_ratio >= 0.66:
+            merge_target = self.p.merge_limit - 0.055
+        elif neg_ratio >= 0.52:
+            merge_target = self.p.merge_limit - 0.030
+        elif hits_all <= 0 and pos_n <= 0:
+            merge_target = self.p.merge_limit + 0.020
+        elif pos_n > neg_n * 1.4:
+            merge_target = self.p.merge_limit + 0.010
+
+        merge_lo = max(0.50, self.p.merge_limit - 0.10)
+        merge_hi = min(0.995, self.p.merge_limit + 0.03)
+        merge_target = float(np.clip(merge_target, merge_lo, merge_hi))
+        self.online_merge_limit = float(
+            self.online_merge_limit + merge_lr * (merge_target - self.online_merge_limit)
+        )
+        self.refinement_events += 1
+
+    def _enqueue_cold_rescue(self, query_vec: np.ndarray, target_topic: int, current_turn: int) -> None:
+        if self.mem_count <= 0:
+            return
+        if len(self.cold_rescue_queue) >= self.p.cold_rescue_max_queue:
+            return
+
+        best_id, best_sim, ops = self._find_best_cluster(query_vec, super_topn=self.p.supercluster_topn_query)
+        self.sim_ops_query_total += ops
+        if best_id is not None and best_sim >= self.p.cluster_sim:
+            candidates, ops2 = self._find_sim_in_cluster(
+                query_vec,
+                best_id,
+                only_cold=True,
+                max_results=max(self.p.cold_rescue_topn * 6, 18),
+            )
+        else:
+            candidates, ops2 = self._find_sim_all_cold(
+                query_vec,
+                max_results=max(self.p.cold_rescue_topn * 6, 18),
+            )
+        self.sim_ops_query_total += ops2
+        if not candidates:
+            return
+
+        chosen = 0
+        gate = float(self._effective_retrieval_knobs(current_turn)["min_sim_gate"])
+        for mem_idx, sim in candidates:
+            if sim < gate:
+                continue
+
+            has_target_turn = False
+            for t in self.mem_turns[mem_idx]:
+                if self.turn_topics[t - 1] == target_topic:
+                    has_target_turn = True
+                    break
+            if not has_target_turn:
+                continue
+
+            if mem_idx in self.cold_rescue_pending:
+                continue
+            delay = int(self.rng.integers(self.p.cold_rescue_delay_min, self.p.cold_rescue_delay_max + 1))
+            due_turn = current_turn + delay
+            heapq.heappush(self.cold_rescue_queue, (due_turn, mem_idx))
+            self.cold_rescue_pending.add(mem_idx)
+            self.cold_rescue_enqueued += 1
+            chosen += 1
+            if chosen >= self.p.cold_rescue_topn:
+                break
+
+    def _process_cold_rescue(self, turn: int) -> None:
+        if not self.cold_rescue_queue:
+            return
+        if self.p.maintenance_task > 0 and turn % self.p.maintenance_task != 0:
+            return
+
+        done = 0
+        while self.cold_rescue_queue and done < self.p.cold_rescue_batch:
+            due_turn, mem_idx = self.cold_rescue_queue[0]
+            if due_turn > turn:
+                break
+            heapq.heappop(self.cold_rescue_queue)
+            self.cold_rescue_pending.discard(mem_idx)
+
+            if mem_idx >= self.mem_count:
+                continue
+            if self.heat_pool[mem_idx] > 0.0:
+                continue
+
+            wake_heat = max(
+                self.p.new_memory_heat * self.p.cold_wake_multiplier,
+                self.p.new_memory_heat,
+            )
+            self._set_heat(mem_idx, wake_heat)
+
+            old_nb = self.p.neighbors_heat
+            self.p.neighbors_heat = max(old_nb, self.p.cold_extra_neighbor_heat)
+            self._neighbors_add_heat(self.vec_pool[mem_idx], turn, mem_idx)
+            self.p.neighbors_heat = old_nb
+
+            done += 1
+            self.cold_rescue_executed += 1
+
+        if done > 0:
+            self._normalize_heat_if_needed()
+
+    def _query_vectors(self, primary: np.ndarray, keyword_weight: Optional[float] = None) -> List[Tuple[np.ndarray, float]]:
+        out: List[Tuple[np.ndarray, float]] = [(primary, 1.0)]
+        kw_weight = self.p.keyword_weight if keyword_weight is None else float(keyword_weight)
+        for _ in range(max(0, self.p.keyword_queries)):
+            noise = unit(self.rng.normal(size=self.p.dim).astype(np.float32))
+            kw = unit((1.0 - self.p.keyword_noise_mix) * primary + self.p.keyword_noise_mix * noise)
+            out.append((kw.astype(np.float32), kw_weight))
         return out
 
     def retrieve(
@@ -1404,11 +1292,6 @@ class AgentMemorySim:
     ) -> Tuple[List[int], int, Dict[str, object]]:
         if self.mem_count <= 0:
             return [], 0, {"candidate_samples": [], "selected_memories": [], "evidence_memories": []}
-
-        # Smart Preloading: Preload cold memories before retrieval
-        preloaded = 0
-        if target_topic is not None and self.p.smart_preload_enabled:
-            preloaded = self._smart_preload_cold_memories(query_vec, target_topic, current_turn or 0)
 
         turn_best: Dict[int, float] = {}
         turn_src: Dict[int, str] = {}
@@ -1493,10 +1376,8 @@ class AgentMemorySim:
                         mem_best_cluster[mem_idx] = cid
                         mem_best_effective[mem_idx] = (sim_pos ** power) * weight
 
-                    # EnhancedWeak: Use soft gate filter
-                    if not self._soft_gate_filter(sim, min_gate):
+                    if sim < min_gate:
                         break
-                    
                     effective = (sim ** power) * weight
                     for t in self.mem_turns[mem_idx]:
                         prev = turn_best.get(t)
@@ -1515,11 +1396,8 @@ class AgentMemorySim:
                         mem_best_sim[mem_idx] = sim
                         mem_best_cluster[mem_idx] = int(self.cluster_of[mem_idx])
                         mem_best_effective[mem_idx] = (sim_pos ** power) * weight
-                    
-                    # EnhancedWeak: Use soft gate filter
-                    if not self._soft_gate_filter(sim, min_gate):
+                    if sim < min_gate:
                         break
-                    
                     effective = (sim ** power) * weight
                     for t in self.mem_turns[mem_idx]:
                         prev = turn_best.get(t)
@@ -1577,7 +1455,6 @@ class AgentMemorySim:
                 "candidate_samples": candidate_samples,
                 "selected_memories": [],
                 "evidence_memories": [],
-                "preloaded": preloaded,
             }
 
         ranked = sorted(turn_best.items(), key=lambda it: it[1], reverse=True)
@@ -1620,7 +1497,6 @@ class AgentMemorySim:
                 "candidate_samples": candidate_samples,
                 "selected_memories": selected_memories,
                 "evidence_memories": evidence_memories,
-                "preloaded": preloaded,
             }
 
         same: List[Tuple[int, float]] = []
@@ -1684,60 +1560,7 @@ class AgentMemorySim:
             "candidate_samples": candidate_samples,
             "selected_memories": selected_memories,
             "evidence_memories": evidence_memories,
-            "preloaded": preloaded,
         }
-
-    def _apply_refinement(
-        self,
-        turn: int,
-        target_topic: Optional[int],
-        hits_all: int,
-        candidate_samples: List[Tuple[int, int, float, float]],
-        selected_memories: List[int],
-        evidence_memories: List[int],
-    ) -> None:
-        if not self.p.refinement_enabled:
-            return
-        if turn < self.p.refinement_start_turn:
-            return
-
-        rp = self._refinement_progress(turn)
-        if rp <= 0.0:
-            return
-
-        self.refinement_events += 1
-        hit = hits_all > 0
-
-        # EnhancedWeak: Update cluster hit rates
-        clusters_seen = set()
-        for mem_idx, cid, sim, effective in candidate_samples:
-            if cid >= 0 and cid not in clusters_seen:
-                self._update_cluster_hit_rate(cid, hit)
-                clusters_seen.add(cid)
-
-        # EnhancedWeak: Adjust gate based on result
-        self._adjust_gate_on_result(hit)
-
-        # Update route scores for clusters
-        route_lr = self.p.refinement_route_lr * rp
-        gate_lr = self.p.refinement_gate_lr * rp
-
-        for mem_idx, cid, sim, effective in candidate_samples:
-            if cid < 0 or cid >= len(self.clusters):
-                continue
-            
-            mem_topic = self._dominant_memory_topic(mem_idx)
-            if mem_topic is None:
-                continue
-            
-            is_target = mem_topic == target_topic
-            delta = 1.0 if is_target else -0.3
-            
-            old_score = float(self.cluster_route_score[cid])
-            self.cluster_route_score[cid] = float(
-                np.clip(old_score + route_lr * delta, -1.0, 1.0)
-            )
-            self.cluster_route_seen[cid] += 1
 
     def _eval_query(self, selected_turns: List[int], current_turn: int, target_topic: int) -> Tuple[int, int]:
         k = len(selected_turns)
@@ -1822,10 +1645,6 @@ class AgentMemorySim:
         route_seen_avg = float(np.mean(route_seen)) if route_seen.size > 0 else 0.0
         persistent_hit_ratio = self.persistent_explore_turn_hits / max(1, self.returned_turns_sum)
 
-        # Smart Preloading stats
-        preload_success_rate = self.preload_successes / max(1, self.preload_attempts)
-        preload_prediction_accuracy = self.preload_correct_predictions / max(1, self.preload_topic_predictions)
-
         return {
             "turns": float(self.p.turns),
             "query_turns": float(self.query_turns),
@@ -1881,17 +1700,6 @@ class AgentMemorySim:
             "avg_sim_ops_query_per_query": avg_query_ops,
             "avg_sim_ops_total_per_turn": avg_turn_ops,
             "p95_sim_ops_total_per_turn": p95_turn_ops,
-            # EnhancedWeak metrics
-            "enhanced_soft_gate_pass_count": float(self.soft_gate_pass_count),
-            "enhanced_total_empty_queries": float(self.total_empty_queries),
-            # Smart Preloading metrics
-            "preload_attempts": float(self.preload_attempts),
-            "preload_successes": float(self.preload_successes),
-            "preload_success_rate": preload_success_rate,
-            "preload_memories_heated": float(self.preload_memories_heated),
-            "preload_topic_predictions": float(self.preload_topic_predictions),
-            "preload_correct_predictions": float(self.preload_correct_predictions),
-            "preload_prediction_accuracy": preload_prediction_accuracy,
         }
 
     def _record_snapshot(self, turn: int) -> None:
@@ -1921,70 +1729,10 @@ class AgentMemorySim:
         summary["heat_gini_min"] = min(gini_vals)
         return summary
 
-    def _enqueue_cold_rescue(self, query_vec: np.ndarray, target_topic: int, turn: int) -> None:
-        if len(self.cold_rescue_queue) >= self.p.cold_rescue_max_queue:
-            return
-
-        delay = int(self.rng.integers(self.p.cold_rescue_delay_min, self.p.cold_rescue_delay_max + 1))
-        exec_turn = turn + delay
-        entry = (exec_turn, target_topic)
-        if entry not in self.cold_rescue_pending:
-            heapq.heappush(self.cold_rescue_queue, entry)
-            self.cold_rescue_pending.add(entry)
-            self.cold_rescue_enqueued += 1
-
-    def _process_cold_rescue(self, turn: int) -> None:
-        if not self.cold_rescue_queue:
-            return
-        if turn % self.p.maintenance_task != 0:
-            return
-
-        batch = []
-        while self.cold_rescue_queue and len(batch) < self.p.cold_rescue_batch:
-            if self.cold_rescue_queue[0][0] > turn:
-                break
-            entry = heapq.heappop(self.cold_rescue_queue)
-            self.cold_rescue_pending.discard(entry)
-            batch.append(entry)
-
-        if not batch:
-            return
-
-        for exec_turn, topic_id in batch:
-            mem_set = self.topic_to_mem.get(topic_id, set())
-            if not mem_set:
-                continue
-
-            cold_memories = [m for m in mem_set if m < self.mem_count and self.heat_pool[m] <= 0.0]
-            if not cold_memories:
-                continue
-
-            self.rng.shuffle(cold_memories)
-            rescued = cold_memories[: self.p.cold_rescue_topn]
-
-            for mem_idx in rescued:
-                boost = int(self.p.new_memory_heat * self.p.cold_wake_multiplier)
-                self._set_heat(mem_idx, float(boost))
-
-                cid = int(self.cluster_of[mem_idx])
-                if cid >= 0 and cid < len(self.clusters):
-                    sim_results, _ = self._find_sim_in_cluster(
-                        self.vec_pool[mem_idx], cid, only_hot=True, max_results=5
-                    )
-                    for nb_idx, _ in sim_results[:2]:
-                        self._set_heat(nb_idx, self.heat_pool[nb_idx] + self.p.cold_extra_neighbor_heat)
-
-            self.cold_rescue_executed += len(rescued)
-
-        self._normalize_heat_if_needed()
-
     def run(self) -> Dict[str, object]:
         current_topic = self.topic.initial_topic()
 
         for turn in range(1, self.p.turns + 1):
-            # Reset IO budget for new turn
-            self.preload_io_count = 0
-            
             if turn > 1:
                 next_topic = self.topic.next_topic(current_topic)
                 if next_topic != current_topic:
@@ -2032,19 +1780,14 @@ class AgentMemorySim:
                 hits_all, _ = self._eval_query(selected, turn, target_topic)
                 if hits_all <= 0:
                     self.empty_target_query_count += 1
-                    
-                # Track preload prediction accuracy
-                preloaded = debug.get("preloaded", 0)
-                if preloaded > 0 and hits_all > 0:
-                    self.preload_correct_predictions += 1
 
                 self._apply_refinement(
                     turn=turn,
                     target_topic=target_topic,
                     hits_all=hits_all,
-                    candidate_samples=debug.get("candidate_samples", []),
-                    selected_memories=debug.get("selected_memories", []),
-                    evidence_memories=debug.get("evidence_memories", []),
+                    candidate_samples=debug.get("candidate_samples", []),  # type: ignore[arg-type]
+                    selected_memories=debug.get("selected_memories", []),  # type: ignore[arg-type]
+                    evidence_memories=debug.get("evidence_memories", []),  # type: ignore[arg-type]
                 )
 
                 need_rescue = (len(selected) == 0) or ((not self.p.cold_rescue_on_empty_only) and hits_all <= 0)
@@ -2065,12 +1808,22 @@ class AgentMemorySim:
 
         summary = self._summary()
         summary = self._finalize_summary(summary)
-        return {"summary": summary, "snapshots": self.snapshots}
+        return {
+            "params": vars(self.p),
+            "summary": summary,
+            "snapshots": self.snapshots,
+        }
 
 
-def run_experiment(params: SimParams) -> Dict[str, object]:
-    sim = AgentMemorySim(params)
-    return sim.run()
+def save_csv(path: Path, rows: List[Dict[str, float]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys = list(rows[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def save_plot(
@@ -2167,83 +1920,656 @@ def save_plot(
     return True, ""
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Agent Memory Simulator with Smart Preloading and EnhancedWeak")
-    parser.add_argument("--turns", type=int, default=20000, help="Number of simulation turns")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--report-every", type=int, default=1000, help="Report interval")
-    parser.add_argument("--output", type=str, default="sim_results.json", help="Output file")
+DEFAULT_STABILITY_METRICS: Tuple[str, ...] = (
+    "learned_min_sim_gate",
+    "online_merge_limit",
+    "target_recall_recent",
+    "target_hit_rate",
+)
+
+
+def parse_metrics_arg(raw: str) -> List[str]:
+    out: List[str] = []
+    for part in str(raw or "").split(","):
+        key = part.strip()
+        if key and key not in out:
+            out.append(key)
+    if not out:
+        out = list(DEFAULT_STABILITY_METRICS)
+    return out
+
+
+def _first_consecutive_true(
+    flags: Sequence[bool],
+    turns: np.ndarray,
+    consecutive: int,
+) -> Tuple[Optional[int], Optional[int]]:
+    need = max(1, int(consecutive))
+    run = 0
+    for i, flag in enumerate(flags):
+        if flag:
+            run += 1
+        else:
+            run = 0
+        if run >= need:
+            start_i = i - need + 1
+            return int(turns[start_i]), int(turns[i])
+    return None, None
+
+
+def estimate_stability(
+    rows: List[Dict[str, float]],
+    metrics: Sequence[str],
+    window_turns: int,
+    min_turn: int,
+    slope_tol: float,
+    rel_std_tol: float,
+    abs_std_tol: float,
+    consecutive: int,
+    min_points: int,
+) -> Dict[str, object]:
+    if not rows:
+        return {
+            "stable_start_turn": None,
+            "stable_turn": None,
+            "available_metrics": [],
+            "missing_metrics": list(metrics),
+            "reason": "no snapshots",
+            "per_metric": {},
+        }
+
+    turns = np.asarray([int(float(r.get("turn", 0))) for r in rows], dtype=np.int32)
+    available = [m for m in metrics if m in rows[0]]
+    missing = [m for m in metrics if m not in rows[0]]
+    if not available:
+        return {
+            "stable_start_turn": None,
+            "stable_turn": None,
+            "available_metrics": [],
+            "missing_metrics": missing,
+            "reason": "metrics not present in snapshots",
+            "per_metric": {},
+        }
+
+    n = int(turns.size)
+    per_metric: Dict[str, Dict[str, object]] = {}
+    by_metric_flags: Dict[str, List[bool]] = {}
+
+    for metric in available:
+        vals = np.asarray([float(r.get(metric, 0.0)) for r in rows], dtype=np.float64)
+        flags = [False] * n
+        last_stats = {"slope": 0.0, "std": 0.0, "rel_std": 0.0}
+
+        for i in range(n):
+            turn_i = int(turns[i])
+            if turn_i < min_turn:
+                continue
+
+            left_turn = turn_i - max(1, int(window_turns))
+            j = int(np.searchsorted(turns, left_turn, side="left"))
+            if (i - j + 1) < max(3, int(min_points)):
+                continue
+
+            t_seg = turns[j : i + 1].astype(np.float64)
+            x_seg = vals[j : i + 1]
+
+            t_centered = t_seg - float(np.mean(t_seg))
+            x_centered = x_seg - float(np.mean(x_seg))
+            denom = float(np.dot(t_centered, t_centered))
+            slope = float(np.dot(t_centered, x_centered) / denom) if denom > 1e-12 else 0.0
+            std = float(np.std(x_seg))
+            mean_abs = abs(float(np.mean(x_seg)))
+            rel_std = std / max(mean_abs, 1e-6)
+
+            stable = (abs(slope) <= slope_tol) and ((rel_std <= rel_std_tol) or (std <= abs_std_tol))
+            flags[i] = stable
+            last_stats = {"slope": slope, "std": std, "rel_std": rel_std}
+
+        start_turn, end_turn = _first_consecutive_true(flags, turns, consecutive)
+        per_metric[metric] = {
+            "stable_start_turn": start_turn,
+            "stable_turn": end_turn,
+            "latest_slope": float(last_stats["slope"]),
+            "latest_std": float(last_stats["std"]),
+            "latest_rel_std": float(last_stats["rel_std"]),
+        }
+        by_metric_flags[metric] = flags
+
+    joint_flags = [all(by_metric_flags[m][i] for m in available) for i in range(n)]
+    stable_start_turn, stable_turn = _first_consecutive_true(joint_flags, turns, consecutive)
+
+    return {
+        "stable_start_turn": stable_start_turn,
+        "stable_turn": stable_turn,
+        "available_metrics": available,
+        "missing_metrics": missing,
+        "config": {
+            "window_turns": int(window_turns),
+            "min_turn": int(min_turn),
+            "slope_tol": float(slope_tol),
+            "rel_std_tol": float(rel_std_tol),
+            "abs_std_tol": float(abs_std_tol),
+            "consecutive": int(consecutive),
+            "min_points": int(min_points),
+        },
+        "per_metric": per_metric,
+    }
+
+
+def estimate_gain_threshold(
+    rows: List[Dict[str, float]],
+    metrics: Sequence[str],
+    window_turns: int,
+    min_turn: int,
+    delta_tol: float,
+    consecutive: int,
+    min_points: int,
+) -> Dict[str, object]:
+    if not rows:
+        return {
+            "gain_start_turn": None,
+            "gain_turn": None,
+            "available_metrics": [],
+            "missing_metrics": list(metrics),
+            "reason": "no snapshots",
+            "per_metric": {},
+        }
+
+    turns = np.asarray([int(float(r.get("turn", 0))) for r in rows], dtype=np.int32)
+    available = [m for m in metrics if m in rows[0]]
+    missing = [m for m in metrics if m not in rows[0]]
+    if not available:
+        return {
+            "gain_start_turn": None,
+            "gain_turn": None,
+            "available_metrics": [],
+            "missing_metrics": missing,
+            "reason": "metrics not present in snapshots",
+            "per_metric": {},
+        }
+
+    n = int(turns.size)
+    per_metric: Dict[str, Dict[str, object]] = {}
+    by_metric_flags: Dict[str, List[bool]] = {}
+
+    for metric in available:
+        vals = np.asarray([float(r.get(metric, 0.0)) for r in rows], dtype=np.float64)
+        flags = [False] * n
+        last_gain = 0.0
+        for i in range(n):
+            turn_i = int(turns[i])
+            if turn_i < min_turn:
+                continue
+            left_turn = turn_i - max(1, int(window_turns))
+            j = int(np.searchsorted(turns, left_turn, side="left"))
+            if (i - j + 1) < max(3, int(min_points)):
+                continue
+            gain = float(vals[i] - vals[j])
+            flags[i] = gain <= delta_tol
+            last_gain = gain
+
+        start_turn, end_turn = _first_consecutive_true(flags, turns, consecutive)
+        per_metric[metric] = {
+            "gain_start_turn": start_turn,
+            "gain_turn": end_turn,
+            "latest_window_gain": last_gain,
+        }
+        by_metric_flags[metric] = flags
+
+    joint_flags = [all(by_metric_flags[m][i] for m in available) for i in range(n)]
+    gain_start_turn, gain_turn = _first_consecutive_true(joint_flags, turns, consecutive)
+
+    return {
+        "gain_start_turn": gain_start_turn,
+        "gain_turn": gain_turn,
+        "available_metrics": available,
+        "missing_metrics": missing,
+        "config": {
+            "window_turns": int(window_turns),
+            "min_turn": int(min_turn),
+            "delta_tol": float(delta_tol),
+            "consecutive": int(consecutive),
+            "min_points": int(min_points),
+        },
+        "per_metric": per_metric,
+    }
+
+
+def run_stability_sweep(base_params: SimParams, args: argparse.Namespace) -> Dict[str, object]:
+    search_min = max(200, int(args.stable_search_min_turns))
+    search_max = max(search_min, int(args.stable_search_max_turns))
+    search_step = max(50, int(args.stable_search_step))
+    runs = max(1, int(args.stable_search_runs))
+    pass_ratio = min(1.0, max(0.0, float(args.stable_search_pass_ratio)))
+    stability_metrics = parse_metrics_arg(args.stability_metrics)
+    gain_metrics = parse_metrics_arg(args.gain_metrics)
+    mode = str(args.stable_search_mode or "both").strip().lower()
+    if mode not in {"stability", "gain", "both"}:
+        mode = "both"
+
+    rows: List[Dict[str, float]] = []
+    recommended_turn: Optional[int] = None
+
+    for turns in range(search_min, search_max + 1, search_step):
+        stable_count = 0
+        threshold_turns: List[int] = []
+
+        for offset in range(runs):
+            run_params = replace(base_params, turns=turns, seed=base_params.seed + offset)
+            sim = AgentMemorySim(run_params)
+            run_result = sim.run()
+            stability = estimate_stability(
+                run_result["snapshots"],  # type: ignore[arg-type]
+                metrics=stability_metrics,
+                window_turns=args.stability_window_turns,
+                min_turn=args.stability_min_turn,
+                slope_tol=args.stability_slope_tol,
+                rel_std_tol=args.stability_rel_std_tol,
+                abs_std_tol=args.stability_abs_std_tol,
+                consecutive=args.stability_consecutive,
+                min_points=args.stability_min_points,
+            )
+            gain = estimate_gain_threshold(
+                run_result["snapshots"],  # type: ignore[arg-type]
+                metrics=gain_metrics,
+                window_turns=args.gain_window_turns,
+                min_turn=args.gain_min_turn,
+                delta_tol=args.gain_delta_tol,
+                consecutive=args.gain_consecutive,
+                min_points=args.gain_min_points,
+            )
+
+            stable_turn = stability.get("stable_turn")
+            gain_turn = gain.get("gain_turn")
+            stable_ok = isinstance(stable_turn, int)
+            gain_ok = isinstance(gain_turn, int)
+            if mode == "stability":
+                run_ok = stable_ok
+            elif mode == "gain":
+                run_ok = gain_ok
+            else:
+                run_ok = stable_ok and gain_ok
+
+            if run_ok:
+                stable_count += 1
+                if mode == "stability":
+                    threshold_turns.append(int(stable_turn))
+                elif mode == "gain":
+                    threshold_turns.append(int(gain_turn))
+                else:
+                    threshold_turns.append(max(int(stable_turn), int(gain_turn)))
+
+        pass_rate = stable_count / float(runs)
+        passed = pass_rate >= pass_ratio
+        median_threshold_turn = (
+            float(np.median(np.asarray(threshold_turns, dtype=np.float64))) if threshold_turns else float("nan")
+        )
+
+        rows.append(
+            {
+                "turn_budget": float(turns),
+                "runs": float(runs),
+                "stable_runs": float(stable_count),
+                "stable_pass_rate": pass_rate,
+                "median_threshold_turn": median_threshold_turn,
+                "passed": 1.0 if passed else 0.0,
+            }
+        )
+        print(
+            f"[Sweep] turns={turns} stable_runs={stable_count}/{runs} "
+            f"pass_rate={pass_rate:.3f} median_threshold_turn={median_threshold_turn if threshold_turns else 'nan'}"
+        )
+
+        if passed and recommended_turn is None:
+            recommended_turn = turns
+
+    return {
+        "sweep_type": "find_stable_turn",
+        "search_min_turns": search_min,
+        "search_max_turns": search_max,
+        "search_step": search_step,
+        "runs": runs,
+        "pass_ratio": pass_ratio,
+        "mode": mode,
+        "stability_metrics": stability_metrics,
+        "gain_metrics": gain_metrics,
+        "recommended_turn": recommended_turn,
+        "rows": rows,
+    }
+
+
+def build_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Agent-memory long-run simplified simulator")
+    parser.add_argument("--turns", type=int, default=20000)
+    parser.add_argument("--dim", type=int, default=256, help="Use 1024 for full project dimension")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--query-prob", type=float, default=0.45)
+    parser.add_argument("--report-every", type=int, default=1000)
+    parser.add_argument("--out-csv", type=str, default="memory/sim_metrics.csv")
+    parser.add_argument("--out-json", type=str, default="memory/sim_summary.json")
+    parser.add_argument("--keyword-queries", type=int, default=2)
+    parser.add_argument("--turn-noise-mix", type=float, default=0.18)
+    parser.add_argument("--switch-prob", type=float, default=0.12)
+    parser.add_argument("--near-switch-prob", type=float, default=0.55)
+    parser.add_argument("--query-current-intent-prob", type=float, default=0.60)
+    parser.add_argument("--query-long-term-min-age", type=int, default=120)
+    parser.add_argument("--query-noise-mix", type=float, default=0.14)
+    parser.add_argument("--disable-learning-curve", action="store_true")
+    parser.add_argument("--learning-warmup-turns", type=int, default=500)
+    parser.add_argument("--learning-full-turns", type=int, default=12000)
+    parser.add_argument("--learning-query-noise-extra", type=float, default=0.18)
+    parser.add_argument("--learning-min-sim-gate-start", type=float, default=0.42)
+    parser.add_argument("--learning-power-suppress-start", type=float, default=1.15)
+    parser.add_argument("--learning-topic-cross-quota-start", type=float, default=0.48)
+    parser.add_argument("--learning-max-memory-start", type=int, default=3)
+    parser.add_argument("--learning-max-turns-start", type=int, default=14)
+    parser.add_argument("--learning-keyword-weight-start", type=float, default=0.78)
+    parser.add_argument("--learning-super-topn-query-start", type=int, default=2)
+    parser.add_argument("--disable-refinement", action="store_true")
+    parser.add_argument("--refinement-start-turn", type=int, default=200)
+    parser.add_argument("--refinement-sample-mem-topk", type=int, default=48)
+    parser.add_argument("--refinement-route-lr", type=float, default=0.10)
+    parser.add_argument("--refinement-gate-lr", type=float, default=0.08)
+    parser.add_argument("--refinement-merge-lr", type=float, default=0.05)
+    parser.add_argument("--refinement-route-bias-scale", type=float, default=0.08)
+    parser.add_argument("--refinement-probe-clusters-start", type=int, default=8)
+    parser.add_argument("--refinement-probe-clusters-end", type=int, default=2)
+    parser.add_argument("--refinement-probe-per-cluster-limit", type=int, default=12)
+    parser.add_argument("--disable-persistent-explore", action="store_true")
+    parser.add_argument("--persistent-explore-epsilon", type=float, default=0.01)
+    parser.add_argument("--persistent-explore-period-turns", type=int, default=0)
+    parser.add_argument("--persistent-explore-extra-clusters", type=int, default=1)
+    parser.add_argument("--persistent-explore-candidate-cap", type=int, default=32)
+    parser.add_argument("--maintenance-task", type=int, default=75)
+    parser.add_argument("--cold-rescue-delay-min", type=int, default=24)
+    parser.add_argument("--cold-rescue-delay-max", type=int, default=120)
+    parser.add_argument("--cold-rescue-topn", type=int, default=3)
+    parser.add_argument("--cold-rescue-batch", type=int, default=24)
+    parser.add_argument("--cold-rescue-on-empty-only", action="store_true")
+    parser.add_argument("--cold-wake-multiplier", type=float, default=1.8)
+    parser.add_argument("--cold-extra-neighbor-heat", type=int, default=18000)
+    parser.add_argument("--shift-probe-turns", type=int, default=12)
+    parser.add_argument("--shift-query-prob-boost", type=float, default=0.12)
+    parser.add_argument("--shift-target-prev-prob", type=float, default=0.55)
+    parser.add_argument("--shift-query-noise-boost", type=float, default=0.06)
+    parser.add_argument("--topic-flow-drift", type=float, default=0.05)
+    parser.add_argument("--topic-flow-anchor-mix", type=float, default=0.22)
+    parser.add_argument("--topic-flow-switch-jolt", type=float, default=0.08)
+    parser.add_argument("--stable-warmup-turns", type=int, default=6)
+    parser.add_argument("--stable-min-pair-sim", type=float, default=0.72)
+    parser.add_argument("--topic-random-lift-interval", type=int, default=3)
+    parser.add_argument("--topic-random-lift-count", type=int, default=2)
+    parser.add_argument("--topic-random-lift-prob", type=float, default=0.85)
+    parser.add_argument("--topic-random-lift-include-hot", action="store_true")
+    parser.add_argument("--topic-cache-weight", type=float, default=1.02)
+    parser.add_argument("--disable-scan-pool-limit", action="store_true")
+    parser.add_argument("--scan-pool-mult", type=float, default=1.4)
+    parser.add_argument("--scan-pool-min-cap", type=int, default=20)
+    parser.add_argument("--scan-pool-hot-ratio", type=float, default=0.55)
+    parser.add_argument("--scan-pool-recent-ratio", type=float, default=0.35)
+    parser.add_argument("--scan-pool-random-ratio", type=float, default=0.10)
+    parser.add_argument("--disable-hierarchical-cluster", action="store_true")
+    parser.add_argument("--supercluster-min-clusters", type=int, default=64)
+    parser.add_argument("--supercluster-target-size", type=int, default=64)
+    parser.add_argument("--supercluster-sim", type=float, default=0.52)
+    parser.add_argument("--supercluster-max-size-mult", type=float, default=1.8)
+    parser.add_argument("--supercluster-topn-add", type=int, default=3)
+    parser.add_argument("--supercluster-topn-query", type=int, default=4)
+    parser.add_argument("--supercluster-topn-scale", type=float, default=0.20)
+    parser.add_argument("--supercluster-rebuild-every", type=int, default=600)
+    parser.add_argument("--use-topic-buckets", action="store_true")
+    parser.add_argument("--disable-softmax", action="store_true")
     parser.add_argument("--no-plot", action="store_true", help="Disable png dashboard generation")
-    parser.add_argument("--plot-out", type=str, default="", help="Output png path (default: output with .png)")
+    parser.add_argument("--plot-out", type=str, default="", help="Output png path (default: out-csv with .png)")
     parser.add_argument("--plot-dpi", type=int, default=160)
-    
-    # Smart Preloading parameters
-    parser.add_argument("--preload-enabled", type=lambda x: x.lower() == 'true', default=True, 
-                        help="Enable smart preloading (true/false)")
-    parser.add_argument("--preload-budget", type=int, default=5, help="Preload budget per query")
-    parser.add_argument("--preload-max-io", type=int, default=8, help="Max IO operations per turn")
-    
-    # EnhancedWeak parameters
-    parser.add_argument("--soft-gate-enabled", type=lambda x: x.lower() == 'true', default=True,
-                        help="Enable soft gate filtering (true/false)")
-    parser.add_argument("--adaptive-gate-enabled", type=lambda x: x.lower() == 'true', default=True,
-                        help="Enable adaptive gate adjustment (true/false)")
-    
-    args = parser.parse_args()
-    
-    params = SimParams(
-        turns=args.turns,
-        seed=args.seed,
-        report_every=args.report_every,
-        smart_preload_enabled=args.preload_enabled,
-        preload_budget_per_query=args.preload_budget,
-        preload_max_io_per_turn=args.preload_max_io,
-        soft_gate_enabled=args.soft_gate_enabled,
+    parser.add_argument(
+        "--stability-metrics",
+        type=str,
+        default="learned_min_sim_gate,online_merge_limit,target_recall_recent,target_hit_rate",
+        help="Comma-separated metrics for parameter-stability detection",
     )
-    
-    print(f"Running simulation with {args.turns} turns...")
-    print(f"Smart preloading: {'enabled' if args.preload_enabled else 'disabled'}")
-    print(f"Soft gate: {'enabled' if args.soft_gate_enabled else 'disabled'}")
-    
-    result = run_experiment(params)
-    
+    parser.add_argument("--stability-window-turns", type=int, default=800)
+    parser.add_argument("--stability-min-turn", type=int, default=1200)
+    parser.add_argument("--stability-slope-tol", type=float, default=1.5e-5)
+    parser.add_argument("--stability-rel-std-tol", type=float, default=0.03)
+    parser.add_argument("--stability-abs-std-tol", type=float, default=0.01)
+    parser.add_argument("--stability-consecutive", type=int, default=3)
+    parser.add_argument("--stability-min-points", type=int, default=6)
+    parser.add_argument(
+        "--gain-metrics",
+        type=str,
+        default="target_recall_recent,target_hit_rate,target_mrr",
+        help="Comma-separated metrics for marginal-gain threshold detection",
+    )
+    parser.add_argument("--gain-window-turns", type=int, default=800)
+    parser.add_argument("--gain-min-turn", type=int, default=1000)
+    parser.add_argument("--gain-delta-tol", type=float, default=0.01)
+    parser.add_argument("--gain-consecutive", type=int, default=3)
+    parser.add_argument("--gain-min-points", type=int, default=6)
+    parser.add_argument(
+        "--find-stable-turn",
+        action="store_true",
+        help="Sweep turn budget and estimate minimum turn where threshold is reached",
+    )
+    parser.add_argument("--stable-search-min-turns", type=int, default=1200)
+    parser.add_argument("--stable-search-max-turns", type=int, default=5000)
+    parser.add_argument("--stable-search-step", type=int, default=200)
+    parser.add_argument("--stable-search-runs", type=int, default=3)
+    parser.add_argument("--stable-search-pass-ratio", type=float, default=0.67)
+    parser.add_argument(
+        "--stable-search-mode",
+        type=str,
+        default="both",
+        help="One of: stability, gain, both",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = build_args()
+    p = SimParams(
+        turns=max(100, args.turns),
+        dim=max(32, args.dim),
+        seed=args.seed,
+        query_prob=min(1.0, max(0.0, args.query_prob)),
+        report_every=max(20, args.report_every),
+        keyword_queries=max(0, args.keyword_queries),
+        turn_noise_mix=min(0.9, max(0.01, args.turn_noise_mix)),
+        switch_prob=min(1.0, max(0.0, args.switch_prob)),
+        near_switch_prob=min(1.0, max(0.0, args.near_switch_prob)),
+        query_current_intent_prob=min(1.0, max(0.0, args.query_current_intent_prob)),
+        query_long_term_min_age=max(2, args.query_long_term_min_age),
+        query_noise_mix=min(0.9, max(0.01, args.query_noise_mix)),
+        learning_curve_enabled=(not args.disable_learning_curve),
+        learning_warmup_turns=max(0, args.learning_warmup_turns),
+        learning_full_turns=max(1, args.learning_full_turns),
+        learning_query_noise_extra=min(0.9, max(0.0, args.learning_query_noise_extra)),
+        learning_min_sim_gate_start=min(1.0, max(0.0, args.learning_min_sim_gate_start)),
+        learning_power_suppress_start=max(1.0, args.learning_power_suppress_start),
+        learning_topic_cross_quota_start=min(0.5, max(0.0, args.learning_topic_cross_quota_start)),
+        learning_max_memory_start=max(1, args.learning_max_memory_start),
+        learning_max_turns_start=max(1, args.learning_max_turns_start),
+        learning_keyword_weight_start=max(0.0, args.learning_keyword_weight_start),
+        learning_super_topn_query_start=max(1, args.learning_super_topn_query_start),
+        refinement_enabled=(not args.disable_refinement),
+        refinement_start_turn=max(0, args.refinement_start_turn),
+        refinement_sample_mem_topk=max(8, args.refinement_sample_mem_topk),
+        refinement_route_lr=min(1.0, max(0.0, args.refinement_route_lr)),
+        refinement_gate_lr=min(1.0, max(0.0, args.refinement_gate_lr)),
+        refinement_merge_lr=min(1.0, max(0.0, args.refinement_merge_lr)),
+        refinement_route_bias_scale=max(0.0, args.refinement_route_bias_scale),
+        refinement_probe_clusters_start=max(1, args.refinement_probe_clusters_start),
+        refinement_probe_clusters_end=max(1, args.refinement_probe_clusters_end),
+        refinement_probe_per_cluster_limit=max(2, args.refinement_probe_per_cluster_limit),
+        persistent_explore_enabled=(not args.disable_persistent_explore),
+        persistent_explore_epsilon=min(1.0, max(0.0, args.persistent_explore_epsilon)),
+        persistent_explore_period_turns=max(0, args.persistent_explore_period_turns),
+        persistent_explore_extra_clusters=max(1, args.persistent_explore_extra_clusters),
+        persistent_explore_candidate_cap=max(1, args.persistent_explore_candidate_cap),
+        maintenance_task=max(1, args.maintenance_task),
+        cold_rescue_delay_min=max(1, args.cold_rescue_delay_min),
+        cold_rescue_delay_max=max(1, args.cold_rescue_delay_max),
+        cold_rescue_topn=max(1, args.cold_rescue_topn),
+        cold_rescue_batch=max(1, args.cold_rescue_batch),
+        cold_rescue_on_empty_only=args.cold_rescue_on_empty_only,
+        cold_wake_multiplier=max(1.0, args.cold_wake_multiplier),
+        cold_extra_neighbor_heat=max(0, args.cold_extra_neighbor_heat),
+        shift_probe_turns=max(0, args.shift_probe_turns),
+        shift_query_prob_boost=min(1.0, max(0.0, args.shift_query_prob_boost)),
+        shift_target_prev_prob=min(1.0, max(0.0, args.shift_target_prev_prob)),
+        shift_query_noise_boost=min(0.9, max(0.0, args.shift_query_noise_boost)),
+        topic_flow_drift=min(0.9, max(0.0, args.topic_flow_drift)),
+        topic_flow_anchor_mix=min(0.9, max(0.0, args.topic_flow_anchor_mix)),
+        topic_flow_switch_jolt=min(0.9, max(0.0, args.topic_flow_switch_jolt)),
+        stable_warmup_turns=max(1, args.stable_warmup_turns),
+        stable_min_pair_sim=min(1.0, max(0.0, args.stable_min_pair_sim)),
+        topic_random_lift_interval=max(1, args.topic_random_lift_interval),
+        topic_random_lift_count=max(1, args.topic_random_lift_count),
+        topic_random_lift_prob=min(1.0, max(0.0, args.topic_random_lift_prob)),
+        topic_random_lift_only_cold=(not args.topic_random_lift_include_hot),
+        topic_cache_weight=max(0.5, args.topic_cache_weight),
+        scan_pool_limit_enabled=(not args.disable_scan_pool_limit),
+        scan_pool_mult=max(1.0, args.scan_pool_mult),
+        scan_pool_min_cap=max(4, args.scan_pool_min_cap),
+        scan_pool_hot_ratio=max(0.0, args.scan_pool_hot_ratio),
+        scan_pool_recent_ratio=max(0.0, args.scan_pool_recent_ratio),
+        scan_pool_random_ratio=max(0.0, args.scan_pool_random_ratio),
+        hierarchical_cluster_enabled=(not args.disable_hierarchical_cluster),
+        supercluster_min_clusters=max(8, args.supercluster_min_clusters),
+        supercluster_target_size=max(8, args.supercluster_target_size),
+        supercluster_sim=min(1.0, max(-1.0, args.supercluster_sim)),
+        supercluster_max_size_mult=max(1.0, args.supercluster_max_size_mult),
+        supercluster_topn_add=max(1, args.supercluster_topn_add),
+        supercluster_topn_query=max(1, args.supercluster_topn_query),
+        supercluster_topn_scale=max(0.0, args.supercluster_topn_scale),
+        supercluster_rebuild_every=max(0, args.supercluster_rebuild_every),
+        use_topic_buckets=args.use_topic_buckets,
+        softmax=not args.disable_softmax,
+    )
+
+    if p.cold_rescue_delay_max < p.cold_rescue_delay_min:
+        p.cold_rescue_delay_max = p.cold_rescue_delay_min
+    if p.learning_full_turns <= p.learning_warmup_turns:
+        p.learning_full_turns = p.learning_warmup_turns + 1
+
+    out_csv = Path(args.out_csv)
+    out_json = Path(args.out_json)
+    if args.find_stable_turn:
+        sweep = run_stability_sweep(p, args)
+        save_csv(out_csv, sweep["rows"])  # type: ignore[arg-type]
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        with out_json.open("w", encoding="utf-8") as f:
+            json.dump(sweep, f, ensure_ascii=False, indent=2)
+        rec = sweep.get("recommended_turn")
+        print("=== Stable Turn Sweep ===")
+        print(f"sweep_type: {sweep.get('sweep_type')}")
+        print(f"mode: {sweep.get('mode')}")
+        print(f"search_min_turns: {int(sweep.get('search_min_turns', 0))}")
+        print(f"search_max_turns: {int(sweep.get('search_max_turns', 0))}")
+        print(f"search_step: {int(sweep.get('search_step', 0))}")
+        print(f"runs_per_point: {int(sweep.get('runs', 0))}")
+        print(f"pass_ratio: {float(sweep.get('pass_ratio', 0.0)):.2f}")
+        print(f"recommended_turn: {rec if rec is not None else 'not found in range'}")
+        print(f"sweep_csv: {out_csv}")
+        print(f"sweep_json: {out_json}")
+        if not args.no_plot:
+            print("snapshot_plot: skipped (find-stable-turn mode)")
+        return
+
+    sim = AgentMemorySim(p)
+    result = sim.run()
+    stability = estimate_stability(
+        result["snapshots"],  # type: ignore[arg-type]
+        metrics=parse_metrics_arg(args.stability_metrics),
+        window_turns=args.stability_window_turns,
+        min_turn=args.stability_min_turn,
+        slope_tol=args.stability_slope_tol,
+        rel_std_tol=args.stability_rel_std_tol,
+        abs_std_tol=args.stability_abs_std_tol,
+        consecutive=args.stability_consecutive,
+        min_points=args.stability_min_points,
+    )
+    gain = estimate_gain_threshold(
+        result["snapshots"],  # type: ignore[arg-type]
+        metrics=parse_metrics_arg(args.gain_metrics),
+        window_turns=args.gain_window_turns,
+        min_turn=args.gain_min_turn,
+        delta_tol=args.gain_delta_tol,
+        consecutive=args.gain_consecutive,
+        min_points=args.gain_min_points,
+    )
+    result["stability"] = stability
+    result["gain_threshold"] = gain
+
+    save_csv(out_csv, result["snapshots"])
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    with out_json.open("w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
     summary = result["summary"]
-    print("\n" + "="*60)
-    print("FINAL RESULTS")
-    print("="*60)
-    print(f"Empty query rate: {summary['empty_query_rate']:.4f}")
-    print(f"Empty target query rate: {summary['empty_target_query_rate']:.4f}")
-    print(f"Target hit rate: {summary['target_hit_rate']:.4f}")
-    print(f"Target recall (recent): {summary['target_recall_recent']:.4f}")
-    print(f"P95 sim ops per turn: {summary['p95_sim_ops_total_per_turn']:.1f}")
-    
-    if args.preload_enabled:
-        print(f"\nSmart Preloading Stats:")
-        print(f"  Preload success rate: {summary.get('preload_success_rate', 0):.4f}")
-        print(f"  Preload memories heated: {summary.get('preload_memories_heated', 0):.0f}")
-    
-    print(f"\nEnhancedWeak Stats:")
-    print(f"  Soft gate passes: {summary.get('enhanced_soft_gate_pass_count', 0):.0f}")
-    print(f"  Learned min gate: {summary.get('learned_min_sim_gate', 0):.4f}")
-    
-    if args.output:
-        output_path = Path(args.output)
-        with open(output_path, "w") as f:
-            json.dump({"summary": summary, "snapshots": result["snapshots"]}, f, indent=2)
-        print(f"\nResults saved to {output_path}")
+    print("=== Agent Memory Simulation Summary ===")
+    print(f"turns: {int(summary['turns'])}")
+    print(f"query_turns: {int(summary['query_turns'])}")
+    print(f"memory_count: {int(summary['memory_count'])}")
+    print(f"hot_memory_ratio: {summary['hot_memory_ratio']:.4f}")
+    print(f"cluster_count: {int(summary['cluster_count'])}")
+    print(f"supercluster_count: {int(summary['supercluster_count'])}")
+    print(f"supercluster_rebuild_count: {int(summary['supercluster_rebuild_count'])}")
+    print(f"merge_rate: {summary['merge_rate']:.4f}")
+    print(f"target_precision_at_k: {summary['target_precision_at_k']:.4f}")
+    print(f"target_recall_recent: {summary['target_recall_recent']:.4f}")
+    print(f"target_recall_all: {summary['target_recall_all']:.4f}")
+    print(f"target_hit_rate: {summary['target_hit_rate']:.4f}")
+    print(f"target_recent_hit_rate: {summary['target_recent_hit_rate']:.4f}")
+    print(f"target_mrr: {summary['target_mrr']:.4f}")
+    print(f"empty_query_rate: {summary['empty_query_rate']:.4f}")
+    print(f"empty_target_query_rate: {summary['empty_target_query_rate']:.4f}")
+    print(f"learning_progress_end: {summary['learning_progress_end']:.4f}")
+    print(f"refinement_progress_end: {summary['refinement_progress_end']:.4f}")
+    print(f"refinement_events: {int(summary['refinement_events'])}")
+    print(f"learned_min_sim_gate: {summary['learned_min_sim_gate']:.4f}")
+    print(f"online_merge_limit: {summary['online_merge_limit']:.4f}")
+    print(f"route_score_abs_mean: {summary['route_score_abs_mean']:.4f}")
+    print(f"effective_probe_clusters_end: {summary['effective_probe_clusters_end']:.1f}")
+    print(f"persistent_explore_events: {int(summary['persistent_explore_events'])}")
+    print(f"persistent_explore_cluster_probes: {int(summary['persistent_explore_cluster_probes'])}")
+    print(f"persistent_explore_turn_hits: {int(summary['persistent_explore_turn_hits'])}")
+    print(f"persistent_explore_hit_ratio: {summary['persistent_explore_hit_ratio']:.4f}")
+    print(f"cold_rescue_enqueued: {int(summary['cold_rescue_enqueued'])}")
+    print(f"cold_rescue_executed: {int(summary['cold_rescue_executed'])}")
+    print(f"topic_lift_attempted: {int(summary['topic_lift_attempted'])}")
+    print(f"topic_lift_executed: {int(summary['topic_lift_executed'])}")
+    print(f"topic_lift_exec_rate: {summary['topic_lift_exec_rate']:.4f}")
+    print(f"topic_cache_size: {int(summary['topic_cache_size'])}")
+    print(f"topic_cache_unload_count: {int(summary['topic_cache_unload_count'])}")
+    print(f"topic_cache_contrib_ratio: {summary['topic_cache_contrib_ratio']:.4f}")
+    print(f"avg_sim_ops_total_per_turn: {summary['avg_sim_ops_total_per_turn']:.2f}")
+    print(f"p95_sim_ops_total_per_turn: {summary['p95_sim_ops_total_per_turn']:.2f}")
+    print(f"normalize_events: {int(summary['normalize_events'])}")
+    print(f"heat_gini_start: {summary['heat_gini_start']:.4f}")
+    print(f"heat_gini_end: {summary['heat_gini_end']:.4f}")
+    print(f"heat_gini_delta: {summary['heat_gini_delta']:.4f}")
+    print(f"heat_gini_max: {summary['heat_gini_max']:.4f}")
+
+    stable_turn = stability.get("stable_turn")
+    gain_turn = gain.get("gain_turn")
+    stable_text = str(stable_turn) if isinstance(stable_turn, int) else "not reached"
+    gain_text = str(gain_turn) if isinstance(gain_turn, int) else "not reached"
+    print(f"stability_turn: {stable_text}")
+    print(f"gain_threshold_turn: {gain_text}")
+    if isinstance(stable_turn, int) and isinstance(gain_turn, int):
+        print(f"recommended_turn_budget: {max(stable_turn, gain_turn)}")
+
+    print(f"snapshot_csv: {out_csv}")
+    print(f"summary_json: {out_json}")
 
     if not args.no_plot:
-        if args.plot_out:
-            plot_out = Path(args.plot_out)
-        elif args.output:
-            plot_out = Path(args.output).with_suffix(".png")
-        else:
-            plot_out = Path("sim_results.png")
+        plot_out = Path(args.plot_out) if args.plot_out else out_csv.with_suffix(".png")
         ok, reason = save_plot(plot_out, result["snapshots"], summary, dpi=args.plot_dpi)
         if ok:
-            print(f"Snapshot plot saved to {plot_out}")
+            print(f"snapshot_plot: {plot_out}")
         else:
-            print(f"Snapshot plot skipped: {reason}")
+            print(f"snapshot_plot: skipped ({reason})")
 
 
 if __name__ == "__main__":
