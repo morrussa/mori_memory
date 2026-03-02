@@ -196,7 +196,7 @@ M.settings = {
         },
         fact_extractor = {
             -- 默认对齐 simu/dialog_hf_realflow_pipeline.py 的 high_recall_v1 + verify pass。
-            prompt_style = "high_recall_v1", -- 可选：high_recall_v1 / strict_v2 / balanced_v3 / balanced_en_v1 / baseline
+            prompt_style = "balanced_v3", -- 可选：high_recall_v1 / strict_v2 / balanced_v3 / balanced_en_v1 / baseline
             verify_pass = true,              -- 开启二次质检，控制噪声
             max_facts = 8,                   -- 单轮最多入库原子事实数
             max_parse_items = 12,            -- 单次解析最多保留候选数量
