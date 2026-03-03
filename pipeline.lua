@@ -15,7 +15,7 @@ local app_config = require("module.config")
 -- 1. 配置模型路径
 local base = "/home/morusa/AI/mori/model/"
 local config = {
-    large_model = base .. "Qwen3-4B-Q4_K_M.gguf",
+    large_model = base .. "Qwen3.5-9B-Q6_K.gguf",
     embedding_model = base .. "Qwen3-Embedding-0.6B-Q8_0.gguf"
 }
 
