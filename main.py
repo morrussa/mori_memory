@@ -3,6 +3,7 @@ from lupa.luajit21 import LuaRuntime
 from llama_cpp import Llama
 import numpy as np
 import zstandard as zstd
+import json
 import os
 import io
 import tarfile
@@ -10,6 +11,63 @@ import shutil
 
 
 class AIPipeline:
+    TOOL_SCHEMAS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "upsert_record",
+                "description": "Upsert one long-term record item into keyring memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "entity": {"type": "string"},
+                        "value": {"type": "string"},
+                        "evidence": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["type", "entity", "value"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_record",
+                "description": "Query keyring memory for reusable facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "types": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ]
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_record",
+                "description": "Delete one record by type and entity.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "entity": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": ["type", "entity"],
+                },
+            },
+        },
+    ]
+
     def __init__(self):
         self.llm_large = None   # GPU 大模型（生成用）
         self.llm_embed = None   # GGUF Embedding 模型
@@ -89,34 +147,45 @@ class AIPipeline:
             out.append(self._normalize_embedding_vec(emb))
         return out
 
-    def generate_chat_sync(self, messages, params):
-        """同步版本：直接返回生成文本（供原子事实提取使用）"""
-        if not self.llm_large:
-            raise RuntimeError("Large model not loaded")
-        
+    def _messages_to_list(self, messages):
         messages_list = []
         try:
             length = len(messages)
             if length > 0:
-                for i in range(1, length + 1):
-                    msg = messages[i]
-                    if msg and 'role' in msg and 'content' in msg:
-                        messages_list.append({
-                            'role': str(msg['role']),
-                            'content': str(msg['content'])
-                        })
-        except TypeError:
-            if 'role' in messages and 'content' in messages:
+                try:
+                    for i in range(1, length + 1):
+                        msg = messages[i]
+                        if msg and 'role' in msg and 'content' in msg:
+                            messages_list.append({
+                                'role': str(msg['role']),
+                                'content': str(msg['content'])
+                            })
+                except Exception:
+                    messages_list = []
+                    try:
+                        for i in range(0, length):
+                            msg = messages[i]
+                            if msg and 'role' in msg and 'content' in msg:
+                                messages_list.append({
+                                    'role': str(msg['role']),
+                                    'content': str(msg['content'])
+                                })
+                    except Exception:
+                        messages_list = []
+        except Exception:
+            if messages and 'role' in messages and 'content' in messages:
                 messages_list.append({
                     'role': str(messages['role']),
                     'content': str(messages['content'])
                 })
-        
-        params_dict = dict(params) if hasattr(params, 'keys') else params
+        return messages_list
+
+    def _normalize_generation_params(self, params):
+        params_dict = dict(params) if hasattr(params, 'keys') else (params or {})
         max_tokens = int(params_dict.get("max_tokens", 128))
         temperature = float(params_dict.get("temperature", 0.7))
         stop = [str(s) for s in params_dict.get("stop", []) if s is not None]
-        
+
         seed = params_dict.get("seed")
         if seed is not None:
             try:
@@ -125,15 +194,134 @@ class AIPipeline:
                     seed = None
             except (TypeError, ValueError):
                 seed = None
-        
+
+        return {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stop": stop,
+            "seed": seed,
+        }
+
+    @staticmethod
+    def _safe_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_types_field(v):
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            parts = [str(x).strip() for x in v if x is not None and str(x).strip()]
+            return ",".join(parts)
+        return ""
+
+    @staticmethod
+    def _parse_tool_arguments(raw_args):
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            try:
+                return json.loads(raw_args)
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def _extract_calls_from_response(self, output):
+        choices = output.get("choices") if isinstance(output, dict) else None
+        if not choices:
+            return []
+        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(msg, dict):
+            return []
+        tool_calls = msg.get("tool_calls") or []
+        calls = []
+
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            fn_name = str(fn.get("name") or "").strip()
+            args_obj = self._parse_tool_arguments(fn.get("arguments"))
+            if not fn_name or not isinstance(args_obj, dict):
+                continue
+
+            if fn_name == "upsert_record":
+                call = {
+                    "act": "upsert_record",
+                    "type": str(args_obj.get("type") or ""),
+                    "entity": str(args_obj.get("entity") or ""),
+                    "value": str(args_obj.get("value") or ""),
+                    "evidence": str(args_obj.get("evidence") or ""),
+                    "confidence": self._safe_float(args_obj.get("confidence")),
+                }
+            elif fn_name == "query_record":
+                call = {
+                    "act": "query_record",
+                    "query": str(args_obj.get("query") or ""),
+                    "types": self._normalize_types_field(args_obj.get("types")),
+                }
+            elif fn_name == "delete_record":
+                call = {
+                    "act": "delete_record",
+                    "type": str(args_obj.get("type") or ""),
+                    "entity": str(args_obj.get("entity") or ""),
+                    "evidence": str(args_obj.get("evidence") or ""),
+                }
+            else:
+                continue
+
+            calls.append(call)
+
+        return calls
+
+    def generate_chat_sync(self, messages, params):
+        """同步版本：直接返回生成文本（供原子事实提取使用）"""
+        if not self.llm_large:
+            raise RuntimeError("Large model not loaded")
+
+        messages_list = self._messages_to_list(messages)
+        gen = self._normalize_generation_params(params)
         output = self.llm_large.create_chat_completion(
             messages=messages_list,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=stop,
-            seed=seed
+            max_tokens=gen["max_tokens"],
+            temperature=gen["temperature"],
+            stop=gen["stop"],
+            seed=gen["seed"]
         )
         return output['choices'][0]['message']['content']
+
+    def generate_tool_calls_sync(self, messages, params):
+        if not self.llm_large:
+            raise RuntimeError("Large model not loaded")
+
+        messages_list = self._messages_to_list(messages)
+        if not messages_list:
+            return [], "empty"
+
+        gen = self._normalize_generation_params(params)
+
+        for attempt in (1, 2):
+            try:
+                output = self.llm_large.create_chat_completion(
+                    messages=messages_list,
+                    tools=self.TOOL_SCHEMAS,
+                    tool_choice="auto",
+                    max_tokens=gen["max_tokens"],
+                    temperature=gen["temperature"],
+                    stop=gen["stop"],
+                    seed=gen["seed"],
+                )
+                calls = self._extract_calls_from_response(output)
+                if calls:
+                    return calls, "ok"
+                return [], "empty"
+            except Exception as e:
+                print(f"[Python][ToolCall] native tool call attempt {attempt} failed: {e}")
+
+        return [], "error"
 
     def load_models(self, large_model_path: str, embedding_model_path: str):
         print("[Python] Loading models...")
@@ -332,50 +520,20 @@ class AIPipeline:
     def generate_chat(self, messages, params, lua_callback):
         if not self.llm_large:
             raise RuntimeError("Large model not loaded")
-    
-        messages_list = []
-        try:
-            length = len(messages)
-            if length > 0:
-                for i in range(1, length + 1):
-                    msg = messages[i]
-                    if msg and 'role' in msg and 'content' in msg:
-                        messages_list.append({
-                            'role': str(msg['role']),
-                            'content': str(msg['content'])
-                        })
-        except TypeError:
-            if 'role' in messages and 'content' in messages:
-                messages_list.append({
-                    'role': str(messages['role']),
-                    'content': str(messages['content'])
-                })
-    
+
+        messages_list = self._messages_to_list(messages)
         if not messages_list:
             raise ValueError("Invalid messages format")
-    
-        params_dict = dict(params) if hasattr(params, 'keys') else params
-        max_tokens = int(params_dict.get("max_tokens", 128))
-        temperature = float(params_dict.get("temperature", 0.7))
-        stop = [str(s) for s in params_dict.get("stop", []) if s is not None]
-        
-        seed = params_dict.get("seed")
-        if seed is not None:
-            try:
-                seed = int(seed)
-                if seed < 0:
-                    seed = None
-            except (TypeError, ValueError):
-                seed = None
-    
-        print(f"[Python] Generating chat with large model... (stop: {stop})")
-    
+
+        gen = self._normalize_generation_params(params)
+        print(f"[Python] Generating chat with large model... (stop: {gen['stop']})")
+
         output = self.llm_large.create_chat_completion(
             messages=messages_list,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            seed=seed,
-            stop=stop
+            max_tokens=gen["max_tokens"],
+            temperature=gen["temperature"],
+            seed=gen["seed"],
+            stop=gen["stop"]
         )
     
         text_result = output['choices'][0]['message']['content']

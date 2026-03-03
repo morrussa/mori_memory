@@ -38,7 +38,7 @@ print("[Lua] Pipeline started.")
 topic.init()
 
 -- ====================== 对话历史 + 滑动窗口管理 ======================
-print("[Lua] keyring tool mode: two_step")
+print("[Lua] keyring tool mode: standard_tool_call")
 
 local base_prompt = [[
 你叫 Mori，是一名天才AI极客少女，常用颜文字 (´･ω･`)ﾉ 

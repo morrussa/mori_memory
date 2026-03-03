@@ -102,16 +102,6 @@ local function strip_cot_safe(text)
     return cleaned
 end
 
-local function parse_field(tbl_line, field)
-    local dq = tbl_line:match(field .. '%s*=%s*"([^"]*)"')
-    if dq then return dq end
-    local sq = tbl_line:match(field .. "%s*=%s*'([^']*)'")
-    if sq then return sq end
-    local raw = tbl_line:match(field .. "%s*=%s*([^,%}]+)")
-    if raw then return trim(raw) end
-    return nil
-end
-
 local function split_csv(s)
     local out = {}
     s = trim(s)
@@ -129,76 +119,6 @@ local function clamp01(v, fallback)
     if n < 0 then return 0 end
     if n > 1 then return 1 end
     return n
-end
-
-local function parse_tool_call_line(line)
-    local s = trim(line)
-    if s == "" then return nil end
-    if not s:match("^%b{}$") then
-        local first = tool.extract_first_lua_table and tool.extract_first_lua_table(s) or s:match("%b{}")
-        if not first then return nil end
-        s = trim(first)
-    end
-    if not s:find("act%s*=") then return nil end
-
-    local act_raw = parse_field(s, "act")
-    if not act_raw then return nil end
-    local act = string.lower(trim((act_raw:gsub('^["\'](.-)["\']$', "%1"))))
-    if act == "" then return nil end
-
-    return {
-        raw = s,
-        act = act,
-        string = parse_field(s, "string"),
-        query = parse_field(s, "query"),
-        type = parse_field(s, "type"),
-        types = parse_field(s, "types"),
-        entity = parse_field(s, "entity"),
-        evidence = parse_field(s, "evidence"),
-        confidence = parse_field(s, "confidence"),
-        namespace = parse_field(s, "namespace"),
-        key = parse_field(s, "key"),
-        value = parse_field(s, "value"),
-    }
-end
-
-local function split_tool_calls_and_text(text)
-    local calls = {}
-    local kept = {}
-
-    text = tostring(text or "")
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        local call = parse_tool_call_line(line)
-        if call then
-            table.insert(calls, call)
-        else
-            table.insert(kept, line)
-        end
-    end
-
-    local visible = table.concat(kept, "\n")
-    visible = trim(visible)
-    return calls, visible
-end
-
-local function collect_tool_calls_only(text)
-    local calls = {}
-    text = tostring(text or "")
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        local call = parse_tool_call_line(line)
-        if call then
-            table.insert(calls, call)
-        end
-    end
-    if #calls > 0 then return calls end
-
-    for block in text:gmatch("%b{}") do
-        local call = parse_tool_call_line(block)
-        if call then
-            table.insert(calls, call)
-        end
-    end
-    return calls
 end
 
 local function utf8_take(s, max_chars)
@@ -284,23 +204,24 @@ local function deterministic_rerank(results, query)
     return out
 end
 
-local function build_tool_pass_prompt(user_input, assistant_text, policy)
+local function build_tool_plan_prompt(user_input, assistant_text, policy)
     local delete_flag = policy.delete_enabled and "允许" or "禁用"
     return string.format([[
-你是 keyring 工具调用规划器，只负责输出工具调用，不负责回复用户。
+你是 keyring 工具调用规划器。
+你将通过标准工具调用返回动作，不要直接回复用户答案。
 
-可用调用（每条必须单独一行，严格 Lua table）：
-{act="upsert_record", type="preference|constraint|identity|credential_hint|long_term_plan", entity="对象", value="内容", evidence="原话片段", confidence=0.0}
-{act="query_record", query="检索内容", types="可选逗号分隔type列表"}
-{act="delete_record", type="...", entity="对象", evidence="删除依据"}
+可用工具：
+1) upsert_record(type, entity, value, evidence, confidence)
+2) query_record(query, types)
+3) delete_record(type, entity, evidence)
 
 硬约束：
-1. 只输出工具调用行，不要解释、不要 markdown、不要代码块。
-2. 如果不需要调用，输出空字符串。
-3. upsert_record 只在“明确且长期稳定事实”时调用，confidence 必须 >= %.2f。
-4. 本轮最多 upsert_record %d 条，最多 query_record %d 条。
-5. delete_record 当前%s。
-6. query_record 可适当发散（同义词、上位词）提高命中，但必须与当前问题相关。
+1. 如果不需要调用，不要调用工具。
+2. upsert_record 只在“明确且长期稳定事实”时调用，confidence 必须 >= %.2f。
+3. 本轮最多 upsert_record %d 条，最多 query_record %d 条。
+4. delete_record 当前%s。
+5. query_record 可适当发散（同义词、上位词）提高命中，但必须与当前问题相关。
+6. 仅在和当前问题强相关时才调用工具。
 
 输入上下文：
 用户原话：
@@ -311,8 +232,59 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy)
 ]], policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, user_input, assistant_text)
 end
 
-local function generate_two_step_tool_calls(user_input, assistant_text, policy)
-    local prompt = build_tool_pass_prompt(user_input, assistant_text, policy)
+local function py_get(obj, key)
+    if obj == nil then return nil end
+    local ok, v = pcall(function() return obj[key] end)
+    if ok then return v end
+    return nil
+end
+
+local function py_calls_to_lua_calls(py_calls)
+    local calls = {}
+    if py_calls == nil then return calls end
+
+    local function push_item(item)
+        local act = trim(py_get(item, "act"))
+        if act == "" then return end
+        local call = {
+            act = act,
+            type = trim(py_get(item, "type")),
+            entity = trim(py_get(item, "entity")),
+            value = trim(py_get(item, "value")),
+            evidence = trim(py_get(item, "evidence")),
+            confidence = py_get(item, "confidence"),
+            query = trim(py_get(item, "query")),
+            types = trim(py_get(item, "types")),
+        }
+        table.insert(calls, call)
+    end
+
+    local ok0, v0 = pcall(function() return py_calls[0] end)
+    if ok0 and v0 ~= nil then
+        local i = 0
+        while true do
+            local ok_idx, item = pcall(function() return py_calls[i] end)
+            if not ok_idx or item == nil then break end
+            push_item(item)
+            i = i + 1
+        end
+        return calls
+    end
+
+    local ok_len, n = pcall(function() return #py_calls end)
+    if ok_len and tonumber(n) and n > 0 then
+        for i = 1, n do
+            local item = py_calls[i]
+            if item ~= nil then
+                push_item(item)
+            end
+        end
+    end
+    return calls
+end
+
+local function generate_standard_tool_calls(user_input, assistant_text, policy)
+    local prompt = build_tool_plan_prompt(user_input, assistant_text, policy)
     local tool_messages = {
         { role = "system", content = prompt }
     }
@@ -321,11 +293,17 @@ local function generate_two_step_tool_calls(user_input, assistant_text, policy)
         temperature = policy.tool_pass_temperature,
         seed = policy.tool_pass_seed,
     }
-    local raw = py_pipeline:generate_chat_sync(tool_messages, tool_params)
-    raw = strip_cot_safe(raw or "")
-    local calls = collect_tool_calls_only(raw)
+
+    local py_calls, status = py_pipeline:generate_tool_calls_sync(tool_messages, tool_params)
+    status = trim(status or "")
+    if status ~= "ok" then
+        print(string.format("[ToolCalling] standard tool_call 跳过: status=%s", status ~= "" and status or "unknown"))
+        return {}
+    end
+
+    local calls = py_calls_to_lua_calls(py_calls)
     if #calls > 0 then
-        print(string.format("[ToolCalling] two_step 产出 %d 条调用", #calls))
+        print(string.format("[ToolCalling] standard tool_call 产出 %d 条调用", #calls))
     end
     return calls
 end
@@ -458,9 +436,7 @@ local function execute_tool_calls(calls, current_turn, policy)
 
     for _, call in ipairs(calls) do
         local ok, msg
-        if call.act == "save_key" then
-            ok, msg = false, "two_step 模式禁用 save_key"
-        elseif call.act == "upsert_record" then
+        if call.act == "upsert_record" then
             ok, msg = apply_upsert_record(call, current_turn, policy, state)
         elseif call.act == "delete_record" then
             ok, msg = apply_delete_record(call, current_turn, policy)
@@ -476,7 +452,7 @@ local function execute_tool_calls(calls, current_turn, policy)
 end
 
 local function resolve_calls_for_turn(user_input, clean_result, policy)
-    return generate_two_step_tool_calls(user_input, clean_result, policy)
+    return generate_standard_tool_calls(user_input, clean_result, policy)
 end
 
 local function build_fact_prompt(user_input, assistant_clean, style)
@@ -875,11 +851,7 @@ function M.handle_chat_result(ctx, result)
 
     local policy = get_tool_policy()
     local cot_clean = strip_cot_safe(result or "")
-    local parsed_calls, visible_text = split_tool_calls_and_text(cot_clean)
-    local clean_result = visible_text
-    if clean_result == "" and #parsed_calls == 0 then
-        clean_result = trim(cot_clean)
-    end
+    local clean_result = trim(cot_clean)
     if clean_result == "" then
         clean_result = "好的，已记录。"
     end
