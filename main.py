@@ -906,6 +906,11 @@ class MoriWebUIChainBridge:
         self.session_debug = bool(session_debug)
         self.primary_conversation_name = "Mori"
         self.history_file_path = str(history_file_path or "memory/history.txt")
+        self.webui_input_chunk_chars = max(256, _read_env_int("MORI_WEBUI_INPUT_CHUNK_CHARS", 4096))
+        self.webui_user_text_max_chars = max(2048, _read_env_int("MORI_WEBUI_USER_TEXT_MAX_CHARS", 120000))
+        self.webui_fingerprint_text_max_chars = max(
+            256, _read_env_int("MORI_WEBUI_FINGERPRINT_TEXT_MAX_CHARS", 4096)
+        )
         self._auto_primary_session = None
         self._primary_session_alias = None
         self._primary_last_seen_ts = 0.0
@@ -922,25 +927,74 @@ class MoriWebUIChainBridge:
         return False
 
     @staticmethod
-    def _content_to_text(content) -> str:
+    def _iter_text_chunks(text: str, chunk_chars: int):
+        value = str(text or "")
+        if not value:
+            return
+        step = max(1, int(chunk_chars or 4096))
+        for i in range(0, len(value), step):
+            yield value[i : i + step]
+
+    @classmethod
+    def _iter_content_text_chunks(cls, content, chunk_chars: int = 4096):
         if isinstance(content, str):
-            return content
+            for chunk in cls._iter_text_chunks(content, chunk_chars):
+                yield chunk
+            return
         if isinstance(content, list):
-            chunks = []
             for item in content:
                 if not isinstance(item, dict):
                     continue
+                text = ""
                 if item.get("type") == "text":
-                    chunks.append(str(item.get("text", "")))
+                    text = str(item.get("text", ""))
                 elif "text" in item and item.get("text") is not None:
-                    chunks.append(str(item.get("text")))
-            return "".join(chunks)
+                    text = str(item.get("text"))
+                if not text:
+                    continue
+                for chunk in cls._iter_text_chunks(text, chunk_chars):
+                    yield chunk
+            return
         if content is None:
-            return ""
-        return str(content)
+            return
+        for chunk in cls._iter_text_chunks(str(content), chunk_chars):
+            yield chunk
 
     @classmethod
-    def _extract_last_user_text(cls, messages) -> str:
+    def _content_to_text_limited(cls, content, chunk_chars: int = 4096, max_chars=None):
+        limit = None
+        if max_chars is not None:
+            limit = max(0, int(max_chars))
+        out = io.StringIO()
+        written = 0
+        truncated = False
+        for piece in cls._iter_content_text_chunks(content, chunk_chars=chunk_chars):
+            if limit is not None and written >= limit:
+                truncated = True
+                break
+            if limit is None:
+                out.write(piece)
+                written += len(piece)
+                continue
+            remaining = limit - written
+            if len(piece) <= remaining:
+                out.write(piece)
+                written += len(piece)
+                continue
+            if remaining > 0:
+                out.write(piece[:remaining])
+                written += remaining
+            truncated = True
+            break
+        return out.getvalue(), truncated
+
+    @classmethod
+    def _content_to_text(cls, content, chunk_chars: int = 4096, max_chars=None) -> str:
+        text, _truncated = cls._content_to_text_limited(content, chunk_chars=chunk_chars, max_chars=max_chars)
+        return text
+
+    @classmethod
+    def _extract_last_user_text(cls, messages, chunk_chars: int = 4096, max_chars=None) -> str:
         if not isinstance(messages, list):
             return ""
         for msg in reversed(messages):
@@ -948,13 +1002,25 @@ class MoriWebUIChainBridge:
                 continue
             if str(msg.get("role", "")).lower() != "user":
                 continue
-            text = cls._content_to_text(msg.get("content"))
-            if text.strip():
-                return text.strip()
+            text, truncated = cls._content_to_text_limited(
+                msg.get("content"),
+                chunk_chars=chunk_chars,
+                max_chars=max_chars,
+            )
+            stripped = text.strip()
+            if not stripped:
+                continue
+            if truncated:
+                stripped = (
+                    stripped
+                    + "\n\n[Input truncated for this turn after chunked read to protect context limits. "
+                    + "If needed, send the next chunk.]"
+                )
+            return stripped
         return ""
 
     @classmethod
-    def _extract_first_role_text(cls, messages, role: str) -> str:
+    def _extract_first_role_text(cls, messages, role: str, chunk_chars: int = 4096, max_chars=None) -> str:
         if not isinstance(messages, list):
             return ""
         role_l = str(role or "").lower()
@@ -963,7 +1029,11 @@ class MoriWebUIChainBridge:
                 continue
             if str(msg.get("role", "")).lower() != role_l:
                 continue
-            text = cls._content_to_text(msg.get("content"))
+            text = cls._content_to_text(
+                msg.get("content"),
+                chunk_chars=chunk_chars,
+                max_chars=max_chars,
+            )
             if text.strip():
                 return text.strip()
         return ""
@@ -1001,8 +1071,18 @@ class MoriWebUIChainBridge:
             return fixed, "fallback.primary_session"
 
         messages = payload.get("messages") if isinstance(payload, dict) else None
-        first_system = self._extract_first_role_text(messages, "system")
-        first_user = self._extract_first_role_text(messages, "user")
+        first_system = self._extract_first_role_text(
+            messages,
+            "system",
+            chunk_chars=self.webui_input_chunk_chars,
+            max_chars=self.webui_fingerprint_text_max_chars,
+        )
+        first_user = self._extract_first_role_text(
+            messages,
+            "user",
+            chunk_chars=self.webui_input_chunk_chars,
+            max_chars=self.webui_fingerprint_text_max_chars,
+        )
         user_agent = str(handler.headers.get("User-Agent", "") or "")
         client_ip = ""
         try:
@@ -1839,7 +1919,11 @@ class MoriWebUIChainBridge:
         model = str(payload.get("model") or self.model_name)
         stream = bool(payload.get("stream"))
         read_only = session_role != "primary"
-        user_text = self._extract_last_user_text(payload.get("messages"))
+        user_text = self._extract_last_user_text(
+            payload.get("messages"),
+            chunk_chars=self.webui_input_chunk_chars,
+            max_chars=self.webui_user_text_max_chars,
+        )
         if not user_text:
             self._send_oai_error(
                 handler,

@@ -181,6 +181,11 @@ agent = {
 
 补充语义：
 - `upsert_max_per_turn` / `query_max_per_turn` 为同一 `turn` 内跨 `step` 累计预算，不会在多步循环中按 step 重置。
+- 记忆通道文件策略（专业建议）：
+  - `settings.keyring.memory_input.max_chars = 2048`：记忆检索/事实提取输入硬上限
+  - `settings.keyring.memory_input.recall_file_payload_mode = "ignore"`：召回阶段忽略附件正文
+  - `settings.keyring.memory_input.fact_file_payload_mode = "ignore"`：原子事实提取阶段忽略附件正文
+  - 可选 `filename_only`：仅保留文件名清单，不传正文
 
 ### 新日志字段
 

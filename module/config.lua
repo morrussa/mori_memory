@@ -194,9 +194,19 @@ M.settings = {
             tool_pass_max_tokens = 128,     -- 二阶段工具调用长度
             tool_pass_seed = 42,            -- 二阶段工具调用随机种子
         },
+        memory_input = {
+            -- 专业策略：对“记忆检索/原子事实提取”走独立输入通道，默认忽略附件正文。
+            file_payload_mode = "ignore",      -- 全局默认：ignore | filename_only | keep
+            recall_file_payload_mode = "ignore", -- 召回搜索阶段文件处理
+            fact_file_payload_mode = "ignore",   -- 原子事实提取阶段文件处理
+            max_chars = 2048,                  -- 记忆通道硬上限（避免炸预算）
+            manifest_max_items = 8,            -- filename_only 时最多保留的文件名条数
+            manifest_name_max_chars = 96,      -- filename_only 时单文件名最大长度
+        },
         fact_extractor = {
             -- 默认对齐 simu/dialog_hf_realflow_pipeline.py 的 high_recall_v1 + verify pass。
             prompt_style = "balanced_v3", -- 可选：high_recall_v1 / strict_v2 / balanced_v3 / balanced_en_v1 / baseline
+            file_payload_mode = "ignore",   -- 兼容旧配置：未设置 keyring.memory_input 时作为 fallback
             verify_pass = true,              -- 开启二次质检，控制噪声
             max_facts = 8,                   -- 单轮最多入库原子事实数
             max_parse_items = 12,            -- 单次解析最多保留候选数量

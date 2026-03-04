@@ -20,7 +20,10 @@ end
 
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
 local FACT_CFG = ((config_mem.settings or {}).keyring or {}).fact_extractor or {}
+local MEMORY_INPUT_CFG = ((config_mem.settings or {}).keyring or {}).memory_input or {}
 local trim
+local resolve_file_payload_mode
+local get_memory_input_policy
 
 local function to_bool(v, fallback)
     if type(v) == "boolean" then return v end
@@ -70,8 +73,13 @@ end
 local function get_fact_policy()
     local style = cfg_string(FACT_CFG.prompt_style, "high_recall_v1")
     local default_extract_tokens = (style == "high_recall_v1") and 320 or 256
+    local input_policy = get_memory_input_policy()
     return {
         prompt_style = style,
+        file_payload_mode = input_policy.fact_mode,
+        memory_input_max_chars = input_policy.max_chars,
+        memory_manifest_max_items = input_policy.manifest_max_items,
+        memory_manifest_name_max_chars = input_policy.manifest_name_max_chars,
         verify_pass = to_bool(FACT_CFG.verify_pass, true),
         max_facts = cfg_number(FACT_CFG.max_facts, 8, 1, 16),
         max_parse_items = cfg_number(FACT_CFG.max_parse_items, 12, 1, 24),
@@ -100,6 +108,124 @@ local function strip_cot_safe(text)
         cleaned = text
     end
     return cleaned
+end
+
+resolve_file_payload_mode = function(mode, fallback_mode)
+    local raw = trim(mode)
+    if raw == "" then
+        raw = trim(fallback_mode)
+    end
+    if raw == "" then
+        raw = "ignore"
+    end
+    local low = trim(raw):lower()
+    if low == "filename" then low = "filename_only" end
+    if low ~= "ignore" and low ~= "filename_only" and low ~= "keep" then
+        low = "ignore"
+    end
+    return low
+end
+
+get_memory_input_policy = function()
+    local default_mode = resolve_file_payload_mode(
+        MEMORY_INPUT_CFG.file_payload_mode,
+        FACT_CFG.file_payload_mode
+    )
+    return {
+        recall_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.recall_file_payload_mode, default_mode),
+        fact_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.fact_file_payload_mode, default_mode),
+        max_chars = cfg_number(MEMORY_INPUT_CFG.max_chars, 2048, 256, 32768),
+        manifest_max_items = cfg_number(MEMORY_INPUT_CFG.manifest_max_items, 8, 1, 64),
+        manifest_name_max_chars = cfg_number(MEMORY_INPUT_CFG.manifest_name_max_chars, 96, 8, 256),
+    }
+end
+
+function M.get_memory_input_policy()
+    return get_memory_input_policy()
+end
+
+local function is_file_attachment_label(label)
+    local raw = trim(label)
+    if raw == "" then return false end
+    local low = raw:lower()
+    if low:find("file", 1, true) then return true end
+    if low:find("pdf", 1, true) then return true end
+    if raw:find("文件", 1, true) then return true end
+    if raw:find("附件", 1, true) then return true end
+    return false
+end
+
+local function strip_file_payload_for_memory(text, opts)
+    text = tostring(text or "")
+    opts = opts or {}
+    local mode = resolve_file_payload_mode(opts.mode, "ignore")
+    local manifest_max_items = cfg_number(opts.manifest_max_items, 8, 1, 64)
+    local manifest_name_max_chars = cfg_number(opts.manifest_name_max_chars, 96, 8, 256)
+    if text == "" or mode == "keep" then
+        return text, false, 0
+    end
+    if not text:find("%-%-%-", 1, true) then
+        return text, false, 0
+    end
+
+    local kept = {}
+    local in_file_block = false
+    local redacted_blocks = 0
+    local file_names = {}
+
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        local tline = trim(line)
+        local label, name = tline:match("^%-%-%-%s*([^:]+)%s*:%s*(.-)%s*%-%-%-%s*$")
+        if label and is_file_attachment_label(label) then
+            redacted_blocks = redacted_blocks + 1
+            in_file_block = true
+            local fname = trim(name)
+            if fname == "" then fname = "unknown" end
+            fname = fname:gsub("[%c]+", " ")
+            if #fname > manifest_name_max_chars then
+                fname = fname:sub(1, manifest_name_max_chars) .. "..."
+            end
+            file_names[#file_names + 1] = fname
+        elseif label then
+            in_file_block = false
+            kept[#kept + 1] = line
+        else
+            if not in_file_block then
+                kept[#kept + 1] = line
+            end
+        end
+    end
+
+    if redacted_blocks <= 0 then
+        return text, false, 0
+    end
+
+    if mode == "filename_only" and #file_names > 0 then
+        local listed = 0
+        kept[#kept + 1] = ""
+        kept[#kept + 1] = "[附件清单(仅文件名)]"
+        for _, fname in ipairs(file_names) do
+            listed = listed + 1
+            if listed > manifest_max_items then
+                break
+            end
+            kept[#kept + 1] = string.format("- %s", fname)
+        end
+        local rest = #file_names - listed
+        if rest > 0 then
+            kept[#kept + 1] = string.format("- ... (%d more files)", rest)
+        end
+    end
+
+    local out = trim(table.concat(kept, "\n"))
+    if out == "" then
+        if mode == "filename_only" and #file_names > 0 then
+            out = "[用户上传了文件附件: " .. table.concat(file_names, ", ") .. "]"
+        else
+            out = "[用户上传了文件附件，正文已忽略]"
+        end
+    end
+    return out, true, redacted_blocks
 end
 
 local function parse_field(tbl_line, field)
@@ -798,6 +924,51 @@ local function verify_facts(user_input, assistant_clean, candidates, fact_policy
     return parse_facts_from_llm(raw, fact_policy, "verify")
 end
 
+function M.sanitize_memory_input(user_input, opts)
+    local safe = tostring(user_input or "")
+    if tool.utf8_sanitize_lossy then
+        safe = tool.utf8_sanitize_lossy(safe)
+    end
+    local input_policy = get_memory_input_policy()
+    local mode = ""
+    local max_chars = input_policy.max_chars
+    local manifest_max_items = input_policy.manifest_max_items
+    local manifest_name_max_chars = input_policy.manifest_name_max_chars
+
+    if type(opts) == "string" then
+        mode = trim(opts)
+    elseif type(opts) == "table" then
+        mode = trim(opts.mode or opts.file_payload_mode or "")
+        if opts.max_chars ~= nil then
+            max_chars = cfg_number(opts.max_chars, max_chars, 256, 32768)
+        end
+        if opts.manifest_max_items ~= nil then
+            manifest_max_items = cfg_number(opts.manifest_max_items, manifest_max_items, 1, 64)
+        end
+        if opts.manifest_name_max_chars ~= nil then
+            manifest_name_max_chars = cfg_number(opts.manifest_name_max_chars, manifest_name_max_chars, 8, 256)
+        end
+    end
+
+    local resolved_mode = resolve_file_payload_mode(mode, input_policy.recall_mode)
+    local normalized, changed, blocks = strip_file_payload_for_memory(safe, {
+        mode = resolved_mode,
+        manifest_max_items = manifest_max_items,
+        manifest_name_max_chars = manifest_name_max_chars,
+    })
+
+    local truncated = false
+    if max_chars > 0 then
+        local clipped = utf8_take(normalized, max_chars)
+        if clipped ~= normalized then
+            truncated = true
+            normalized = trim(clipped) .. "\n\n[memory input truncated]"
+        end
+    end
+
+    return normalized, (changed or truncated), blocks, resolved_mode, truncated
+end
+
 function M.extract_atomic_facts(user_input, assistant_text)
     local fact_policy = get_fact_policy()
     local safe_user = tostring(user_input or "")
@@ -806,8 +977,22 @@ function M.extract_atomic_facts(user_input, assistant_text)
         safe_user = tool.utf8_sanitize_lossy(safe_user)
         safe_assistant = tool.utf8_sanitize_lossy(safe_assistant)
     end
+    local memory_user, changed, blocks, mode, truncated = M.sanitize_memory_input(safe_user, {
+        mode = fact_policy.file_payload_mode,
+        max_chars = fact_policy.memory_input_max_chars,
+        manifest_max_items = fact_policy.memory_manifest_max_items,
+        manifest_name_max_chars = fact_policy.memory_manifest_name_max_chars,
+    })
+    if changed then
+        print(string.format(
+            "[Lua Fact Extract] memory 输入净化（mode=%s, blocks=%d, truncated=%s）",
+            tostring(mode),
+            tonumber(blocks) or 0,
+            truncated and "yes" or "no"
+        ))
+    end
     local assistant_clean = tool.replace(safe_assistant, "\n", " ")
-    local fact_prompt = build_fact_prompt(safe_user, assistant_clean, fact_policy.prompt_style)
+    local fact_prompt = build_fact_prompt(memory_user, assistant_clean, fact_policy.prompt_style)
     local facts_str = run_fact_chat_once(
         fact_prompt,
         fact_policy.extract_max_tokens,
@@ -817,7 +1002,7 @@ function M.extract_atomic_facts(user_input, assistant_text)
     local facts = parse_facts_from_llm(facts_str, fact_policy, "extract")
 
     if #facts > 0 and fact_policy.verify_pass then
-        local checked = verify_facts(safe_user, assistant_clean, facts, fact_policy)
+        local checked = verify_facts(memory_user, assistant_clean, facts, fact_policy)
         if #checked > 0 then
             facts = checked
             print(string.format("[Lua Fact Extract] verify 通过，保留 %d 条", #facts))
@@ -835,7 +1020,7 @@ function M.extract_atomic_facts(user_input, assistant_text)
         facts = parse_facts_from_llm(repaired, fact_policy, "repair")
 
         if #facts > 0 and fact_policy.verify_pass then
-            local checked2 = verify_facts(safe_user, assistant_clean, facts, fact_policy)
+            local checked2 = verify_facts(memory_user, assistant_clean, facts, fact_policy)
             if #checked2 > 0 then
                 facts = checked2
                 print(string.format("[Lua Fact Extract] repair+verify 通过，保留 %d 条", #facts))

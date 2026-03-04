@@ -180,6 +180,22 @@ function M.run_turn(args)
         0,
         math.floor(tonumber(agent_cfg.max_failure_refine_steps) or 2)
     )
+    local memory_input_policy = tool_calling.get_memory_input_policy()
+    local memory_user_input, memory_input_sanitized, redacted_blocks, file_mode, memory_input_truncated =
+        tool_calling.sanitize_memory_input(user_input, {
+            mode = memory_input_policy.recall_mode,
+            max_chars = memory_input_policy.max_chars,
+            manifest_max_items = memory_input_policy.manifest_max_items,
+            manifest_name_max_chars = memory_input_policy.manifest_name_max_chars,
+        })
+    if memory_input_sanitized then
+        print(string.format(
+            "[AgentRuntime] memory 输入净化（mode=%s, blocks=%d, truncated=%s）",
+            tostring(file_mode),
+            tonumber(redacted_blocks) or 0,
+            memory_input_truncated and "yes" or "no"
+        ))
+    end
 
     local attempts = 0
     local done = false
@@ -188,14 +204,14 @@ function M.run_turn(args)
 
     state_name = "PREPARE"
     local current_turn = history.get_turn() + 1
-    local user_vec_q = tool.get_embedding_query(user_input)
-    local user_vec_p = tool.get_embedding_passage(user_input)
+    local user_vec_q = tool.get_embedding_query(memory_user_input)
+    local user_vec_p = tool.get_embedding_passage(memory_user_input)
     if not read_only then
-        topic.add_turn(current_turn, user_input, user_vec_p)
+        topic.add_turn(current_turn, memory_user_input, user_vec_p)
     end
 
     state_name = "BUILD_CONTEXT"
-    local memory_context = recall.check_and_retrieve(user_input, user_vec_q, {
+    local memory_context = recall.check_and_retrieve(memory_user_input, user_vec_q, {
         read_only = read_only,
     })
     local plan_bom = tool_registry.get_long_term_plan_bom()
@@ -379,7 +395,7 @@ function M.run_turn(args)
             add_to_history(user_input, final_result)
         end
 
-        local facts = tool_calling.extract_atomic_facts(user_input, final_result)
+        local facts = tool_calling.extract_atomic_facts(memory_user_input, final_result)
         local cur_summary = topic.get_summary(current_turn)
         if cur_summary and cur_summary ~= "" then
             print("[当前话题摘要] " .. cur_summary)
