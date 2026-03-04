@@ -135,7 +135,7 @@ http://127.0.0.1:8080
 ## AgentRuntime / ToolRegistry（一次性替换版）
 
 当前主链路已切到（按职责分层）：
-- `module/agent/runtime.lua`：主状态机（`PREPARE -> BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS -> PERSIST -> DONE`）
+- `module/agent/runtime.lua`：多步闭环状态机（循环 `BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS`，最后 `PERSIST`）
 - `module/agent/tool_planner.lua`：二阶段工具规划（只产出工具调用）
 - `module/agent/tool_registry.lua`：工具执行与 pending context（仅 notebook 工具）
 - `module/agent/context_window.lua`：按 token 预算裁剪上下文（模板后精确计数）
@@ -162,6 +162,9 @@ agent = {
     completion_reserve_tokens = 1024,
     token_count_mode = "templated_exact",
     context_drop_order = "memory_tool_plan",
+    continue_on_tool_context = true,
+    continue_on_tool_failure = true,
+    max_failure_refine_steps = 2,
 }
 ```
 
@@ -171,6 +174,7 @@ agent = {
 - `kept_pairs`
 - `dropped_blocks`
 - `tool_calls_count`
+- `continue reason`
 - `agent_state_end`
 
 

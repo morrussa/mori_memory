@@ -33,10 +33,87 @@ local function get_scratch_buf(pool, n)
     return buf
 end
 
+local function utf8_sanitize_lossy(s)
+    s = tostring(s or "")
+    local n = #s
+    if n <= 0 then return s end
+
+    local out = {}
+    local i = 1
+    while i <= n do
+        local b1 = s:byte(i)
+        if not b1 then break end
+
+        if b1 < 0x80 then
+            out[#out + 1] = string.char(b1)
+            i = i + 1
+        elseif b1 >= 0xC2 and b1 <= 0xDF then
+            local b2 = s:byte(i + 1)
+            if b2 and b2 >= 0x80 and b2 <= 0xBF then
+                out[#out + 1] = s:sub(i, i + 1)
+                i = i + 2
+            else
+                out[#out + 1] = "?"
+                i = i + 1
+            end
+        elseif b1 >= 0xE0 and b1 <= 0xEF then
+            local b2 = s:byte(i + 1)
+            local b3 = s:byte(i + 2)
+            local ok = false
+            if b2 and b3 and b2 >= 0x80 and b2 <= 0xBF and b3 >= 0x80 and b3 <= 0xBF then
+                if b1 == 0xE0 then
+                    ok = (b2 >= 0xA0 and b2 <= 0xBF)
+                elseif b1 == 0xED then
+                    ok = (b2 >= 0x80 and b2 <= 0x9F)
+                else
+                    ok = true
+                end
+            end
+            if ok then
+                out[#out + 1] = s:sub(i, i + 2)
+                i = i + 3
+            else
+                out[#out + 1] = "?"
+                i = i + 1
+            end
+        elseif b1 >= 0xF0 and b1 <= 0xF4 then
+            local b2 = s:byte(i + 1)
+            local b3 = s:byte(i + 2)
+            local b4 = s:byte(i + 3)
+            local ok = false
+            if b2 and b3 and b4 and b2 >= 0x80 and b2 <= 0xBF and b3 >= 0x80 and b3 <= 0xBF and b4 >= 0x80 and b4 <= 0xBF then
+                if b1 == 0xF0 then
+                    ok = (b2 >= 0x90 and b2 <= 0xBF)
+                elseif b1 == 0xF4 then
+                    ok = (b2 >= 0x80 and b2 <= 0x8F)
+                else
+                    ok = true
+                end
+            end
+            if ok then
+                out[#out + 1] = s:sub(i, i + 3)
+                i = i + 4
+            else
+                out[#out + 1] = "?"
+                i = i + 1
+            end
+        else
+            out[#out + 1] = "?"
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+function M.utf8_sanitize_lossy(s)
+    return utf8_sanitize_lossy(s)
+end
+
 -- ==================== 核心转换函数 ====================
 
 function M.get_embedding(text, mode)
     mode = mode or "query" -- "query" | "passage"
+    text = utf8_sanitize_lossy(text)
     local py_vec = py_pipeline:get_embedding(text, mode)
     return M._force_to_table(py_vec)
 end

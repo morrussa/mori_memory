@@ -148,7 +148,13 @@ end
 
 function M.plan_calls(user_input, assistant_text, policy)
     local p = policy or get_default_policy()
-    local prompt = build_tool_pass_prompt(tostring(user_input or ""), tostring(assistant_text or ""), p)
+    local safe_user = tostring(user_input or "")
+    local safe_assistant = tostring(assistant_text or "")
+    if tool.utf8_sanitize_lossy then
+        safe_user = tool.utf8_sanitize_lossy(safe_user)
+        safe_assistant = tool.utf8_sanitize_lossy(safe_assistant)
+    end
+    local prompt = build_tool_pass_prompt(safe_user, safe_assistant, p)
     local tool_messages = {
         { role = "user", content = prompt }
     }

@@ -1,0 +1,316 @@
+local function contains(s, part)
+    return tostring(s or ""):find(part, 1, true) ~= nil
+end
+
+local STUB_MODULES = {
+    "module.config",
+    "module.tool",
+    "module.memory.history",
+    "module.memory.topic",
+    "module.memory.recall",
+    "module.agent.tool_calling",
+    "module.agent.tool_planner",
+    "module.agent.tool_registry",
+    "module.agent.context_window",
+    "module.agent.runtime",
+}
+
+local function clear_modules()
+    for _, name in ipairs(STUB_MODULES) do
+        package.loaded[name] = nil
+        package.preload[name] = nil
+    end
+end
+
+local function install_stubs(state, scenario)
+    package.preload["module.config"] = function()
+        return {
+            settings = {
+                agent = {
+                    max_steps = scenario.max_steps or 4,
+                    input_token_budget = 12000,
+                    completion_reserve_tokens = 256,
+                    continue_on_tool_context = true,
+                    continue_on_tool_failure = true,
+                    max_failure_refine_steps = scenario.max_failure_refine_steps or 3,
+                }
+            }
+        }
+    end
+
+    package.preload["module.tool"] = function()
+        local M = {}
+        function M.remove_cot(text) return tostring(text or "") end
+        function M.extract_first_lua_table(s)
+            local first = tostring(s or ""):match("%b{}")
+            return first
+        end
+        function M.get_embedding_query(_) return { 0.1, 0.2 } end
+        function M.get_embedding_passage(_) return { 0.2, 0.3 } end
+        return M
+    end
+
+    package.preload["module.memory.history"] = function()
+        local M = {}
+        local turn = 0
+        function M.get_turn() return turn end
+        function M.add_history(user_text, assistant_text)
+            state.history_adds = state.history_adds + 1
+            state.last_history = { user = user_text, assistant = assistant_text }
+            turn = turn + 1
+        end
+        return M
+    end
+
+    package.preload["module.memory.topic"] = function()
+        local M = {}
+        function M.add_turn(current_turn, user_text, _)
+            state.topic_add_turns = state.topic_add_turns + 1
+            state.last_topic_turn = current_turn
+            state.last_topic_user = user_text
+        end
+        function M.update_assistant(current_turn, assistant_text)
+            state.topic_updates = state.topic_updates + 1
+            state.last_topic_update = { turn = current_turn, assistant = assistant_text }
+        end
+        function M.get_summary(_) return "" end
+        function M.get_topic_anchor(turn)
+            return "anchor-" .. tostring(turn or 0)
+        end
+        return M
+    end
+
+    package.preload["module.memory.recall"] = function()
+        local M = {}
+        function M.check_and_retrieve(user_input, _)
+            state.recall_calls = state.recall_calls + 1
+            state.last_recall_user = user_input
+            return "【相关记忆】\n记忆A"
+        end
+        return M
+    end
+
+    package.preload["module.agent.tool_calling"] = function()
+        local M = {}
+        function M.extract_atomic_facts(_, assistant_text)
+            state.extract_calls = state.extract_calls + 1
+            state.last_extract_input = assistant_text
+            return { "事实1" }
+        end
+        function M.save_turn_memory(facts, current_turn)
+            state.memory_save_calls = state.memory_save_calls + 1
+            state.last_saved = { facts = facts, turn = current_turn }
+        end
+        return M
+    end
+
+    package.preload["module.agent.tool_planner"] = function()
+        local M = {}
+        function M.plan_calls(_, assistant_text, _)
+            state.plan_calls = state.plan_calls + 1
+            state.plan_inputs[state.plan_calls] = assistant_text
+            local scripted = scenario.plan_outputs[state.plan_calls]
+            if scripted == nil then
+                scripted = scenario.plan_outputs[#scenario.plan_outputs] or {}
+            end
+            return scripted
+        end
+        return M
+    end
+
+    package.preload["module.agent.tool_registry"] = function()
+        local M = {}
+        local pending_ctx = ""
+
+        function M.get_long_term_plan_bom()
+            return "【LongTermPlan BOM】"
+        end
+
+        function M.get_policy()
+            return {}
+        end
+
+        function M.consume_pending_system_context_for_turn(_)
+            local out = pending_ctx
+            pending_ctx = ""
+            return out
+        end
+
+        function M.get_pending_system_context(_)
+            return pending_ctx
+        end
+
+        function M.execute_calls(calls, _)
+            state.exec_calls = state.exec_calls + 1
+            local result = {
+                executed = 0,
+                failed = 0,
+                skipped = 0,
+                logs = {},
+            }
+            for _, c in ipairs(calls or {}) do
+                if c.act == "query_record" then
+                    result.executed = result.executed + 1
+                    pending_ctx = "【Tool:query_record 上一轮检索结果】\nquery: " .. tostring(c.query or "")
+                    result.logs[#result.logs + 1] = "query_record ok (1 hits)"
+                elseif c.act == "fail_call" then
+                    result.failed = result.failed + 1
+                    result.logs[#result.logs + 1] = "fail_call simulated error"
+                else
+                    result.executed = result.executed + 1
+                    result.logs[#result.logs + 1] = "ok"
+                end
+            end
+            state.exec_results[state.exec_calls] = result
+            return result
+        end
+
+        return M
+    end
+
+    package.preload["module.agent.context_window"] = function()
+        local M = {}
+        function M.build_messages(opts)
+            state.build_context_calls = state.build_context_calls + 1
+            state.tool_contexts[state.build_context_calls] = tostring(opts.tool_context or "")
+            local messages = {
+                { role = "system", content = "sys" },
+                { role = "user", content = tostring(opts.user_input or "") },
+            }
+            local meta = {
+                total_tokens = 100,
+                kept_history_pairs = 0,
+                dropped_history_pairs = 0,
+                dropped_blocks = {},
+                budget = tonumber(opts.input_token_budget) or 0,
+            }
+            return messages, meta
+        end
+        return M
+    end
+
+    _G.py_pipeline = {
+        generate_chat = function(_, _, _, cb, _)
+            state.generate_calls = state.generate_calls + 1
+            local out = scenario.generate_outputs[state.generate_calls]
+            if out == nil then
+                out = scenario.generate_outputs[#scenario.generate_outputs]
+            end
+            cb(out)
+        end,
+    }
+end
+
+local function run_scenario(name, scenario)
+    clear_modules()
+    local state = {
+        generate_calls = 0,
+        build_context_calls = 0,
+        plan_calls = 0,
+        exec_calls = 0,
+        extract_calls = 0,
+        memory_save_calls = 0,
+        history_adds = 0,
+        topic_add_turns = 0,
+        topic_updates = 0,
+        recall_calls = 0,
+        tool_contexts = {},
+        plan_inputs = {},
+        exec_results = {},
+    }
+
+    install_stubs(state, scenario)
+
+    local runtime = require("module.agent.runtime")
+    local final = runtime.run_turn({
+        user_input = "请结合我的信息回答",
+        read_only = false,
+        conversation_history = {
+            { role = "system", content = "你是测试助手" },
+        },
+        add_to_history = function(_, _)
+            state.add_to_history_calls = (state.add_to_history_calls or 0) + 1
+        end,
+    })
+
+    scenario.assertions(state, final)
+    print(string.format("[PASS] %s | generate=%d plan=%d exec=%d", name, state.generate_calls, state.plan_calls, state.exec_calls))
+end
+
+local scenarios = {
+    {
+        name = "tool_hit_reinject",
+        max_steps = 4,
+        plan_outputs = {
+            {
+                { act = "query_record", query = "用户偏好", raw = '{act="query_record",query="用户偏好"}' },
+            },
+            {},
+        },
+        generate_outputs = {
+            "初版回答：我先给你一个大概结论。",
+            "最终答案（已结合工具检索）",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "tool_hit 应该触发第二步生成")
+            assert(state.plan_calls == 2, "tool_hit 应该进行两次工具规划")
+            assert(state.history_adds == 1, "最终持久化应只写一次 history")
+            assert(state.memory_save_calls == 1, "最终持久化应只写一次 memory")
+            assert(contains(state.tool_contexts[2], "Tool:query_record"), "第二步上下文应包含工具检索结果")
+            assert(final == "最终答案（已结合工具检索）", "最终答案应为第二步收敛结果")
+        end,
+    },
+    {
+        name = "tool_fail_refine",
+        max_steps = 4,
+        max_failure_refine_steps = 2,
+        plan_outputs = {
+            {
+                { act = "fail_call", raw = '{act="fail_call"}' },
+            },
+            {},
+        },
+        generate_outputs = {
+            "初版回答：尝试执行工具。",
+            "修正版回答：工具失败，给出无工具依赖方案。",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "tool_fail 应该触发失败后重修")
+            assert(contains(state.tool_contexts[2], "reason=tool_failed"), "第二步应包含失败反馈")
+            assert(state.exec_results[1] and state.exec_results[1].failed == 1, "第一步应有1次工具失败")
+            assert(final == "修正版回答：工具失败，给出无工具依赖方案。", "最终答案应是失败后修正版")
+        end,
+    },
+    {
+        name = "repeat_call_converge",
+        max_steps = 5,
+        max_failure_refine_steps = 4,
+        plan_outputs = {
+            {
+                { act = "fail_call", raw = '{act="fail_call",type="x"}' },
+            },
+            {
+                { act = "fail_call", raw = '{act="fail_call",type="x"}' },
+            },
+            {
+                { act = "fail_call", raw = '{act="fail_call",type="x"}' },
+            },
+        },
+        generate_outputs = {
+            "草稿1",
+            "草稿2",
+            "草稿3",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "重复同签名调用应在第2步收敛，避免死循环")
+            assert(state.exec_calls == 2, "重复同签名调用应只执行两轮")
+            assert(final == "草稿2", "重复签名收敛时应返回最后一版答案")
+        end,
+    },
+}
+
+for _, s in ipairs(scenarios) do
+    run_scenario(s.name, s)
+end
+
+print("ALL_SCENARIOS_PASS")

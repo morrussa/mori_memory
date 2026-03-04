@@ -72,6 +72,9 @@ local function normalize_result_text(result)
     if visible == "" then
         visible = "好的，已记录。"
     end
+    if tool.utf8_sanitize_lossy then
+        visible = tool.utf8_sanitize_lossy(visible)
+    end
     return visible
 end
 
@@ -84,6 +87,65 @@ end
 
 local function get_agent_cfg()
     return (config.settings or {}).agent or {}
+end
+
+local function to_bool(v, fallback)
+    if type(v) == "boolean" then return v end
+    if type(v) == "number" then return v ~= 0 end
+    if type(v) == "string" then
+        local s = v:lower()
+        if s == "true" or s == "1" or s == "yes" then return true end
+        if s == "false" or s == "0" or s == "no" then return false end
+    end
+    return fallback == true
+end
+
+local function utf8_take(s, max_chars)
+    s = tostring(s or "")
+    max_chars = tonumber(max_chars) or 0
+    if max_chars <= 0 then return s end
+
+    local out = {}
+    local count = 0
+    for ch in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        count = count + 1
+        if count > max_chars then break end
+        out[count] = ch
+    end
+    return table.concat(out)
+end
+
+local function build_step_feedback(step_idx, clean_result, calls, exec_result, reason, has_pending_ctx)
+    local lines = {
+        "【Agent多步反馈】",
+        string.format("step=%d reason=%s", tonumber(step_idx) or 0, tostring(reason or "unknown")),
+        string.format(
+            "calls=%d executed=%d failed=%d skipped=%d pending_context=%s",
+            #(calls or {}),
+            tonumber((exec_result or {}).executed) or 0,
+            tonumber((exec_result or {}).failed) or 0,
+            tonumber((exec_result or {}).skipped) or 0,
+            has_pending_ctx and "yes" or "no"
+        ),
+    }
+
+    local draft = trim(clean_result)
+    if draft ~= "" then
+        lines[#lines + 1] = "上一版回答（可修正）："
+        lines[#lines + 1] = utf8_take(draft, 220)
+    end
+
+    local logs = (exec_result and exec_result.logs) or {}
+    if type(logs) == "table" and #logs > 0 then
+        lines[#lines + 1] = "工具执行日志："
+        for i, msg in ipairs(logs) do
+            if i > 4 then break end
+            lines[#lines + 1] = string.format("%d) %s", i, utf8_take(msg, 160))
+        end
+    end
+
+    lines[#lines + 1] = "请基于最新工具反馈修正答案；若工具失败，请避免引用失败结果。"
+    return table.concat(lines, "\n")
 end
 
 function M.run_turn(args)
@@ -108,41 +170,63 @@ function M.run_turn(args)
         128,
         math.floor(tonumber(agent_cfg.input_token_budget) or 12000)
     )
+    local continue_on_tool_context = to_bool(agent_cfg.continue_on_tool_context, true)
+    local continue_on_tool_failure = to_bool(agent_cfg.continue_on_tool_failure, true)
+    local max_failure_refine_steps = math.max(
+        0,
+        math.floor(tonumber(agent_cfg.max_failure_refine_steps) or 2)
+    )
 
     local attempts = 0
     local done = false
     local final_result = ""
     local state_name = "INIT"
 
+    state_name = "PREPARE"
+    local current_turn = history.get_turn() + 1
+    local user_vec_q = tool.get_embedding_query(user_input)
+    local user_vec_p = tool.get_embedding_passage(user_input)
+    if not read_only then
+        topic.add_turn(current_turn, user_input, user_vec_p)
+    end
+
+    state_name = "BUILD_CONTEXT"
+    local memory_context = recall.check_and_retrieve(user_input, user_vec_q)
+    local plan_bom = tool_registry.get_long_term_plan_bom()
+    local tool_policy = tool_registry.get_policy()
+    local step_feedback = ""
+    local failure_refine_used = 0
+    local last_call_signature = ""
+
     while (not done) and attempts < max_steps do
         attempts = attempts + 1
 
-        state_name = "PREPARE"
-        local current_turn = history.get_turn() + 1
-        local user_vec_q = tool.get_embedding_query(user_input)
-        local user_vec_p = tool.get_embedding_passage(user_input)
-        if not read_only then
-            topic.add_turn(current_turn, user_input, user_vec_p)
-        end
-
         state_name = "BUILD_CONTEXT"
-        local memory_context = recall.check_and_retrieve(user_input, user_vec_q)
-        local plan_bom = tool_registry.get_long_term_plan_bom()
-        local tool_context = ""
+        local consumed_tool_context = ""
         if not read_only then
-            tool_context = tool_registry.consume_pending_system_context_for_turn(current_turn)
+            consumed_tool_context = tool_registry.consume_pending_system_context_for_turn(current_turn)
+        end
+        local merged_tool_context = trim(consumed_tool_context)
+        if step_feedback ~= "" then
+            if merged_tool_context ~= "" then
+                merged_tool_context = merged_tool_context .. "\n\n" .. step_feedback
+            else
+                merged_tool_context = step_feedback
+            end
+            step_feedback = ""
         end
 
         local messages_for_llm, ctx_meta = context_window.build_messages({
             conversation_history = conversation_history,
             user_input = user_input,
             plan_bom = plan_bom,
-            tool_context = tool_context,
+            tool_context = merged_tool_context,
             memory_context = memory_context,
             input_token_budget = token_budget,
         })
         print(string.format(
-            "[AgentRuntime] context_tokens=%d kept_pairs=%d dropped_blocks=%s",
+            "[AgentRuntime][step=%d] context_tokens=%d kept_pairs=%d dropped_blocks=%s",
+            attempts,
             tonumber(ctx_meta.total_tokens) or 0,
             tonumber(ctx_meta.kept_history_pairs) or 0,
             join_dropped_blocks(ctx_meta.dropped_blocks)
@@ -154,7 +238,8 @@ function M.run_turn(args)
             temperature = 0.75,
             seed = math.random(1, 2147483647),
         }
-        if stream_sink then
+        -- 多步模式下避免流式泄露中间草稿；最终文本由上层统一输出。
+        if stream_sink and max_steps <= 1 then
             params.stream = true
         end
 
@@ -162,18 +247,37 @@ function M.run_turn(args)
         local function chat_callback(result)
             generated_text = tostring(result or "")
         end
-        py_pipeline:generate_chat(messages_for_llm, params, chat_callback, stream_sink)
+        py_pipeline:generate_chat(messages_for_llm, params, chat_callback, params.stream and stream_sink or nil)
         local clean_result = normalize_result_text(generated_text)
+        final_result = clean_result
 
         state_name = "PLAN_TOOLS"
-        local tool_policy = tool_registry.get_policy()
         local calls = {}
         if not read_only then
             calls = tool_planner.plan_calls(user_input, clean_result, tool_policy)
         else
             print("[AgentRuntime] read_only 模式：跳过工具规划")
         end
-        print(string.format("[AgentRuntime] tool_calls_count=%d", #(calls or {})))
+        local call_count = #(calls or {})
+        print(string.format("[AgentRuntime][step=%d] tool_calls_count=%d", attempts, call_count))
+
+        local call_signature = ""
+        if call_count > 0 then
+            local sig_parts = {}
+            for _, c in ipairs(calls) do
+                local raw = trim(c.raw or "")
+                if raw == "" then raw = trim(c.act or "") end
+                if raw ~= "" then
+                    sig_parts[#sig_parts + 1] = raw
+                end
+            end
+            table.sort(sig_parts)
+            call_signature = table.concat(sig_parts, "||")
+        end
+        local repeated_calls = (call_signature ~= "" and call_signature == last_call_signature)
+        if call_signature ~= "" then
+            last_call_signature = call_signature
+        end
 
         state_name = "EXECUTE_TOOLS"
         local exec_result = tool_registry.execute_calls(calls, {
@@ -182,37 +286,78 @@ function M.run_turn(args)
             policy = tool_policy,
         })
         print(string.format(
-            "[AgentRuntime] tool_exec executed=%d failed=%d skipped=%d",
+            "[AgentRuntime][step=%d] tool_exec executed=%d failed=%d skipped=%d",
+            attempts,
             tonumber(exec_result.executed) or 0,
             tonumber(exec_result.failed) or 0,
             tonumber(exec_result.skipped) or 0
         ))
 
-        state_name = "PERSIST"
-        print("\n[Assistant]: " .. clean_result)
+        local has_pending_context = false
         if not read_only then
-            history.add_history(user_input, clean_result)
-            topic.update_assistant(current_turn, clean_result)
-            if add_to_history then
-                add_to_history(user_input, clean_result)
-            end
-
-            local facts = tool_calling.extract_atomic_facts(user_input, clean_result)
-            local cur_summary = topic.get_summary(current_turn)
-            if cur_summary and cur_summary ~= "" then
-                print("[当前话题摘要] " .. cur_summary)
-            end
-            tool_calling.save_turn_memory(facts, current_turn)
-        else
-            print("[AgentRuntime] read_only 模式：跳过 history/topic/memory 写入")
+            has_pending_context = trim(tool_registry.get_pending_system_context(current_turn)) ~= ""
         end
 
-        final_result = clean_result
-        done = true
+        local continue_reason = nil
+        if attempts < max_steps then
+            if continue_on_tool_context and has_pending_context then
+                continue_reason = "tool_context_updated"
+            elseif continue_on_tool_failure and (tonumber(exec_result.failed) or 0) > 0 and failure_refine_used < max_failure_refine_steps then
+                continue_reason = "tool_failed"
+                failure_refine_used = failure_refine_used + 1
+            end
+        end
+
+        if continue_reason and repeated_calls and not has_pending_context then
+            print(string.format(
+                "[AgentRuntime][step=%d] 检测到重复工具调用签名，提前收敛",
+                attempts
+            ))
+            continue_reason = nil
+        end
+
+        if continue_reason then
+            step_feedback = build_step_feedback(
+                attempts,
+                clean_result,
+                calls,
+                exec_result,
+                continue_reason,
+                has_pending_context
+            )
+            print(string.format("[AgentRuntime][step=%d] continue reason=%s", attempts, continue_reason))
+        else
+            done = true
+        end
     end
 
     if not done then
-        error(string.format("[AgentRuntime] max_steps exceeded: %d", max_steps))
+        if final_result == "" then
+            error(string.format("[AgentRuntime] max_steps exceeded: %d", max_steps))
+        end
+        print(string.format(
+            "[AgentRuntime][WARN] max_steps reached (%d)，返回最后一版结果",
+            max_steps
+        ))
+    end
+
+    state_name = "PERSIST"
+    print("\n[Assistant]: " .. final_result)
+    if not read_only then
+        history.add_history(user_input, final_result)
+        topic.update_assistant(current_turn, final_result)
+        if add_to_history then
+            add_to_history(user_input, final_result)
+        end
+
+        local facts = tool_calling.extract_atomic_facts(user_input, final_result)
+        local cur_summary = topic.get_summary(current_turn)
+        if cur_summary and cur_summary ~= "" then
+            print("[当前话题摘要] " .. cur_summary)
+        end
+        tool_calling.save_turn_memory(facts, current_turn)
+    else
+        print("[AgentRuntime] read_only 模式：跳过 history/topic/memory 写入")
     end
 
     state_name = "DONE"

@@ -676,6 +676,9 @@ Candidates: %s
 end
 
 local function normalize_fact(fact)
+    if tool.utf8_sanitize_lossy then
+        fact = tool.utf8_sanitize_lossy(fact)
+    end
     fact = trim(tostring(fact or ""))
     fact = fact:gsub("[%c]+", " ")
     fact = fact:gsub("%s+", " ")
@@ -797,8 +800,14 @@ end
 
 function M.extract_atomic_facts(user_input, assistant_text)
     local fact_policy = get_fact_policy()
-    local assistant_clean = tool.replace(assistant_text or "", "\n", " ")
-    local fact_prompt = build_fact_prompt(user_input, assistant_clean, fact_policy.prompt_style)
+    local safe_user = tostring(user_input or "")
+    local safe_assistant = tostring(assistant_text or "")
+    if tool.utf8_sanitize_lossy then
+        safe_user = tool.utf8_sanitize_lossy(safe_user)
+        safe_assistant = tool.utf8_sanitize_lossy(safe_assistant)
+    end
+    local assistant_clean = tool.replace(safe_assistant, "\n", " ")
+    local fact_prompt = build_fact_prompt(safe_user, assistant_clean, fact_policy.prompt_style)
     local facts_str = run_fact_chat_once(
         fact_prompt,
         fact_policy.extract_max_tokens,
@@ -808,7 +817,7 @@ function M.extract_atomic_facts(user_input, assistant_text)
     local facts = parse_facts_from_llm(facts_str, fact_policy, "extract")
 
     if #facts > 0 and fact_policy.verify_pass then
-        local checked = verify_facts(user_input, assistant_clean, facts, fact_policy)
+        local checked = verify_facts(safe_user, assistant_clean, facts, fact_policy)
         if #checked > 0 then
             facts = checked
             print(string.format("[Lua Fact Extract] verify 通过，保留 %d 条", #facts))
@@ -826,7 +835,7 @@ function M.extract_atomic_facts(user_input, assistant_text)
         facts = parse_facts_from_llm(repaired, fact_policy, "repair")
 
         if #facts > 0 and fact_policy.verify_pass then
-            local checked2 = verify_facts(user_input, assistant_clean, facts, fact_policy)
+            local checked2 = verify_facts(safe_user, assistant_clean, facts, fact_policy)
             if #checked2 > 0 then
                 facts = checked2
                 print(string.format("[Lua Fact Extract] repair+verify 通过，保留 %d 条", #facts))

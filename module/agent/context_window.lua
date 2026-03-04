@@ -69,21 +69,29 @@ local function count_messages_tokens(messages)
     return to_int(n, 0, 0)
 end
 
-local function build_messages(system_prompt, user_input, history_pairs, blocks)
-    local msgs = {
-        { role = "system", content = system_prompt },
-    }
+local function compose_system_prompt(system_prompt, blocks)
+    local out = { tostring(system_prompt or "") }
 
+    -- 为兼容要求“system 只能出现在第一条”的模板，将所有系统注入块并入首条 system。
     -- 注入顺序保持与旧链路一致：plan -> tool -> memory
     if blocks.plan_bom and blocks.plan_bom ~= "" then
-        msgs[#msgs + 1] = { role = "system", content = blocks.plan_bom }
+        out[#out + 1] = tostring(blocks.plan_bom)
     end
     if blocks.tool_context and blocks.tool_context ~= "" then
-        msgs[#msgs + 1] = { role = "system", content = blocks.tool_context }
+        out[#out + 1] = tostring(blocks.tool_context)
     end
     if blocks.memory_context and blocks.memory_context ~= "" then
-        msgs[#msgs + 1] = { role = "system", content = blocks.memory_context }
+        out[#out + 1] = tostring(blocks.memory_context)
     end
+
+    return table.concat(out, "\n\n")
+end
+
+local function build_messages(system_prompt, user_input, history_pairs, blocks)
+    local merged_system_prompt = compose_system_prompt(system_prompt, blocks)
+    local msgs = {
+        { role = "system", content = merged_system_prompt },
+    }
 
     for _, pair in ipairs(history_pairs or {}) do
         if trim(pair.user) ~= "" then

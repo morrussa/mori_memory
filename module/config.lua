@@ -218,6 +218,9 @@ M.settings = {
         completion_reserve_tokens = 1024,
         token_count_mode = "templated_exact", -- 固定：模板后精确计数
         context_drop_order = "memory_tool_plan", -- 超预算时先丢 memory_context，再 tool_context，再 plan_bom
+        continue_on_tool_context = true, -- 工具产生新上下文时继续下一步重生成
+        continue_on_tool_failure = true, -- 工具失败时触发自修正重试
+        max_failure_refine_steps = 2, -- 单轮最多因工具失败触发多少次重修
     },
     topic = {--在退出时，如果topic没有闭合，在topic.bin的第一行写下 current_turn\x1F<topic_head_vec>\x1F<topic_now_vec> ，topic.bin的第一行永远留给这个用途。
         make_cluster1 = 4,--当一个topic建立时，它向前make_cluster1步以建立头质心，
