@@ -8,7 +8,10 @@ local tool_calling = require("module.agent.tool_calling")
 local tool_planner = require("module.agent.tool_planner")
 local tool_registry = require("module.agent.tool_registry")
 local context_window = require("module.agent.context_window")
+local tool_parser = require("module.agent.tool_parser")
 local config = require("module.config")
+
+local SUPPORTED_TOOL_ACTS = tool_parser.clone_supported_acts()
 
 local function trim(s)
     if not s then return "" end
@@ -24,50 +27,17 @@ local function strip_cot_safe(text)
     return cleaned
 end
 
-local function parse_field(tbl_line, field)
-    local dq = tbl_line:match(field .. '%s*=%s*"([^"]*)"')
-    if dq then return dq end
-    local sq = tbl_line:match(field .. "%s*=%s*'([^']*)'")
-    if sq then return sq end
-    local raw = tbl_line:match(field .. "%s*=%s*([^,%}]+)")
-    if raw then return trim(raw) end
-    return nil
-end
-
-local function parse_tool_call_line(line)
-    local s = trim(line)
-    if s == "" then return nil end
-    if not s:match("^%b{}$") then
-        local first = tool.extract_first_lua_table and tool.extract_first_lua_table(s) or s:match("%b{}")
-        if not first then return nil end
-        s = trim(first)
-    end
-    if not s:find("act%s*=") then return nil end
-    local act_raw = parse_field(s, "act")
-    if not act_raw then return nil end
-    local act = string.lower(trim((act_raw:gsub('^["\'](.-)["\']$', "%1"))))
-    if act == "" then return nil end
-    return { act = act, raw = s }
-end
-
-local function remove_tool_call_lines(text)
-    local kept = {}
-    text = tostring(text or "")
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        local call = parse_tool_call_line(line)
-        if not call then
-            kept[#kept + 1] = line
-        end
-    end
-    local visible = table.concat(kept, "\n")
-    return trim(visible)
-end
-
 local function normalize_result_text(result)
     local cot_clean = strip_cot_safe(result or "")
-    local visible = remove_tool_call_lines(cot_clean)
+    local calls, visible = tool_parser.split_tool_calls_and_text(cot_clean, {
+        supported_acts = SUPPORTED_TOOL_ACTS,
+    })
     if visible == "" then
-        visible = trim(cot_clean)
+        if #(calls or {}) > 0 then
+            visible = "好的，我先处理。"
+        else
+            visible = trim(cot_clean)
+        end
     end
     if visible == "" then
         visible = "好的，已记录。"
@@ -75,7 +45,7 @@ local function normalize_result_text(result)
     if tool.utf8_sanitize_lossy then
         visible = tool.utf8_sanitize_lossy(visible)
     end
-    return visible
+    return visible, calls
 end
 
 local function join_dropped_blocks(blocks)
@@ -100,6 +70,51 @@ local function to_bool(v, fallback)
     return fallback == true
 end
 
+local function normalize_function_choice(raw_choice)
+    return tool_parser.normalize_function_choice(raw_choice, {
+        supported_acts = SUPPORTED_TOOL_ACTS,
+    })
+end
+
+local function resolve_native_tool_choice(function_choice)
+    local choice = normalize_function_choice(function_choice)
+    if choice == "auto" or choice == "none" then
+        return choice
+    end
+    return {
+        type = "function",
+        ["function"] = {
+            name = choice,
+        },
+    }
+end
+
+local function filter_calls_by_choice(calls, function_choice, parallel_enabled)
+    local in_calls = {}
+    if type(calls) == "table" then
+        in_calls = calls
+    end
+
+    if function_choice == "none" then
+        return {}, #in_calls, 0
+    end
+
+    local filtered = {}
+    for _, call in ipairs(in_calls) do
+        local act = trim((call or {}).act):lower()
+        if function_choice == "auto" or act == function_choice then
+            filtered[#filtered + 1] = call
+        end
+    end
+
+    local pre_parallel_count = #filtered
+    if (not parallel_enabled) and #filtered > 1 then
+        filtered = { filtered[1] }
+    end
+
+    return filtered, #in_calls, pre_parallel_count
+end
+
 local function utf8_take(s, max_chars)
     s = tostring(s or "")
     max_chars = tonumber(max_chars) or 0
@@ -115,10 +130,117 @@ local function utf8_take(s, max_chars)
     return table.concat(out)
 end
 
-local function build_step_feedback(step_idx, clean_result, calls, exec_result, reason, has_pending_ctx)
+local function format_call_brief(call)
+    call = call or {}
+    local act = trim(call.act or "")
+    if act == "" then
+        return "{act=\"unknown\"}"
+    end
+    if act == "query_record" then
+        local q = trim(call.query or call.string or call.value)
+        local types = trim(call.types or call.type)
+        local payload = string.format('{act="%s"', act)
+        if q ~= "" then
+            payload = payload .. string.format(', query="%s"', utf8_take(q, 80))
+        end
+        if types ~= "" then
+            payload = payload .. string.format(', types="%s"', utf8_take(types, 48))
+        end
+        return payload .. "}"
+    end
+    if act == "upsert_record" then
+        local rec_type = trim(call.type)
+        local entity = trim(call.entity)
+        local value = trim(call.value or call.string)
+        return string.format(
+            '{act="%s", type="%s", entity="%s", value="%s"}',
+            act,
+            utf8_take(rec_type, 28),
+            utf8_take(entity, 48),
+            utf8_take(value, 64)
+        )
+    end
+    if act == "delete_record" then
+        return string.format(
+            '{act="%s", type="%s", entity="%s"}',
+            act,
+            utf8_take(trim(call.type), 28),
+            utf8_take(trim(call.entity), 48)
+        )
+    end
+    return string.format('{act="%s"}', act)
+end
+
+local function build_observation_entry(step_idx, call_source, calls, exec_result)
+    local executed = tonumber((exec_result or {}).executed) or 0
+    local failed = tonumber((exec_result or {}).failed) or 0
+    local skipped = tonumber((exec_result or {}).skipped) or 0
+    local count = #(calls or {})
+    if count <= 0 and executed <= 0 and failed <= 0 and skipped <= 0 then
+        return ""
+    end
+
+    local lines = {
+        string.format(
+            "step=%d source=%s calls=%d executed=%d failed=%d skipped=%d",
+            tonumber(step_idx) or 0,
+            tostring(call_source or "unknown"),
+            count,
+            executed,
+            failed,
+            skipped
+        ),
+    }
+    if count > 0 then
+        lines[#lines + 1] = "actions:"
+        for i, call in ipairs(calls or {}) do
+            if i > 4 then break end
+            lines[#lines + 1] = string.format("%d) %s", i, format_call_brief(call))
+        end
+    end
+
+    local logs = (exec_result and exec_result.logs) or {}
+    if type(logs) == "table" and #logs > 0 then
+        lines[#lines + 1] = "observations:"
+        for i, msg in ipairs(logs) do
+            if i > 4 then break end
+            lines[#lines + 1] = string.format("%d) %s", i, utf8_take(msg, 160))
+        end
+    end
+
+    return table.concat(lines, "\n")
+end
+
+local function build_tool_observation_trace(entries, max_steps, max_chars)
+    if type(entries) ~= "table" or #entries <= 0 then
+        return ""
+    end
+    max_steps = math.max(1, math.floor(tonumber(max_steps) or 4))
+    max_chars = math.max(120, math.floor(tonumber(max_chars) or 1200))
+    local start_idx = math.max(1, #entries - max_steps + 1)
+    local lines = {
+        "【Tool Observation Trace】",
+        "以下是本轮已发生的 Action/Observation 轨迹（按时间顺序）：",
+    }
+    local idx = 0
+    for i = start_idx, #entries do
+        idx = idx + 1
+        lines[#lines + 1] = string.format("trace#%d", idx)
+        lines[#lines + 1] = entries[i]
+    end
+    local text = table.concat(lines, "\n")
+    local clipped = utf8_take(text, max_chars)
+    if clipped ~= text then
+        return trim(clipped) .. "\n...(trace truncated)"
+    end
+    return text
+end
+
+local function build_step_feedback(step_idx, clean_result, calls, exec_result, reason, has_pending_ctx, call_source)
     local lines = {
         "【Agent多步反馈】",
         string.format("step=%d reason=%s", tonumber(step_idx) or 0, tostring(reason or "unknown")),
+        string.format("call_source=%s", tostring(call_source or "planner_pass")),
         string.format(
             "calls=%d executed=%d failed=%d skipped=%d pending_context=%s",
             #(calls or {}),
@@ -180,6 +302,19 @@ function M.run_turn(args)
         0,
         math.floor(tonumber(agent_cfg.max_failure_refine_steps) or 2)
     )
+    local direct_tool_call_enabled = to_bool(agent_cfg.direct_tool_call_enabled, true)
+    local native_tool_call_enabled = to_bool(agent_cfg.native_tool_call_enabled, true)
+    local include_tool_observation_trace = to_bool(agent_cfg.include_tool_observation_trace, true)
+    local function_choice = normalize_function_choice(agent_cfg.function_choice)
+    local parallel_function_calls = to_bool(agent_cfg.parallel_function_calls, true)
+    local tool_trace_max_steps = math.max(
+        1,
+        math.floor(tonumber(agent_cfg.tool_trace_max_steps) or 4)
+    )
+    local tool_trace_max_chars = math.max(
+        240,
+        math.floor(tonumber(agent_cfg.tool_trace_max_chars) or 1200)
+    )
     local memory_input_policy = tool_calling.get_memory_input_policy()
     local memory_user_input, memory_input_sanitized, redacted_blocks, file_mode, memory_input_truncated =
         tool_calling.sanitize_memory_input(user_input, {
@@ -220,6 +355,8 @@ function M.run_turn(args)
     local context_refine_used = 0
     local failure_refine_used = 0
     local last_call_signature = ""
+    local tool_observation_entries = {}
+    local latest_observation = ""
 
     while (not done) and attempts < max_steps do
         attempts = attempts + 1
@@ -237,6 +374,20 @@ function M.run_turn(args)
                 merged_tool_context = step_feedback
             end
             step_feedback = ""
+        end
+        if include_tool_observation_trace then
+            local trace_context = build_tool_observation_trace(
+                tool_observation_entries,
+                tool_trace_max_steps,
+                tool_trace_max_chars
+            )
+            if trace_context ~= "" then
+                if merged_tool_context ~= "" then
+                    merged_tool_context = merged_tool_context .. "\n\n" .. trace_context
+                else
+                    merged_tool_context = trace_context
+                end
+            end
         end
 
         local messages_for_llm, ctx_meta = context_window.build_messages({
@@ -270,22 +421,132 @@ function M.run_turn(args)
         end
 
         local generated_text = ""
-        local function chat_callback(result)
-            generated_text = tostring(result or "")
+        local direct_calls = {}
+        local direct_call_source = "none"
+        local used_native_generation = false
+
+        local can_try_native_tools = (
+            (not read_only)
+            and native_tool_call_enabled
+            and (params.stream ~= true)
+            and (py_pipeline.generate_chat_with_tools_sync ~= nil)
+        )
+        if can_try_native_tools then
+            local native_tools = tool_registry.get_openai_tools and tool_registry.get_openai_tools(tool_policy) or {}
+            if type(native_tools) == "table" and #native_tools > 0 then
+                local native_tool_choice = resolve_native_tool_choice(function_choice)
+                local ok_native, native_text, native_calls_blob = pcall(function()
+                    return py_pipeline:generate_chat_with_tools_sync(
+                        messages_for_llm,
+                        params,
+                        native_tools,
+                        native_tool_choice,
+                        parallel_function_calls
+                    )
+                end)
+                if ok_native then
+                    used_native_generation = true
+                    generated_text = tostring(native_text or "")
+                    local native_calls = tool_parser.collect_tool_calls_only(
+                        tostring(native_calls_blob or ""),
+                        { supported_acts = SUPPORTED_TOOL_ACTS }
+                    )
+                    if type(native_calls) == "table" and #native_calls > 0 then
+                        direct_calls = native_calls
+                        direct_call_source = "model_native"
+                    end
+                else
+                    print(string.format(
+                        "[AgentRuntime][step=%d][WARN] native tools 生成失败，回退普通生成: %s",
+                        attempts,
+                        tostring(native_text)
+                    ))
+                end
+            end
         end
-        py_pipeline:generate_chat(messages_for_llm, params, chat_callback, params.stream and stream_sink or nil)
-        local clean_result = normalize_result_text(generated_text)
+
+        if not used_native_generation then
+            local function chat_callback(result)
+                generated_text = tostring(result or "")
+            end
+            py_pipeline:generate_chat(messages_for_llm, params, chat_callback, params.stream and stream_sink or nil)
+        end
+
+        local clean_result, parsed_direct_calls = normalize_result_text(generated_text)
+        if #direct_calls == 0 and type(parsed_direct_calls) == "table" and #parsed_direct_calls > 0 then
+            direct_calls = parsed_direct_calls
+            direct_call_source = "model_direct"
+        end
         final_result = clean_result
 
         state_name = "PLAN_TOOLS"
         local calls = {}
+        local call_source = "none"
         if not read_only then
-            calls = tool_planner.plan_calls(user_input, clean_result, tool_policy)
+            if direct_tool_call_enabled and type(direct_calls) == "table" and #direct_calls > 0 then
+                calls = direct_calls
+                call_source = (direct_call_source ~= "" and direct_call_source) or "model_direct"
+                print(string.format(
+                    "[AgentRuntime][step=%d] 命中模型直出工具调用，跳过二阶段 planner",
+                    attempts
+                ))
+            else
+                local tool_trace = ""
+                if include_tool_observation_trace then
+                    tool_trace = build_tool_observation_trace(
+                        tool_observation_entries,
+                        tool_trace_max_steps,
+                        tool_trace_max_chars
+                    )
+                end
+                calls = tool_planner.plan_calls(user_input, clean_result, tool_policy, {
+                    step_idx = attempts,
+                    last_observation = latest_observation,
+                    tool_trace = tool_trace,
+                    function_choice = function_choice,
+                    parallel_function_calls = parallel_function_calls,
+                })
+                call_source = "planner_pass"
+            end
         else
             print("[AgentRuntime] read_only 模式：跳过工具规划")
         end
+
+        local raw_call_count = #(calls or {})
+        local calls_after_choice, _, pre_parallel_count = filter_calls_by_choice(
+            calls,
+            function_choice,
+            parallel_function_calls
+        )
+        calls = calls_after_choice
+        if raw_call_count ~= #calls then
+            print(string.format(
+                "[AgentRuntime][step=%d] tool calls filtered by choice=%s parallel=%s raw=%d kept=%d",
+                attempts,
+                tostring(function_choice),
+                parallel_function_calls and "true" or "false",
+                raw_call_count,
+                #calls
+            ))
+            if function_choice == "none" then
+                call_source = "none"
+            end
+        elseif pre_parallel_count ~= #calls then
+            print(string.format(
+                "[AgentRuntime][step=%d] parallel_function_calls=false, keep first call only (from %d to %d)",
+                attempts,
+                pre_parallel_count,
+                #calls
+            ))
+        end
+
         local call_count = #(calls or {})
-        print(string.format("[AgentRuntime][step=%d] tool_calls_count=%d", attempts, call_count))
+        print(string.format(
+            "[AgentRuntime][step=%d] tool_calls_count=%d source=%s",
+            attempts,
+            call_count,
+            call_source
+        ))
 
         local call_signature = ""
         if call_count > 0 then
@@ -312,12 +573,29 @@ function M.run_turn(args)
             policy = tool_policy,
         })
         print(string.format(
-            "[AgentRuntime][step=%d] tool_exec executed=%d failed=%d skipped=%d",
+            "[AgentRuntime][step=%d] tool_exec executed=%d failed=%d skipped=%d parallel_batches=%d retries=%d",
             attempts,
             tonumber(exec_result.executed) or 0,
             tonumber(exec_result.failed) or 0,
-            tonumber(exec_result.skipped) or 0
+            tonumber(exec_result.skipped) or 0,
+            tonumber(exec_result.parallel_batches) or 0,
+            tonumber(exec_result.retry_total) or 0
         ))
+        if not read_only then
+            local observation_entry = build_observation_entry(
+                attempts,
+                call_source,
+                calls,
+                exec_result
+            )
+            if observation_entry ~= "" then
+                latest_observation = observation_entry
+                tool_observation_entries[#tool_observation_entries + 1] = observation_entry
+                if #tool_observation_entries > tool_trace_max_steps then
+                    table.remove(tool_observation_entries, 1)
+                end
+            end
+        end
 
         local has_pending_context = false
         if not read_only then
@@ -368,7 +646,8 @@ function M.run_turn(args)
                 calls,
                 exec_result,
                 continue_reason,
-                context_updated
+                context_updated,
+                call_source
             )
             print(string.format("[AgentRuntime][step=%d] continue reason=%s", attempts, continue_reason))
         else

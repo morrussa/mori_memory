@@ -224,21 +224,36 @@ local function get_tool_policy()
         tool_pass_temperature = cfg_number(TOOL_CFG.tool_pass_temperature, 0.15, 0, 1),
         tool_pass_max_tokens = cfg_number(TOOL_CFG.tool_pass_max_tokens, 128, 32),
         tool_pass_seed = cfg_number(TOOL_CFG.tool_pass_seed, 42),
+        parallel_execute_enabled = to_bool(TOOL_CFG.parallel_execute_enabled, true),
+        parallel_query_batch_size = cfg_number(TOOL_CFG.parallel_query_batch_size, 4, 1),
+        retry_transient_max = cfg_number(TOOL_CFG.retry_transient_max, 1, 0),
+        retry_unknown_max = cfg_number(TOOL_CFG.retry_unknown_max, 0, 0),
+        retry_validation_max = cfg_number(TOOL_CFG.retry_validation_max, 0, 0),
+        retry_budget_max = cfg_number(TOOL_CFG.retry_budget_max, 0, 0),
+        retry_total_cap = cfg_number(TOOL_CFG.retry_total_cap, 2, 0),
     }
 end
 
 local function apply_upsert_record(call, current_turn, policy, state)
     if state.upsert_count >= policy.upsert_max_per_turn then
-        return false, string.format("upsert_record 超出预算（max=%d）", policy.upsert_max_per_turn)
+        return false, string.format("upsert_record 超出预算（max=%d）", policy.upsert_max_per_turn), {
+            error_code = "budget",
+        }
     end
 
     local rec_type = trim(call.type)
     local entity = trim(call.entity)
     local value = trim(call.value)
     if value == "" then value = trim(call.string) end
-    if rec_type == "" then return false, "upsert_record 缺少 type" end
-    if entity == "" then return false, "upsert_record 缺少 entity" end
-    if value == "" then return false, "upsert_record 缺少 value" end
+    if rec_type == "" then
+        return false, "upsert_record 缺少 type", { error_code = "validation" }
+    end
+    if entity == "" then
+        return false, "upsert_record 缺少 entity", { error_code = "validation" }
+    end
+    if value == "" then
+        return false, "upsert_record 缺少 value", { error_code = "validation" }
+    end
 
     local confidence = clamp01(call.confidence, 0.75)
     if confidence < policy.upsert_min_confidence then
@@ -246,7 +261,9 @@ local function apply_upsert_record(call, current_turn, policy, state)
             "upsert_record 置信度 %.2f 低于阈值 %.2f",
             confidence,
             policy.upsert_min_confidence
-        )
+        ), {
+            error_code = "validation",
+        }
     end
 
     local id, op = notebook.upsert_record(rec_type, entity, value, {
@@ -256,21 +273,31 @@ local function apply_upsert_record(call, current_turn, policy, state)
         source = "tool_call_upsert_record",
     })
     if not id then
-        return false, "upsert_record 写入失败: " .. tostring(op)
+        return false, "upsert_record 写入失败: " .. tostring(op), {
+            error_code = "transient",
+        }
     end
     state.upsert_count = state.upsert_count + 1
-    return true, string.format("upsert_record %s (id=%d)", tostring(op), id)
+    return true, string.format("upsert_record %s (id=%d)", tostring(op), id), {
+        error_code = "ok",
+    }
 end
 
 local function apply_delete_record(call, current_turn, policy)
     if not policy.delete_enabled then
-        return false, "delete_record 已禁用"
+        return false, "delete_record 已禁用", {
+            error_code = "validation",
+        }
     end
 
     local rec_type = trim(call.type)
     local entity = trim(call.entity)
-    if rec_type == "" then return false, "delete_record 缺少 type" end
-    if entity == "" then return false, "delete_record 缺少 entity" end
+    if rec_type == "" then
+        return false, "delete_record 缺少 type", { error_code = "validation" }
+    end
+    if entity == "" then
+        return false, "delete_record 缺少 entity", { error_code = "validation" }
+    end
 
     local id, op = notebook.delete_record(rec_type, entity, {
         turn = current_turn,
@@ -278,24 +305,40 @@ local function apply_delete_record(call, current_turn, policy)
         source = "tool_call_delete_record",
     })
     if not id then
-        return false, "delete_record 失败: " .. tostring(op)
+        return false, "delete_record 失败: " .. tostring(op), {
+            error_code = "transient",
+        }
     end
-    return true, string.format("delete_record %s (id=%d)", tostring(op), id)
+    return true, string.format("delete_record %s (id=%d)", tostring(op), id), {
+        error_code = "ok",
+    }
 end
 
 local function apply_query_record(call, current_turn, policy, state)
     if state.query_count >= policy.query_max_per_turn then
-        return false, string.format("query_record 超出预算（max=%d）", policy.query_max_per_turn)
+        return false, string.format("query_record 超出预算（max=%d）", policy.query_max_per_turn), {
+            error_code = "budget",
+        }
     end
 
     local query, types, query_key = normalize_query_payload(call, policy)
-    if query == "" then return false, "query_record 缺少 query/string/value" end
+    if query == "" then
+        return false, "query_record 缺少 query/string/value", {
+            error_code = "validation",
+        }
+    end
 
-    local results = notebook.query_records(query, {
+    local ok_query, results_or_err = pcall(notebook.query_records, query, {
         types = types,
         limit = policy.query_fetch_limit,
         mark_hit = true,
     })
+    if not ok_query then
+        return false, "query_record 查询失败: " .. tostring(results_or_err), {
+            error_code = "transient",
+        }
+    end
+    local results = results_or_err or {}
     results = deterministic_rerank(results, query)
     if #results > policy.query_inject_top then
         for i = #results, policy.query_inject_top + 1, -1 do
@@ -307,7 +350,12 @@ local function apply_query_record(call, current_turn, policy, state)
     print(string.format("[ToolRegistry] query_record 命中 %d 条", #results))
     local query_result_signature = build_query_result_signature(query_key, results)
     if #results > 0 then
-        print(notebook.render_results(results))
+        local ok_render, rendered = pcall(notebook.render_results, results)
+        if ok_render then
+            print(rendered)
+        else
+            print("[ToolRegistry][WARN] render_results 失败: " .. tostring(rendered))
+        end
         local block = {}
         table.insert(block, "【Tool:query_record 上一轮检索结果】")
         table.insert(block, "query: " .. query)
@@ -337,14 +385,277 @@ local function apply_query_record(call, current_turn, policy, state)
         end
     end
     return true, string.format("query_record ok (%d hits)", #results), {
+        error_code = "ok",
         query_key = query_key,
         query_signature = query_result_signature,
         context_added = (#results > 0),
     }
 end
 
+local function shallow_copy(tbl)
+    local out = {}
+    for k, v in pairs(tbl or {}) do
+        out[k] = v
+    end
+    return out
+end
+
+local function classify_error_code(msg, meta)
+    local code = trim((meta or {}).error_code or "")
+    if code ~= "" then
+        return code
+    end
+
+    local text = trim(msg)
+    if text:find("超出预算", 1, true) then return "budget" end
+    if text:find("缺少", 1, true) then return "validation" end
+    if text:find("低于阈值", 1, true) then return "validation" end
+    if text:find("已禁用", 1, true) then return "validation" end
+    if text:find("去重跳过", 1, true) then return "duplicate" end
+    if text:find("写入失败", 1, true) then return "transient" end
+    if text:find("失败", 1, true) then return "transient" end
+    if text:find("未知 act", 1, true) then return "unknown_act" end
+    return "unknown"
+end
+
+local function get_retry_limit(policy, error_code)
+    if error_code == "transient" then
+        return math.max(0, math.floor(tonumber(policy.retry_transient_max) or 0))
+    end
+    if error_code == "unknown" then
+        return math.max(0, math.floor(tonumber(policy.retry_unknown_max) or 0))
+    end
+    if error_code == "validation" then
+        return math.max(0, math.floor(tonumber(policy.retry_validation_max) or 0))
+    end
+    if error_code == "budget" then
+        return math.max(0, math.floor(tonumber(policy.retry_budget_max) or 0))
+    end
+    return 0
+end
+
+local function build_retry_variant(call, error_code, retry_idx)
+    local next_call = shallow_copy(call)
+    local strategy = ""
+
+    if next_call.act == "query_record" then
+        if retry_idx == 1 then
+            if trim(next_call.types or "") ~= "" or trim(next_call.type or "") ~= "" then
+                next_call.types = ""
+                next_call.type = ""
+                strategy = "drop_types"
+            end
+        elseif retry_idx == 2 then
+            local q = trim(next_call.query)
+            if q == "" then q = trim(next_call.string) end
+            if q == "" then q = trim(next_call.value) end
+            if q ~= "" then
+                local clipped = utf8_take(q, 48)
+                if clipped ~= q then
+                    next_call.query = clipped
+                    next_call.string = nil
+                    next_call.value = nil
+                    strategy = "shrink_query"
+                end
+            end
+        end
+    end
+
+    if strategy ~= "" then
+        return next_call, strategy
+    end
+
+    if error_code == "transient" or error_code == "unknown" then
+        return next_call, "same_payload"
+    end
+    return nil, ""
+end
+
+local function build_execution_batches(calls, policy)
+    local batches = {}
+    local query_batch = {}
+    local max_batch = math.max(1, math.floor(tonumber(policy.parallel_query_batch_size) or 1))
+
+    local function flush_query_batch()
+        if #query_batch == 0 then return end
+        local mode = "serial"
+        if policy.parallel_execute_enabled and #query_batch > 1 then
+            mode = "parallel"
+        end
+        batches[#batches + 1] = {
+            mode = mode,
+            calls = query_batch,
+        }
+        query_batch = {}
+    end
+
+    for _, call in ipairs(calls or {}) do
+        if policy.parallel_execute_enabled and tostring((call or {}).act or "") == "query_record" then
+            query_batch[#query_batch + 1] = call
+            if #query_batch >= max_batch then
+                flush_query_batch()
+            end
+        else
+            flush_query_batch()
+            batches[#batches + 1] = {
+                mode = "serial",
+                calls = { call },
+            }
+        end
+    end
+
+    flush_query_batch()
+    return batches
+end
+
+local function execute_apply_once(call, current_turn, policy, state)
+    if call.act == "upsert_record" then
+        return apply_upsert_record(call, current_turn, policy, state)
+    elseif call.act == "delete_record" then
+        return apply_delete_record(call, current_turn, policy)
+    elseif call.act == "query_record" then
+        return apply_query_record(call, current_turn, policy, state)
+    end
+    return false, "跳过未知 act: " .. tostring(call.act), {
+        error_code = "unknown_act",
+    }
+end
+
+local function execute_call_with_retry(call, current_turn, policy, state)
+    local retry_logs = {}
+    local count_result = true
+    local initial_query_key = ""
+    if call.act == "query_record" then
+        local query, _, query_key = normalize_query_payload(call, policy)
+        initial_query_key = query_key
+        if query ~= "" and query_key ~= "" and state.query_seen[query_key] then
+            return true, "query_record 去重跳过（同轮重复 query+types）", {
+                error_code = "duplicate",
+            }, false, retry_logs
+        end
+    end
+
+    local attempts = 0
+    local max_total = math.max(0, math.floor(tonumber(policy.retry_total_cap) or 0))
+    local working = shallow_copy(call)
+    local final_ok, final_msg, final_meta
+    local used_retries = 0
+
+    while true do
+        attempts = attempts + 1
+        if working.act == "query_record" then
+            local _, _, key = normalize_query_payload(working, policy)
+            if key ~= "" then
+                state.query_seen[key] = true
+            elseif initial_query_key ~= "" then
+                state.query_seen[initial_query_key] = true
+            end
+        end
+
+        local ok, msg, meta = execute_apply_once(working, current_turn, policy, state)
+        final_ok, final_msg, final_meta = ok, msg, meta
+        if ok then
+            break
+        end
+
+        local err_code = classify_error_code(msg, meta)
+        local allow_retries = get_retry_limit(policy, err_code)
+        used_retries = attempts - 1
+        if used_retries >= allow_retries or used_retries >= max_total then
+            break
+        end
+
+        local next_call, strategy = build_retry_variant(working, err_code, attempts)
+        if not next_call then
+            break
+        end
+
+        local retry_msg = string.format(
+            "retry#%d act=%s reason=%s strategy=%s",
+            used_retries + 1,
+            tostring(working.act or ""),
+            tostring(err_code),
+            tostring(strategy ~= "" and strategy or "none")
+        )
+        retry_logs[#retry_logs + 1] = retry_msg
+        working = next_call
+    end
+
+    return final_ok, final_msg, final_meta, count_result, retry_logs
+end
+
 function M.get_policy()
     return get_tool_policy()
+end
+
+function M.get_openai_tools(policy_override)
+    local policy = policy_override or get_tool_policy()
+    local tools = {
+        {
+            type = "function",
+            ["function"] = {
+                name = "query_record",
+                description = "检索长期记忆记录（preference/constraint/identity/credential_hint/long_term_plan）",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        query = { type = "string", description = "检索关键词或短句" },
+                        types = {
+                            type = "string",
+                            description = "可选，逗号分隔类型列表（如 preference,constraint）",
+                        },
+                        type = { type = "string", description = "可选，单类型（types 的简写）" },
+                    },
+                    required = { "query" },
+                    additionalProperties = false,
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "upsert_record",
+                description = "写入或更新长期记忆记录",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        type = {
+                            type = "string",
+                            description = "记录类型：preference|constraint|identity|credential_hint|long_term_plan",
+                        },
+                        entity = { type = "string", description = "主体对象" },
+                        value = { type = "string", description = "事实内容" },
+                        evidence = { type = "string", description = "可选，证据片段" },
+                        confidence = { type = "number", description = "可选，0~1 置信度" },
+                    },
+                    required = { "type", "entity", "value" },
+                    additionalProperties = false,
+                },
+            },
+        },
+    }
+
+    if policy.delete_enabled then
+        tools[#tools + 1] = {
+            type = "function",
+            ["function"] = {
+                name = "delete_record",
+                description = "删除长期记忆记录",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        type = { type = "string", description = "记录类型" },
+                        entity = { type = "string", description = "主体对象" },
+                        evidence = { type = "string", description = "可选，删除依据" },
+                    },
+                    required = { "type", "entity" },
+                    additionalProperties = false,
+                },
+            },
+        }
+    end
+
+    return tools
 end
 
 function M.execute_calls(calls, exec_ctx)
@@ -361,6 +672,11 @@ function M.execute_calls(calls, exec_ctx)
         context_updated = false,
         context_novel = false,
         context_signature = "",
+        parallel_batches = 0,
+        parallel_calls = 0,
+        retry_total = 0,
+        retry_success = 0,
+        retry_failed = 0,
     }
 
     if type(calls) ~= "table" or #calls == 0 then
@@ -385,51 +701,66 @@ function M.execute_calls(calls, exec_ctx)
     local step_query_signatures = {}
     local step_query_sig_seen = {}
 
-    for _, call in ipairs(calls) do
-        local ok, msg
-        local count_result = true
-        if call.act == "upsert_record" then
-            ok, msg = apply_upsert_record(call, current_turn, policy, state)
-        elseif call.act == "delete_record" then
-            ok, msg = apply_delete_record(call, current_turn, policy)
-        elseif call.act == "query_record" then
-            local query, _, query_key = normalize_query_payload(call, policy)
-            if query ~= "" and query_key ~= "" and state.query_seen[query_key] then
-                ok = true
-                count_result = false
-                result.skipped = result.skipped + 1
-                msg = "query_record 去重跳过（同轮重复 query+types）"
-            else
-                if query_key ~= "" then
-                    state.query_seen[query_key] = true
-                end
-                local meta
-                ok, msg, meta = apply_query_record(call, current_turn, policy, state)
-                if ok and meta and trim(meta.query_signature) ~= "" then
-                    local sig = trim(meta.query_signature)
-                    if not step_query_sig_seen[sig] then
-                        step_query_sig_seen[sig] = true
-                        step_query_signatures[#step_query_signatures + 1] = sig
-                    end
-                end
-            end
-        else
-            ok, msg = false, "跳过未知 act: " .. tostring(call.act)
+    local batches = build_execution_batches(calls, policy)
+    for batch_idx, batch in ipairs(batches or {}) do
+        local batch_calls = (batch and batch.calls) or {}
+        local is_parallel = (batch and batch.mode == "parallel") and #batch_calls > 1
+        if is_parallel then
+            result.parallel_batches = result.parallel_batches + 1
+            result.parallel_calls = result.parallel_calls + #batch_calls
+            print(string.format(
+                "[ToolRegistry] PARALLEL batch=%d size=%d mode=query_record",
+                batch_idx,
+                #batch_calls
+            ))
         end
 
-        if count_result then
-            if ok then
-                result.executed = result.executed + 1
-            else
-                result.failed = result.failed + 1
+        for _, call in ipairs(batch_calls) do
+            local ok, msg, meta, count_result, retry_logs = execute_call_with_retry(
+                call,
+                current_turn,
+                policy,
+                state
+            )
+            for _, retry_msg in ipairs(retry_logs or {}) do
+                result.retry_total = result.retry_total + 1
+                result.logs[#result.logs + 1] = retry_msg
+                print(string.format("[ToolRegistry] RETRY | %s", retry_msg))
             end
+
+            if #(retry_logs or {}) > 0 then
+                if ok then
+                    result.retry_success = result.retry_success + 1
+                else
+                    result.retry_failed = result.retry_failed + 1
+                end
+            end
+
+            if ok and meta and trim(meta.query_signature) ~= "" then
+                local sig = trim(meta.query_signature)
+                if not step_query_sig_seen[sig] then
+                    step_query_sig_seen[sig] = true
+                    step_query_signatures[#step_query_signatures + 1] = sig
+                end
+            end
+
+            if count_result then
+                if ok then
+                    result.executed = result.executed + 1
+                else
+                    result.failed = result.failed + 1
+                end
+            else
+                result.skipped = result.skipped + 1
+            end
+
+            result.logs[#result.logs + 1] = msg
+            local level = ok and "OK" or "FAIL"
+            if count_result == false then
+                level = "SKIP"
+            end
+            print(string.format("[ToolRegistry] %s | %s", level, msg))
         end
-        result.logs[#result.logs + 1] = msg
-        local level = ok and "OK" or "FAIL"
-        if count_result == false then
-            level = "SKIP"
-        end
-        print(string.format("[ToolRegistry] %s | %s", level, msg))
     end
     turn_budget.upsert_count = state.upsert_count
     turn_budget.query_count = state.query_count

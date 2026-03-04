@@ -1,9 +1,11 @@
 local M = {}
 
 local tool = require("module.tool")
+local tool_parser = require("module.agent.tool_parser")
 local config_mem = require("module.config")
 
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
+local SUPPORTED_TOOL_ACTS = tool_parser.clone_supported_acts()
 
 local function trim(s)
     if not s then return "" end
@@ -29,6 +31,27 @@ local function cfg_number(v, fallback, min_v, max_v)
     return n
 end
 
+local function normalize_function_choice(raw_choice)
+    return tool_parser.normalize_function_choice(raw_choice, {
+        supported_acts = SUPPORTED_TOOL_ACTS,
+    })
+end
+
+local function utf8_take(s, max_chars)
+    s = tostring(s or "")
+    max_chars = tonumber(max_chars) or 0
+    if max_chars <= 0 then return s end
+
+    local out = {}
+    local count = 0
+    for ch in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        count = count + 1
+        if count > max_chars then break end
+        out[count] = ch
+    end
+    return table.concat(out)
+end
+
 local function strip_cot_safe(text)
     text = tostring(text or "")
     local cleaned = tool.remove_cot(text)
@@ -38,69 +61,43 @@ local function strip_cot_safe(text)
     return cleaned
 end
 
-local function parse_field(tbl_line, field)
-    local dq = tbl_line:match(field .. '%s*=%s*"([^"]*)"')
-    if dq then return dq end
-    local sq = tbl_line:match(field .. "%s*=%s*'([^']*)'")
-    if sq then return sq end
-    local raw = tbl_line:match(field .. "%s*=%s*([^,%}]+)")
-    if raw then return trim(raw) end
-    return nil
-end
-
-local function parse_tool_call_line(line)
-    local s = trim(line)
-    if s == "" then return nil end
-    if not s:match("^%b{}$") then
-        local first = tool.extract_first_lua_table and tool.extract_first_lua_table(s) or s:match("%b{}")
-        if not first then return nil end
-        s = trim(first)
-    end
-    if not s:find("act%s*=") then return nil end
-
-    local act_raw = parse_field(s, "act")
-    if not act_raw then return nil end
-    local act = string.lower(trim((act_raw:gsub('^["\'](.-)["\']$', "%1"))))
-    if act == "" then return nil end
-
-    return {
-        raw = s,
-        act = act,
-        string = parse_field(s, "string"),
-        query = parse_field(s, "query"),
-        type = parse_field(s, "type"),
-        types = parse_field(s, "types"),
-        entity = parse_field(s, "entity"),
-        evidence = parse_field(s, "evidence"),
-        confidence = parse_field(s, "confidence"),
-        namespace = parse_field(s, "namespace"),
-        key = parse_field(s, "key"),
-        value = parse_field(s, "value"),
-    }
-end
-
-local function collect_tool_calls_only(text)
-    local calls = {}
-    text = tostring(text or "")
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        local call = parse_tool_call_line(line)
-        if call then
-            table.insert(calls, call)
-        end
-    end
-    if #calls > 0 then return calls end
-
-    for block in text:gmatch("%b{}") do
-        local call = parse_tool_call_line(block)
-        if call then
-            table.insert(calls, call)
-        end
-    end
-    return calls
-end
-
-local function build_tool_pass_prompt(user_input, assistant_text, policy)
+local function build_tool_pass_prompt(user_input, assistant_text, policy, planner_ctx)
+    planner_ctx = planner_ctx or {}
     local delete_flag = policy.delete_enabled and "允许" or "禁用"
+    local step_idx = math.max(1, math.floor(tonumber(planner_ctx.step_idx) or 1))
+    local function_choice = normalize_function_choice(planner_ctx.function_choice)
+    local parallel_function_calls = to_bool(planner_ctx.parallel_function_calls, true)
+    local last_observation = trim(planner_ctx.last_observation or "")
+    local tool_trace = trim(planner_ctx.tool_trace or "")
+
+    if tool.utf8_sanitize_lossy then
+        last_observation = tool.utf8_sanitize_lossy(last_observation)
+        tool_trace = tool.utf8_sanitize_lossy(tool_trace)
+    end
+    last_observation = utf8_take(last_observation, 700)
+    tool_trace = utf8_take(tool_trace, 900)
+
+    if last_observation == "" then
+        last_observation = "（无）"
+    end
+    if tool_trace == "" then
+        tool_trace = "（无）"
+    end
+
+    local function_choice_rule = "function_choice=auto，可按需调用任意可用工具。"
+    if function_choice == "none" then
+        function_choice_rule = "function_choice=none，本轮禁止调用任何工具，必须输出空字符串。"
+    elseif function_choice ~= "auto" then
+        function_choice_rule = string.format(
+            "function_choice=%s，本轮只允许输出 act=\"%s\"。",
+            function_choice,
+            function_choice
+        )
+    end
+    local parallel_rule = parallel_function_calls
+        and "parallel_function_calls=true：若有多个互补检索，可同轮输出多条调用。"
+        or "parallel_function_calls=false：本轮最多输出 1 条工具调用。"
+
     return string.format([[
 你是 keyring 工具调用规划器，只负责输出工具调用，不负责回复用户。
 
@@ -116,14 +113,50 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy)
 4. 本轮最多 upsert_record %d 条，最多 query_record %d 条。
 5. delete_record 当前%s。
 6. query_record 可适当发散（同义词、上位词）提高命中，但必须与当前问题相关。
+7. 若上一轮 observation 已明确“无命中/无增量/重复”，不要重复同一 query_record。
+8. 优先利用 observation 与 trace 纠错；仅在确有新增信息时再继续调用。
+9. 若需要多个互补检索，可同轮输出多条独立 query_record（系统会并行批处理）。
+10. %s
+11. %s
 
 输入上下文：
+当前 step：
+%d
+
 用户原话：
 %s
 
 助手回复：
 %s
-]], policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, user_input, assistant_text)
+
+上一轮 observation：
+%s
+
+当前轮 trace 摘要：
+%s
+]], policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, function_choice_rule, parallel_rule, step_idx, user_input, assistant_text, last_observation, tool_trace)
+end
+
+local function filter_planner_calls(calls, planner_ctx)
+    planner_ctx = planner_ctx or {}
+    local function_choice = normalize_function_choice(planner_ctx.function_choice)
+    local parallel_function_calls = to_bool(planner_ctx.parallel_function_calls, true)
+
+    local out = {}
+    if function_choice == "none" then
+        return out
+    end
+
+    for _, c in ipairs(calls or {}) do
+        local act = trim((c or {}).act):lower()
+        if function_choice == "auto" or act == function_choice then
+            out[#out + 1] = c
+        end
+    end
+    if (not parallel_function_calls) and #out > 1 then
+        out = { out[1] }
+    end
+    return out
 end
 
 local function get_default_policy()
@@ -146,15 +179,16 @@ function M.get_policy()
     return get_default_policy()
 end
 
-function M.plan_calls(user_input, assistant_text, policy)
+function M.plan_calls(user_input, assistant_text, policy, planner_ctx)
     local p = policy or get_default_policy()
+    planner_ctx = planner_ctx or {}
     local safe_user = tostring(user_input or "")
     local safe_assistant = tostring(assistant_text or "")
     if tool.utf8_sanitize_lossy then
         safe_user = tool.utf8_sanitize_lossy(safe_user)
         safe_assistant = tool.utf8_sanitize_lossy(safe_assistant)
     end
-    local prompt = build_tool_pass_prompt(safe_user, safe_assistant, p)
+    local prompt = build_tool_pass_prompt(safe_user, safe_assistant, p, planner_ctx)
     local tool_messages = {
         { role = "user", content = prompt }
     }
@@ -165,9 +199,16 @@ function M.plan_calls(user_input, assistant_text, policy)
     }
     local raw = py_pipeline:generate_chat_sync(tool_messages, tool_params)
     raw = strip_cot_safe(raw or "")
-    local calls = collect_tool_calls_only(raw)
+    local calls = tool_parser.collect_tool_calls_only(raw, {
+        supported_acts = SUPPORTED_TOOL_ACTS,
+    })
+    calls = filter_planner_calls(calls, planner_ctx)
     if #calls > 0 then
-        print(string.format("[ToolPlanner] two_step 产出 %d 条调用", #calls))
+        print(string.format(
+            "[ToolPlanner] two_step 产出 %d 条调用 (step=%d)",
+            #calls,
+            math.max(1, math.floor(tonumber(planner_ctx.step_idx) or 1))
+        ))
     end
     return calls
 end

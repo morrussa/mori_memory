@@ -193,6 +193,13 @@ M.settings = {
             tool_pass_temperature = 0.15,   -- 二阶段工具调用温度
             tool_pass_max_tokens = 128,     -- 二阶段工具调用长度
             tool_pass_seed = 42,            -- 二阶段工具调用随机种子
+            parallel_execute_enabled = true, -- 多 query_record 按批次并行调度（同批独立执行）
+            parallel_query_batch_size = 4,   -- 并行批次最大调用数
+            retry_transient_max = 1,         -- 可恢复错误最大重试次数
+            retry_unknown_max = 0,           -- 未知错误最大重试次数
+            retry_validation_max = 0,        -- 参数/校验错误默认不重试
+            retry_budget_max = 0,            -- 预算错误默认不重试
+            retry_total_cap = 2,             -- 单调用总重试上限
         },
         memory_input = {
             -- 专业策略：对“记忆检索/原子事实提取”走独立输入通道，默认忽略附件正文。
@@ -241,6 +248,13 @@ M.settings = {
         max_context_refine_steps = 2, -- 单轮最多因工具上下文增量触发多少次重生成
         continue_on_tool_failure = true, -- 工具失败时触发自修正重试
         max_failure_refine_steps = 2, -- 单轮最多因工具失败触发多少次重修
+        direct_tool_call_enabled = true, -- 允许模型直出 {act="..."} 并直接执行（qwen-agent 风格）
+        native_tool_call_enabled = true, -- 优先使用 OpenAI 原生 tools 协议（tool_calls），失败时回退文本解析
+        function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record
+        parallel_function_calls = true, -- qwen-agent 对齐：false 时单轮最多执行 1 条工具调用
+        include_tool_observation_trace = true, -- 把 Action/Observation 轨迹注入下一步上下文
+        tool_trace_max_steps = 4, -- 轨迹最多保留多少个 step
+        tool_trace_max_chars = 1200, -- 轨迹注入文本最大长度
     },
     topic = {--在退出时，如果topic没有闭合，在topic.bin的第一行写下 current_turn\x1F<topic_head_vec>\x1F<topic_now_vec> ，topic.bin的第一行永远留给这个用途。
         make_cluster1 = 4,--当一个topic建立时，它向前make_cluster1步以建立头质心，

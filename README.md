@@ -136,9 +136,12 @@ http://127.0.0.1:8080
 
 当前主链路已切到（按职责分层）：
 - `module/agent/runtime.lua`：多步闭环状态机（循环 `BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS`，最后 `PERSIST`）
-- `module/agent/tool_planner.lua`：二阶段工具规划（只产出工具调用）
+  - 支持 qwen-agent 风格 “Action -> Observation” 轨迹回注
+  - 支持模型直出工具调用（`{act="..."}` / `<tool_call>...</tool_call>` / `✿FUNCTION✿ + ✿ARGS✿`）
+- `module/agent/tool_planner.lua`：二阶段工具规划（只产出工具调用，显式消费上一轮 observation/trace）
 - `module/agent/tool_registry.lua`：工具执行与 pending context（仅 notebook 工具）
 - `module/agent/context_window.lua`：按 token 预算裁剪上下文（模板后精确计数）
+- `module/agent/tool_parser.lua`：统一工具调用解析层（兼容 Lua table / Qwen / Nous 风格）
 - `module/memory/*.lua`：记忆与检索子系统（history/topic/recall/store/heat/cluster/adaptive/saver）
 
 路径约束：
@@ -176,11 +179,23 @@ agent = {
     max_context_refine_steps = 2,
     continue_on_tool_failure = true,
     max_failure_refine_steps = 2,
+    direct_tool_call_enabled = true,
+    native_tool_call_enabled = true,
+    function_choice = "auto",
+    parallel_function_calls = true,
+    include_tool_observation_trace = true,
+    tool_trace_max_steps = 4,
+    tool_trace_max_chars = 1200,
 }
 ```
 
 补充语义：
 - `upsert_max_per_turn` / `query_max_per_turn` 为同一 `turn` 内跨 `step` 累计预算，不会在多步循环中按 step 重置。
+- `settings.agent.native_tool_call_enabled = true`：优先走 OpenAI 原生 tools 协议（`tools/tool_choice/parallel_tool_calls` + `tool_calls`），失败自动回退文本解析。
+- `settings.agent.function_choice`：`auto|none|query_record|upsert_record|delete_record`，用于约束本轮可执行工具。
+- `settings.agent.parallel_function_calls=false`：单轮只保留第一条工具调用（qwen-agent 对齐）。
+- `settings.keyring.tool_calling.parallel_execute_enabled = true`：连续 `query_record` 会按批次并行调度（默认批大小 `parallel_query_batch_size=4`）。
+- `settings.keyring.tool_calling.retry_transient_max = 1`：仅“可恢复错误”自动重试；预算/参数类错误默认不重试（`retry_budget_max=0`、`retry_validation_max=0`）。
 - 记忆通道文件策略（专业建议）：
   - `settings.keyring.memory_input.max_chars = 2048`：记忆检索/事实提取输入硬上限
   - `settings.keyring.memory_input.recall_file_payload_mode = "ignore"`：召回阶段忽略附件正文
@@ -193,6 +208,8 @@ agent = {
 - `kept_pairs`
 - `dropped_blocks`
 - `tool_calls_count`
+- `tool_calls_count source=model_native|model_direct|planner_pass`
+- `tool_exec ... parallel_batches=... retries=...`
 - `continue reason`
 - `工具上下文无增量，提前收敛`
 - `agent_state_end`

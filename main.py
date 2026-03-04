@@ -190,7 +190,17 @@ class LlamaCppServerClient:
                 f"Invalid JSON from llama-server {endpoint}: {e}; body={body[:1000]}"
             ) from e
 
-    def create_chat_completion(self, messages, max_tokens=128, temperature=0.7, stop=None, seed=None):
+    def create_chat_completion(
+        self,
+        messages,
+        max_tokens=128,
+        temperature=0.7,
+        stop=None,
+        seed=None,
+        tools=None,
+        tool_choice=None,
+        parallel_tool_calls=None,
+    ):
         payload = {
             "model": self.model_name,
             "messages": messages,
@@ -201,6 +211,12 @@ class LlamaCppServerClient:
             payload["stop"] = list(stop)
         if seed is not None:
             payload["seed"] = int(seed)
+        if tools:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            payload["parallel_tool_calls"] = bool(parallel_tool_calls)
         return self._request_json(
             "POST",
             "/v1/chat/completions",
@@ -391,21 +407,111 @@ class AIPipeline:
 
     @staticmethod
     def _extract_chat_text(output: dict) -> str:
+        text, _tool_calls = AIPipeline._extract_chat_text_and_tool_calls(output)
+        return text
+
+    @staticmethod
+    def _extract_chat_text_and_tool_calls(output: dict):
         choices = output.get("choices") if isinstance(output, dict) else None
         if not choices:
             raise RuntimeError(f"Invalid chat completion response: {output}")
 
         message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
         content = message.get("content", "")
+        text = ""
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+            text = content
+        elif isinstance(content, list):
             texts = []
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
                     texts.append(str(item.get("text", "")))
-            return "".join(texts)
-        return str(content)
+            text = "".join(texts)
+        else:
+            text = str(content)
+
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+        else:
+            norm_tool_calls = []
+            for item in tool_calls:
+                if not isinstance(item, dict):
+                    continue
+                fn = item.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                name = str(fn.get("name", "") or "").strip()
+                if not name:
+                    continue
+                norm_tool_calls.append(
+                    {
+                        "id": str(item.get("id", "") or ""),
+                        "type": str(item.get("type", "function") or "function"),
+                        "function": {
+                            "name": name,
+                            "arguments": str(fn.get("arguments", "") or ""),
+                        },
+                    }
+                )
+            tool_calls = norm_tool_calls
+
+        return text, tool_calls
+
+    @staticmethod
+    def _coerce_lua_value(value, _depth: int = 0):
+        if _depth > 24:
+            return None
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            out = {}
+            for k, v in value.items():
+                out[str(k)] = AIPipeline._coerce_lua_value(v, _depth + 1)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [AIPipeline._coerce_lua_value(v, _depth + 1) for v in value]
+
+        try:
+            keys = value.keys()
+        except Exception:
+            keys = None
+        if keys is not None:
+            out = {}
+            for k in keys:
+                out[str(k)] = AIPipeline._coerce_lua_value(value[k], _depth + 1)
+            return out
+
+        try:
+            n = len(value)
+        except Exception:
+            n = None
+        if isinstance(n, int) and n >= 0:
+            seq = []
+            ok = True
+            for i in range(1, n + 1):
+                try:
+                    seq.append(AIPipeline._coerce_lua_value(value[i], _depth + 1))
+                except Exception:
+                    ok = False
+                    break
+            if ok:
+                return seq
+
+            seq = []
+            ok = True
+            for i in range(0, n):
+                try:
+                    seq.append(AIPipeline._coerce_lua_value(value[i], _depth + 1))
+                except Exception:
+                    ok = False
+                    break
+            if ok:
+                return seq
+
+        return value
 
     @staticmethod
     def _coerce_messages(messages):
@@ -417,19 +523,33 @@ class AIPipeline:
                 for i in range(1, length + 1):
                     msg = messages[i]
                     if msg and "role" in msg and "content" in msg:
+                        content = AIPipeline._coerce_lua_value(msg["content"])
+                        if content is None:
+                            content = ""
+                        row = {
+                            "role": str(msg["role"]),
+                            "content": content,
+                        }
+                        for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content"):
+                            if extra_key in msg and msg[extra_key] is not None:
+                                row[extra_key] = AIPipeline._coerce_lua_value(msg[extra_key])
                         messages_list.append(
-                            {
-                                "role": str(msg["role"]),
-                                "content": str(msg["content"]),
-                            }
+                            row
                         )
         except TypeError:
             if isinstance(messages, dict) and "role" in messages and "content" in messages:
+                content = AIPipeline._coerce_lua_value(messages["content"])
+                if content is None:
+                    content = ""
+                row = {
+                    "role": str(messages["role"]),
+                    "content": content,
+                }
+                for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content"):
+                    if extra_key in messages and messages[extra_key] is not None:
+                        row[extra_key] = AIPipeline._coerce_lua_value(messages[extra_key])
                 messages_list.append(
-                    {
-                        "role": str(messages["role"]),
-                        "content": str(messages["content"]),
-                    }
+                    row
                 )
 
         if not messages_list and isinstance(messages, list):
@@ -438,14 +558,157 @@ class AIPipeline:
                     continue
                 if "role" not in msg or "content" not in msg:
                     continue
+                content = AIPipeline._coerce_lua_value(msg.get("content"))
+                if content is None:
+                    content = ""
+                row = {
+                    "role": str(msg.get("role")),
+                    "content": content,
+                }
+                for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content"):
+                    if msg.get(extra_key) is not None:
+                        row[extra_key] = AIPipeline._coerce_lua_value(msg.get(extra_key))
                 messages_list.append(
-                    {
-                        "role": str(msg["role"]),
-                        "content": str(msg["content"]),
-                    }
+                    row
                 )
 
         return messages_list
+
+    @staticmethod
+    def _coerce_tools(tools):
+        raw = AIPipeline._coerce_lua_value(tools)
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            return []
+
+        out = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function" and isinstance(item.get("function"), dict):
+                fn = item["function"]
+                name = str(fn.get("name", "") or "").strip()
+                if not name:
+                    continue
+                out.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": str(fn.get("description", "") or ""),
+                            "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                        },
+                    }
+                )
+                continue
+
+            name = str(item.get("name", "") or "").strip()
+            if not name:
+                continue
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": str(item.get("description", "") or ""),
+                        "parameters": item.get("parameters", {"type": "object", "properties": {}}),
+                    },
+                }
+            )
+        return out
+
+    @staticmethod
+    def _coerce_tool_choice(tool_choice):
+        if tool_choice is None:
+            return None
+        raw = AIPipeline._coerce_lua_value(tool_choice)
+        if isinstance(raw, str):
+            s = raw.strip().lower()
+            if s in {"auto", "none", "required"}:
+                return s
+            if s:
+                return {"type": "function", "function": {"name": s}}
+            return "auto"
+        if isinstance(raw, dict):
+            return raw
+        return "auto"
+
+    @staticmethod
+    def _lua_escape_str(value: str) -> str:
+        s = str(value or "")
+        s = s.replace("\\", "\\\\")
+        s = s.replace("\"", "\\\"")
+        s = s.replace("\r", "\\r")
+        s = s.replace("\n", "\\n")
+        return s
+
+    @staticmethod
+    def _dict_to_lua_table_row(payload: dict) -> str:
+        ordered_keys = [
+            "act",
+            "string",
+            "query",
+            "type",
+            "types",
+            "entity",
+            "evidence",
+            "confidence",
+            "namespace",
+            "key",
+            "value",
+        ]
+        parts = []
+        for key in ordered_keys:
+            if key not in payload:
+                continue
+            val = payload[key]
+            if val is None:
+                continue
+            if isinstance(val, bool):
+                lit = "true" if val else "false"
+            elif isinstance(val, (int, float)):
+                lit = str(val)
+            else:
+                lit = '"' + AIPipeline._lua_escape_str(str(val)) + '"'
+            parts.append(f"{key}={lit}")
+        return "{" + ", ".join(parts) + "}"
+
+    @staticmethod
+    def _tool_calls_to_lua_rows(tool_calls):
+        if not isinstance(tool_calls, list):
+            return ""
+        rows = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name", "") or "").strip()
+            if not name:
+                continue
+            args_raw = fn.get("arguments", "")
+            args_obj = {}
+            if isinstance(args_raw, dict):
+                args_obj = args_raw
+            elif isinstance(args_raw, str):
+                s = args_raw.strip()
+                if s:
+                    try:
+                        parsed = json.loads(s)
+                        if isinstance(parsed, dict):
+                            args_obj = parsed
+                    except Exception:
+                        args_obj = {}
+
+            payload = {"act": name}
+            if isinstance(args_obj, dict):
+                for key in ("string", "query", "type", "types", "entity", "evidence", "confidence", "namespace", "key", "value"):
+                    if key in args_obj:
+                        payload[key] = args_obj.get(key)
+            rows.append(AIPipeline._dict_to_lua_table_row(payload))
+        return "\n".join(rows)
 
     def get_embedding(self, text: str, mode: str = "query"):
         """将文本转换为向量"""
@@ -566,6 +829,54 @@ class AIPipeline:
             seed=seed
         )
         return self._extract_chat_text(output)
+
+    def generate_chat_with_tools_sync(
+        self,
+        messages,
+        params,
+        tools,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    ):
+        """同步工具调用版本：返回 (text, lua_tool_rows)"""
+        if not self.llm_large:
+            raise RuntimeError("Large model not loaded")
+
+        messages_list = self._coerce_messages(messages)
+        if not messages_list:
+            raise ValueError("Invalid messages format")
+
+        params_dict = dict(params) if hasattr(params, 'keys') else params
+        max_tokens = int(params_dict.get("max_tokens", 128))
+        temperature = float(params_dict.get("temperature", 0.7))
+        stop = [str(s) for s in params_dict.get("stop", []) if s is not None]
+
+        seed = params_dict.get("seed")
+        if seed is not None:
+            try:
+                seed = int(seed)
+                if seed < 0:
+                    seed = None
+            except (TypeError, ValueError):
+                seed = None
+
+        tools_payload = self._coerce_tools(tools)
+        tool_choice_payload = self._coerce_tool_choice(tool_choice)
+        parallel_payload = bool(parallel_tool_calls)
+
+        output = self.llm_large.create_chat_completion(
+            messages=messages_list,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            seed=seed,
+            tools=tools_payload,
+            tool_choice=tool_choice_payload,
+            parallel_tool_calls=parallel_payload,
+        )
+        text_result, tool_calls = self._extract_chat_text_and_tool_calls(output)
+        lua_rows = self._tool_calls_to_lua_rows(tool_calls)
+        return text_result, lua_rows
 
     def load_models(self, large_model_path: str, embedding_model_path: str):
         print("[Python] Loading models...")

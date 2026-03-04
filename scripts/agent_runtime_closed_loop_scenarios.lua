@@ -11,6 +11,7 @@ local STUB_MODULES = {
     "module.agent.tool_calling",
     "module.agent.tool_planner",
     "module.agent.tool_registry",
+    "module.agent.tool_parser",
     "module.agent.context_window",
     "module.agent.runtime",
 }
@@ -33,6 +34,8 @@ local function install_stubs(state, scenario)
                     continue_on_tool_context = true,
                     continue_on_tool_failure = true,
                     max_failure_refine_steps = scenario.max_failure_refine_steps or 3,
+                    function_choice = scenario.function_choice or "auto",
+                    parallel_function_calls = (scenario.parallel_function_calls ~= false),
                 }
             }
         }
@@ -93,6 +96,17 @@ local function install_stubs(state, scenario)
 
     package.preload["module.agent.tool_calling"] = function()
         local M = {}
+        function M.get_memory_input_policy()
+            return {
+                recall_mode = "ignore",
+                max_chars = 2048,
+                manifest_max_items = 8,
+                manifest_name_max_chars = 96,
+            }
+        end
+        function M.sanitize_memory_input(user_input, _)
+            return tostring(user_input or ""), false, 0, "ignore", false
+        end
         function M.extract_atomic_facts(_, assistant_text)
             state.extract_calls = state.extract_calls + 1
             state.last_extract_input = assistant_text
@@ -107,9 +121,10 @@ local function install_stubs(state, scenario)
 
     package.preload["module.agent.tool_planner"] = function()
         local M = {}
-        function M.plan_calls(_, assistant_text, _)
+        function M.plan_calls(_, assistant_text, _, planner_ctx)
             state.plan_calls = state.plan_calls + 1
             state.plan_inputs[state.plan_calls] = assistant_text
+            state.plan_ctxs[state.plan_calls] = planner_ctx or {}
             local scripted = scenario.plan_outputs[state.plan_calls]
             if scripted == nil then
                 scripted = scenario.plan_outputs[#scenario.plan_outputs] or {}
@@ -129,6 +144,26 @@ local function install_stubs(state, scenario)
 
         function M.get_policy()
             return {}
+        end
+
+        function M.get_openai_tools(_)
+            return {
+                {
+                    type = "function",
+                    ["function"] = {
+                        name = "query_record",
+                        description = "query memory records",
+                        parameters = {
+                            type = "object",
+                            properties = {
+                                query = { type = "string" },
+                                types = { type = "string" },
+                            },
+                            required = { "query" },
+                        },
+                    },
+                },
+            }
         end
 
         function M.consume_pending_system_context_for_turn(_)
@@ -199,6 +234,23 @@ local function install_stubs(state, scenario)
             end
             cb(out)
         end,
+        generate_chat_with_tools_sync = function(_, _, _, _, _, _)
+            state.generate_calls = state.generate_calls + 1
+            state.native_generate_calls = (state.native_generate_calls or 0) + 1
+            local out = scenario.native_generate_outputs and scenario.native_generate_outputs[state.native_generate_calls]
+            local calls = scenario.native_generate_tool_calls and scenario.native_generate_tool_calls[state.native_generate_calls]
+
+            if out == nil and scenario.generate_outputs then
+                out = scenario.generate_outputs[state.generate_calls]
+                if out == nil then
+                    out = scenario.generate_outputs[#scenario.generate_outputs]
+                end
+            end
+            if calls == nil then
+                calls = ""
+            end
+            return out or "", calls
+        end,
     }
 end
 
@@ -206,6 +258,7 @@ local function run_scenario(name, scenario)
     clear_modules()
     local state = {
         generate_calls = 0,
+        native_generate_calls = 0,
         build_context_calls = 0,
         plan_calls = 0,
         exec_calls = 0,
@@ -218,6 +271,7 @@ local function run_scenario(name, scenario)
         recall_opts = {},
         tool_contexts = {},
         plan_inputs = {},
+        plan_ctxs = {},
         exec_results = {},
     }
 
@@ -260,6 +314,117 @@ local scenarios = {
             assert(state.memory_save_calls == 1, "最终持久化应只写一次 memory")
             assert(contains(state.tool_contexts[2], "Tool:query_record"), "第二步上下文应包含工具检索结果")
             assert(final == "最终答案（已结合工具检索）", "最终答案应为第二步收敛结果")
+        end,
+    },
+    {
+        name = "native_tools_protocol_call",
+        max_steps = 4,
+        plan_outputs = {
+            {},
+        },
+        native_generate_outputs = {
+            "我先查一下。",
+            "最终答案：已结合 native tool_calls。",
+        },
+        native_generate_tool_calls = {
+            "{act=\"query_record\", query=\"用户偏好\", types=\"preference\"}",
+            "",
+        },
+        assertions = function(state, final)
+            assert((state.native_generate_calls or 0) >= 1, "应命中 native tools 生成接口")
+            assert(state.generate_calls == 2, "native tool_calls 应触发第二步生成")
+            assert(state.plan_calls == 1, "native tool_calls 命中时应跳过首轮 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "首轮应执行 native query_record")
+            assert(final == "最终答案：已结合 native tool_calls。", "最终答案应来自第二步收敛结果")
+        end,
+    },
+    {
+        name = "direct_model_tool_call",
+        max_steps = 4,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "我先查一下。\n{act=\"query_record\", query=\"用户偏好\", types=\"preference\"}",
+            "最终答案：已结合检索信息。",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "直出工具调用应触发下一步生成")
+            assert(state.plan_calls == 1, "第一步命中直出调用时应跳过 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "第一步应执行直出 query_record")
+            assert(contains(state.tool_contexts[2], "Tool Observation Trace"), "第二步上下文应注入 observation 轨迹")
+            assert(contains(state.tool_contexts[2], "Tool:query_record"), "第二步上下文应包含 query_record 结果")
+            assert(final == "最终答案：已结合检索信息。", "最终答案应来自第二步收敛结果")
+        end,
+    },
+    {
+        name = "direct_model_tool_call_qwen_xml",
+        max_steps = 4,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "我先查一下。\n<tool_call>\n{\"name\":\"query_record\",\"arguments\":{\"query\":\"用户偏好\",\"types\":\"preference\"}}\n</tool_call>",
+            "最终答案：已结合 qwen xml 工具结果。",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "qwen xml 工具调用应触发下一步生成")
+            assert(state.plan_calls == 1, "第一步命中 qwen xml 调用时应跳过 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "第一步应执行 qwen xml query_record")
+            assert(contains(state.tool_contexts[2], "Tool:query_record"), "第二步上下文应包含 query_record 结果")
+            assert(final == "最终答案：已结合 qwen xml 工具结果。", "最终答案应来自第二步收敛结果")
+        end,
+    },
+    {
+        name = "direct_model_tool_call_qwen_function_tags",
+        max_steps = 4,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "我先查一下。\n✿FUNCTION✿: query_record\n✿ARGS✿: {\"query\":\"用户偏好\",\"types\":\"preference\"}",
+            "最终答案：已结合 qwen function 标记结果。",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "qwen FUNCTION/ARGS 调用应触发下一步生成")
+            assert(state.plan_calls == 1, "第一步命中 qwen FUNCTION/ARGS 时应跳过 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "第一步应执行 qwen FUNCTION/ARGS query_record")
+            assert(contains(state.tool_contexts[2], "Tool:query_record"), "第二步上下文应包含 query_record 结果")
+            assert(final == "最终答案：已结合 qwen function 标记结果。", "最终答案应来自第二步收敛结果")
+        end,
+    },
+    {
+        name = "function_choice_none_block_direct_calls",
+        max_steps = 4,
+        function_choice = "none",
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "先给你结论。\n{act=\"query_record\", query=\"用户偏好\", types=\"preference\"}",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 1, "function_choice=none 不应触发下一步")
+            assert(state.plan_calls == 0, "第一步命中直出调用时仍应跳过 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 0, "function_choice=none 不应执行工具")
+            assert(final == "先给你结论。", "应返回可见文本答案")
+        end,
+    },
+    {
+        name = "parallel_function_calls_false_keep_first",
+        max_steps = 4,
+        parallel_function_calls = false,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "我先查。\n{act=\"query_record\", query=\"用户偏好\", types=\"preference\"}\n{act=\"query_record\", query=\"长期目标\", types=\"long_term_plan\"}",
+            "最终答案：已按单调用约束收敛。",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "首轮命中工具后应触发下一步生成")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "parallel_function_calls=false 应仅执行首条调用")
+            assert(final == "最终答案：已按单调用约束收敛。", "最终答案应来自第二步收敛结果")
         end,
     },
     {

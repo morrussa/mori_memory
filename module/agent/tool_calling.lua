@@ -1,6 +1,7 @@
 local M = {}
 
 local tool = require("module.tool")
+local tool_parser = require("module.agent.tool_parser")
 local history = require("module.memory.history")
 local topic = require("module.memory.topic")
 local memory = require("module.memory.store")
@@ -21,6 +22,7 @@ end
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
 local FACT_CFG = ((config_mem.settings or {}).keyring or {}).fact_extractor or {}
 local MEMORY_INPUT_CFG = ((config_mem.settings or {}).keyring or {}).memory_input or {}
+local SUPPORTED_TOOL_ACTS = tool_parser.clone_supported_acts()
 local trim
 local resolve_file_payload_mode
 local get_memory_input_policy
@@ -228,16 +230,6 @@ local function strip_file_payload_for_memory(text, opts)
     return out, true, redacted_blocks
 end
 
-local function parse_field(tbl_line, field)
-    local dq = tbl_line:match(field .. '%s*=%s*"([^"]*)"')
-    if dq then return dq end
-    local sq = tbl_line:match(field .. "%s*=%s*'([^']*)'")
-    if sq then return sq end
-    local raw = tbl_line:match(field .. "%s*=%s*([^,%}]+)")
-    if raw then return trim(raw) end
-    return nil
-end
-
 local function split_csv(s)
     local out = {}
     s = trim(s)
@@ -257,74 +249,16 @@ local function clamp01(v, fallback)
     return n
 end
 
-local function parse_tool_call_line(line)
-    local s = trim(line)
-    if s == "" then return nil end
-    if not s:match("^%b{}$") then
-        local first = tool.extract_first_lua_table and tool.extract_first_lua_table(s) or s:match("%b{}")
-        if not first then return nil end
-        s = trim(first)
-    end
-    if not s:find("act%s*=") then return nil end
-
-    local act_raw = parse_field(s, "act")
-    if not act_raw then return nil end
-    local act = string.lower(trim((act_raw:gsub('^["\'](.-)["\']$', "%1"))))
-    if act == "" then return nil end
-
-    return {
-        raw = s,
-        act = act,
-        string = parse_field(s, "string"),
-        query = parse_field(s, "query"),
-        type = parse_field(s, "type"),
-        types = parse_field(s, "types"),
-        entity = parse_field(s, "entity"),
-        evidence = parse_field(s, "evidence"),
-        confidence = parse_field(s, "confidence"),
-        namespace = parse_field(s, "namespace"),
-        key = parse_field(s, "key"),
-        value = parse_field(s, "value"),
-    }
-end
-
 local function split_tool_calls_and_text(text)
-    local calls = {}
-    local kept = {}
-
-    text = tostring(text or "")
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        local call = parse_tool_call_line(line)
-        if call then
-            table.insert(calls, call)
-        else
-            table.insert(kept, line)
-        end
-    end
-
-    local visible = table.concat(kept, "\n")
-    visible = trim(visible)
-    return calls, visible
+    return tool_parser.split_tool_calls_and_text(text, {
+        supported_acts = SUPPORTED_TOOL_ACTS,
+    })
 end
 
 local function collect_tool_calls_only(text)
-    local calls = {}
-    text = tostring(text or "")
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        local call = parse_tool_call_line(line)
-        if call then
-            table.insert(calls, call)
-        end
-    end
-    if #calls > 0 then return calls end
-
-    for block in text:gmatch("%b{}") do
-        local call = parse_tool_call_line(block)
-        if call then
-            table.insert(calls, call)
-        end
-    end
-    return calls
+    return tool_parser.collect_tool_calls_only(text, {
+        supported_acts = SUPPORTED_TOOL_ACTS,
+    })
 end
 
 local function utf8_take(s, max_chars)
