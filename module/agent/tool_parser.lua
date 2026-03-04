@@ -26,6 +26,9 @@ local ACT_ALIAS = {
 }
 
 local CALL_FIELDS = {
+    "tool_call_id",
+    "arguments_json",
+    "arguments",
     "string",
     "query",
     "type",
@@ -70,11 +73,56 @@ local function normalize_act(name, supported_acts)
 end
 
 local function parse_lua_field(tbl_line, field)
-    local dq = tbl_line:match(field .. '%s*=%s*"([^"]*)"')
-    if dq then return dq end
-    local sq = tbl_line:match(field .. "%s*=%s*'([^']*)'")
-    if sq then return sq end
-    local raw = tbl_line:match(field .. "%s*=%s*([^,%}]+)")
+    tbl_line = tostring(tbl_line or "")
+    field = tostring(field or "")
+    if field == "" or tbl_line == "" then
+        return nil
+    end
+
+    local safe_field = field:gsub("(%W)", "%%%1")
+    local p1, p2 = tbl_line:find("%f[%w_]" .. safe_field .. "%f[^%w_]%s*=%s*")
+    if not p1 then
+        return nil
+    end
+    local i = (p2 or 0) + 1
+    while i <= #tbl_line do
+        local ch = tbl_line:sub(i, i)
+        if ch == " " or ch == "\t" or ch == "\r" or ch == "\n" then
+            i = i + 1
+        else
+            break
+        end
+    end
+    if i > #tbl_line then
+        return nil
+    end
+
+    local first = tbl_line:sub(i, i)
+    if first == '"' or first == "'" then
+        local quote = first
+        i = i + 1
+        local out = {}
+        while i <= #tbl_line do
+            local ch = tbl_line:sub(i, i)
+            if ch == "\\" then
+                local nxt = tbl_line:sub(i + 1, i + 1)
+                if nxt ~= "" then
+                    out[#out + 1] = nxt
+                    i = i + 2
+                else
+                    i = i + 1
+                end
+            elseif ch == quote then
+                return table.concat(out)
+            else
+                out[#out + 1] = ch
+                i = i + 1
+            end
+        end
+        return table.concat(out)
+    end
+
+    local raw = tbl_line:match("%f[%w_]" .. safe_field .. "%f[^%w_]%s*=%s*([^,%}]+)")
     if raw then return trim(raw) end
     return nil
 end
@@ -356,7 +404,21 @@ local function parse_json_function_object(raw, supported_acts)
     if not act then return nil end
 
     local args_blob = extract_json_args_blob(s)
-    return build_call(act, s, args_blob, s)
+    local call = build_call(act, s, args_blob, s)
+    if trim(call.tool_call_id or "") == "" then
+        local tcid = parse_mixed_field(s, "tool_call_id")
+        if tcid == nil or trim(tcid) == "" then
+            tcid = parse_mixed_field(s, "id")
+        end
+        call.tool_call_id = trim(tcid or "")
+    end
+    if trim(call.arguments_json or "") == "" then
+        local arg_raw = trim(args_blob or "")
+        if arg_raw ~= "" then
+            call.arguments_json = arg_raw
+        end
+    end
+    return call
 end
 
 local function append_unique_call(calls, seen, call)
@@ -442,6 +504,85 @@ local function parse_qwen_symbol_calls(text, calls, spans, seen, supported_acts)
         end
         pos = (next_fn or (n + 1))
         ::continue::
+    end
+end
+
+local function is_react_boundary_line(line)
+    local low = trim(line):lower()
+    if low == "" then return false end
+    if low:match("^action%s*:") then return true end
+    if low:match("^observation%s*:") then return true end
+    if low:match("^final%s+answer%s*:") then return true end
+    if low:match("^thought%s*:") then return true end
+    if low:match("^question%s*:") then return true end
+    return false
+end
+
+local function parse_react_action_calls(text, calls, spans, seen, supported_acts)
+    local lines = {}
+    local cursor = 1
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        local line_start = cursor
+        local line_end = cursor + #line - 1
+        if line_end < line_start then
+            line_end = line_start
+        end
+        lines[#lines + 1] = {
+            text = line,
+            s = line_start,
+            e = line_end,
+        }
+        cursor = cursor + #line + 1
+    end
+
+    local idx = 1
+    while idx <= #lines do
+        local line = lines[idx].text
+        local action_name = line:match("^%s*[Aa]ction%s*:%s*(.-)%s*$")
+        if action_name and action_name ~= "" then
+            local act = normalize_act(action_name, supported_acts)
+            local raw_start = lines[idx].s
+            local raw_end = lines[idx].e
+            local args_blob = ""
+            local next_idx = idx + 1
+
+            if next_idx <= #lines then
+                local first_input = lines[next_idx].text:match("^%s*[Aa]ction%s*[Ii]nput%s*:%s*(.*)$")
+                if first_input ~= nil then
+                    args_blob = tostring(first_input or "")
+                    raw_end = lines[next_idx].e
+                    next_idx = next_idx + 1
+                    while next_idx <= #lines do
+                        local next_line = lines[next_idx].text
+                        if is_react_boundary_line(next_line) then
+                            break
+                        end
+                        args_blob = args_blob .. "\n" .. tostring(next_line or "")
+                        raw_end = lines[next_idx].e
+                        next_idx = next_idx + 1
+                    end
+                end
+            end
+
+            if act then
+                local args_clean = trim(args_blob)
+                local raw_block = trim(text:sub(raw_start, raw_end))
+                local call = build_call(act, raw_block, args_clean, args_clean)
+                if trim(call.arguments_json or "") == "" and args_clean ~= "" then
+                    call.arguments_json = args_clean
+                end
+                append_unique_call(calls, seen, call)
+                add_span(spans, raw_start, raw_end)
+            end
+
+            if next_idx > idx then
+                idx = next_idx
+            else
+                idx = idx + 1
+            end
+        else
+            idx = idx + 1
+        end
     end
 end
 
@@ -564,6 +705,7 @@ local function parse_calls_with_spans(text, opts)
 
     parse_tool_call_xml(text, calls, spans, seen, supported_acts)
     parse_qwen_symbol_calls(text, calls, spans, seen, supported_acts)
+    parse_react_action_calls(text, calls, spans, seen, supported_acts)
     parse_lua_lines(text, calls, spans, seen, supported_acts)
     parse_json_objects(text, calls, spans, seen, supported_acts)
 
@@ -614,6 +756,9 @@ function M.parse_tool_call_line(line, opts)
     if call then return call end
 
     call = collect_first_call_with_parser(text, supported_acts, parse_qwen_symbol_calls)
+    if call then return call end
+
+    call = collect_first_call_with_parser(text, supported_acts, parse_react_action_calls)
     if call then return call end
 
     call = collect_first_call_with_parser(text, supported_acts, parse_tool_call_xml)

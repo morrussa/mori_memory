@@ -212,7 +212,41 @@ local function compose_system_prompt(system_prompt, blocks)
     return table.concat(out, "\n\n")
 end
 
-local function build_messages(system_prompt, user_input, history_pairs, blocks)
+local function normalize_tail_messages(messages)
+    local out = {}
+    if type(messages) ~= "table" then
+        return out
+    end
+    for _, msg in ipairs(messages) do
+        if type(msg) == "table" then
+            local role = trim(msg.role)
+            if role ~= "" then
+                local row = {
+                    role = role,
+                    content = msg.content,
+                }
+                if row.content == nil then
+                    row.content = ""
+                end
+                for _, key in ipairs({
+                    "name",
+                    "tool_call_id",
+                    "tool_calls",
+                    "reasoning_content",
+                    "function_call",
+                }) do
+                    if msg[key] ~= nil then
+                        row[key] = msg[key]
+                    end
+                end
+                out[#out + 1] = row
+            end
+        end
+    end
+    return out
+end
+
+local function build_messages(system_prompt, user_input, history_pairs, blocks, tail_messages)
     local merged_system_prompt = compose_system_prompt(system_prompt, blocks)
     local msgs = {
         { role = "system", content = merged_system_prompt },
@@ -228,6 +262,9 @@ local function build_messages(system_prompt, user_input, history_pairs, blocks)
     end
 
     msgs[#msgs + 1] = { role = "user", content = user_input }
+    for _, tail in ipairs(tail_messages or {}) do
+        msgs[#msgs + 1] = tail
+    end
     return msgs
 end
 
@@ -263,6 +300,7 @@ function M.build_messages(opts)
         memory_context = trim(opts.memory_context),
         history_summary = trim(opts.history_summary),
     }
+    local tail_messages = normalize_tail_messages(opts.tail_messages)
 
     local plan_pinned = to_bool(
         opts.plan_bom_pinned,
@@ -318,7 +356,7 @@ function M.build_messages(opts)
         return false
     end
 
-    local base_messages = build_messages(system_prompt, user_input, {}, blocks)
+    local base_messages = build_messages(system_prompt, user_input, {}, blocks, tail_messages)
     local total_tokens = count_messages_tokens(base_messages)
 
     if total_tokens > budget then
@@ -333,7 +371,7 @@ function M.build_messages(opts)
             end
             local changed = drop_block(name)
             if changed then
-                base_messages = build_messages(system_prompt, user_input, {}, blocks)
+                base_messages = build_messages(system_prompt, user_input, {}, blocks, tail_messages)
                 total_tokens = count_messages_tokens(base_messages)
             end
         end
@@ -354,7 +392,7 @@ function M.build_messages(opts)
                 compacted = true
             end
             blocks.plan_bom = clipped
-            base_messages = build_messages(system_prompt, user_input, {}, blocks)
+            base_messages = build_messages(system_prompt, user_input, {}, blocks, tail_messages)
             total_tokens = count_messages_tokens(base_messages)
             if total_tokens <= budget then
                 if compacted then
@@ -388,7 +426,7 @@ function M.build_messages(opts)
             candidate_pairs[#candidate_pairs + 1] = kept_pairs[k]
         end
 
-        local candidate_messages = build_messages(system_prompt, user_input, candidate_pairs, blocks)
+        local candidate_messages = build_messages(system_prompt, user_input, candidate_pairs, blocks, tail_messages)
         local candidate_tokens = count_messages_tokens(candidate_messages)
         if candidate_tokens <= budget then
             kept_pairs = candidate_pairs
@@ -431,7 +469,7 @@ function M.build_messages(opts)
                     clipped = trim(clipped) .. "\n...(history auto-compressed)"
                 end
                 blocks.history_summary = clipped
-                local candidate_messages = build_messages(system_prompt, user_input, summary_kept_pairs, blocks)
+                local candidate_messages = build_messages(system_prompt, user_input, summary_kept_pairs, blocks, tail_messages)
                 local candidate_tokens = count_messages_tokens(candidate_messages)
                 if candidate_tokens <= budget then
                     final_messages = candidate_messages

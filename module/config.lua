@@ -228,6 +228,17 @@ M.settings = {
             verify_temperature = 0.0,
             verify_seed = 46,
         },
+        external_tools = {
+            enabled = false, -- qwen-agent 工具生态开关（true 后可调用 qwen_agent 内置工具）
+            include_memory_tools = true, -- 是否保留 query/upsert/delete 内置记忆工具
+            context_inject = true, -- 外部工具结果是否注入下一步上下文
+            context_max_chars = 1200, -- 外部工具结果注入上限
+            names = { -- 为空时加载 qwen-agent 全部可用工具；建议按需启用
+                "web_search",
+                "web_extractor",
+                "amap_weather",
+            },
+        },
     },
     agent = {
         max_steps = 4,
@@ -248,6 +259,13 @@ M.settings = {
         max_context_refine_steps = 2, -- 单轮最多因工具上下文增量触发多少次重生成
         continue_on_tool_failure = true, -- 工具失败时触发自修正重试
         max_failure_refine_steps = 2, -- 单轮最多因工具失败触发多少次重修
+        llm_retry_max = 2, -- qwen-agent 对齐：主生成失败后的最大重试次数（不含首轮）
+        llm_retry_backoff_sec = 0.35, -- 重试指数退避基线秒数
+        native_llm_retry_max = 2, -- 原生 tools 生成链路重试次数（默认跟随 llm_retry_max）
+        planner_retry_max = 1, -- 二阶段 planner 失败时最大重试次数
+        planner_retry_backoff_sec = 0.2, -- planner 重试退避秒数
+        function_protocol_enabled = true, -- 以 assistant/tool 协议消息回放工具调用链（qwen-agent 对齐）
+        function_protocol_result_max_chars = 600, -- 单条 tool result 回放长度上限
         direct_tool_call_enabled = true, -- 允许模型直出 {act="..."} 并直接执行（qwen-agent 风格）
         native_tool_call_enabled = true, -- 优先使用 OpenAI 原生 tools 协议（tool_calls），失败时回退文本解析
         function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record

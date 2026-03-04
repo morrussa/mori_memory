@@ -2,10 +2,21 @@ local M = {}
 
 local tool = require("module.tool")
 local tool_parser = require("module.agent.tool_parser")
+local tool_registry = require("module.agent.tool_registry")
 local config_mem = require("module.config")
 
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
-local SUPPORTED_TOOL_ACTS = tool_parser.clone_supported_acts()
+
+local function get_supported_tool_acts()
+    local acts = tool_parser.clone_supported_acts()
+    if tool_registry.get_supported_acts then
+        local ok, merged = pcall(tool_registry.get_supported_acts, acts)
+        if ok and type(merged) == "table" then
+            acts = merged
+        end
+    end
+    return acts
+end
 
 local function trim(s)
     if not s then return "" end
@@ -31,9 +42,9 @@ local function cfg_number(v, fallback, min_v, max_v)
     return n
 end
 
-local function normalize_function_choice(raw_choice)
+local function normalize_function_choice(raw_choice, supported_acts)
     return tool_parser.normalize_function_choice(raw_choice, {
-        supported_acts = SUPPORTED_TOOL_ACTS,
+        supported_acts = supported_acts or tool_parser.clone_supported_acts(),
     })
 end
 
@@ -61,14 +72,48 @@ local function strip_cot_safe(text)
     return cleaned
 end
 
-local function build_tool_pass_prompt(user_input, assistant_text, policy, planner_ctx)
+local function build_dynamic_tool_call_examples(policy)
+    local lines = {
+        '{act="upsert_record", type="preference|constraint|identity|credential_hint|long_term_plan", entity="对象", value="内容", evidence="原话片段", confidence=0.0}',
+        '{act="query_record", query="检索内容", types="可选逗号分隔type列表"}',
+        '{act="delete_record", type="...", entity="对象", evidence="删除依据"}',
+    }
+    local schemas = {}
+    if tool_registry.get_openai_tools then
+        local ok, out = pcall(tool_registry.get_openai_tools, policy)
+        if ok and type(out) == "table" then
+            schemas = out
+        end
+    end
+    local known = {
+        upsert_record = true,
+        query_record = true,
+        delete_record = true,
+    }
+    for _, item in ipairs(schemas) do
+        local fn = type(item) == "table" and item["function"] or nil
+        local name = trim((fn or {}).name or "")
+        if name ~= "" and (not known[name]) then
+            known[name] = true
+            lines[#lines + 1] = string.format(
+                '{act="%s", arguments_json="{\\"...\\": ...}"}',
+                name
+            )
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+local function build_tool_pass_prompt(user_input, assistant_text, policy, planner_ctx, supported_acts)
     planner_ctx = planner_ctx or {}
+    supported_acts = supported_acts or tool_parser.clone_supported_acts()
     local delete_flag = policy.delete_enabled and "允许" or "禁用"
     local step_idx = math.max(1, math.floor(tonumber(planner_ctx.step_idx) or 1))
-    local function_choice = normalize_function_choice(planner_ctx.function_choice)
+    local function_choice = normalize_function_choice(planner_ctx.function_choice, supported_acts)
     local parallel_function_calls = to_bool(planner_ctx.parallel_function_calls, true)
     local last_observation = trim(planner_ctx.last_observation or "")
     local tool_trace = trim(planner_ctx.tool_trace or "")
+    local tool_examples = build_dynamic_tool_call_examples(policy)
 
     if tool.utf8_sanitize_lossy then
         last_observation = tool.utf8_sanitize_lossy(last_observation)
@@ -102,9 +147,7 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy, planne
 你是 keyring 工具调用规划器，只负责输出工具调用，不负责回复用户。
 
 可用调用（每条必须单独一行，严格 Lua table）：
-{act="upsert_record", type="preference|constraint|identity|credential_hint|long_term_plan", entity="对象", value="内容", evidence="原话片段", confidence=0.0}
-{act="query_record", query="检索内容", types="可选逗号分隔type列表"}
-{act="delete_record", type="...", entity="对象", evidence="删除依据"}
+%s
 
 硬约束：
 1. 只输出工具调用行，不要解释、不要 markdown、不要代码块。
@@ -134,12 +177,13 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy, planne
 
 当前轮 trace 摘要：
 %s
-]], policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, function_choice_rule, parallel_rule, step_idx, user_input, assistant_text, last_observation, tool_trace)
+]], tool_examples, policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, function_choice_rule, parallel_rule, step_idx, user_input, assistant_text, last_observation, tool_trace)
 end
 
-local function filter_planner_calls(calls, planner_ctx)
+local function filter_planner_calls(calls, planner_ctx, supported_acts)
     planner_ctx = planner_ctx or {}
-    local function_choice = normalize_function_choice(planner_ctx.function_choice)
+    supported_acts = supported_acts or tool_parser.clone_supported_acts()
+    local function_choice = normalize_function_choice(planner_ctx.function_choice, supported_acts)
     local parallel_function_calls = to_bool(planner_ctx.parallel_function_calls, true)
 
     local out = {}
@@ -182,13 +226,14 @@ end
 function M.plan_calls(user_input, assistant_text, policy, planner_ctx)
     local p = policy or get_default_policy()
     planner_ctx = planner_ctx or {}
+    local supported_acts = get_supported_tool_acts()
     local safe_user = tostring(user_input or "")
     local safe_assistant = tostring(assistant_text or "")
     if tool.utf8_sanitize_lossy then
         safe_user = tool.utf8_sanitize_lossy(safe_user)
         safe_assistant = tool.utf8_sanitize_lossy(safe_assistant)
     end
-    local prompt = build_tool_pass_prompt(safe_user, safe_assistant, p, planner_ctx)
+    local prompt = build_tool_pass_prompt(safe_user, safe_assistant, p, planner_ctx, supported_acts)
     local tool_messages = {
         { role = "user", content = prompt }
     }
@@ -200,9 +245,9 @@ function M.plan_calls(user_input, assistant_text, policy, planner_ctx)
     local raw = py_pipeline:generate_chat_sync(tool_messages, tool_params)
     raw = strip_cot_safe(raw or "")
     local calls = tool_parser.collect_tool_calls_only(raw, {
-        supported_acts = SUPPORTED_TOOL_ACTS,
+        supported_acts = supported_acts,
     })
-    calls = filter_planner_calls(calls, planner_ctx)
+    calls = filter_planner_calls(calls, planner_ctx, supported_acts)
     if #calls > 0 then
         print(string.format(
             "[ToolPlanner] two_step 产出 %d 条调用 (step=%d)",

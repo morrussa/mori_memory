@@ -11,7 +11,16 @@ local context_window = require("module.agent.context_window")
 local tool_parser = require("module.agent.tool_parser")
 local config = require("module.config")
 
-local SUPPORTED_TOOL_ACTS = tool_parser.clone_supported_acts()
+local function get_supported_tool_acts()
+    local acts = tool_parser.clone_supported_acts()
+    if tool_registry.get_supported_acts then
+        local ok, merged = pcall(tool_registry.get_supported_acts, acts)
+        if ok and type(merged) == "table" then
+            acts = merged
+        end
+    end
+    return acts
+end
 
 local function trim(s)
     if not s then return "" end
@@ -27,10 +36,10 @@ local function strip_cot_safe(text)
     return cleaned
 end
 
-local function normalize_result_text(result)
+local function normalize_result_text(result, supported_acts)
     local cot_clean = strip_cot_safe(result or "")
     local calls, visible = tool_parser.split_tool_calls_and_text(cot_clean, {
-        supported_acts = SUPPORTED_TOOL_ACTS,
+        supported_acts = supported_acts or tool_parser.clone_supported_acts(),
     })
     if visible == "" then
         if #(calls or {}) > 0 then
@@ -70,14 +79,72 @@ local function to_bool(v, fallback)
     return fallback == true
 end
 
-local function normalize_function_choice(raw_choice)
+local function cfg_number(v, fallback, min_v, max_v)
+    local n = tonumber(v)
+    if not n then n = tonumber(fallback) or 0 end
+    if min_v and n < min_v then n = min_v end
+    if max_v and n > max_v then n = max_v end
+    return n
+end
+
+local function sleep_seconds(sec)
+    sec = tonumber(sec) or 0
+    if sec <= 0 then return end
+
+    local ok_socket, socket = pcall(require, "socket")
+    if ok_socket and socket and type(socket.sleep) == "function" then
+        pcall(socket.sleep, sec)
+        return
+    end
+
+    local ok_sleep = pcall(os.execute, string.format("sleep %.3f", sec))
+    if not ok_sleep then
+        -- no-op fallback
+    end
+end
+
+local function run_with_retry(label, max_retries, base_backoff_sec, fn)
+    local retries = math.max(0, math.floor(tonumber(max_retries) or 0))
+    local attempt = 0
+
+    while true do
+        attempt = attempt + 1
+        local ok, r1, r2, r3 = pcall(fn)
+        if ok then
+            return true, r1, r2, r3, attempt - 1
+        end
+
+        if attempt > (retries + 1) then
+            return false, r1, nil, nil, attempt - 1
+        end
+
+        local wait = math.max(0, tonumber(base_backoff_sec) or 0) * (2 ^ math.max(0, attempt - 1))
+        print(string.format(
+            "[AgentRuntime][WARN] %s 失败 (attempt=%d/%d): %s",
+            tostring(label or "unknown_call"),
+            attempt,
+            retries + 1,
+            tostring(r1)
+        ))
+        if wait > 0 then
+            print(string.format(
+                "[AgentRuntime][WARN] %s 将在 %.2fs 后重试",
+                tostring(label or "unknown_call"),
+                wait
+            ))
+            sleep_seconds(wait)
+        end
+    end
+end
+
+local function normalize_function_choice(raw_choice, supported_acts)
     return tool_parser.normalize_function_choice(raw_choice, {
-        supported_acts = SUPPORTED_TOOL_ACTS,
+        supported_acts = supported_acts or tool_parser.clone_supported_acts(),
     })
 end
 
-local function resolve_native_tool_choice(function_choice)
-    local choice = normalize_function_choice(function_choice)
+local function resolve_native_tool_choice(function_choice, supported_acts)
+    local choice = normalize_function_choice(function_choice, supported_acts)
     if choice == "auto" or choice == "none" then
         return choice
     end
@@ -169,6 +236,129 @@ local function format_call_brief(call)
         )
     end
     return string.format('{act="%s"}', act)
+end
+
+local function json_escape_str(s)
+    s = tostring(s or "")
+    s = s:gsub("\\", "\\\\")
+    s = s:gsub('"', '\\"')
+    s = s:gsub("\r", "\\r")
+    s = s:gsub("\n", "\\n")
+    return s
+end
+
+local function to_json_literal(v)
+    if type(v) == "boolean" then
+        return v and "true" or "false"
+    end
+    if type(v) == "number" then
+        return tostring(v)
+    end
+    if v == nil then
+        return "null"
+    end
+    return '"' .. json_escape_str(v) .. '"'
+end
+
+local function build_call_arguments_json(call)
+    call = call or {}
+    local raw = trim(call.arguments_json or call.arguments)
+    if raw ~= "" then
+        return raw
+    end
+
+    local obj = {}
+    if trim(call.query) ~= "" then obj.query = call.query end
+    if trim(call.string) ~= "" then obj.string = call.string end
+    if trim(call.value) ~= "" then obj.value = call.value end
+    if trim(call.type) ~= "" then obj.type = call.type end
+    if trim(call.types) ~= "" then obj.types = call.types end
+    if trim(call.entity) ~= "" then obj.entity = call.entity end
+    if trim(call.evidence) ~= "" then obj.evidence = call.evidence end
+    if trim(call.namespace) ~= "" then obj.namespace = call.namespace end
+    if trim(call.key) ~= "" then obj.key = call.key end
+    if call.confidence ~= nil and tostring(call.confidence) ~= "" then
+        obj.confidence = tonumber(call.confidence) or call.confidence
+    end
+
+    local keys = {}
+    for k, _ in pairs(obj) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    if #keys == 0 then
+        return "{}"
+    end
+
+    local parts = {}
+    for _, k in ipairs(keys) do
+        parts[#parts + 1] = '"' .. json_escape_str(k) .. '":' .. to_json_literal(obj[k])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function build_function_protocol_tail(exec_result, max_result_chars)
+    local events = (exec_result or {}).call_results
+    if type(events) ~= "table" or #events == 0 then
+        return {}
+    end
+    max_result_chars = math.max(64, math.floor(tonumber(max_result_chars) or 600))
+
+    local tool_calls = {}
+    local tool_msgs = {}
+    local fallback_id = 0
+
+    for _, ev in ipairs(events) do
+        if type(ev) == "table" and ev.skipped ~= true then
+            local act = trim(ev.act or "")
+            if act ~= "" then
+                fallback_id = fallback_id + 1
+                local tcid = trim(ev.tool_call_id or "")
+                if tcid == "" then
+                    tcid = string.format("call_auto_%d", fallback_id)
+                end
+                tool_calls[#tool_calls + 1] = {
+                    id = tcid,
+                    type = "function",
+                    ["function"] = {
+                        name = act,
+                        arguments = tostring(ev.arguments_json or "{}"),
+                    },
+                }
+
+                local result_text = trim(ev.result or "")
+                if result_text == "" then
+                    result_text = trim(ev.message or "")
+                end
+                if result_text == "" then
+                    result_text = (ev.ok == true) and "ok" or "failed"
+                end
+                result_text = utf8_take(result_text, max_result_chars)
+                tool_msgs[#tool_msgs + 1] = {
+                    role = "tool",
+                    tool_call_id = tcid,
+                    name = act,
+                    content = result_text,
+                }
+            end
+        end
+    end
+
+    if #tool_calls == 0 then
+        return {}
+    end
+
+    local tail = {
+        {
+            role = "assistant",
+            content = "",
+            tool_calls = tool_calls,
+        }
+    }
+    for _, msg in ipairs(tool_msgs) do
+        tail[#tail + 1] = msg
+    end
+    return tail
 end
 
 local function build_observation_entry(step_idx, call_source, calls, exec_result)
@@ -283,6 +473,7 @@ function M.run_turn(args)
     local add_to_history = args.add_to_history
 
     local agent_cfg = get_agent_cfg()
+    local supported_tool_acts = get_supported_tool_acts()
     local max_steps = math.max(1, math.floor(tonumber(agent_cfg.max_steps) or 4))
     local completion_reserve_tokens = math.max(
         64,
@@ -305,8 +496,13 @@ function M.run_turn(args)
     local direct_tool_call_enabled = to_bool(agent_cfg.direct_tool_call_enabled, true)
     local native_tool_call_enabled = to_bool(agent_cfg.native_tool_call_enabled, true)
     local include_tool_observation_trace = to_bool(agent_cfg.include_tool_observation_trace, true)
-    local function_choice = normalize_function_choice(agent_cfg.function_choice)
+    local function_choice = normalize_function_choice(agent_cfg.function_choice, supported_tool_acts)
     local parallel_function_calls = to_bool(agent_cfg.parallel_function_calls, true)
+    local function_protocol_enabled = to_bool(agent_cfg.function_protocol_enabled, true)
+    local function_protocol_result_max_chars = math.max(
+        64,
+        math.floor(tonumber(agent_cfg.function_protocol_result_max_chars) or 600)
+    )
     local tool_trace_max_steps = math.max(
         1,
         math.floor(tonumber(agent_cfg.tool_trace_max_steps) or 4)
@@ -315,6 +511,20 @@ function M.run_turn(args)
         240,
         math.floor(tonumber(agent_cfg.tool_trace_max_chars) or 1200)
     )
+    local llm_retry_max = math.max(
+        0,
+        math.floor(tonumber(agent_cfg.llm_retry_max) or 2)
+    )
+    local llm_retry_backoff_sec = cfg_number(agent_cfg.llm_retry_backoff_sec, 0.35, 0, 10)
+    local native_llm_retry_max = math.max(
+        0,
+        math.floor(tonumber(agent_cfg.native_llm_retry_max) or llm_retry_max)
+    )
+    local planner_retry_max = math.max(
+        0,
+        math.floor(tonumber(agent_cfg.planner_retry_max) or 1)
+    )
+    local planner_retry_backoff_sec = cfg_number(agent_cfg.planner_retry_backoff_sec, 0.2, 0, 10)
     local memory_input_policy = tool_calling.get_memory_input_policy()
     local memory_user_input, memory_input_sanitized, redacted_blocks, file_mode, memory_input_truncated =
         tool_calling.sanitize_memory_input(user_input, {
@@ -357,6 +567,7 @@ function M.run_turn(args)
     local last_call_signature = ""
     local tool_observation_entries = {}
     local latest_observation = ""
+    local pending_protocol_tail = {}
 
     while (not done) and attempts < max_steps do
         attempts = attempts + 1
@@ -397,7 +608,9 @@ function M.run_turn(args)
             tool_context = merged_tool_context,
             memory_context = memory_context,
             input_token_budget = token_budget,
+            tail_messages = pending_protocol_tail,
         })
+        pending_protocol_tail = {}
         print(string.format(
             "[AgentRuntime][step=%d] context_tokens=%d kept_pairs=%d dropped_pairs=%d compressed_pairs=%d history_summary=%s dropped_blocks=%s",
             attempts,
@@ -434,8 +647,12 @@ function M.run_turn(args)
         if can_try_native_tools then
             local native_tools = tool_registry.get_openai_tools and tool_registry.get_openai_tools(tool_policy) or {}
             if type(native_tools) == "table" and #native_tools > 0 then
-                local native_tool_choice = resolve_native_tool_choice(function_choice)
-                local ok_native, native_text, native_calls_blob = pcall(function()
+                local native_tool_choice = resolve_native_tool_choice(function_choice, supported_tool_acts)
+                local ok_native, native_text, native_calls_blob = run_with_retry(
+                    "native tools generation",
+                    native_llm_retry_max,
+                    llm_retry_backoff_sec,
+                    function()
                     return py_pipeline:generate_chat_with_tools_sync(
                         messages_for_llm,
                         params,
@@ -443,13 +660,14 @@ function M.run_turn(args)
                         native_tool_choice,
                         parallel_function_calls
                     )
-                end)
+                end
+                )
                 if ok_native then
                     used_native_generation = true
                     generated_text = tostring(native_text or "")
                     local native_calls = tool_parser.collect_tool_calls_only(
                         tostring(native_calls_blob or ""),
-                        { supported_acts = SUPPORTED_TOOL_ACTS }
+                        { supported_acts = supported_tool_acts }
                     )
                     if type(native_calls) == "table" and #native_calls > 0 then
                         direct_calls = native_calls
@@ -457,7 +675,7 @@ function M.run_turn(args)
                     end
                 else
                     print(string.format(
-                        "[AgentRuntime][step=%d][WARN] native tools 生成失败，回退普通生成: %s",
+                        "[AgentRuntime][step=%d][WARN] native tools 生成失败（重试后），回退普通生成: %s",
                         attempts,
                         tostring(native_text)
                     ))
@@ -466,13 +684,26 @@ function M.run_turn(args)
         end
 
         if not used_native_generation then
-            local function chat_callback(result)
-                generated_text = tostring(result or "")
+            local ok_chat, chat_err = run_with_retry(
+                "chat generation",
+                llm_retry_max,
+                llm_retry_backoff_sec,
+                function()
+                    local function chat_callback(result)
+                        generated_text = tostring(result or "")
+                    end
+                    py_pipeline:generate_chat(messages_for_llm, params, chat_callback, params.stream and stream_sink or nil)
+                end
+            )
+            if not ok_chat then
+                error(string.format(
+                    "[AgentRuntime] chat generation failed after retries: %s",
+                    tostring(chat_err)
+                ))
             end
-            py_pipeline:generate_chat(messages_for_llm, params, chat_callback, params.stream and stream_sink or nil)
         end
 
-        local clean_result, parsed_direct_calls = normalize_result_text(generated_text)
+        local clean_result, parsed_direct_calls = normalize_result_text(generated_text, supported_tool_acts)
         if #direct_calls == 0 and type(parsed_direct_calls) == "table" and #parsed_direct_calls > 0 then
             direct_calls = parsed_direct_calls
             direct_call_source = "model_direct"
@@ -499,14 +730,32 @@ function M.run_turn(args)
                         tool_trace_max_chars
                     )
                 end
-                calls = tool_planner.plan_calls(user_input, clean_result, tool_policy, {
-                    step_idx = attempts,
-                    last_observation = latest_observation,
-                    tool_trace = tool_trace,
-                    function_choice = function_choice,
-                    parallel_function_calls = parallel_function_calls,
-                })
-                call_source = "planner_pass"
+                local ok_plan, plan_calls_or_err = run_with_retry(
+                    "tool planner",
+                    planner_retry_max,
+                    planner_retry_backoff_sec,
+                    function()
+                        return tool_planner.plan_calls(user_input, clean_result, tool_policy, {
+                            step_idx = attempts,
+                            last_observation = latest_observation,
+                            tool_trace = tool_trace,
+                            function_choice = function_choice,
+                            parallel_function_calls = parallel_function_calls,
+                        })
+                    end
+                )
+                if ok_plan then
+                    calls = plan_calls_or_err
+                    call_source = "planner_pass"
+                else
+                    calls = {}
+                    call_source = "planner_error"
+                    print(string.format(
+                        "[AgentRuntime][step=%d][WARN] planner 失败（重试后）: %s",
+                        attempts,
+                        tostring(plan_calls_or_err)
+                    ))
+                end
             end
         else
             print("[AgentRuntime] read_only 模式：跳过工具规划")
@@ -649,9 +898,18 @@ function M.run_turn(args)
                 context_updated,
                 call_source
             )
+            if function_protocol_enabled then
+                pending_protocol_tail = build_function_protocol_tail(
+                    exec_result,
+                    function_protocol_result_max_chars
+                )
+            else
+                pending_protocol_tail = {}
+            end
             print(string.format("[AgentRuntime][step=%d] continue reason=%s", attempts, continue_reason))
         else
             done = true
+            pending_protocol_tail = {}
         end
     end
 

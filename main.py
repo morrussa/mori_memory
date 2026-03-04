@@ -19,6 +19,11 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+try:
+    import json5
+except Exception:
+    json5 = None
+
 
 class LlamaCppServerClient:
     def __init__(
@@ -365,6 +370,8 @@ class AIPipeline:
         self.llm_embed = None   # GGUF Embedding 模型
         self.suppress_large_webui_log = False
         self.quiet_server_urls = False
+        self._qwen_tool_instances = {}
+        self._qwen_tool_specs = {}
         self.llama_cpp_root = os.environ.get("LLAMA_CPP_ROOT", "/home/morusa/AI/llama-cpp")
         self.large_server_host = os.environ.get("MORI_LARGE_SERVER_HOST", "127.0.0.1")
         self.large_server_port = self._get_env_port("MORI_LARGE_SERVER_PORT", default=None)
@@ -430,31 +437,48 @@ class AIPipeline:
         else:
             text = str(content)
 
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            tool_calls = []
-        else:
-            norm_tool_calls = []
-            for item in tool_calls:
-                if not isinstance(item, dict):
-                    continue
-                fn = item.get("function")
-                if not isinstance(fn, dict):
-                    continue
-                name = str(fn.get("name", "") or "").strip()
-                if not name:
-                    continue
-                norm_tool_calls.append(
-                    {
-                        "id": str(item.get("id", "") or ""),
-                        "type": str(item.get("type", "function") or "function"),
-                        "function": {
-                            "name": name,
-                            "arguments": str(fn.get("arguments", "") or ""),
-                        },
-                    }
-                )
-            tool_calls = norm_tool_calls
+        def _normalize_tool_call(item):
+            if not isinstance(item, dict):
+                return None
+            fn = item.get("function")
+            if not isinstance(fn, dict):
+                return None
+            name = str(fn.get("name", "") or "").strip()
+            if not name:
+                return None
+            return {
+                "id": str(item.get("id", "") or ""),
+                "type": str(item.get("type", "function") or "function"),
+                "function": {
+                    "name": name,
+                    "arguments": str(fn.get("arguments", "") or ""),
+                },
+            }
+
+        tool_calls_raw = message.get("tool_calls")
+        tool_calls = []
+        if isinstance(tool_calls_raw, list):
+            for item in tool_calls_raw:
+                norm = _normalize_tool_call(item)
+                if norm:
+                    tool_calls.append(norm)
+
+        # Legacy/兼容分支：部分服务只返回 function_call，不返回 tool_calls。
+        if not tool_calls:
+            fc = message.get("function_call")
+            if isinstance(fc, dict):
+                name = str(fc.get("name", "") or "").strip()
+                if name:
+                    tool_calls.append(
+                        {
+                            "id": str(message.get("tool_call_id", "") or "1"),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": str(fc.get("arguments", "") or ""),
+                            },
+                        }
+                    )
 
         return text, tool_calls
 
@@ -530,7 +554,7 @@ class AIPipeline:
                             "role": str(msg["role"]),
                             "content": content,
                         }
-                        for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content"):
+                        for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content", "function_call", "function_id"):
                             if extra_key in msg and msg[extra_key] is not None:
                                 row[extra_key] = AIPipeline._coerce_lua_value(msg[extra_key])
                         messages_list.append(
@@ -545,7 +569,7 @@ class AIPipeline:
                     "role": str(messages["role"]),
                     "content": content,
                 }
-                for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content"):
+                for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content", "function_call", "function_id"):
                     if extra_key in messages and messages[extra_key] is not None:
                         row[extra_key] = AIPipeline._coerce_lua_value(messages[extra_key])
                 messages_list.append(
@@ -565,14 +589,104 @@ class AIPipeline:
                     "role": str(msg.get("role")),
                     "content": content,
                 }
-                for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content"):
+                for extra_key in ("name", "tool_call_id", "tool_calls", "reasoning_content", "function_call", "function_id"):
                     if msg.get(extra_key) is not None:
                         row[extra_key] = AIPipeline._coerce_lua_value(msg.get(extra_key))
                 messages_list.append(
                     row
                 )
 
-        return messages_list
+        return AIPipeline._normalize_fncall_messages_for_oai(messages_list)
+
+    @staticmethod
+    def _normalize_fncall_messages_for_oai(messages):
+        normalized = []
+
+        def _normalize_tool_calls(tool_calls):
+            out = []
+            if not isinstance(tool_calls, list):
+                return out
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                name = str(fn.get("name", "") or "").strip()
+                if not name:
+                    continue
+                out.append(
+                    {
+                        "id": str(tc.get("id", "") or ""),
+                        "type": str(tc.get("type", "function") or "function"),
+                        "function": {
+                            "name": name,
+                            "arguments": str(fn.get("arguments", "") or ""),
+                        },
+                    }
+                )
+            return out
+
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            row = dict(msg)
+            role = str(row.get("role", "") or "").strip().lower()
+
+            if role == "function":
+                row["role"] = "tool"
+                if row.get("tool_call_id") is None:
+                    row["tool_call_id"] = str(row.get("function_id", "") or row.get("id", "") or "1")
+                if row.get("content") is None:
+                    row["content"] = ""
+                normalized.append(row)
+                continue
+
+            fc = row.get("function_call")
+            if role == "assistant" and isinstance(fc, dict):
+                fn_name = str(fc.get("name", "") or "").strip()
+                if fn_name:
+                    tc = {
+                        "id": str(
+                            row.get("tool_call_id", "")
+                            or row.get("function_id", "")
+                            or row.get("id", "")
+                            or "1"
+                        ),
+                        "type": "function",
+                        "function": {
+                            "name": fn_name,
+                            "arguments": str(fc.get("arguments", "") or ""),
+                        },
+                    }
+                    if normalized and str(normalized[-1].get("role", "")).lower() == "assistant":
+                        prev_tcs = _normalize_tool_calls(normalized[-1].get("tool_calls"))
+                        prev_tcs.append(tc)
+                        normalized[-1]["tool_calls"] = prev_tcs
+                        if (
+                            row.get("content")
+                            and (not normalized[-1].get("content"))
+                        ):
+                            normalized[-1]["content"] = row.get("content")
+                    else:
+                        normalized.append(
+                            {
+                                "role": "assistant",
+                                "content": row.get("content", ""),
+                                "tool_calls": [tc],
+                                **(
+                                    {"reasoning_content": row.get("reasoning_content")}
+                                    if row.get("reasoning_content") is not None
+                                    else {}
+                                ),
+                            }
+                        )
+                    continue
+
+            if role == "assistant" and row.get("tool_calls") is not None:
+                row["tool_calls"] = _normalize_tool_calls(row.get("tool_calls"))
+            normalized.append(row)
+        return normalized
 
     @staticmethod
     def _coerce_tools(tools):
@@ -647,6 +761,9 @@ class AIPipeline:
     def _dict_to_lua_table_row(payload: dict) -> str:
         ordered_keys = [
             "act",
+            "tool_call_id",
+            "arguments_json",
+            "arguments",
             "string",
             "query",
             "type",
@@ -689,26 +806,262 @@ class AIPipeline:
             if not name:
                 continue
             args_raw = fn.get("arguments", "")
-            args_obj = {}
-            if isinstance(args_raw, dict):
-                args_obj = args_raw
-            elif isinstance(args_raw, str):
-                s = args_raw.strip()
-                if s:
-                    try:
-                        parsed = json.loads(s)
-                        if isinstance(parsed, dict):
-                            args_obj = parsed
-                    except Exception:
-                        args_obj = {}
+            args_obj = AIPipeline._parse_tool_arguments_relaxed(args_raw)
+            args_text = str(args_raw or "").strip()
 
             payload = {"act": name}
+            payload["tool_call_id"] = str(tc.get("id", "") or "")
             if isinstance(args_obj, dict):
+                payload["arguments_json"] = json.dumps(args_obj, ensure_ascii=False)
                 for key in ("string", "query", "type", "types", "entity", "evidence", "confidence", "namespace", "key", "value"):
                     if key in args_obj:
                         payload[key] = args_obj.get(key)
+                if "input" in args_obj and (payload.get("query") is None) and (payload.get("string") is None):
+                    payload["string"] = args_obj.get("input")
+            elif args_text:
+                payload["arguments_json"] = args_text
+            if (
+                isinstance(args_text, str)
+                and args_text
+                and payload.get("query") is None
+                and payload.get("string") is None
+                and payload.get("value") is None
+            ):
+                payload["string"] = args_text
             rows.append(AIPipeline._dict_to_lua_table_row(payload))
         return "\n".join(rows)
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> str:
+        s = str(text or "")
+        start = s.find("{")
+        if start < 0:
+            return ""
+
+        depth = 0
+        quote = None
+        escaped = False
+        for idx in range(start, len(s)):
+            ch = s[idx]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+
+            if ch in {'"', "'"}:
+                quote = ch
+                continue
+            if ch == "{":
+                depth += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:idx + 1]
+        return ""
+
+    @staticmethod
+    def _parse_tool_arguments_relaxed(args_raw):
+        if isinstance(args_raw, dict):
+            return args_raw
+        if not isinstance(args_raw, str):
+            return {}
+
+        text = args_raw.strip()
+        if not text:
+            return {}
+
+        parsers = [json.loads]
+        if json5 is not None:
+            parsers.append(json5.loads)
+
+        for parser in parsers:
+            try:
+                parsed = parser(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+
+        first_obj = AIPipeline._extract_first_json_object(text)
+        if first_obj:
+            for parser in parsers:
+                try:
+                    parsed = parser(first_obj)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    continue
+
+        return {}
+
+    @staticmethod
+    def _coerce_qwen_tool_entries(tool_entries):
+        raw = AIPipeline._coerce_lua_value(tool_entries)
+        if raw is None:
+            return []
+        if isinstance(raw, (str, dict)):
+            return [raw]
+        if isinstance(raw, list):
+            return raw
+        return []
+
+    @staticmethod
+    def _normalize_qwen_tool_entry(entry):
+        if isinstance(entry, str):
+            name = entry.strip()
+            if not name:
+                return None, None
+            return name, None
+        if isinstance(entry, dict):
+            if isinstance(entry.get("function"), dict):
+                fn = entry.get("function") or {}
+                name = str(fn.get("name", "") or "").strip()
+                if not name:
+                    return None, None
+                cfg = entry.get("cfg")
+                if cfg is None:
+                    cfg = entry.get("config")
+                if cfg is None:
+                    cfg = entry
+                if isinstance(cfg, dict):
+                    cfg = dict(cfg)
+                    cfg.pop("function", None)
+                return name, cfg if isinstance(cfg, dict) else None
+            name = str(entry.get("name", "") or "").strip()
+            if not name:
+                return None, None
+            cfg = dict(entry)
+            cfg.pop("name", None)
+            return name, cfg if cfg else None
+        return None, None
+
+    def list_qwen_tool_names(self):
+        try:
+            from qwen_agent.tools import TOOL_REGISTRY
+        except Exception as e:
+            raise RuntimeError(f"qwen-agent tools unavailable: {e}") from e
+        return sorted([str(x) for x in TOOL_REGISTRY.keys()])
+
+    def get_qwen_tool_schemas(self, tool_entries=None):
+        try:
+            from qwen_agent.tools import TOOL_REGISTRY
+        except Exception as e:
+            raise RuntimeError(f"qwen-agent tools unavailable: {e}") from e
+
+        entries = self._coerce_qwen_tool_entries(tool_entries)
+        if not entries:
+            entries = sorted(TOOL_REGISTRY.keys())
+
+        schemas = []
+        new_instances = {}
+        new_specs = {}
+
+        for entry in entries:
+            tool_name, tool_cfg = self._normalize_qwen_tool_entry(entry)
+            if not tool_name:
+                continue
+            cls = TOOL_REGISTRY.get(tool_name)
+            if cls is None:
+                print(f"[Python][WARN] qwen tool not registered: {tool_name}")
+                continue
+            try:
+                inst = cls(tool_cfg)
+            except Exception as e:
+                print(f"[Python][WARN] qwen tool init failed: {tool_name}: {e}")
+                continue
+
+            fn = getattr(inst, "function", None)
+            if not isinstance(fn, dict):
+                fn = {
+                    "name": tool_name,
+                    "description": str(getattr(inst, "description", "") or ""),
+                    "parameters": getattr(inst, "parameters", {"type": "object", "properties": {}}),
+                }
+            fn_name = str(fn.get("name", "") or tool_name).strip()
+            if not fn_name:
+                continue
+
+            schema = {
+                "type": "function",
+                "function": {
+                    "name": fn_name,
+                    "description": str(fn.get("description", "") or ""),
+                    "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                },
+            }
+            schemas.append(schema)
+            new_instances[fn_name] = inst
+            new_specs[fn_name] = schema
+
+        self._qwen_tool_instances = new_instances
+        self._qwen_tool_specs = new_specs
+        return schemas
+
+    @staticmethod
+    def _normalize_qwen_tool_result(result):
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if isinstance(result, list):
+            packed = []
+            for item in result:
+                if hasattr(item, "model_dump"):
+                    packed.append(item.model_dump())
+                    continue
+                if isinstance(item, dict):
+                    packed.append(item)
+                    continue
+                text = getattr(item, "text", None)
+                file_v = getattr(item, "file", None)
+                image_v = getattr(item, "image", None)
+                audio_v = getattr(item, "audio", None)
+                if text is not None or file_v is not None or image_v is not None or audio_v is not None:
+                    packed.append(
+                        {
+                            "text": text,
+                            "file": file_v,
+                            "image": image_v,
+                            "audio": audio_v,
+                        }
+                    )
+                else:
+                    packed.append(str(item))
+            return json.dumps(packed, ensure_ascii=False, indent=2)
+        return str(result)
+
+    def call_qwen_tool(self, tool_name, tool_args="{}"):
+        name = str(tool_name or "").strip()
+        if not name:
+            raise ValueError("tool_name is empty")
+
+        tool = self._qwen_tool_instances.get(name)
+        if tool is None:
+            self.get_qwen_tool_schemas([name])
+            tool = self._qwen_tool_instances.get(name)
+        if tool is None:
+            raise RuntimeError(f"qwen tool `{name}` is not available")
+
+        args = self._coerce_lua_value(tool_args)
+        if isinstance(args, str):
+            args = args.strip()
+            if args == "":
+                args = "{}"
+        elif isinstance(args, dict):
+            pass
+        else:
+            args = str(args)
+
+        try:
+            result = tool.call(args)
+        except Exception as e:
+            raise RuntimeError(f"qwen tool `{name}` call failed: {e}") from e
+        return self._normalize_qwen_tool_result(result)
 
     def get_embedding(self, text: str, mode: str = "query"):
         """将文本转换为向量"""

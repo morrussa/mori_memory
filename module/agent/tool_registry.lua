@@ -16,6 +16,19 @@ M._turn_budget_state = {
 }
 
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
+local CORE_TOOL_ACTS = {
+    query_record = true,
+    upsert_record = true,
+    delete_record = true,
+}
+
+M._external_tools = {
+    cfg_signature = "",
+    enabled = false,
+    schemas = {},
+    names = {},
+    name_set = {},
+}
 
 local function trim(s)
     if not s then return "" end
@@ -73,6 +86,203 @@ local function utf8_take(s, max_chars)
         out[count] = ch
     end
     return table.concat(out)
+end
+
+local function json_escape_str(s)
+    s = tostring(s or "")
+    s = s:gsub("\\", "\\\\")
+    s = s:gsub('"', '\\"')
+    s = s:gsub("\r", "\\r")
+    s = s:gsub("\n", "\\n")
+    return s
+end
+
+local function to_json_literal(v)
+    if type(v) == "boolean" then
+        return v and "true" or "false"
+    end
+    if type(v) == "number" then
+        return tostring(v)
+    end
+    if v == nil then
+        return "null"
+    end
+    return '"' .. json_escape_str(v) .. '"'
+end
+
+local function normalize_tool_entry_names(raw, out)
+    out = out or {}
+    if type(raw) == "string" then
+        for _, x in ipairs(split_csv(raw)) do
+            out[#out + 1] = x
+        end
+        return out
+    end
+    if type(raw) ~= "table" then
+        return out
+    end
+    for _, item in ipairs(raw) do
+        if type(item) == "string" then
+            local n = trim(item)
+            if n ~= "" then
+                out[#out + 1] = n
+            end
+        elseif type(item) == "table" then
+            local n = trim(item.name or (((item["function"] or {}).name) or ""))
+            if n ~= "" then
+                out[#out + 1] = n
+            end
+        end
+    end
+    return out
+end
+
+local function get_external_cfg()
+    local keyring = ((config_mem.settings or {}).keyring or {})
+    return keyring.external_tools or {}
+end
+
+local function get_external_tool_entries()
+    local ext_cfg = get_external_cfg()
+    local merged = {}
+    normalize_tool_entry_names(ext_cfg.tools, merged)
+    normalize_tool_entry_names(ext_cfg.names, merged)
+    if #merged == 0 then
+        normalize_tool_entry_names(ext_cfg.allowlist, merged)
+    end
+    return merged
+end
+
+local function external_cfg_signature(ext_cfg, entries)
+    local parts = {
+        tostring(to_bool(ext_cfg.enabled, false) and "1" or "0"),
+        tostring(to_bool(ext_cfg.include_memory_tools, true) and "1" or "0"),
+    }
+    local copy = {}
+    for _, x in ipairs(entries or {}) do
+        copy[#copy + 1] = tostring(x)
+    end
+    table.sort(copy)
+    parts[#parts + 1] = table.concat(copy, ",")
+    return table.concat(parts, "|")
+end
+
+local function refresh_external_tools()
+    local ext_cfg = get_external_cfg()
+    local enabled = to_bool(ext_cfg.enabled, false)
+    local entries = get_external_tool_entries()
+    local sig = external_cfg_signature(ext_cfg, entries)
+
+    if M._external_tools.cfg_signature == sig then
+        return M._external_tools
+    end
+
+    local state = {
+        cfg_signature = sig,
+        enabled = false,
+        schemas = {},
+        names = {},
+        name_set = {},
+    }
+
+    if (not enabled) or type(py_pipeline) ~= "table" or py_pipeline.get_qwen_tool_schemas == nil then
+        M._external_tools = state
+        return state
+    end
+
+    local ok_schemas, schemas_or_err = pcall(function()
+        if #entries > 0 then
+            return py_pipeline:get_qwen_tool_schemas(entries)
+        end
+        return py_pipeline:get_qwen_tool_schemas(nil)
+    end)
+    if not ok_schemas or type(schemas_or_err) ~= "table" then
+        print(string.format(
+            "[ToolRegistry][WARN] 外部工具加载失败: %s",
+            tostring(schemas_or_err)
+        ))
+        M._external_tools = state
+        return state
+    end
+
+    for _, item in ipairs(schemas_or_err) do
+        if type(item) == "table" and type(item["function"]) == "table" then
+            local fn = item["function"]
+            local name = trim(fn.name or "")
+            if name ~= "" and (not CORE_TOOL_ACTS[name]) then
+                state.schemas[#state.schemas + 1] = item
+                if not state.name_set[name] then
+                    state.name_set[name] = true
+                    state.names[#state.names + 1] = name
+                end
+            end
+        end
+    end
+
+    state.enabled = (#state.schemas > 0)
+    if state.enabled then
+        table.sort(state.names)
+        print(string.format(
+            "[ToolRegistry] 外部工具已启用，共 %d 个: %s",
+            #state.names,
+            table.concat(state.names, ",")
+        ))
+    end
+
+    M._external_tools = state
+    return state
+end
+
+local function push_pending_context(current_turn, payload)
+    payload = trim(payload or "")
+    if payload == "" then
+        return
+    end
+    local anchor = topic.get_topic_anchor and topic.get_topic_anchor(current_turn) or nil
+    if M._pending_system_context ~= "" and M._pending_topic_anchor == anchor then
+        M._pending_system_context = M._pending_system_context .. "\n\n" .. payload
+    else
+        M._pending_system_context = payload
+        M._pending_topic_anchor = anchor
+        M._pending_created_turn = tonumber(current_turn) or 0
+    end
+end
+
+local function build_call_arguments_json(call)
+    local raw = trim((call or {}).arguments_json or (call or {}).arguments or "")
+    if raw ~= "" then
+        return raw
+    end
+
+    local obj = {}
+    local c = call or {}
+    if trim(c.query) ~= "" then obj.query = c.query end
+    if trim(c.string) ~= "" then obj.string = c.string end
+    if trim(c.value) ~= "" then obj.value = c.value end
+    if trim(c.type) ~= "" then obj.type = c.type end
+    if trim(c.types) ~= "" then obj.types = c.types end
+    if trim(c.entity) ~= "" then obj.entity = c.entity end
+    if trim(c.evidence) ~= "" then obj.evidence = c.evidence end
+    if trim(c.namespace) ~= "" then obj.namespace = c.namespace end
+    if trim(c.key) ~= "" then obj.key = c.key end
+    if c.confidence ~= nil and tostring(c.confidence) ~= "" then
+        obj.confidence = tonumber(c.confidence) or c.confidence
+    end
+
+    local keys = {}
+    for k, _ in pairs(obj) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    if #keys == 0 then
+        return "{}"
+    end
+
+    local parts = {}
+    for _, k in ipairs(keys) do
+        parts[#parts + 1] = '"' .. json_escape_str(k) .. '":' .. to_json_literal(obj[k])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
 end
 
 local function dedupe_and_clip_types(types, max_types)
@@ -212,6 +422,7 @@ local function get_turn_budget_state(current_turn)
 end
 
 local function get_tool_policy()
+    local ext_cfg = get_external_cfg()
     return {
         upsert_min_confidence = cfg_number(TOOL_CFG.upsert_min_confidence, 0.82, 0, 1),
         upsert_max_per_turn = cfg_number(TOOL_CFG.upsert_max_per_turn, 1, 0),
@@ -231,6 +442,10 @@ local function get_tool_policy()
         retry_validation_max = cfg_number(TOOL_CFG.retry_validation_max, 0, 0),
         retry_budget_max = cfg_number(TOOL_CFG.retry_budget_max, 0, 0),
         retry_total_cap = cfg_number(TOOL_CFG.retry_total_cap, 2, 0),
+        external_enabled = to_bool(ext_cfg.enabled, false),
+        external_include_memory_tools = to_bool(ext_cfg.include_memory_tools, true),
+        external_context_inject = to_bool(ext_cfg.context_inject, true),
+        external_context_max_chars = cfg_number(ext_cfg.context_max_chars, 1200, 120, 10000),
     }
 end
 
@@ -375,20 +590,69 @@ local function apply_query_record(call, current_turn, policy, state)
         if payload ~= payload_raw then
             payload = payload .. "\n...(truncated)"
         end
-        local anchor = topic.get_topic_anchor and topic.get_topic_anchor(current_turn) or nil
-        if M._pending_system_context ~= "" and M._pending_topic_anchor == anchor then
-            M._pending_system_context = M._pending_system_context .. "\n\n" .. payload
-        else
-            M._pending_system_context = payload
-            M._pending_topic_anchor = anchor
-            M._pending_created_turn = tonumber(current_turn) or 0
-        end
+        push_pending_context(current_turn, payload)
     end
     return true, string.format("query_record ok (%d hits)", #results), {
         error_code = "ok",
         query_key = query_key,
         query_signature = query_result_signature,
+        context_signature = query_result_signature,
         context_added = (#results > 0),
+        tool_result = (#results > 0) and ("query_record hits=" .. tostring(#results)) or "query_record hits=0",
+    }
+end
+
+local function apply_external_tool(call, current_turn, policy)
+    local ext_state = refresh_external_tools()
+    local act = trim((call or {}).act or "")
+    if act == "" then
+        return false, "external tool 缺少 act", {
+            error_code = "validation",
+        }
+    end
+    if (not ext_state.enabled) or (not ext_state.name_set[act]) then
+        return false, "external tool 未启用: " .. tostring(act), {
+            error_code = "validation",
+        }
+    end
+    if type(py_pipeline) ~= "table" or py_pipeline.call_qwen_tool == nil then
+        return false, "external tool runtime 不可用", {
+            error_code = "transient",
+        }
+    end
+
+    local args_json = build_call_arguments_json(call)
+    local ok_call, result_or_err = pcall(function()
+        return py_pipeline:call_qwen_tool(act, args_json)
+    end)
+    if not ok_call then
+        return false, "external tool 调用失败: " .. tostring(result_or_err), {
+            error_code = "transient",
+        }
+    end
+
+    local raw_result = trim(result_or_err or "")
+    if raw_result == "" then
+        raw_result = "[empty tool result]"
+    end
+    local clipped = utf8_take(raw_result, policy.external_context_max_chars)
+    if clipped ~= raw_result then
+        clipped = clipped .. "\n...(truncated)"
+    end
+
+    local context_added = false
+    if policy.external_context_inject then
+        local payload = string.format("【Tool:%s 返回】\n%s", act, clipped)
+        push_pending_context(current_turn, payload)
+        context_added = true
+    end
+
+    local context_signature = act .. "\x1F" .. clipped
+    return true, string.format("external tool %s ok", act), {
+        error_code = "ok",
+        context_added = context_added,
+        context_signature = context_signature,
+        tool_result = clipped,
     }
 end
 
@@ -516,6 +780,10 @@ local function execute_apply_once(call, current_turn, policy, state)
     elseif call.act == "query_record" then
         return apply_query_record(call, current_turn, policy, state)
     end
+    local ext_state = refresh_external_tools()
+    if ext_state.enabled and ext_state.name_set[tostring((call or {}).act or "")] then
+        return apply_external_tool(call, current_turn, policy)
+    end
     return false, "跳过未知 act: " .. tostring(call.act), {
         error_code = "unknown_act",
     }
@@ -588,8 +856,8 @@ function M.get_policy()
     return get_tool_policy()
 end
 
-function M.get_openai_tools(policy_override)
-    local policy = policy_override or get_tool_policy()
+local function get_memory_openai_tools(policy)
+    policy = policy or get_tool_policy()
     local tools = {
         {
             type = "function",
@@ -658,6 +926,63 @@ function M.get_openai_tools(policy_override)
     return tools
 end
 
+function M.get_openai_tools(policy_override)
+    local policy = policy_override or get_tool_policy()
+    local tools = {}
+
+    if policy.external_include_memory_tools then
+        local core = get_memory_openai_tools(policy)
+        for _, item in ipairs(core or {}) do
+            tools[#tools + 1] = item
+        end
+    end
+
+    local ext_state = refresh_external_tools()
+    if policy.external_enabled and ext_state.enabled then
+        for _, item in ipairs(ext_state.schemas or {}) do
+            tools[#tools + 1] = item
+        end
+    end
+
+    return tools
+end
+
+function M.get_supported_acts(base_acts)
+    local acts = {}
+    for k, v in pairs(base_acts or {}) do
+        if v then
+            acts[k] = true
+        end
+    end
+
+    local policy = get_tool_policy()
+    if policy.external_include_memory_tools then
+        acts.query_record = true
+        acts.upsert_record = true
+        if policy.delete_enabled then
+            acts.delete_record = true
+        end
+    end
+
+    local ext_state = refresh_external_tools()
+    if policy.external_enabled and ext_state.enabled then
+        for name, enabled in pairs(ext_state.name_set or {}) do
+            if enabled then
+                acts[name] = true
+            end
+        end
+    end
+
+    -- 当 memory 工具显式关闭时，移除内置 act，避免解析误命中。
+    if not policy.external_include_memory_tools then
+        acts.query_record = nil
+        acts.upsert_record = nil
+        acts.delete_record = nil
+    end
+
+    return acts
+end
+
 function M.execute_calls(calls, exec_ctx)
     exec_ctx = exec_ctx or {}
     local policy = exec_ctx.policy or get_tool_policy()
@@ -669,6 +994,7 @@ function M.execute_calls(calls, exec_ctx)
         skipped = 0,
         failed = 0,
         logs = {},
+        call_results = {},
         context_updated = false,
         context_novel = false,
         context_signature = "",
@@ -698,8 +1024,9 @@ function M.execute_calls(calls, exec_ctx)
     local turn_budget = get_turn_budget_state(current_turn)
     state.upsert_count = turn_budget.upsert_count
     state.query_count = turn_budget.query_count
-    local step_query_signatures = {}
-    local step_query_sig_seen = {}
+    local step_context_signatures = {}
+    local step_context_sig_seen = {}
+    local call_seq = 0
 
     local batches = build_execution_batches(calls, policy)
     for batch_idx, batch in ipairs(batches or {}) do
@@ -716,6 +1043,13 @@ function M.execute_calls(calls, exec_ctx)
         end
 
         for _, call in ipairs(batch_calls) do
+            call_seq = call_seq + 1
+            local tool_call_id = trim((call or {}).tool_call_id or "")
+            if tool_call_id == "" then
+                tool_call_id = string.format("call_%d_%d", current_turn, call_seq)
+                call.tool_call_id = tool_call_id
+            end
+
             local ok, msg, meta, count_result, retry_logs = execute_call_with_retry(
                 call,
                 current_turn,
@@ -736,13 +1070,23 @@ function M.execute_calls(calls, exec_ctx)
                 end
             end
 
-            if ok and meta and trim(meta.query_signature) ~= "" then
-                local sig = trim(meta.query_signature)
-                if not step_query_sig_seen[sig] then
-                    step_query_sig_seen[sig] = true
-                    step_query_signatures[#step_query_signatures + 1] = sig
+            if ok and meta then
+                local sig = trim(meta.context_signature or meta.query_signature)
+                if sig ~= "" and (not step_context_sig_seen[sig]) then
+                    step_context_sig_seen[sig] = true
+                    step_context_signatures[#step_context_signatures + 1] = sig
                 end
             end
+
+            result.call_results[#result.call_results + 1] = {
+                act = tostring((call or {}).act or ""),
+                tool_call_id = tool_call_id,
+                arguments_json = build_call_arguments_json(call),
+                ok = (ok == true),
+                skipped = (count_result == false),
+                message = tostring(msg or ""),
+                result = tostring((meta or {}).tool_result or ""),
+            }
 
             if count_result then
                 if ok then
@@ -765,9 +1109,9 @@ function M.execute_calls(calls, exec_ctx)
     turn_budget.upsert_count = state.upsert_count
     turn_budget.query_count = state.query_count
 
-    if #step_query_signatures > 0 then
-        table.sort(step_query_signatures)
-        local step_sig = table.concat(step_query_signatures, "||")
+    if #step_context_signatures > 0 then
+        table.sort(step_context_signatures)
+        local step_sig = table.concat(step_context_signatures, "||")
         result.context_signature = step_sig
         local same_turn = (tonumber(M._last_context_turn) or 0) == current_turn
         local is_novel = (not same_turn) or (step_sig ~= tostring(M._last_context_signature or ""))
@@ -782,8 +1126,8 @@ function M.execute_calls(calls, exec_ctx)
                 clear_pending_system_context()
             end
             result.context_updated = false
-            result.logs[#result.logs + 1] = "query_record 命中但无增量上下文，已跳过注入"
-            print("[ToolRegistry] SKIP | query_record 命中但无增量上下文，已跳过注入")
+            result.logs[#result.logs + 1] = "tool 命中但无增量上下文，已跳过注入"
+            print("[ToolRegistry] SKIP | tool 命中但无增量上下文，已跳过注入")
         end
     end
 
