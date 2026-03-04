@@ -21,12 +21,13 @@ pip install --upgrade pip setuptools wheel
 
 python -m pip install -r requirements.txt
 
+
 CMAKE_ARGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120" \
 CUDACXX=/usr/local/cuda-13.1/bin/nvcc \
 CC=/usr/bin/gcc-14 \
 CXX=/usr/bin/g++-14 \
 FORCE_CMAKE=1 \
-pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir --verbose
+cmake -S . -B build $CMAKE_ARGS
 
 --这个是我自己的cuda和gcc环境
 
@@ -36,3 +37,5 @@ make
 cd ..
 rm -rf build dist lupa.egg-info lupa/*.so lupa/*.c
 pip install lupa --no-binary :all: --verbose --no-cache-dir --force-reinstall
+
+qwen3.5支持pr：

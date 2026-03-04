@@ -1,76 +1,212 @@
 import lupa.luajit21 as lupa
 from lupa.luajit21 import LuaRuntime
-from llama_cpp import Llama
 import numpy as np
 import zstandard as zstd
-import json
 import os
 import io
 import tarfile
 import shutil
+import atexit
+import json
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+
+
+class LlamaCppServerClient:
+    def __init__(
+        self,
+        server_bin: str,
+        model_path: str,
+        ctx_size: int,
+        embedding: bool = False,
+        startup_timeout: int = 600,
+    ):
+        self.server_bin = server_bin
+        self.model_path = model_path
+        self.ctx_size = int(ctx_size)
+        self.embedding = bool(embedding)
+        self.startup_timeout = int(startup_timeout)
+        self.model_name = os.path.basename(model_path) or "local-model"
+        self.port = self._find_free_port()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.process = None
+        self.log_path = None
+        self._log_file = None
+        self._start_server()
+
+    @staticmethod
+    def _find_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _start_server(self):
+        os.makedirs("logs", exist_ok=True)
+        role = "embedding" if self.embedding else "chat"
+        self.log_path = os.path.join("logs", f"llama_server_{role}_{self.port}.log")
+        self._log_file = open(self.log_path, "a", encoding="utf-8")
+
+        cmd = [
+            self.server_bin,
+            "--model",
+            self.model_path,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.port),
+            "--ctx-size",
+            str(self.ctx_size),
+            "--gpu-layers",
+            "all",
+            "--no-webui",
+            "--reasoning-format",
+            "none",
+        ]
+        if self.embedding:
+            cmd.append("--embeddings")
+
+        env = os.environ.copy()
+        lib_dir = os.path.dirname(self.server_bin)
+        old_ld_path = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{lib_dir}:{old_ld_path}" if old_ld_path else lib_dir
+
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        self._wait_until_ready()
+        print(f"[Python] llama-server ready ({role}) at {self.base_url}")
+
+    def _wait_until_ready(self):
+        deadline = time.time() + self.startup_timeout
+        while time.time() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                log_tail = self._tail_log()
+                raise RuntimeError(
+                    f"llama-server exited early (code={self.process.returncode}) for model: {self.model_path}\n"
+                    f"log tail:\n{log_tail}"
+                )
+
+            try:
+                status, _ = self._raw_http("GET", "/health", timeout=2)
+                if status == 200:
+                    return
+            except Exception:
+                pass
+
+            time.sleep(0.5)
+
+        raise TimeoutError(
+            f"Timed out waiting llama-server ({self.model_path}) on {self.base_url}. "
+            f"Check logs: {self.log_path}"
+        )
+
+    def _tail_log(self, lines: int = 40) -> str:
+        if not self.log_path or not os.path.exists(self.log_path):
+            return ""
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
+                data = f.readlines()
+            return "".join(data[-lines:]).strip()
+        except Exception:
+            return ""
+
+    def _raw_http(self, method: str, endpoint: str, payload=None, timeout: int = 600):
+        url = f"{self.base_url}{endpoint}"
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                return int(resp.status), body
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return int(e.code), body
+
+    def _request_json(self, method: str, endpoint: str, payload=None, timeout: int = 600):
+        status, body = self._raw_http(method, endpoint, payload=payload, timeout=timeout)
+        if status >= 400:
+            raise RuntimeError(
+                f"llama-server request failed ({status}) {endpoint}: {body[:4000]}"
+            )
+        if not body:
+            return {}
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Invalid JSON from llama-server {endpoint}: {e}; body={body[:1000]}"
+            ) from e
+
+    def create_chat_completion(self, messages, max_tokens=128, temperature=0.7, stop=None, seed=None):
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+        }
+        if stop:
+            payload["stop"] = list(stop)
+        if seed is not None:
+            payload["seed"] = int(seed)
+        return self._request_json(
+            "POST",
+            "/v1/chat/completions",
+            payload=payload,
+            timeout=3600,
+        )
+
+    def create_embedding(self, texts):
+        payload = {
+            "model": self.model_name,
+            "input": texts,
+            "encoding_format": "float",
+        }
+        return self._request_json(
+            "POST",
+            "/v1/embeddings",
+            payload=payload,
+            timeout=600,
+        )
+
+    def stop(self):
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+            self.process = None
+
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
 
 
 class AIPipeline:
-    TOOL_SCHEMAS = [
-        {
-            "type": "function",
-            "function": {
-                "name": "upsert_record",
-                "description": "Upsert one long-term record item into keyring memory.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string"},
-                        "entity": {"type": "string"},
-                        "value": {"type": "string"},
-                        "evidence": {"type": "string"},
-                        "confidence": {"type": "number"},
-                    },
-                    "required": ["type", "entity", "value"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "query_record",
-                "description": "Query keyring memory for reusable facts.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "types": {
-                            "oneOf": [
-                                {"type": "string"},
-                                {"type": "array", "items": {"type": "string"}},
-                            ]
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "delete_record",
-                "description": "Delete one record by type and entity.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string"},
-                        "entity": {"type": "string"},
-                        "evidence": {"type": "string"},
-                    },
-                    "required": ["type", "entity"],
-                },
-            },
-        },
-    ]
-
     def __init__(self):
         self.llm_large = None   # GPU 大模型（生成用）
         self.llm_embed = None   # GGUF Embedding 模型
+        self.llama_cpp_root = os.environ.get("LLAMA_CPP_ROOT", "/home/morusa/AI/llama-cpp")
+        self.llama_server_bin = os.environ.get(
+            "LLAMA_SERVER_BIN",
+            os.path.join(self.llama_cpp_root, "build", "bin", "llama-server"),
+        )
+        atexit.register(self.shutdown)
 
     @staticmethod
     def _normalize_embedding_vec(embedding):
@@ -79,6 +215,24 @@ class AIPipeline:
         if norm > 0:
             emb_array = emb_array / norm
         return emb_array.tolist()
+
+    @staticmethod
+    def _extract_chat_text(output: dict) -> str:
+        choices = output.get("choices") if isinstance(output, dict) else None
+        if not choices:
+            raise RuntimeError(f"Invalid chat completion response: {output}")
+
+        message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    texts.append(str(item.get("text", "")))
+            return "".join(texts)
+        return str(content)
 
     def get_embedding(self, text: str, mode: str = "query"):
         """将文本转换为向量"""
@@ -147,45 +301,34 @@ class AIPipeline:
             out.append(self._normalize_embedding_vec(emb))
         return out
 
-    def _messages_to_list(self, messages):
+    def generate_chat_sync(self, messages, params):
+        """同步版本：直接返回生成文本（供原子事实提取使用）"""
+        if not self.llm_large:
+            raise RuntimeError("Large model not loaded")
+        
         messages_list = []
         try:
             length = len(messages)
             if length > 0:
-                try:
-                    for i in range(1, length + 1):
-                        msg = messages[i]
-                        if msg and 'role' in msg and 'content' in msg:
-                            messages_list.append({
-                                'role': str(msg['role']),
-                                'content': str(msg['content'])
-                            })
-                except Exception:
-                    messages_list = []
-                    try:
-                        for i in range(0, length):
-                            msg = messages[i]
-                            if msg and 'role' in msg and 'content' in msg:
-                                messages_list.append({
-                                    'role': str(msg['role']),
-                                    'content': str(msg['content'])
-                                })
-                    except Exception:
-                        messages_list = []
-        except Exception:
-            if messages and 'role' in messages and 'content' in messages:
+                for i in range(1, length + 1):
+                    msg = messages[i]
+                    if msg and 'role' in msg and 'content' in msg:
+                        messages_list.append({
+                            'role': str(msg['role']),
+                            'content': str(msg['content'])
+                        })
+        except TypeError:
+            if 'role' in messages and 'content' in messages:
                 messages_list.append({
                     'role': str(messages['role']),
                     'content': str(messages['content'])
                 })
-        return messages_list
-
-    def _normalize_generation_params(self, params):
-        params_dict = dict(params) if hasattr(params, 'keys') else (params or {})
+        
+        params_dict = dict(params) if hasattr(params, 'keys') else params
         max_tokens = int(params_dict.get("max_tokens", 128))
         temperature = float(params_dict.get("temperature", 0.7))
         stop = [str(s) for s in params_dict.get("stop", []) if s is not None]
-
+        
         seed = params_dict.get("seed")
         if seed is not None:
             try:
@@ -194,161 +337,69 @@ class AIPipeline:
                     seed = None
             except (TypeError, ValueError):
                 seed = None
-
-        return {
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stop": stop,
-            "seed": seed,
-        }
-
-    @staticmethod
-    def _safe_float(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _normalize_types_field(v):
-        if isinstance(v, str):
-            return v
-        if isinstance(v, list):
-            parts = [str(x).strip() for x in v if x is not None and str(x).strip()]
-            return ",".join(parts)
-        return ""
-
-    @staticmethod
-    def _parse_tool_arguments(raw_args):
-        if isinstance(raw_args, dict):
-            return raw_args
-        if isinstance(raw_args, str):
-            try:
-                return json.loads(raw_args)
-            except json.JSONDecodeError:
-                return None
-        return None
-
-    def _extract_calls_from_response(self, output):
-        choices = output.get("choices") if isinstance(output, dict) else None
-        if not choices:
-            return []
-        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-        if not isinstance(msg, dict):
-            return []
-        tool_calls = msg.get("tool_calls") or []
-        calls = []
-
-        for tc in tool_calls:
-            if not isinstance(tc, dict):
-                continue
-            fn = tc.get("function") or {}
-            fn_name = str(fn.get("name") or "").strip()
-            args_obj = self._parse_tool_arguments(fn.get("arguments"))
-            if not fn_name or not isinstance(args_obj, dict):
-                continue
-
-            if fn_name == "upsert_record":
-                call = {
-                    "act": "upsert_record",
-                    "type": str(args_obj.get("type") or ""),
-                    "entity": str(args_obj.get("entity") or ""),
-                    "value": str(args_obj.get("value") or ""),
-                    "evidence": str(args_obj.get("evidence") or ""),
-                    "confidence": self._safe_float(args_obj.get("confidence")),
-                }
-            elif fn_name == "query_record":
-                call = {
-                    "act": "query_record",
-                    "query": str(args_obj.get("query") or ""),
-                    "types": self._normalize_types_field(args_obj.get("types")),
-                }
-            elif fn_name == "delete_record":
-                call = {
-                    "act": "delete_record",
-                    "type": str(args_obj.get("type") or ""),
-                    "entity": str(args_obj.get("entity") or ""),
-                    "evidence": str(args_obj.get("evidence") or ""),
-                }
-            else:
-                continue
-
-            calls.append(call)
-
-        return calls
-
-    def generate_chat_sync(self, messages, params):
-        """同步版本：直接返回生成文本（供原子事实提取使用）"""
-        if not self.llm_large:
-            raise RuntimeError("Large model not loaded")
-
-        messages_list = self._messages_to_list(messages)
-        gen = self._normalize_generation_params(params)
+        
         output = self.llm_large.create_chat_completion(
             messages=messages_list,
-            max_tokens=gen["max_tokens"],
-            temperature=gen["temperature"],
-            stop=gen["stop"],
-            seed=gen["seed"]
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            seed=seed
         )
-        return output['choices'][0]['message']['content']
-
-    def generate_tool_calls_sync(self, messages, params):
-        if not self.llm_large:
-            raise RuntimeError("Large model not loaded")
-
-        messages_list = self._messages_to_list(messages)
-        if not messages_list:
-            return [], "empty"
-
-        gen = self._normalize_generation_params(params)
-
-        for attempt in (1, 2):
-            try:
-                output = self.llm_large.create_chat_completion(
-                    messages=messages_list,
-                    tools=self.TOOL_SCHEMAS,
-                    tool_choice="auto",
-                    max_tokens=gen["max_tokens"],
-                    temperature=gen["temperature"],
-                    stop=gen["stop"],
-                    seed=gen["seed"],
-                )
-                calls = self._extract_calls_from_response(output)
-                if calls:
-                    return calls, "ok"
-                return [], "empty"
-            except Exception as e:
-                print(f"[Python][ToolCall] native tool call attempt {attempt} failed: {e}")
-
-        return [], "error"
+        return self._extract_chat_text(output)
 
     def load_models(self, large_model_path: str, embedding_model_path: str):
         print("[Python] Loading models...")
-        
+
+        self.shutdown()
+        if not os.path.isfile(self.llama_server_bin):
+            raise FileNotFoundError(f"llama-server not found: {self.llama_server_bin}")
+
         # 1. 大模型（GPU）
         if large_model_path:
+            if not os.path.exists(large_model_path):
+                raise FileNotFoundError(f"Large model not found: {large_model_path}")
             print(f"[Python] Loading Large LLM on GPU: {large_model_path}")
-            self.llm_large = Llama(
+            self.llm_large = LlamaCppServerClient(
+                server_bin=self.llama_server_bin,
                 model_path=large_model_path,
-                n_gpu_layers=-1,
-                n_ctx=40960,
-                verbose=False
+                ctx_size=40960,
+                embedding=False,
             )
 
         # 2. Embedding 模型（GGUF）
         if embedding_model_path:
+            if not os.path.exists(embedding_model_path):
+                raise FileNotFoundError(f"Embedding model not found: {embedding_model_path}")
             print(f"[Python] Loading GGUF Embedding model: {embedding_model_path}")
-            self.llm_embed = Llama(
+            self.llm_embed = LlamaCppServerClient(
+                server_bin=self.llama_server_bin,
                 model_path=embedding_model_path,
+                ctx_size=2048,
                 embedding=True,
-                logits_all=True,
-                n_gpu_layers=-1,
-                n_ctx=2048,
-                verbose=False
             )
 
         print("[Python] All models loaded (llama.cpp + GGUF).")
+
+    def shutdown(self):
+        if self.llm_large is not None:
+            try:
+                self.llm_large.stop()
+            except Exception as e:
+                print(f"[Python][WARN] Stop large llama-server failed: {e}")
+            self.llm_large = None
+
+        if self.llm_embed is not None:
+            try:
+                self.llm_embed.stop()
+            except Exception as e:
+                print(f"[Python][WARN] Stop embedding llama-server failed: {e}")
+            self.llm_embed = None
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     def unpack_state(self):
         zst_path = "memory/state.zst"
@@ -520,23 +571,53 @@ class AIPipeline:
     def generate_chat(self, messages, params, lua_callback):
         if not self.llm_large:
             raise RuntimeError("Large model not loaded")
-
-        messages_list = self._messages_to_list(messages)
+    
+        messages_list = []
+        try:
+            length = len(messages)
+            if length > 0:
+                for i in range(1, length + 1):
+                    msg = messages[i]
+                    if msg and 'role' in msg and 'content' in msg:
+                        messages_list.append({
+                            'role': str(msg['role']),
+                            'content': str(msg['content'])
+                        })
+        except TypeError:
+            if 'role' in messages and 'content' in messages:
+                messages_list.append({
+                    'role': str(messages['role']),
+                    'content': str(messages['content'])
+                })
+    
         if not messages_list:
             raise ValueError("Invalid messages format")
-
-        gen = self._normalize_generation_params(params)
-        print(f"[Python] Generating chat with large model... (stop: {gen['stop']})")
-
+    
+        params_dict = dict(params) if hasattr(params, 'keys') else params
+        max_tokens = int(params_dict.get("max_tokens", 128))
+        temperature = float(params_dict.get("temperature", 0.7))
+        stop = [str(s) for s in params_dict.get("stop", []) if s is not None]
+        
+        seed = params_dict.get("seed")
+        if seed is not None:
+            try:
+                seed = int(seed)
+                if seed < 0:
+                    seed = None
+            except (TypeError, ValueError):
+                seed = None
+    
+        print(f"[Python] Generating chat with large model... (stop: {stop})")
+    
         output = self.llm_large.create_chat_completion(
             messages=messages_list,
-            max_tokens=gen["max_tokens"],
-            temperature=gen["temperature"],
-            seed=gen["seed"],
-            stop=gen["stop"]
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            stop=stop
         )
-    
-        text_result = output['choices'][0]['message']['content']
+
+        text_result = self._extract_chat_text(output)
         if lua_callback:
             lua_callback(text_result)
         return text_result
@@ -548,10 +629,13 @@ def main():
     lua.globals()['py_pipeline'] = pipeline
 
     pipeline.unpack_state()
-    
-    print("[Python] Executing pipeline.lua...")
-    with open("pipeline.lua", "r", encoding="utf-8") as f:
-        lua.execute(f.read())
+
+    try:
+        print("[Python] Executing pipeline.lua...")
+        with open("pipeline.lua", "r", encoding="utf-8") as f:
+            lua.execute(f.read())
+    finally:
+        pipeline.shutdown()
 
 
 if __name__ == "__main__":
