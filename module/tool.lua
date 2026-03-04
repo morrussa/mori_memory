@@ -545,7 +545,7 @@ end
 -- ==================== 全量热记忆搜索（旧版，仍保留 Lua 循环，使用 double） ====================
 
 function M.find_sim_all_heat(vec)
-    local memory = require("module.memory")
+    local memory = require("module.memory.store")
     local results = {}
     local v1 = vec
 

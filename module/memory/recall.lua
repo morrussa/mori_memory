@@ -4,13 +4,13 @@
 local M = {}
 
 local tool = require("module.tool")
-local memory = require("module.memory")
-local history = require("module.history")
+local memory = require("module.memory.store")
+local history = require("module.memory.history")
 local config = require("module.config")
-local cluster = require("module.cluster")
-local topic = require("module.topic")
-local adaptive = require("module.adaptive")
-local heat = require("module.heat")
+local cluster = require("module.memory.cluster")
+local topic = require("module.memory.topic")
+local adaptive = require("module.memory.adaptive")
+local heat = require("module.memory.heat")
 
 local ANXIETY_SENTENCES = {
     "我很焦虑", "我急死了", "快点", "急急急", "我现在很着急"

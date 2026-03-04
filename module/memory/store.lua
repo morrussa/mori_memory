@@ -4,10 +4,10 @@ local M = {}
 
 local tool = require("module.tool")
 local config = require("module.config")
-local cluster = require("module.cluster")
-local adaptive = require("module.adaptive")
+local cluster = require("module.memory.cluster")
+local adaptive = require("module.memory.adaptive")
 local ffi = require("ffi")
-local saver = require("module.saver")
+local saver = require("module.memory.saver")
 local persistence = require("module.persistence")
 
 local STORAGE_CFG = (config.settings or {}).storage_v3 or {}
@@ -58,7 +58,7 @@ local function shallow_copy_array(src)
 end
 
 local function topic_key_for_turn(turn)
-    local ok_topic, topic = pcall(require, "module.topic")
+    local ok_topic, topic = pcall(require, "module.memory.topic")
     if not ok_topic or not topic then
         return nil
     end
@@ -795,7 +795,7 @@ function M.save_to_disk()
 end
 
 function M.add_memory(vec, turn)
-    local heat_mod = require("module.heat")
+    local heat_mod = require("module.memory.heat")
 
     if type(vec) ~= "table" or #vec <= 0 then
         return nil, "invalid_vector"

@@ -1,13 +1,13 @@
 local M = {}
 
 local tool = require("module.tool")
-local history = require("module.history")
-local topic = require("module.topic")
-local recall = require("module.recall")
-local tool_calling = require("module.tool_calling")
-local tool_planner = require("module.tool_planner")
-local tool_registry = require("module.tool_registry")
-local context_window = require("module.context_window")
+local history = require("module.memory.history")
+local topic = require("module.memory.topic")
+local recall = require("module.memory.recall")
+local tool_calling = require("module.agent.tool_calling")
+local tool_planner = require("module.agent.tool_planner")
+local tool_registry = require("module.agent.tool_registry")
+local context_window = require("module.agent.context_window")
 local config = require("module.config")
 
 local function trim(s)

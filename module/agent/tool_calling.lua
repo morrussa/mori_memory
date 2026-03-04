@@ -1,12 +1,12 @@
 local M = {}
 
 local tool = require("module.tool")
-local history = require("module.history")
-local topic = require("module.topic")
-local memory = require("module.memory")
-local heat = require("module.heat")
+local history = require("module.memory.history")
+local topic = require("module.memory.topic")
+local memory = require("module.memory.store")
+local heat = require("module.memory.heat")
 local config_mem = require("module.config")
-local notebook = require("module.notebook")
+local notebook = require("module.agent.notebook")
 
 M._pending_system_context = ""
 M._pending_topic_anchor = nil

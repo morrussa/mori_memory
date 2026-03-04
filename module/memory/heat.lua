@@ -36,7 +36,7 @@ local function normalize_line(line)
     if not n then return nil end
     n = math.floor(n)
     if n < 1 then return nil end
-    local memory = require("module.memory")
+    local memory = require("module.memory.store")
     if n > memory.get_total_lines() then return nil end
     return n
 end
@@ -107,8 +107,8 @@ function M.normalize_heat()
     -- 容差内不处理
     if current_total <= TARGET_HEAT + TOLERANCE then return end
 
-    local memory = require("module.memory")
-    local cluster = require("module.cluster")
+    local memory = require("module.memory.store")
+    local cluster = require("module.memory.cluster")
     
     local excess = current_total - TARGET_HEAT
     
@@ -227,7 +227,7 @@ local function sync_heat_to_table(line, new_heat)
 end
 
 function M.sync_line(line)
-    local memory = require("module.memory")
+    local memory = require("module.memory.store")
     local idx = normalize_line(line)
     if not idx then return false end
     local h = memory.get_heat_by_index(idx) or 0
@@ -247,7 +247,7 @@ end
 
 -- ====================== LOAD：从 memory.txt 重建热区 ======================
 function M.load()
-    local memory = require("module.memory")
+    local memory = require("module.memory.store")
     M.heat = { indices = {}, values = {} }
     M.heat_pos = {}
     local total = memory.get_total_lines()
@@ -263,8 +263,8 @@ end
 
 -- ====================== 邻居加热 ======================
 function M.neighbors_add_heat(vec, total_turn, target_mem_line)
-    local memory = require("module.memory")
-    local cluster = require("module.cluster")
+    local memory = require("module.memory.store")
+    local cluster = require("module.memory.cluster")
 
     target_mem_line = target_mem_line or memory.get_total_lines()
     target_mem_line = normalize_line(target_mem_line)
@@ -343,7 +343,7 @@ function M.neighbors_add_heat(vec, total_turn, target_mem_line)
 end
 
 local function topic_relation_to_target(turn, target_info, sim_th)
-    local topic = require("module.topic")
+    local topic = require("module.memory.topic")
     local ti = topic.get_topic_for_turn and topic.get_topic_for_turn(turn) or nil
     if not target_info or not ti then
         return "cross"
@@ -368,9 +368,9 @@ local function topic_relation_to_target(turn, target_info, sim_th)
 end
 
 function M.enqueue_cold_rescue(query_vec, current_turn, target_topic_info, min_gate)
-    local memory = require("module.memory")
-    local cluster = require("module.cluster")
-    local adaptive = require("module.adaptive")
+    local memory = require("module.memory.store")
+    local cluster = require("module.memory.cluster")
+    local adaptive = require("module.memory.adaptive")
     local aq = ((config.settings or {}).ai_query or {})
     if not query_vec or #query_vec == 0 then return end
 
@@ -437,11 +437,11 @@ end
 
 -- ====================== 冷救援执行（兼容旧函数名） ======================
 function M.perform_cold_exchange(current_turn)
-    local memory = require("module.memory")
-    local cluster = require("module.cluster")
-    local saver = require("module.saver")
-    local history = require("module.history")
-    local adaptive = require("module.adaptive")
+    local memory = require("module.memory.store")
+    local cluster = require("module.memory.cluster")
+    local saver = require("module.memory.saver")
+    local history = require("module.memory.history")
+    local adaptive = require("module.memory.adaptive")
     local aq = ((config.settings or {}).ai_query or {})
     if #M.pending_cold == 0 then return end
 
@@ -519,7 +519,7 @@ end
 
 -- ====================== 新记忆加入热区 ======================
 function M.add_new_heat(line, heat_value)
-    local memory = require("module.memory")
+    local memory = require("module.memory.store")
     heat_value = heat_value or NEW_HEAT
     memory.set_heat(line, heat_value)
     sync_heat_to_table(line, heat_value)
@@ -529,8 +529,8 @@ end
 
 -- ====================== 零 Floor 最终版 ======================
 function M.add_new_with_cluster_cap(new_line, vec)
-    local cluster = require("module.cluster")
-    local memory = require("module.memory")
+    local cluster = require("module.memory.cluster")
+    local memory = require("module.memory.store")
     local cfg = config.settings.cluster
     local CAP = cfg.cluster_heat_cap or 520000
 

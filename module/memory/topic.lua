@@ -4,7 +4,7 @@ local ffi = require("ffi")
 local tool = require("module.tool")
 local config = require("module.config")
 local persistence = require("module.persistence")
-local history_module = require("module.history") -- 依赖 history 进行 rebuild
+local history_module = require("module.memory.history") -- 依赖 history 进行 rebuild
 local py_pipeline = py_pipeline
 
 -- ==================== 配置读取 ====================

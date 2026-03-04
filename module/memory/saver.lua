@@ -1,4 +1,4 @@
--- module/saver.lua
+-- module/memory/saver.lua
 local M = {}
 
 M.dirty = false
@@ -10,12 +10,12 @@ end
 function M.flush_all(force)
     if not M.dirty and not force then return true end
 
-    local memory = require("module.memory")
-    local cluster = require("module.cluster")
-    local history = require("module.history")
-    local heat = require("module.heat")   -- 延迟加载 heat 模块
-    local notebook = require("module.notebook")
-    local adaptive = require("module.adaptive")
+    local memory = require("module.memory.store")
+    local cluster = require("module.memory.cluster")
+    local history = require("module.memory.history")
+    local heat = require("module.memory.heat")   -- 延迟加载 heat 模块
+    local notebook = require("module.agent.notebook")
+    local adaptive = require("module.memory.adaptive")
 
     print("[Saver] === 开始原子保存 raw 文件 ===")
 
@@ -56,7 +56,7 @@ end
 -- 程序正常退出时自动调用
 function M.on_exit()
     print("[Saver] 正在原子保存并最终归档...")
-    local topic = require("module.topic")
+    local topic = require("module.memory.topic")
     topic.finalize()
     local ok = M.flush_all(true)
     if not ok then

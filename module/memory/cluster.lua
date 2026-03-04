@@ -116,7 +116,7 @@ end
 local function rebuild_cluster_member_views(c)
     if not c then return end
 
-    local ok_mem, memory = pcall(require, "module.memory")
+    local ok_mem, memory = pcall(require, "module.memory.store")
     if not ok_mem or not memory then
         c.hot_members = {}
         c.cold_members = {}
@@ -400,7 +400,7 @@ function M.load()
         end
     end
 
-    local ok_mem, memory = pcall(require, "module.memory")
+    local ok_mem, memory = pcall(require, "module.memory.store")
     if ok_mem and memory and memory.set_cluster_id then
         for line, cid in pairs(M.line_to_cluster) do
             memory.set_cluster_id(line, cid)
@@ -538,8 +538,8 @@ function M.find_best_cluster(vec, opts)
 end
 
 function M.add(vec, mem_index)
-    local saver = require("module.saver")
-    local memory = require("module.memory")
+    local saver = require("module.memory.saver")
+    local memory = require("module.memory.store")
     if #vec == 0 then
         print("[Cluster] Error: 收到空向量")
         return nil
@@ -585,7 +585,7 @@ function M.add(vec, mem_index)
 end
 
 function M.mark_cold(mem_line)
-    local saver = require("module.saver")
+    local saver = require("module.memory.saver")
     local id = M.line_to_cluster[mem_line]
     local c = id and M.clusters[id] or nil
     if c then
@@ -597,7 +597,7 @@ function M.mark_cold(mem_line)
 end
 
 function M.mark_hot(mem_line)
-    local saver = require("module.saver")
+    local saver = require("module.memory.saver")
     local id = M.line_to_cluster[mem_line]
     local c = id and M.clusters[id] or nil
     if c then
@@ -609,7 +609,7 @@ function M.mark_hot(mem_line)
 end
 
 function M.on_memory_heat_change(mem_line, old_heat, new_heat)
-    local saver = require("module.saver")
+    local saver = require("module.memory.saver")
     local id = M.line_to_cluster[mem_line]
     local c = id and M.clusters[id] or nil
     if not c then
@@ -656,7 +656,7 @@ function M.get_cold_members(cid)
 end
 
 function M.find_sim_in_cluster(vec, cluster_id, opts)
-    local memory = require("module.memory")
+    local memory = require("module.memory.store")
     opts = opts or {}
     local only_hot = opts.only_hot == true
     local only_cold = opts.only_cold == true

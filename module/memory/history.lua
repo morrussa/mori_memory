@@ -87,7 +87,7 @@ function M.load()
 end
 
 function M.add_history(user, ai)
-    local saver = require("module.saver")
+    local saver = require("module.memory.saver")
 
     local ai_processed = tool.remove_cot(ai)
     local line = escape_field(user) .. FIELD_SEP .. escape_field(ai_processed)

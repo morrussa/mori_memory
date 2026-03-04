@@ -1,6 +1,8 @@
 model/
 agent_memory_sim.py
 memory/
+!module/memory/
+!module/memory/*.lua
 luajit/
 __pycache__/
 readme.txt

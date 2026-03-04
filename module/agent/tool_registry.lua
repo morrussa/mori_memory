@@ -1,7 +1,7 @@
 local M = {}
 
-local notebook = require("module.notebook")
-local topic = require("module.topic")
+local notebook = require("module.agent.notebook")
+local topic = require("module.memory.topic")
 local config_mem = require("module.config")
 
 M._pending_system_context = ""

@@ -134,11 +134,15 @@ http://127.0.0.1:8080
 
 ## AgentRuntime / ToolRegistry（一次性替换版）
 
-当前主链路已切到：
-- `module/agent_runtime.lua`：主状态机（`PREPARE -> BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS -> PERSIST -> DONE`）
-- `module/tool_planner.lua`：二阶段工具规划（只产出工具调用）
-- `module/tool_registry.lua`：工具执行与 pending context（仅 notebook 工具）
-- `module/context_window.lua`：按 token 预算裁剪上下文（模板后精确计数）
+当前主链路已切到（按职责分层）：
+- `module/agent/runtime.lua`：主状态机（`PREPARE -> BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS -> PERSIST -> DONE`）
+- `module/agent/tool_planner.lua`：二阶段工具规划（只产出工具调用）
+- `module/agent/tool_registry.lua`：工具执行与 pending context（仅 notebook 工具）
+- `module/agent/context_window.lua`：按 token 预算裁剪上下文（模板后精确计数）
+- `module/memory/*.lua`：记忆与检索子系统（history/topic/recall/store/heat/cluster/adaptive/saver）
+
+路径约束：
+- 仅保留新路径：`module/agent/*.lua` 与 `module/memory/*.lua`。
 
 ### Token 滑窗（精确计数）
 

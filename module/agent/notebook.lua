@@ -129,7 +129,7 @@ local function turns_to_csv(turns)
 end
 
 local function mark_dirty()
-    local ok, saver = pcall(require, "module.saver")
+    local ok, saver = pcall(require, "module.memory.saver")
     if ok and saver and saver.mark_dirty then
         saver.mark_dirty()
     end
