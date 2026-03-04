@@ -218,7 +218,17 @@ M.settings = {
         completion_reserve_tokens = 1024,
         token_count_mode = "templated_exact", -- 固定：模板后精确计数
         context_drop_order = "memory_tool_plan", -- 超预算时先丢 memory_context，再 tool_context，再 plan_bom
+        plan_bom_pinned = true, -- true=滑窗时尽量保留 plan_bom，不可接受的情况下先压缩而不是直接丢弃
+        plan_bom_compact_min_chars = 120, -- plan 保底压缩长度
+        history_auto_compress = true, -- 超预算丢弃历史时，自动生成历史压缩块注入上下文
+        history_auto_compress_min_dropped_pairs = 1, -- 至少丢弃多少历史 pair 才触发自动压缩
+        history_auto_compress_max_pairs = 24, -- 自动压缩最多覆盖多少条被丢弃历史 pair
+        history_auto_compress_user_chars = 64, -- 压缩块内单条 user 文本截断长度
+        history_auto_compress_assistant_chars = 96, -- 压缩块内单条 assistant 文本截断长度
+        history_auto_compress_max_chars = 1400, -- 压缩块初始最大长度
+        history_auto_compress_min_chars = 220, -- 压缩块最小长度下限
         continue_on_tool_context = true, -- 工具产生新上下文时继续下一步重生成
+        max_context_refine_steps = 2, -- 单轮最多因工具上下文增量触发多少次重生成
         continue_on_tool_failure = true, -- 工具失败时触发自修正重试
         max_failure_refine_steps = 2, -- 单轮最多因工具失败触发多少次重修
     },

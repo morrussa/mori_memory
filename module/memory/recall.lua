@@ -76,6 +76,10 @@ local function ai_cfg()
     return ((config.settings or {}).ai_query or {})
 end
 
+local function is_read_only(opts)
+    return type(opts) == "table" and opts.read_only == true
+end
+
 local function clamp(v, lo, hi)
     if v < lo then return lo end
     if v > hi then return hi end
@@ -169,11 +173,14 @@ local function normalize_vec(vec)
     return out
 end
 
-local function query_vectors(base_vec, keyword_weight)
+local function query_vectors(base_vec, keyword_weight, opts)
     local cfg = ai_cfg()
     local out = {
         { vec = base_vec, weight = 1.0, is_primary = true }
     }
+    if is_read_only(opts) then
+        return out
+    end
     local query_n = math.max(1, math.floor(tonumber(cfg.keyword_queries) or 2))
     if query_n <= 1 then
         return out
@@ -798,7 +805,7 @@ local function update_cluster_hit_rate(cid, hit)
     M._cluster_hit_rate_ema[cid] = alpha * current_rate + (1.0 - alpha) * old_ema
 end
 
-local function soft_gate_filter(sim, min_gate)
+local function soft_gate_filter(sim, min_gate, opts)
     local cfg = ai_cfg()
     if sim >= min_gate then
         return true
@@ -815,6 +822,9 @@ local function soft_gate_filter(sim, min_gate)
 
     local den = math.max(1e-6, min_gate - threshold)
     local prob = clamp((sim - threshold) / den, 0.0, 1.0)
+    if is_read_only(opts) then
+        return prob >= 0.5
+    end
     if math.random() < prob then
         M._soft_gate_pass_count = M._soft_gate_pass_count + 1
         return true
@@ -822,7 +832,10 @@ local function soft_gate_filter(sim, min_gate)
     return false
 end
 
-local function adjust_gate_on_result(hit)
+local function adjust_gate_on_result(hit, opts)
+    if is_read_only(opts) then
+        return
+    end
     local cfg = ai_cfg()
     local gate_floor = tonumber(cfg.min_gate_floor) or 0.25
     local gate_ceiling = tonumber(cfg.max_gate_ceiling) or 0.85
@@ -850,7 +863,7 @@ local function adjust_gate_on_result(hit)
     adaptive.mark_dirty()
 end
 
-local function top_probe_clusters(vec, probe_clusters, super_topn, turn)
+local function top_probe_clusters(vec, probe_clusters, super_topn, turn, opts)
     local cfg = ai_cfg()
     local cand, ops0 = cluster.super_candidate_clusters(vec, super_topn)
     if #cand <= 0 then
@@ -893,7 +906,7 @@ local function top_probe_clusters(vec, probe_clusters, super_topn, turn)
         out[#out + 1] = scored[i].cid
     end
 
-    if cfg.refinement_enabled == true and #scored > k then
+    if (not is_read_only(opts)) and cfg.refinement_enabled == true and #scored > k then
         local rp = refinement_progress(turn)
         local explore_n = math.floor((1.0 - rp) * k * 0.75 + 0.5)
         if explore_n > 0 then
@@ -994,7 +1007,10 @@ local function pick_top_lines_by_sim(query_vec, lines, budget)
     return out
 end
 
-local function smart_preload_cold_memories(query_vec, current_turn, current_key, current_info, candidate_clusters)
+local function smart_preload_cold_memories(query_vec, current_turn, current_key, current_info, candidate_clusters, opts)
+    if is_read_only(opts) then
+        return 0
+    end
     _ = current_turn
     local cfg = ai_cfg()
     if cfg.smart_preload_enabled ~= true then
@@ -1150,9 +1166,33 @@ local function unload_topic_cache()
     unload_preload_cache()
 end
 
-local function update_topic_stability(current_anchor, query_vec)
+local function update_topic_stability(current_anchor, query_vec, opts)
     local stable_warm = math.max(1, tonumber(ai_cfg().stable_warmup_turns) or 6)
     local stable_sim = tonumber(ai_cfg().stable_min_pair_sim) or 0.72
+
+    if is_read_only(opts) then
+        local same_topic_streak = 1
+        local streak_sim_sum = 0.0
+        local streak_sim_count = 0
+
+        if current_anchor and current_anchor == M._last_topic_anchor then
+            same_topic_streak = (tonumber(M._same_topic_streak) or 0) + 1
+            if M._prev_query_vec and query_vec and #query_vec > 0 then
+                local sim = tool.cosine_similarity(M._prev_query_vec, query_vec)
+                streak_sim_sum = (tonumber(M._streak_sim_sum) or 0.0) + sim
+                streak_sim_count = (tonumber(M._streak_sim_count) or 0) + 1
+            else
+                streak_sim_sum = tonumber(M._streak_sim_sum) or 0.0
+                streak_sim_count = tonumber(M._streak_sim_count) or 0
+            end
+        end
+
+        local avg_pair = 1.0
+        if streak_sim_count > 0 then
+            avg_pair = streak_sim_sum / streak_sim_count
+        end
+        return (same_topic_streak >= stable_warm) and (avg_pair >= stable_sim)
+    end
 
     if current_anchor and current_anchor == M._last_topic_anchor then
         M._same_topic_streak = M._same_topic_streak + 1
@@ -1178,7 +1218,10 @@ local function update_topic_stability(current_anchor, query_vec)
     return (M._same_topic_streak >= stable_warm) and (avg_pair >= stable_sim)
 end
 
-local function topic_random_lift(turn, current_anchor, stable_ready)
+local function topic_random_lift(turn, current_anchor, stable_ready, opts)
+    if is_read_only(opts) then
+        return
+    end
     local cfg = ai_cfg()
     if not current_anchor then return end
     if not stable_ready then return end
@@ -1240,7 +1283,8 @@ local function collect_candidate_samples(mem_best_sim, mem_best_cluster, mem_bes
     return out
 end
 
-local function apply_refinement(turn, hits_all, candidate_samples, selected_memories, current_info, sim_th)
+local function apply_refinement(turn, hits_all, candidate_samples, selected_memories, current_info, sim_th, opts)
+    if is_read_only(opts) then return end
     if ai_cfg().refinement_enabled ~= true then return end
     if not current_info then return end
 
@@ -1284,12 +1328,16 @@ local function apply_refinement(turn, hits_all, candidate_samples, selected_memo
     })
 end
 
-local function retrieve(user_input, user_vec, current_turn, current_info, current_anchor)
+local function retrieve(user_input, user_vec, current_turn, current_info, current_anchor, opts)
+    opts = opts or {}
+    local read_only = is_read_only(opts)
     if memory.get_total_lines() <= 0 then
         return ""
     end
 
-    memory.begin_turn(current_turn)
+    if not read_only then
+        memory.begin_turn(current_turn)
+    end
 
     local cfg = ai_cfg()
     local knobs = effective_retrieval_knobs(current_turn)
@@ -1386,7 +1434,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         return sim
     end
 
-    local query_vecs = query_vectors(user_vec, keyword_weight)
+    local query_vecs = query_vectors(user_vec, keyword_weight, opts)
     local primary = query_vecs[1]
     if (not primary) or type(primary.vec) ~= "table" or #primary.vec == 0 then
         return ""
@@ -1394,7 +1442,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local primary_qptr = tool.to_ptr_vec(primary.vec) or primary.vec
 
     local persistent_extra_budget = 0
-    if cfg.persistent_explore_enabled == true and cluster.cluster_count() > 1 then
+    if (not read_only) and cfg.persistent_explore_enabled == true and cluster.cluster_count() > 1 then
         local eps = clamp(tonumber(cfg.persistent_explore_epsilon) or 0.01, 0.0, 1.0)
         local periodic = math.max(0, tonumber(cfg.persistent_explore_period_turns) or 0)
         local trigger = false
@@ -1406,8 +1454,10 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
-    local cluster_ids_for_preload, _ = top_probe_clusters(primary_qptr, probe_clusters, query_topn, current_turn)
-    local preloaded_clusters = smart_preload_cold_memories(primary_qptr, current_turn, current_topic_key, current_info, cluster_ids_for_preload)
+    local cluster_ids_for_preload, _ = top_probe_clusters(primary_qptr, probe_clusters, query_topn, current_turn, opts)
+    local preloaded_clusters = smart_preload_cold_memories(
+        primary_qptr, current_turn, current_topic_key, current_info, cluster_ids_for_preload, opts
+    )
 
     local function update_mem_best(mem_idx, sim, effective, cid, source)
         local prev_sim = mem_best_sim[mem_idx]
@@ -1468,7 +1518,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 end
             end
         else
-            local cluster_ids, _ = top_probe_clusters(qptr, probe_clusters, query_topn, current_turn)
+            local cluster_ids, _ = top_probe_clusters(qptr, probe_clusters, query_topn, current_turn, opts)
             local persistent_probe_clusters_vec = {}
 
             if q_idx == 1 and persistent_extra_budget > 0 and #cluster_ids > 0 then
@@ -1523,7 +1573,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                     local effective = (sim_pos ^ power) * weight
                     update_mem_best(mem_idx, sim, effective, cid, src_label)
 
-                    if not soft_gate_filter(sim, min_gate) then
+                    if not soft_gate_filter(sim, min_gate, opts) then
                         break
                     end
                 end
@@ -1555,7 +1605,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             table.sort(preload_scored, function(a, b) return a.sim > b.sim end)
             for _, item in ipairs(preload_scored) do
                 local sim = item.sim
-                if not soft_gate_filter(sim, min_gate) then
+                if not soft_gate_filter(sim, min_gate, opts) then
                     break
                 end
                 local mem_idx = item.mem_idx
@@ -1612,8 +1662,10 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             preloaded_clusters, #kept_memories, dropped_by_memory_gate,
             secondary_near_mode_used and "near_lossless" or keyword_perf_mode
         ))
-        adjust_gate_on_result(false)
-        heat.enqueue_cold_rescue(user_vec, current_turn, current_info, min_gate)
+        adjust_gate_on_result(false, opts)
+        if not read_only then
+            heat.enqueue_cold_rescue(user_vec, current_turn, current_info, min_gate)
+        end
         return ""
     end
 
@@ -1622,7 +1674,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             selected[#selected + 1] = ranked[i]
         end
 
-        if cfg.refinement_enabled == true then
+        if (not read_only) and cfg.refinement_enabled == true then
             local rp = refinement_progress(current_turn)
             local explore_slots = math.floor(max_turns * 0.55 * (1.0 - rp) + 0.5)
             if explore_slots > 0 and #ranked > max_turns then
@@ -1703,7 +1755,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
-    if cache_contrib > 0 then
+    if (not read_only) and cache_contrib > 0 then
         adaptive.add_counter("topic_cache_selected_turns_total", cache_contrib)
     end
 
@@ -1722,7 +1774,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             end
         end
     end
-    if persistent_hits > 0 then
+    if (not read_only) and persistent_hits > 0 then
         adaptive.add_counter("persistent_explore_turn_hits", persistent_hits)
     end
 
@@ -1740,20 +1792,22 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     for _, sample in ipairs(candidate_samples) do
         local cid = tonumber(sample.cid)
         if cid and cid >= 0 and not clusters_seen[cid] then
-            update_cluster_hit_rate(cid, hit_flag)
+            if not read_only then
+                update_cluster_hit_rate(cid, hit_flag)
+            end
             clusters_seen[cid] = true
         end
     end
 
-    adjust_gate_on_result(hit_flag)
+    adjust_gate_on_result(hit_flag, opts)
 
-    apply_refinement(current_turn, hits_all, candidate_samples, selected_memories, current_info, sim_th)
+    apply_refinement(current_turn, hits_all, candidate_samples, selected_memories, current_info, sim_th, opts)
 
     local need_rescue = (#selected_turns == 0)
     if not need_rescue and (cfg.cold_rescue_on_empty_only ~= true) and hits_all <= 0 then
         need_rescue = true
     end
-    if need_rescue then
+    if need_rescue and (not read_only) then
         heat.enqueue_cold_rescue(user_vec, current_turn, current_info, min_gate)
     end
 
@@ -1781,24 +1835,28 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     return ""
 end
 
-function M.check_and_retrieve(user_input, user_vec)
+function M.check_and_retrieve(user_input, user_vec, opts)
+    opts = opts or {}
+    local read_only = is_read_only(opts)
     user_vec = user_vec or tool.get_embedding_query(user_input)
 
     local current_turn = history.get_turn() + 1
     local current_info = topic.get_topic_for_turn and topic.get_topic_for_turn(current_turn) or nil
     local current_key = topic_key_for_current(current_turn, current_info)
 
-    if M._last_topic_anchor and current_key ~= M._last_topic_anchor then
+    if (not read_only) and M._last_topic_anchor and current_key ~= M._last_topic_anchor then
         unload_topic_cache()
     end
 
-    local stable_ready = update_topic_stability(current_key, user_vec)
-    topic_random_lift(current_turn, current_key, stable_ready)
+    local stable_ready = update_topic_stability(current_key, user_vec, opts)
+    topic_random_lift(current_turn, current_key, stable_ready, opts)
 
     local should_recall, _ = need_recall(user_input, user_vec, current_turn)
     if should_recall then
-        M._last_recall_attempt_turn = current_turn
-        return retrieve(user_input, user_vec, current_turn, current_info, current_key)
+        if not read_only then
+            M._last_recall_attempt_turn = current_turn
+        end
+        return retrieve(user_input, user_vec, current_turn, current_info, current_key, opts)
     end
 
     return ""

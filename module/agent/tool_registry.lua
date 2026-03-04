@@ -7,6 +7,13 @@ local config_mem = require("module.config")
 M._pending_system_context = ""
 M._pending_topic_anchor = nil
 M._pending_created_turn = 0
+M._last_context_signature = ""
+M._last_context_turn = 0
+M._turn_budget_state = {
+    turn = 0,
+    upsert_count = 0,
+    query_count = 0,
+}
 
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
 
@@ -87,6 +94,52 @@ local function dedupe_and_clip_types(types, max_types)
     return out
 end
 
+local function normalize_query_payload(call, policy)
+    local query = trim(call.query)
+    if query == "" then query = trim(call.string) end
+    if query == "" then query = trim(call.value) end
+
+    local types = split_csv(call.types or "")
+    if #types == 0 and trim(call.type) ~= "" then
+        table.insert(types, trim(call.type))
+    end
+    types = dedupe_and_clip_types(types, policy.query_max_types)
+
+    local sorted_types = {}
+    for i, t in ipairs(types) do
+        sorted_types[i] = t
+    end
+    table.sort(sorted_types)
+
+    local query_key = ""
+    if query ~= "" then
+        query_key = query:lower() .. "\x1F" .. table.concat(sorted_types, ",")
+    end
+
+    return query, types, query_key
+end
+
+local function build_query_result_signature(query_key, results)
+    if query_key == "" or type(results) ~= "table" or #results == 0 then
+        return ""
+    end
+    local parts = { query_key }
+    for _, r in ipairs(results) do
+        local rid = tonumber(r.id)
+        if rid and rid > 0 then
+            parts[#parts + 1] = tostring(rid)
+        else
+            parts[#parts + 1] = string.format(
+                "%s|%s|%s",
+                tostring(r.type or ""),
+                tostring(r.entity or ""),
+                tostring(r.value or "")
+            )
+        end
+    end
+    return table.concat(parts, "|")
+end
+
 local function deterministic_rerank(results, query)
     local ranked = {}
     local now = os.time()
@@ -140,6 +193,22 @@ local function clear_pending_system_context()
     M._pending_system_context = ""
     M._pending_topic_anchor = nil
     M._pending_created_turn = 0
+end
+
+local function get_turn_budget_state(current_turn)
+    local turn_id = tonumber(current_turn) or 0
+    local state = M._turn_budget_state
+    if type(state) ~= "table" or (tonumber(state.turn) or -1) ~= turn_id then
+        state = {
+            turn = turn_id,
+            upsert_count = 0,
+            query_count = 0,
+        }
+        M._turn_budget_state = state
+    end
+    state.upsert_count = tonumber(state.upsert_count) or 0
+    state.query_count = tonumber(state.query_count) or 0
+    return state
 end
 
 local function get_tool_policy()
@@ -219,16 +288,8 @@ local function apply_query_record(call, current_turn, policy, state)
         return false, string.format("query_record 超出预算（max=%d）", policy.query_max_per_turn)
     end
 
-    local query = trim(call.query)
-    if query == "" then query = trim(call.string) end
-    if query == "" then query = trim(call.value) end
+    local query, types, query_key = normalize_query_payload(call, policy)
     if query == "" then return false, "query_record 缺少 query/string/value" end
-
-    local types = split_csv(call.types or "")
-    if #types == 0 and trim(call.type) ~= "" then
-        table.insert(types, trim(call.type))
-    end
-    types = dedupe_and_clip_types(types, policy.query_max_types)
 
     local results = notebook.query_records(query, {
         types = types,
@@ -244,6 +305,7 @@ local function apply_query_record(call, current_turn, policy, state)
 
     state.query_count = state.query_count + 1
     print(string.format("[ToolRegistry] query_record 命中 %d 条", #results))
+    local query_result_signature = build_query_result_signature(query_key, results)
     if #results > 0 then
         print(notebook.render_results(results))
         local block = {}
@@ -274,7 +336,11 @@ local function apply_query_record(call, current_turn, policy, state)
             M._pending_created_turn = tonumber(current_turn) or 0
         end
     end
-    return true, string.format("query_record ok (%d hits)", #results)
+    return true, string.format("query_record ok (%d hits)", #results), {
+        query_key = query_key,
+        query_signature = query_result_signature,
+        context_added = (#results > 0),
+    }
 end
 
 function M.get_policy()
@@ -292,6 +358,9 @@ function M.execute_calls(calls, exec_ctx)
         skipped = 0,
         failed = 0,
         logs = {},
+        context_updated = false,
+        context_novel = false,
+        context_signature = "",
     }
 
     if type(calls) ~= "table" or #calls == 0 then
@@ -308,27 +377,83 @@ function M.execute_calls(calls, exec_ctx)
     local state = {
         upsert_count = 0,
         query_count = 0,
+        query_seen = {},
     }
+    local turn_budget = get_turn_budget_state(current_turn)
+    state.upsert_count = turn_budget.upsert_count
+    state.query_count = turn_budget.query_count
+    local step_query_signatures = {}
+    local step_query_sig_seen = {}
 
     for _, call in ipairs(calls) do
         local ok, msg
+        local count_result = true
         if call.act == "upsert_record" then
             ok, msg = apply_upsert_record(call, current_turn, policy, state)
         elseif call.act == "delete_record" then
             ok, msg = apply_delete_record(call, current_turn, policy)
         elseif call.act == "query_record" then
-            ok, msg = apply_query_record(call, current_turn, policy, state)
+            local query, _, query_key = normalize_query_payload(call, policy)
+            if query ~= "" and query_key ~= "" and state.query_seen[query_key] then
+                ok = true
+                count_result = false
+                result.skipped = result.skipped + 1
+                msg = "query_record 去重跳过（同轮重复 query+types）"
+            else
+                if query_key ~= "" then
+                    state.query_seen[query_key] = true
+                end
+                local meta
+                ok, msg, meta = apply_query_record(call, current_turn, policy, state)
+                if ok and meta and trim(meta.query_signature) ~= "" then
+                    local sig = trim(meta.query_signature)
+                    if not step_query_sig_seen[sig] then
+                        step_query_sig_seen[sig] = true
+                        step_query_signatures[#step_query_signatures + 1] = sig
+                    end
+                end
+            end
         else
             ok, msg = false, "跳过未知 act: " .. tostring(call.act)
         end
 
-        if ok then
-            result.executed = result.executed + 1
-        else
-            result.failed = result.failed + 1
+        if count_result then
+            if ok then
+                result.executed = result.executed + 1
+            else
+                result.failed = result.failed + 1
+            end
         end
         result.logs[#result.logs + 1] = msg
-        print(string.format("[ToolRegistry] %s | %s", ok and "OK" or "FAIL", msg))
+        local level = ok and "OK" or "FAIL"
+        if count_result == false then
+            level = "SKIP"
+        end
+        print(string.format("[ToolRegistry] %s | %s", level, msg))
+    end
+    turn_budget.upsert_count = state.upsert_count
+    turn_budget.query_count = state.query_count
+
+    if #step_query_signatures > 0 then
+        table.sort(step_query_signatures)
+        local step_sig = table.concat(step_query_signatures, "||")
+        result.context_signature = step_sig
+        local same_turn = (tonumber(M._last_context_turn) or 0) == current_turn
+        local is_novel = (not same_turn) or (step_sig ~= tostring(M._last_context_signature or ""))
+        result.context_novel = is_novel
+
+        if is_novel then
+            M._last_context_signature = step_sig
+            M._last_context_turn = current_turn
+            result.context_updated = trim(M._pending_system_context) ~= ""
+        else
+            if M._pending_system_context ~= "" then
+                clear_pending_system_context()
+            end
+            result.context_updated = false
+            result.logs[#result.logs + 1] = "query_record 命中但无增量上下文，已跳过注入"
+            print("[ToolRegistry] SKIP | query_record 命中但无增量上下文，已跳过注入")
+        end
     end
 
     return result

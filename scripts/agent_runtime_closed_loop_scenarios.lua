@@ -82,9 +82,10 @@ local function install_stubs(state, scenario)
 
     package.preload["module.memory.recall"] = function()
         local M = {}
-        function M.check_and_retrieve(user_input, _)
+        function M.check_and_retrieve(user_input, _, opts)
             state.recall_calls = state.recall_calls + 1
             state.last_recall_user = user_input
+            state.recall_opts[state.recall_calls] = opts or {}
             return "【相关记忆】\n记忆A"
         end
         return M
@@ -214,6 +215,7 @@ local function run_scenario(name, scenario)
         topic_add_turns = 0,
         topic_updates = 0,
         recall_calls = 0,
+        recall_opts = {},
         tool_contexts = {},
         plan_inputs = {},
         exec_results = {},
@@ -224,7 +226,7 @@ local function run_scenario(name, scenario)
     local runtime = require("module.agent.runtime")
     local final = runtime.run_turn({
         user_input = "请结合我的信息回答",
-        read_only = false,
+        read_only = (scenario.read_only == true),
         conversation_history = {
             { role = "system", content = "你是测试助手" },
         },
@@ -305,6 +307,28 @@ local scenarios = {
             assert(state.generate_calls == 2, "重复同签名调用应在第2步收敛，避免死循环")
             assert(state.exec_calls == 2, "重复同签名调用应只执行两轮")
             assert(final == "草稿2", "重复签名收敛时应返回最后一版答案")
+        end,
+    },
+    {
+        name = "read_only_zero_side_effect",
+        read_only = true,
+        max_steps = 4,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "只读答案（不写状态）",
+        },
+        assertions = function(state, final)
+            assert(state.recall_calls == 1, "read_only 仍应执行 recall 检索")
+            assert(state.recall_opts[1] and state.recall_opts[1].read_only == true, "read_only 标记应透传 recall")
+            assert(state.plan_calls == 0, "read_only 不应进入工具规划")
+            assert(state.history_adds == 0, "read_only 不应写 history")
+            assert(state.topic_add_turns == 0, "read_only 不应写 topic.add_turn")
+            assert(state.topic_updates == 0, "read_only 不应写 topic.update_assistant")
+            assert(state.memory_save_calls == 0, "read_only 不应写 memory")
+            assert((state.add_to_history_calls or 0) == 0, "read_only 不应写 conversation_history")
+            assert(final == "只读答案（不写状态）", "read_only 应返回生成结果")
         end,
     },
 }

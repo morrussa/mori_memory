@@ -172,6 +172,10 @@ function M.run_turn(args)
     )
     local continue_on_tool_context = to_bool(agent_cfg.continue_on_tool_context, true)
     local continue_on_tool_failure = to_bool(agent_cfg.continue_on_tool_failure, true)
+    local max_context_refine_steps = math.max(
+        0,
+        math.floor(tonumber(agent_cfg.max_context_refine_steps) or 2)
+    )
     local max_failure_refine_steps = math.max(
         0,
         math.floor(tonumber(agent_cfg.max_failure_refine_steps) or 2)
@@ -191,10 +195,13 @@ function M.run_turn(args)
     end
 
     state_name = "BUILD_CONTEXT"
-    local memory_context = recall.check_and_retrieve(user_input, user_vec_q)
+    local memory_context = recall.check_and_retrieve(user_input, user_vec_q, {
+        read_only = read_only,
+    })
     local plan_bom = tool_registry.get_long_term_plan_bom()
     local tool_policy = tool_registry.get_policy()
     local step_feedback = ""
+    local context_refine_used = 0
     local failure_refine_used = 0
     local last_call_signature = ""
 
@@ -225,10 +232,13 @@ function M.run_turn(args)
             input_token_budget = token_budget,
         })
         print(string.format(
-            "[AgentRuntime][step=%d] context_tokens=%d kept_pairs=%d dropped_blocks=%s",
+            "[AgentRuntime][step=%d] context_tokens=%d kept_pairs=%d dropped_pairs=%d compressed_pairs=%d history_summary=%s dropped_blocks=%s",
             attempts,
             tonumber(ctx_meta.total_tokens) or 0,
             tonumber(ctx_meta.kept_history_pairs) or 0,
+            tonumber(ctx_meta.dropped_history_pairs) or 0,
+            tonumber(ctx_meta.compressed_history_pairs) or 0,
+            (ctx_meta.history_summary_used == true) and "Y" or "N",
             join_dropped_blocks(ctx_meta.dropped_blocks)
         ))
 
@@ -297,18 +307,37 @@ function M.run_turn(args)
         if not read_only then
             has_pending_context = trim(tool_registry.get_pending_system_context(current_turn)) ~= ""
         end
+        local context_updated = (exec_result.context_updated == true)
+        local context_novel = exec_result.context_novel
+        if (not context_updated) and has_pending_context then
+            context_updated = true
+        end
+        if context_novel == nil then
+            context_novel = context_updated
+        else
+            context_novel = (context_novel == true)
+        end
 
         local continue_reason = nil
         if attempts < max_steps then
-            if continue_on_tool_context and has_pending_context then
+            if continue_on_tool_context and context_updated and context_refine_used < max_context_refine_steps then
                 continue_reason = "tool_context_updated"
+                context_refine_used = context_refine_used + 1
             elseif continue_on_tool_failure and (tonumber(exec_result.failed) or 0) > 0 and failure_refine_used < max_failure_refine_steps then
                 continue_reason = "tool_failed"
                 failure_refine_used = failure_refine_used + 1
             end
         end
 
-        if continue_reason and repeated_calls and not has_pending_context then
+        if continue_reason == "tool_context_updated" and (not context_novel) then
+            print(string.format(
+                "[AgentRuntime][step=%d] 工具上下文无增量，提前收敛",
+                attempts
+            ))
+            continue_reason = nil
+        end
+
+        if continue_reason and repeated_calls and continue_reason ~= "tool_context_updated" then
             print(string.format(
                 "[AgentRuntime][step=%d] 检测到重复工具调用签名，提前收敛",
                 attempts
@@ -323,7 +352,7 @@ function M.run_turn(args)
                 calls,
                 exec_result,
                 continue_reason,
-                has_pending_context
+                context_updated
             )
             print(string.format("[AgentRuntime][step=%d] continue reason=%s", attempts, continue_reason))
         else

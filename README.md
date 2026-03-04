@@ -151,7 +151,8 @@ http://127.0.0.1:8080
   - 先调用 `/apply-template`
   - 再调用 `/tokenize`
 - Fail-close：token 计数失败会直接抛错，不回退近似估算
-- 上下文块超预算时丢弃顺序固定：`memory_context -> tool_context -> plan_bom`
+- 默认优先丢弃：`memory_context -> tool_context`，`plan_bom` 默认固定保留（必要时自动压缩）
+- 当历史对话被滑窗丢弃时，会自动注入 `【历史自动压缩】` 块，保留早期任务/计划线索
 
 ### 新配置（`module/config.lua`）
 
@@ -162,11 +163,24 @@ agent = {
     completion_reserve_tokens = 1024,
     token_count_mode = "templated_exact",
     context_drop_order = "memory_tool_plan",
+    plan_bom_pinned = true,
+    plan_bom_compact_min_chars = 120,
+    history_auto_compress = true,
+    history_auto_compress_min_dropped_pairs = 1,
+    history_auto_compress_max_pairs = 24,
+    history_auto_compress_user_chars = 64,
+    history_auto_compress_assistant_chars = 96,
+    history_auto_compress_max_chars = 1400,
+    history_auto_compress_min_chars = 220,
     continue_on_tool_context = true,
+    max_context_refine_steps = 2,
     continue_on_tool_failure = true,
     max_failure_refine_steps = 2,
 }
 ```
+
+补充语义：
+- `upsert_max_per_turn` / `query_max_per_turn` 为同一 `turn` 内跨 `step` 累计预算，不会在多步循环中按 step 重置。
 
 ### 新日志字段
 
@@ -175,6 +189,7 @@ agent = {
 - `dropped_blocks`
 - `tool_calls_count`
 - `continue reason`
+- `工具上下文无增量，提前收敛`
 - `agent_state_end`
 
 
