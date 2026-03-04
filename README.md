@@ -132,6 +132,43 @@ http://127.0.0.1:8080
 - 已修复 `Jinja Exception: No user query found in messages`（内部二阶段调用已改为带 `user` 消息）
 - 在 `MORI_RUN_MODE=webui` 下，底层上游端口会被 API key 保护（避免误打开直连端口绕过 Mori 链路）
 
+## AgentRuntime / ToolRegistry（一次性替换版）
+
+当前主链路已切到：
+- `module/agent_runtime.lua`：主状态机（`PREPARE -> BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS -> PERSIST -> DONE`）
+- `module/tool_planner.lua`：二阶段工具规划（只产出工具调用）
+- `module/tool_registry.lua`：工具执行与 pending context（仅 notebook 工具）
+- `module/context_window.lua`：按 token 预算裁剪上下文（模板后精确计数）
+
+### Token 滑窗（精确计数）
+
+- 已移除 `pipeline.lua` 固定轮数窗口（`MAX_HISTORY_TURNS`）主路径
+- 现在使用 `py_pipeline:count_chat_tokens(messages)` 做模板后精确计数：
+  - 先调用 `/apply-template`
+  - 再调用 `/tokenize`
+- Fail-close：token 计数失败会直接抛错，不回退近似估算
+- 上下文块超预算时丢弃顺序固定：`memory_context -> tool_context -> plan_bom`
+
+### 新配置（`module/config.lua`）
+
+```lua
+agent = {
+    max_steps = 4,
+    input_token_budget = 12000,
+    completion_reserve_tokens = 1024,
+    token_count_mode = "templated_exact",
+    context_drop_order = "memory_tool_plan",
+}
+```
+
+### 新日志字段
+
+- `context_tokens`
+- `kept_pairs`
+- `dropped_blocks`
+- `tool_calls_count`
+- `agent_state_end`
+
 
 
 ——————————

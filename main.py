@@ -295,6 +295,38 @@ class LlamaCppServerClient:
             timeout=600,
         )
 
+    def apply_chat_template(self, messages):
+        payload = {
+            "messages": messages,
+        }
+        output = self._request_json(
+            "POST",
+            "/apply-template",
+            payload=payload,
+            timeout=120,
+        )
+        prompt = output.get("prompt")
+        if prompt is None:
+            raise RuntimeError(f"Invalid /apply-template response: {output}")
+        return str(prompt)
+
+    def tokenize_text(self, text: str, add_special: bool = True, parse_special: bool = True):
+        payload = {
+            "content": str(text or ""),
+            "add_special": bool(add_special),
+            "parse_special": bool(parse_special),
+        }
+        output = self._request_json(
+            "POST",
+            "/tokenize",
+            payload=payload,
+            timeout=120,
+        )
+        tokens = output.get("tokens")
+        if not isinstance(tokens, list):
+            raise RuntimeError(f"Invalid /tokenize response: {output}")
+        return len(tokens)
+
     def stop(self):
         if self.process is not None:
             if self.process.poll() is None:
@@ -375,6 +407,46 @@ class AIPipeline:
             return "".join(texts)
         return str(content)
 
+    @staticmethod
+    def _coerce_messages(messages):
+        messages_list = []
+
+        try:
+            length = len(messages)
+            if length > 0:
+                for i in range(1, length + 1):
+                    msg = messages[i]
+                    if msg and "role" in msg and "content" in msg:
+                        messages_list.append(
+                            {
+                                "role": str(msg["role"]),
+                                "content": str(msg["content"]),
+                            }
+                        )
+        except TypeError:
+            if isinstance(messages, dict) and "role" in messages and "content" in messages:
+                messages_list.append(
+                    {
+                        "role": str(messages["role"]),
+                        "content": str(messages["content"]),
+                    }
+                )
+
+        if not messages_list and isinstance(messages, list):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                if "role" not in msg or "content" not in msg:
+                    continue
+                messages_list.append(
+                    {
+                        "role": str(msg["role"]),
+                        "content": str(msg["content"]),
+                    }
+                )
+
+        return messages_list
+
     def get_embedding(self, text: str, mode: str = "query"):
         """将文本转换为向量"""
         if not self.llm_embed:
@@ -442,28 +514,35 @@ class AIPipeline:
             out.append(self._normalize_embedding_vec(emb))
         return out
 
+    def apply_chat_template(self, messages):
+        if not self.llm_large:
+            raise RuntimeError("Large model not loaded")
+        messages_list = self._coerce_messages(messages)
+        if not messages_list:
+            raise ValueError("Invalid messages format")
+        return self.llm_large.apply_chat_template(messages_list)
+
+    def tokenize_text(self, text: str, add_special: bool = True, parse_special: bool = True):
+        if not self.llm_large:
+            raise RuntimeError("Large model not loaded")
+        return self.llm_large.tokenize_text(
+            text=text,
+            add_special=add_special,
+            parse_special=parse_special,
+        )
+
+    def count_chat_tokens(self, messages):
+        prompt = self.apply_chat_template(messages)
+        return self.tokenize_text(prompt, add_special=True, parse_special=True)
+
     def generate_chat_sync(self, messages, params):
         """同步版本：直接返回生成文本（供原子事实提取使用）"""
         if not self.llm_large:
             raise RuntimeError("Large model not loaded")
-        
-        messages_list = []
-        try:
-            length = len(messages)
-            if length > 0:
-                for i in range(1, length + 1):
-                    msg = messages[i]
-                    if msg and 'role' in msg and 'content' in msg:
-                        messages_list.append({
-                            'role': str(msg['role']),
-                            'content': str(msg['content'])
-                        })
-        except TypeError:
-            if 'role' in messages and 'content' in messages:
-                messages_list.append({
-                    'role': str(messages['role']),
-                    'content': str(messages['content'])
-                })
+
+        messages_list = self._coerce_messages(messages)
+        if not messages_list:
+            raise ValueError("Invalid messages format")
         
         params_dict = dict(params) if hasattr(params, 'keys') else params
         max_tokens = int(params_dict.get("max_tokens", 128))
@@ -503,7 +582,7 @@ class AIPipeline:
             self.llm_large = LlamaCppServerClient(
                 server_bin=self.llama_server_bin,
                 model_path=large_model_path,
-                ctx_size=40960,
+                ctx_size=30720,
                 embedding=False,
                 host=self.large_server_host,
                 port=self.large_server_port,
@@ -723,24 +802,8 @@ class AIPipeline:
     def generate_chat(self, messages, params, lua_callback, lua_stream_callback=None):
         if not self.llm_large:
             raise RuntimeError("Large model not loaded")
-    
-        messages_list = []
-        try:
-            length = len(messages)
-            if length > 0:
-                for i in range(1, length + 1):
-                    msg = messages[i]
-                    if msg and 'role' in msg and 'content' in msg:
-                        messages_list.append({
-                            'role': str(msg['role']),
-                            'content': str(msg['content'])
-                        })
-        except TypeError:
-            if 'role' in messages and 'content' in messages:
-                messages_list.append({
-                    'role': str(messages['role']),
-                    'content': str(messages['content'])
-                })
+
+        messages_list = self._coerce_messages(messages)
     
         if not messages_list:
             raise ValueError("Invalid messages format")
