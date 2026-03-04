@@ -314,7 +314,8 @@ end
 local function generate_two_step_tool_calls(user_input, assistant_text, policy)
     local prompt = build_tool_pass_prompt(user_input, assistant_text, policy)
     local tool_messages = {
-        { role = "system", content = prompt }
+        -- jinja chat template 需要 user 消息作为查询入口
+        { role = "user", content = prompt }
     }
     local tool_params = {
         max_tokens = policy.tool_pass_max_tokens,
@@ -737,7 +738,8 @@ end
 
 local function run_fact_chat_once(prompt, max_tokens, temperature, seed)
     local messages = {
-        { role = "system", content = prompt }
+        -- jinja chat template 需要 user 消息作为查询入口
+        { role = "user", content = prompt }
     }
     local params = {
         max_tokens = max_tokens,
@@ -871,6 +873,7 @@ end
 function M.handle_chat_result(ctx, result)
     local user_input = ctx.user_input
     local current_turn = ctx.current_turn
+    local read_only = ctx.read_only == true
     local add_to_history = ctx.add_to_history
 
     local policy = get_tool_policy()
@@ -884,24 +887,39 @@ function M.handle_chat_result(ctx, result)
         clean_result = "好的，已记录。"
     end
 
-    local calls_to_run = resolve_calls_for_turn(user_input, clean_result, policy)
-    execute_tool_calls(calls_to_run, current_turn, policy)
+    if not read_only then
+        local calls_to_run = resolve_calls_for_turn(user_input, clean_result, policy)
+        execute_tool_calls(calls_to_run, current_turn, policy)
+    else
+        print("[ToolCalling] read_only 模式：跳过工具写入")
+    end
     print("\n[Assistant]: " .. clean_result)
 
-    history.add_history(user_input, clean_result)
-    topic.update_assistant(current_turn, clean_result)
-    if add_to_history then
-        add_to_history(user_input, clean_result)
+    if not read_only then
+        history.add_history(user_input, clean_result)
+        topic.update_assistant(current_turn, clean_result)
+        if add_to_history then
+            add_to_history(user_input, clean_result)
+        end
+    else
+        print("[ToolCalling] read_only 模式：跳过 history/topic 写入")
     end
 
-    local facts = M.extract_atomic_facts(user_input, clean_result)
+    local facts = {}
 
-    local cur_summary = topic.get_summary(current_turn)
-    if cur_summary and cur_summary ~= "" then
-        print("[当前话题摘要] " .. cur_summary)
+    if not read_only then
+        facts = M.extract_atomic_facts(user_input, clean_result)
+
+        local cur_summary = topic.get_summary(current_turn)
+        if cur_summary and cur_summary ~= "" then
+            print("[当前话题摘要] " .. cur_summary)
+        end
+
+        M.save_turn_memory(facts, current_turn)
+    else
+        print("[ToolCalling] read_only 模式：跳过 memory 写入")
     end
 
-    M.save_turn_memory(facts, current_turn)
     return clean_result, facts
 end
 
