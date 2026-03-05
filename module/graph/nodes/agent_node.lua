@@ -421,6 +421,67 @@ local function enforce_file_read_guard(state, tool_calls)
     return calls
 end
 
+local function append_finish_tool_schema(tools)
+    local out = {}
+    local seen_finish = false
+    for _, item in ipairs(tools or {}) do
+        out[#out + 1] = item
+        local fn = type(item) == "table" and item["function"] or nil
+        local name = util.trim(type(fn) == "table" and fn.name or "")
+        if name == "finish_turn" then
+            seen_finish = true
+        end
+    end
+    if seen_finish then
+        return out
+    end
+    out[#out + 1] = {
+        type = "function",
+        ["function"] = {
+            name = "finish_turn",
+            description = "Finish current turn when no more tools are needed; put final user-facing answer in message.",
+            parameters = {
+                type = "object",
+                properties = {
+                    message = { type = "string", description = "Final response to user" },
+                },
+                required = { "message" },
+            },
+        },
+    }
+    return out
+end
+
+local function split_finish_calls(calls, fallback_content)
+    local out = {}
+    local saw_finish = false
+    local finish_message = ""
+    local fallback = util.trim(fallback_content or "")
+
+    for _, call in ipairs(calls or {}) do
+        if util.trim((call or {}).tool) == "finish_turn" then
+            saw_finish = true
+            local args = type((call or {}).args) == "table" and (call or {}).args or {}
+            local msg = util.trim(
+                args.message
+                or args.final
+                or args.answer
+                or args.content
+                or args.text
+            )
+            if msg == "" then
+                msg = fallback
+            end
+            if finish_message == "" then
+                finish_message = msg
+            end
+        else
+            out[#out + 1] = call
+        end
+    end
+    return out, saw_finish, finish_message
+end
+
 local function parse_model_output(raw)
     if type(raw) == "string" then
         local parsed = util.parse_lua_table_literal(raw)
@@ -479,10 +540,10 @@ local function call_agent_with_tools(state)
         seed = tonumber(cfg.seed) or 42,
     }
 
-    local tools = tool_registry.get_tool_schemas()
+    local tools = append_finish_tool_schema(tool_registry.get_tool_schemas())
     local tool_choice = cfg.tool_choice
     if util.trim(tool_choice) == "" then
-        tool_choice = "auto"
+        tool_choice = "required"
     end
     local parallel_tool_calls = util.to_bool(cfg.parallel_tool_calls, true)
 
@@ -552,10 +613,15 @@ function M.run(state, _ctx)
         return state
     end
 
-    local tool_calls = enforce_file_read_guard(state, out.tool_calls or {})
+    local guarded_calls = enforce_file_read_guard(state, out.tool_calls or {})
+    local tool_calls, model_done, finish_message = split_finish_calls(guarded_calls, out.content)
+    local assistant_content = tostring(out.content or "")
+    if model_done and #tool_calls <= 0 and util.trim(finish_message) ~= "" then
+        assistant_content = finish_message
+    end
     state.messages.runtime_messages[#state.messages.runtime_messages + 1] = {
         role = "assistant",
-        content = tostring(out.content or ""),
+        content = assistant_content,
         tool_calls = tool_calls,
     }
 
@@ -576,6 +642,8 @@ function M.run(state, _ctx)
         state.agent_loop.pending_tool_calls = {}
         state.agent_loop.stop_reason = "remaining_steps_exhausted"
         state.planner.tool_calls = {}
+    elseif model_done and #tool_calls <= 0 then
+        state.agent_loop.stop_reason = "model_done"
     elseif util.trim(state.agent_loop.stop_reason) == "" then
         state.agent_loop.stop_reason = ""
     end
