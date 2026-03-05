@@ -9,6 +9,7 @@ local tool_planner = require("module.agent.tool_planner")
 local tool_registry = require("module.agent.tool_registry")
 local context_window = require("module.agent.context_window")
 local tool_parser = require("module.agent.tool_parser")
+local substep = require("module.agent.substep")
 local config = require("module.config")
 
 local PLAN_SIGNAL_PROMPT = [[
@@ -558,6 +559,70 @@ function M.run_turn(args)
         0,
         10
     )
+    local substep_route_cfg = agent_cfg.substep_route or {}
+    local substep_route_defaults = agent_defaults.substep_route or {}
+    local substep_registry = substep.resolve_registry(
+        agent_cfg.substeps,
+        agent_defaults.substeps
+    )
+    local substep_default = substep.resolve_default_name(agent_cfg, agent_defaults, substep_registry)
+    local substep_auto_route = to_bool(
+        substep_route_cfg.auto_route,
+        to_bool(
+            agent_cfg.substep_auto_route,
+            to_bool(substep_route_defaults.auto_route, agent_defaults.substep_auto_route)
+        )
+    )
+    local substep_profile, substep_source = substep.resolve_turn_substep({
+        requested = args.substep,
+        user_input = user_input,
+        registry = substep_registry,
+        default_name = substep_default,
+        auto_route = substep_auto_route,
+        plan_keywords = substep_route_cfg.plan_keywords
+            or agent_cfg.substep_plan_keywords
+            or substep_route_defaults.plan_keywords
+            or agent_defaults.substep_plan_keywords,
+        explore_keywords = substep_route_cfg.explore_keywords
+            or agent_cfg.substep_explore_keywords
+            or substep_route_defaults.explore_keywords
+            or agent_defaults.substep_explore_keywords,
+    })
+    print(string.format(
+        "[AgentRuntime] turn_substep=%s source=%s auto_route=%s",
+        tostring((substep_profile or {}).name or "general-purpose"),
+        tostring(substep_source or "default"),
+        substep_auto_route and "true" or "false"
+    ))
+    local substep_planner_cfg = type((substep_profile or {}).planner) == "table"
+        and substep_profile.planner or {}
+    planner_gate_mode = normalize_planner_gate_mode(
+        substep_planner_cfg.planner_gate_mode or planner_gate_mode
+    )
+    planner_default_when_missing = to_bool(
+        substep_planner_cfg.planner_default_when_missing,
+        planner_default_when_missing
+    )
+    function_choice = normalize_function_choice(
+        substep_planner_cfg.function_choice or function_choice,
+        supported_tool_acts
+    )
+    parallel_function_calls = to_bool(
+        substep_planner_cfg.parallel_function_calls,
+        parallel_function_calls
+    )
+    include_tool_observation_trace = to_bool(
+        substep_planner_cfg.include_tool_observation_trace,
+        include_tool_observation_trace
+    )
+    print(string.format(
+        "[AgentRuntime] substep_planner gate=%s default_when_missing=%s function_choice=%s parallel=%s trace=%s",
+        tostring(planner_gate_mode),
+        planner_default_when_missing and "true" or "false",
+        tostring(function_choice),
+        parallel_function_calls and "true" or "false",
+        include_tool_observation_trace and "true" or "false"
+    ))
     local memory_input_policy = tool_calling.get_memory_input_policy()
     local memory_user_input, memory_input_sanitized, redacted_blocks, file_mode, memory_input_truncated =
         tool_calling.sanitize_memory_input(user_input, {
@@ -648,8 +713,9 @@ function M.run_turn(args)
             context_drop_order = agent_cfg.context_drop_order,
         })
         print(string.format(
-            "[AgentRuntime][step=%d] context_tokens=%d kept_pairs=%d dropped_pairs=%d compressed_pairs=%d history_summary=%s dropped_blocks=%s",
+            "[AgentRuntime][step=%d] substep=%s context_tokens=%d kept_pairs=%d dropped_pairs=%d compressed_pairs=%d history_summary=%s dropped_blocks=%s",
             attempts,
+            tostring((substep_profile or {}).name or "general-purpose"),
             tonumber(ctx_meta.total_tokens) or 0,
             tonumber(ctx_meta.kept_history_pairs) or 0,
             tonumber(ctx_meta.dropped_history_pairs) or 0,
@@ -734,6 +800,9 @@ function M.run_turn(args)
                             tool_trace = tool_trace,
                             function_choice = function_choice,
                             parallel_function_calls = parallel_function_calls,
+                            substep_name = (substep_profile or {}).name,
+                            substep_label = (substep_profile or {}).label,
+                            substep_description = (substep_profile or {}).description,
                         })
                     end
                 )

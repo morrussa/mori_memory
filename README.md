@@ -139,11 +139,13 @@ http://127.0.0.1:8080
 
 当前主链路已切到（按职责分层）：
 - `module/agent/runtime.lua`：多步闭环状态机（循环 `BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS`，最后 `PERSIST`）
+  - 每轮绑定平级子步骤：`general-purpose | explore | plan`（支持扩展注册）
   - 支持 qwen-agent 风格 “Action -> Observation” 轨迹回注
   - 主模型仅负责聊天/总结；工具调用统一由二阶段 `tool_planner` 产出并执行
 - `module/agent/tool_planner.lua`：二阶段工具规划（只产出工具调用，显式消费上一轮 observation/trace）
 - `module/agent/tool_registry.lua`：工具执行与 pending context（仅 notebook 工具）
 - `module/agent/context_window.lua`：按 token 预算裁剪上下文（模板后精确计数）
+- `module/agent/substep.lua`：子步骤注册表与路由器（默认内置 `general-purpose / explore / plan`）
 - `module/agent/tool_parser.lua`：统一工具调用解析层（兼容 Lua table / Qwen 符号 / ReAct 风格；不再解析 XML/JSON 调用协议）
 - `module/memory/*.lua`：记忆与检索子系统（history/topic/recall/store/heat/cluster/adaptive/saver）
 - 工具参数协议：Lua table 是第一公民（`arguments={...}`）；JSON 仅保留 Python 边界兼容解析，不作为模型/规划器协议。
@@ -182,6 +184,36 @@ agent = {
     max_steps = 4,
     input_token_budget = 12000,
     completion_reserve_tokens = 1024,
+    substep_default = "general-purpose",
+    substep_auto_route = true,
+    substep_route = {
+        auto_route = true,
+        plan_keywords = { "架构", "规划", "方案", "设计", "plan", "roadmap", "architecture" },
+        explore_keywords = { "探索", "搜索", "查找", "定位", "关键词", "代码库", "文件", "grep", "rg", "ripgrep" },
+    },
+    substeps = {
+        ["general-purpose"] = {
+            label = "general-purpose",
+            description = "通用任务处理、代码搜索、多步骤任务",
+            system_prompt = "优先给出可执行结果；必要时分步推进，并保持每一步可验证。",
+            planner = {},
+        },
+        explore = {
+            label = "Explore",
+            description = "快速探索代码库、查找文件、搜索关键词",
+            system_prompt = "先快速定位范围并收集证据，再基于证据给出结论。",
+            planner = {
+                planner_gate_mode = "always",
+                planner_default_when_missing = true,
+            },
+        },
+        plan = {
+            label = "Plan",
+            description = "架构规划、实现方案设计",
+            system_prompt = "先给出架构与实施路径，再细化模块边界、风险和验收方法。",
+            planner = {},
+        },
+    },
     token_count_mode = "templated_exact",
     context_drop_order = "memory_tool_plan",
     plan_bom_pinned = true,
@@ -223,7 +255,10 @@ agent = {
 补充语义：
 - `upsert_max_per_turn` / `query_max_per_turn` 为同一 `turn` 内跨 `step` 累计预算，不会在多步循环中按 step 重置。
 - 工具调用统一走二阶段 planner；主回复只负责给出 `<<PLAN:YES|NO>>` 计划信号。
-- 计划信号提示采用运行时动态注入：仅首轮注入，进入 plan/refine 轮后不再重复注入。
+- 计划信号提示采用运行时动态注入：仅首轮注入，进入后续子步骤轮后不再重复注入。
+- 子步骤为平级架构：`general-purpose`（通用任务）、`explore`（快速探索代码/文件/关键词）、`plan`（架构与实现方案）。
+- 子步骤只影响 planner/tool 策略，不会把“子步骤展开文本”注入主 LLM 上下文；主 LLM 只消费常规上下文与工具返回结果。
+- `settings.agent.substeps` 可注册更多子步骤；`settings.agent.substep_default` 控制默认类型；`settings.agent.substep_route` 控制自动路由关键词；每个子步骤可通过 `planner` 字段覆盖规划策略。
 - `settings.agent.planner_gate_mode = "assistant_signal"`：按主回复信号决定是否进入 planner（可选 `always`）。
 - `settings.agent.planner_default_when_missing = false`：缺失计划信号时默认不进入 planner（建议保持 `false`）。
 - `settings.agent.function_choice`：`auto|none|query_record|upsert_record|delete_record`，用于约束本轮可执行工具。

@@ -281,6 +281,55 @@ local DEFAULT_SETTINGS = {
         max_steps = 4,
         input_token_budget = 12000,
         completion_reserve_tokens = 1024,
+        substep_default = "general-purpose", -- 默认子步骤：general-purpose|explore|plan（可扩展）
+        substep_auto_route = true, -- 根据用户意图自动路由到 plan/explore；关闭则固定走 substep_default
+        substep_route = {
+            auto_route = true,
+            plan_keywords = {
+                "架构",
+                "规划",
+                "方案",
+                "设计",
+                "plan",
+                "roadmap",
+                "architecture",
+            },
+            explore_keywords = {
+                "探索",
+                "搜索",
+                "查找",
+                "定位",
+                "关键词",
+                "代码库",
+                "文件",
+                "grep",
+                "rg",
+                "ripgrep",
+            },
+        },
+        substeps = {
+            ["general-purpose"] = {
+                label = "general-purpose",
+                description = "通用任务处理、代码搜索、多步骤任务",
+                system_prompt = "优先给出可执行结果；必要时分步推进，并保持每一步可验证。",
+                planner = {},
+            },
+            explore = {
+                label = "Explore",
+                description = "快速探索代码库、查找文件、搜索关键词",
+                system_prompt = "先快速定位范围并收集证据，再基于证据给出结论。",
+                planner = {
+                    planner_gate_mode = "always",
+                    planner_default_when_missing = true,
+                },
+            },
+            plan = {
+                label = "Plan",
+                description = "架构规划、实现方案设计",
+                system_prompt = "先给出架构与实施路径，再细化模块边界、风险和验收方法。",
+                planner = {},
+            },
+        },
         token_count_mode = "templated_exact", -- 固定：模板后精确计数
         context_drop_order = "memory_tool_plan", -- 超预算时先丢 memory_context，再 tool_context，再 plan_bom
         plan_bom_pinned = true, -- true=滑窗时尽量保留 plan_bom，不可接受的情况下先压缩而不是直接丢弃

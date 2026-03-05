@@ -10,6 +10,7 @@ local function clear_mods()
         "module.agent.tool_registry",
         "module.agent.context_window",
         "module.agent.tool_parser",
+        "module.agent.substep",
         "module.agent.runtime",
     }
     for _, m in ipairs(mods) do
@@ -31,6 +32,7 @@ local state = {
     generate_calls = 0,
     planner_calls = 0,
     exec_calls = 0,
+    planner_ctxs = {},
 }
 
 package.preload["module.config"] = function()
@@ -48,6 +50,11 @@ package.preload["module.config"] = function()
                 planner_default_when_missing = false,
                 function_choice = "auto",
                 parallel_function_calls = true,
+                substep_default = "general-purpose",
+                substep_auto_route = true,
+                substep_route = {
+                    auto_route = true,
+                },
             },
         },
     }
@@ -107,8 +114,9 @@ end
 
 package.preload["module.agent.tool_planner"] = function()
     local M = {}
-    function M.plan_calls()
+    function M.plan_calls(_, _, _, planner_ctx)
         state.planner_calls = state.planner_calls + 1
+        state.planner_ctxs[state.planner_calls] = planner_ctx or {}
         if state.planner_calls == 1 then
             return {
                 {
@@ -244,6 +252,9 @@ local step2_system = tostring(state.system_prompts_by_step[2] or "")
 assert(#step1_tail == 0, "step1 should not contain protocol tail messages")
 assert(#step2_tail == 0, "step2 should not append legacy assistant/tool protocol tail")
 assert(contains(step1_system, "<<PLAN:YES>>"), "step1 system prompt should contain plan marker instruction")
-assert(not contains(step2_system, "<<PLAN:YES>>"), "step2(system in plan mode) should not repeat plan marker instruction")
+assert(not contains(step2_system, "<<PLAN:YES>>"), "step2 system prompt should not repeat plan marker instruction")
+assert(not contains(step1_system, "【当前子步骤】"), "step1 system prompt should not inject substep expansion")
+assert(not contains(step2_system, "【当前子步骤】"), "step2 system prompt should not inject substep expansion")
+assert((state.planner_ctxs[1] or {}).substep_name == "general-purpose", "planner ctx should receive substep name")
 
 print("AGENT_RUNTIME_PROTOCOL_MESSAGES_TESTS_PASS")

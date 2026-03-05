@@ -13,6 +13,7 @@ local STUB_MODULES = {
     "module.agent.tool_registry",
     "module.agent.tool_parser",
     "module.agent.context_window",
+    "module.agent.substep",
     "module.agent.runtime",
 }
 
@@ -38,6 +39,11 @@ local function install_stubs(state, scenario)
                     planner_default_when_missing = (scenario.planner_default_when_missing == true),
                     function_choice = scenario.function_choice or "auto",
                     parallel_function_calls = (scenario.parallel_function_calls ~= false),
+                    substep_default = scenario.substep_default or "general-purpose",
+                    substep_auto_route = (scenario.substep_auto_route ~= false),
+                    substep_route = scenario.substep_route or {
+                        auto_route = (scenario.substep_auto_route ~= false),
+                    },
                 }
             }
         }
@@ -263,7 +269,8 @@ local function run_scenario(name, scenario)
 
     local runtime = require("module.agent.runtime")
     local final = runtime.run_turn({
-        user_input = "请结合我的信息回答",
+        user_input = scenario.user_input or "请结合我的信息回答",
+        substep = scenario.substep,
         read_only = (scenario.read_only == true),
         conversation_history = {
             { role = "system", content = "你是测试助手" },
@@ -408,6 +415,58 @@ local scenarios = {
             assert(state.memory_save_calls == 0, "read_only 不应写 memory")
             assert((state.add_to_history_calls or 0) == 0, "read_only 不应写 conversation_history")
             assert(final == "只读答案（不写状态）", "read_only 应返回生成结果")
+        end,
+    },
+    {
+        name = "auto_route_explore_substep",
+        user_input = "先帮我搜索代码库里和会话相关的关键词",
+        max_steps = 3,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "先做快速探索。 <<PLAN:YES>>",
+        },
+        assertions = function(state, final)
+            local planner_ctx = state.plan_ctxs[1] or {}
+            assert(planner_ctx.substep_name == "explore", "应自动路由到 explore 子步骤")
+            assert(planner_ctx.substep_label == "Explore", "explore 子步骤应传递 label")
+            assert(final == "先做快速探索。", "最终答案应返回清洗后的文本")
+        end,
+    },
+    {
+        name = "explore_substep_planner_gate_always",
+        user_input = "帮我查找项目里与会话路由相关的代码位置",
+        max_steps = 3,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "我先快速扫一遍。 <<PLAN:NO>>",
+        },
+        assertions = function(state, final)
+            local planner_ctx = state.plan_ctxs[1] or {}
+            assert(planner_ctx.substep_name == "explore", "关键词路由应命中 explore 子步骤")
+            assert(state.plan_calls == 1, "explore 子步骤应使用 planner_gate_mode=always")
+            assert(final == "我先快速扫一遍。", "最终答案应返回清洗后的文本")
+        end,
+    },
+    {
+        name = "requested_plan_substep",
+        substep = "plan",
+        user_input = "请给我一个完整实现方案",
+        max_steps = 3,
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "我先给出架构方案。 <<PLAN:YES>>",
+        },
+        assertions = function(state, final)
+            local planner_ctx = state.plan_ctxs[1] or {}
+            assert(planner_ctx.substep_name == "plan", "显式 substep=plan 应透传到 planner")
+            assert(planner_ctx.substep_label == "Plan", "plan 子步骤应传递 label")
+            assert(final == "我先给出架构方案。", "最终答案应返回清洗后的文本")
         end,
     },
 }

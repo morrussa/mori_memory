@@ -145,6 +145,9 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy, planne
         planner_ctx.parallel_function_calls,
         get_default_parallel_function_calls()
     )
+    local substep_name = trim(planner_ctx.substep_name or "general-purpose")
+    local substep_label = trim(planner_ctx.substep_label or "")
+    local substep_description = trim(planner_ctx.substep_description or "")
     local last_observation = trim(planner_ctx.last_observation or "")
     local tool_trace = trim(planner_ctx.tool_trace or "")
     local tool_examples = build_dynamic_tool_call_examples(policy)
@@ -161,6 +164,12 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy, planne
     end
     if tool_trace == "" then
         tool_trace = "（无）"
+    end
+    if substep_label == "" then
+        substep_label = substep_name
+    end
+    if substep_description == "" then
+        substep_description = "（无）"
     end
 
     local function_choice_rule = "function_choice=auto，可按需调用任意可用工具。"
@@ -200,6 +209,11 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy, planne
 当前 step：
 %d
 
+当前子步骤：
+%s (%s)
+子步骤任务描述：
+%s
+
 用户原话：
 %s
 
@@ -211,7 +225,7 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy, planne
 
 当前轮 trace 摘要：
 %s
-]], tool_examples, policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, function_choice_rule, parallel_rule, step_idx, user_input, assistant_text, last_observation, tool_trace)
+]], tool_examples, policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, function_choice_rule, parallel_rule, step_idx, substep_name, substep_label, substep_description, user_input, assistant_text, last_observation, tool_trace)
 end
 
 local function filter_planner_calls(calls, planner_ctx, supported_acts)
