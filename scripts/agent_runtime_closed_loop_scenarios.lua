@@ -308,6 +308,47 @@ local scenarios = {
         end,
     },
     {
+        name = "inline_plan_signal_suffix_triggers_planner",
+        max_steps = 3,
+        plan_outputs = {
+            {
+                { act = "query_record", query = "上传文件 main.py", raw = '{act="query_record",query="上传文件 main.py"}' },
+            },
+            {},
+        },
+        generate_outputs = {
+            "我先看看你上传的文件。{act=\"plan\"}",
+            "已读取并完成分析。\n{act=\"no_plan\"}",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 2, "行尾 plan 信号应触发第二步生成")
+            assert(state.plan_calls == 1, "首步应触发 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "首步应执行工具")
+            assert(final == "已读取并完成分析。", "最终答案应为收敛后的可见文本")
+        end,
+    },
+    {
+        name = "two_phase_plan_signal_probe_without_inline_marker",
+        max_steps = 3,
+        plan_outputs = {
+            {
+                { act = "query_record", query = "上传文件 main.py", raw = '{act="query_record",query="上传文件 main.py"}' },
+            },
+            {},
+        },
+        generate_outputs = {
+            "我先读取上传文件并分析。",
+            "{act=\"plan\"}",
+            "已结合读取结果完成分析。\n{act=\"no_plan\"}",
+        },
+        assertions = function(state, final)
+            assert(state.generate_calls == 3, "无内嵌 signal 时应触发二阶段信号判定")
+            assert(state.plan_calls == 1, "二阶段判定为 plan 后应触发 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "首轮应执行工具")
+            assert(final == "已结合读取结果完成分析。", "最终答案应为收敛后的可见文本")
+        end,
+    },
+    {
         name = "function_choice_none_blocks_planner_calls",
         max_steps = 4,
         function_choice = "none",
@@ -449,6 +490,44 @@ local scenarios = {
             assert(planner_ctx.substep_name == "explore", "关键词路由应命中 explore 子步骤")
             assert(state.plan_calls == 1, "explore 子步骤应使用 planner_gate_mode=always")
             assert(final == "我先快速扫一遍。", "最终答案应返回清洗后的文本")
+        end,
+    },
+    {
+        name = "max_step_tool_hit_final_synthesis",
+        max_steps = 1,
+        plan_outputs = {
+            {
+                { act = "query_record", query = "main.py 内容", raw = '{act="query_record",query="main.py 内容"}' },
+            },
+        },
+        generate_outputs = {
+            "先读取一下上传文件。\n{act=\"plan\"}",
+            "最终答案：已结合工具读取结果。\n{act=\"no_plan\"}",
+        },
+        assertions = function(state, final)
+            assert(state.plan_calls == 1, "max_steps=1 时首轮应进入 planner")
+            assert(state.exec_results[1] and state.exec_results[1].executed == 1, "首轮应执行一次工具")
+            assert(state.generate_calls == 2, "最后一轮执行工具后应触发最终合成生成")
+            assert(contains(state.tool_contexts[2], "Tool:query_record"), "最终合成上下文应包含工具结果")
+            assert(final == "最终答案：已结合工具读取结果。", "最终答案应来自最终合成结果")
+        end,
+    },
+    {
+        name = "upload_manifest_disables_auto_explore_route",
+        user_input = "请先帮我搜索代码库里和会话相关的逻辑\n\n[上传文件已保存到 ./workspace/download]\n- main.py (tool_path=download/mori_xxx_main.py, bytes=38531)",
+        max_steps = 2,
+        planner_gate_mode = "always",
+        plan_outputs = {
+            {},
+        },
+        generate_outputs = {
+            "收到，我先基于上传文件来分析。",
+        },
+        assertions = function(state, final)
+            local planner_ctx = state.plan_ctxs[1] or {}
+            assert(planner_ctx.substep_name == "general-purpose", "带上传清单时应禁用 auto-route explore")
+            assert(state.plan_calls == 1, "planner_gate_mode=always 时应进入 planner")
+            assert(final == "收到，我先基于上传文件来分析。", "最终答案应为可见文本")
         end,
     },
     {

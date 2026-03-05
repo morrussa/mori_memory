@@ -13,12 +13,11 @@ local substep = require("module.agent.substep")
 local config = require("module.config")
 
 local PLAN_SIGNAL_PROMPT = [[
-【计划信号】
-仅在回复最后一行输出一个 Lua table 计划信号：{act="plan"} 或 {act="no_plan"}。
-- 需要后台二阶段 planner 调用工具：{act="plan"}
+你是二阶段工具门控判定器。
+只输出一行 Lua table：{act="plan"} 或 {act="no_plan"}。
+- 需要后台 planner 调用工具：{act="plan"}
 - 不需要工具：{act="no_plan"}
-禁止输出其它工具调用格式（包括 query_record/upsert_record/delete_record 等）。
-不要输出解释或其它计划信号。
+禁止输出解释、前后缀文本、代码块或其它工具调用格式。
 ]]
 
 local PLAN_SIGNAL_SUPPORTED_ACTS = {
@@ -51,8 +50,24 @@ local function strip_cot_safe(text)
     return cleaned
 end
 
+local function strip_tool_protocol_artifacts(text)
+    local raw = tostring(text or "")
+    local visible = raw
+    local ok_split, _calls, split_visible = pcall(tool_parser.split_tool_calls_and_text, raw, {
+        supported_acts = get_supported_tool_acts(),
+    })
+    if ok_split and type(split_visible) == "string" then
+        visible = split_visible
+    end
+    visible = visible:gsub("<tool_call>[%z\1-\255]-</tool_call>", "")
+    visible = visible:gsub("</?tool_call>", "")
+    visible = visible:gsub("✿FUNCTION✿[^\n]*", "")
+    visible = visible:gsub("✿ARGS✿[^\n]*", "")
+    return trim(visible)
+end
+
 local function normalize_result_text(result)
-    local visible = trim(strip_cot_safe(result or ""))
+    local visible = trim(strip_tool_protocol_artifacts(strip_cot_safe(result or "")))
     if visible == "" then
         visible = "好的，已记录。"
     end
@@ -87,32 +102,39 @@ end
 
 local function extract_plan_signal(text)
     local raw = tostring(text or "")
-    local signal = nil
-    local signal_line_idx = nil
-    local lines = {}
-
-    for line in (raw .. "\n"):gmatch("(.-)\n") do
-        lines[#lines + 1] = line
+    if raw == "" then
+        return "", nil
     end
 
-    for i = #lines, 1, -1 do
-        if trim(lines[i]) ~= "" then
-            local parsed = parse_plan_signal_line(lines[i])
-            if parsed ~= nil then
-                signal = parsed
-                signal_line_idx = i
-            end
+    local signal = nil
+    local rebuilt = {}
+    local cursor = 1
+    local changed = false
+
+    while true do
+        local s_idx, e_idx = raw:find("%b{}", cursor)
+        if not s_idx then
             break
+        end
+
+        local candidate = raw:sub(s_idx, e_idx)
+        local parsed = parse_plan_signal_line(candidate)
+        if parsed ~= nil then
+            rebuilt[#rebuilt + 1] = raw:sub(cursor, s_idx - 1)
+            cursor = e_idx + 1
+            signal = parsed
+            changed = true
+        else
+            cursor = e_idx + 1
         end
     end
 
-    if signal_line_idx then
-        table.remove(lines, signal_line_idx)
-        raw = table.concat(lines, "\n")
+    if changed then
+        rebuilt[#rebuilt + 1] = raw:sub(cursor)
+        raw = table.concat(rebuilt, "")
     end
 
-    raw = trim(raw)
-    return raw, signal
+    return trim(raw), signal
 end
 
 local function resolve_base_system_prompt(conversation_history)
@@ -447,6 +469,20 @@ local function build_step_feedback(step_idx, clean_result, calls, exec_result, r
     return table.concat(lines, "\n")
 end
 
+local function has_upload_manifest_hint(text)
+    local raw = tostring(text or "")
+    if raw == "" then
+        return false
+    end
+    if raw:find("[上传文件已保存到", 1, true) then
+        return true
+    end
+    if raw:find("tool_path=", 1, true) then
+        return true
+    end
+    return false
+end
+
 local function can_emit_stream_sink(stream_sink)
     return stream_sink ~= nil
 end
@@ -586,7 +622,10 @@ local function build_stream_tool_arguments(call, fallback_raw)
 
     local raw = trim(fallback_raw or call.raw or "")
     if raw ~= "" then
-        return raw
+        local parsed_raw = parse_fallback_args(raw)
+        if type(parsed_raw) == "table" then
+            return parsed_raw
+        end
     end
     return {}
 end
@@ -826,7 +865,7 @@ function M.run_turn(args)
         user_input = user_input,
         registry = substep_registry,
         default_name = substep_default,
-        auto_route = substep_auto_route,
+        auto_route = substep_auto_route and (not has_upload_manifest_hint(user_input)),
         plan_keywords = substep_route_cfg.plan_keywords
             or agent_cfg.substep_plan_keywords
             or substep_route_defaults.plan_keywords
@@ -913,6 +952,7 @@ function M.run_turn(args)
     local last_call_signature = ""
     local tool_observation_entries = {}
     local latest_observation = ""
+    local need_final_synthesis = false
 
     while (not done) and attempts < max_steps do
         attempts = attempts + 1
@@ -949,10 +989,7 @@ function M.run_turn(args)
 
         local messages_for_llm, ctx_meta = context_window.build_messages({
             conversation_history = conversation_history,
-            system_prompt = build_step_system_prompt(
-                base_system_prompt,
-                (not read_only) and planner_gate_mode == "assistant_signal" and attempts == 1
-            ),
+            system_prompt = build_step_system_prompt(base_system_prompt, false),
             user_input = user_input,
             plan_bom = plan_bom,
             tool_context = merged_tool_context,
@@ -1003,9 +1040,62 @@ function M.run_turn(args)
             ))
         end
 
-        local clean_result = normalize_result_text(generated_text)
         local planner_signal = nil
-        clean_result, planner_signal = extract_plan_signal(clean_result)
+        local visible_text = ""
+        visible_text, planner_signal = extract_plan_signal(generated_text)
+        local clean_result = normalize_result_text(visible_text)
+        if (not read_only) and planner_gate_mode == "assistant_signal" and planner_signal == nil then
+            state_name = "PLAN_SIGNAL"
+            emit_stream_status(stream_sink, string.format("第 %d 步判定是否需要工具…", attempts))
+            local probe_text = table.concat({
+                "【用户输入】",
+                user_input,
+                "",
+                "【第一阶段回答】",
+                clean_result,
+                "",
+                "请仅输出 {act=\"plan\"} 或 {act=\"no_plan\"}。",
+            }, "\n")
+            local probe_messages = {
+                { role = "system", content = PLAN_SIGNAL_PROMPT },
+                { role = "user", content = probe_text },
+            }
+            local probe_params = {
+                max_tokens = 32,
+                temperature = 0,
+                seed = math.random(llm_seed_min, llm_seed_max),
+            }
+            local probe_output = ""
+            local ok_probe, probe_err = run_with_retry(
+                "plan signal probe",
+                llm_retry_max,
+                llm_retry_backoff_sec,
+                function()
+                    local function probe_callback(result)
+                        probe_output = tostring(result or "")
+                    end
+                    py_pipeline:generate_chat(probe_messages, probe_params, probe_callback, nil)
+                end
+            )
+            if ok_probe then
+                local _probe_visible = ""
+                _probe_visible, planner_signal = extract_plan_signal(probe_output)
+                print(string.format(
+                    "[AgentRuntime][step=%d] plan_signal_probe signal=%s raw=%s",
+                    attempts,
+                    (planner_signal == true and "plan")
+                        or (planner_signal == false and "no_plan")
+                        or "nil",
+                    trim(_probe_visible) ~= "" and utf8_take(trim(_probe_visible), 80) or "(empty)"
+                ))
+            else
+                print(string.format(
+                    "[AgentRuntime][step=%d][WARN] plan signal probe failed after retries: %s",
+                    attempts,
+                    tostring(probe_err)
+                ))
+            end
+        end
         if clean_result == "" then
             clean_result = "好的，已记录。"
         end
@@ -1159,6 +1249,13 @@ function M.run_turn(args)
                 )
             )
         end
+        if attempts >= max_steps and call_count > 0 then
+            local executed = tonumber(exec_result.executed) or 0
+            local failed = tonumber(exec_result.failed) or 0
+            if executed > 0 or failed > 0 then
+                need_final_synthesis = true
+            end
+        end
         if not read_only then
             local observation_entry = build_observation_entry(
                 attempts,
@@ -1209,7 +1306,7 @@ function M.run_turn(args)
             continue_reason = nil
         end
 
-        if continue_reason and repeated_calls and continue_reason ~= "tool_context_updated" then
+        if continue_reason and repeated_calls then
             print(string.format(
                 "[AgentRuntime][step=%d] 检测到重复工具调用签名，提前收敛",
                 attempts
@@ -1247,6 +1344,83 @@ function M.run_turn(args)
             "[AgentRuntime][WARN] max_steps reached (%d)，返回最后一版结果",
             max_steps
         ))
+    end
+
+    if need_final_synthesis then
+        state_name = "FINAL_SYNTHESIZE"
+        emit_stream_status(stream_sink, "正在基于最后一轮工具结果生成最终回答…")
+
+        local consumed_tool_context = ""
+        if not read_only then
+            consumed_tool_context = tool_registry.consume_pending_system_context_for_turn(current_turn)
+        end
+        local merged_tool_context = trim(consumed_tool_context)
+        if include_tool_observation_trace then
+            local trace_context = build_tool_observation_trace(
+                tool_observation_entries,
+                tool_trace_max_steps,
+                tool_trace_max_chars
+            )
+            if trace_context ~= "" then
+                if merged_tool_context ~= "" then
+                    merged_tool_context = merged_tool_context .. "\n\n" .. trace_context
+                else
+                    merged_tool_context = trace_context
+                end
+            end
+        end
+
+        local messages_for_llm, ctx_meta = context_window.build_messages({
+            conversation_history = conversation_history,
+            system_prompt = build_step_system_prompt(base_system_prompt, false),
+            user_input = user_input,
+            plan_bom = plan_bom,
+            tool_context = merged_tool_context,
+            memory_context = memory_context,
+            input_token_budget = token_budget,
+            token_count_mode = agent_cfg.token_count_mode,
+            context_drop_order = agent_cfg.context_drop_order,
+        })
+        print(string.format(
+            "[AgentRuntime][final] substep=%s context_tokens=%d kept_pairs=%d dropped_pairs=%d compressed_pairs=%d history_summary=%s dropped_blocks=%s",
+            tostring((substep_profile or {}).name or "general-purpose"),
+            tonumber(ctx_meta.total_tokens) or 0,
+            tonumber(ctx_meta.kept_history_pairs) or 0,
+            tonumber(ctx_meta.dropped_history_pairs) or 0,
+            tonumber(ctx_meta.compressed_history_pairs) or 0,
+            (ctx_meta.history_summary_used == true) and "Y" or "N",
+            join_dropped_blocks(ctx_meta.dropped_blocks)
+        ))
+
+        local params = {
+            max_tokens = completion_reserve_tokens,
+            temperature = llm_temperature,
+            seed = math.random(llm_seed_min, llm_seed_max),
+        }
+        local synthesized_text = ""
+        local ok_chat, chat_err = run_with_retry(
+            "final synthesis generation",
+            llm_retry_max,
+            llm_retry_backoff_sec,
+            function()
+                local function chat_callback(result)
+                    synthesized_text = tostring(result or "")
+                end
+                py_pipeline:generate_chat(messages_for_llm, params, chat_callback, nil)
+            end
+        )
+        if ok_chat then
+            local final_clean = normalize_result_text(synthesized_text)
+            final_clean, _ = extract_plan_signal(final_clean)
+            if final_clean ~= "" then
+                final_result = final_clean
+            end
+        else
+            print(string.format(
+                "[AgentRuntime][WARN] final synthesis generation failed after retries: %s",
+                tostring(chat_err)
+            ))
+        end
     end
 
     state_name = "PERSIST"
