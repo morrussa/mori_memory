@@ -7,11 +7,60 @@ local math = require("math")
 local cluster = require("module.memory.cluster")
 local saver =require("module.memory.saver")
 local recall = require("module.memory.recall")
-local notebook = require("module.agent.notebook")
 local adaptive = require("module.memory.adaptive")
 local app_config = require("module.config")
-local agent_runtime = require("module.agent.runtime")
+local graph_runtime = require("module.graph.graph_runtime")
 local run_mode = tostring(MORI_RUN_MODE or "cli")
+local graph_cfg = ((app_config.settings or {}).graph or {})
+
+local function read_env_int(name, fallback, min_value)
+    local raw = os.getenv(name)
+    if not raw or raw == "" then
+        return tonumber(fallback)
+    end
+    local n = tonumber(raw)
+    if not n then
+        return tonumber(fallback)
+    end
+    if min_value and n < min_value then
+        n = min_value
+    end
+    return math.floor(n)
+end
+
+local function read_env_bool(name, fallback)
+    local raw = os.getenv(name)
+    if not raw or raw == "" then
+        return fallback == true
+    end
+    local v = tostring(raw):lower()
+    if v == "1" or v == "true" or v == "yes" or v == "on" then
+        return true
+    end
+    if v == "0" or v == "false" or v == "no" or v == "off" then
+        return false
+    end
+    return fallback == true
+end
+
+do
+    graph_cfg.tool_loop_max = read_env_int("MORI_GRAPH_TOOL_LOOP_MAX", graph_cfg.tool_loop_max or 5, 1)
+    graph_cfg.max_nodes_per_run = read_env_int("MORI_GRAPH_MAX_NODES_PER_RUN", graph_cfg.max_nodes_per_run or 128, 20)
+    graph_cfg.streaming = graph_cfg.streaming or {}
+    graph_cfg.streaming.token_chunk_chars = read_env_int(
+        "MORI_GRAPH_STREAM_TOKEN_CHUNK_CHARS",
+        (graph_cfg.streaming or {}).token_chunk_chars or 24,
+        1
+    )
+    graph_cfg.repair = graph_cfg.repair or {}
+    graph_cfg.repair.max_attempts = read_env_int(
+        "MORI_GRAPH_REPAIR_MAX_ATTEMPTS",
+        (graph_cfg.repair or {}).max_attempts or 2,
+        0
+    )
+    graph_cfg.cli = graph_cfg.cli or {}
+    graph_cfg.cli.debug_trace = read_env_bool("MORI_GRAPH_DEBUG_TRACE", (graph_cfg.cli or {}).debug_trace == true)
+end
 
 local runtime_cfg = (app_config.settings or {}).runtime or {}
 local runtime_defaults = (app_config.defaults or {}).runtime
@@ -22,13 +71,6 @@ local model_cfg = runtime_cfg.models or {}
 local model_defaults = runtime_defaults.models or {}
 local demo_cfg = runtime_cfg.demo_chat or {}
 local demo_defaults = runtime_defaults.demo_chat or {}
-local webui_stream_max_steps = tonumber(MORI_WEBUI_STREAM_MAX_STEPS)
-if run_mode == "webui" and webui_stream_max_steps == nil then
-    webui_stream_max_steps = 1
-end
-if webui_stream_max_steps ~= nil then
-    webui_stream_max_steps = math.floor(webui_stream_max_steps)
-end
 
 local function join_model_path(base_dir, path_or_name)
     local path = tostring(path_or_name or "")
@@ -66,7 +108,6 @@ saver.mark_dirty()
 history.load()
 adaptive.load()
 recall.init_all_sentiment_vectors()
-notebook.load()
 
 print("[Lua] Pipeline started.")
 
@@ -80,15 +121,12 @@ local base_prompt = [[
 当遇到你不确定或觉得信息不足的问题时，你会要求用户提供更多信息，而不是直接拒绝。
 你尊重每一个认真提问的人。
 
-你有 keyring 长期记忆系统，系统会在后台二阶段自动执行工具调用。
-系统会在每轮自动注入 LongTermPlan BOM（来自已存 long_term_plan 记录）。
+你有长期记忆系统，系统会在后台按需召回历史，并在回合结束后提取可复用事实写入记忆。
 
 规则：
-1. 正常回复用户，不要输出任何工具调用格式（包括 `{act="..."}`、`<tool_call>...</tool_call>`、`✿FUNCTION✿/✿ARGS✿`）。
-2. 若你判断需要长期保存事实、更新计划、或检索旧记录，直接在正文自然表达意图即可，后台会自动处理。
-3. 回答时优先保持与 LongTermPlan BOM 一致；若信息冲突，先向用户确认。
-4. 若用户上传文件且上下文给出了附件目录路径（MORI_AGENT_FILES_DIR，默认 ./workspace），不要假设你已读完整正文；先在正文说明你将分段检索/读取，再由后台 planner 按需调用 list_agent_files/read_agent_file/read_agent_file_lines/search_agent_file/search_agent_files。
-5. 若系统在当前轮要求你输出计划信号，请严格按要求仅输出一个 Lua table 信号（{act="plan"} 或 {act="no_plan"}），并放在回复最后一行。
+1. 正常回复用户，不要输出任何工具协议、路由信号或调试信息。
+2. 若你需要读取附件，请先说明你会分段检索关键片段再作答。
+3. 若工具失败，请给出可执行的降级方案。
 ]]
 
 local conversation_history = {
@@ -145,7 +183,7 @@ local function shutdown_pipeline()
     saver.on_exit()
 end
 
-local function process_user_input(line, stream_sink, _thread_id, read_only)
+local function process_user_input(line, stream_sink, _unused, read_only, uploads)
     local user_input = tostring(line or ""):match("^%s*(.-)%s*$")
     if user_input == "" then
         return ""
@@ -157,12 +195,23 @@ local function process_user_input(line, stream_sink, _thread_id, read_only)
         read_only = (read_only == true),
         conversation_history = conversation_history,
         add_to_history = add_to_history,
+        uploads = uploads or {},
     }
-    if run_mode == "webui" and stream_sink and webui_stream_max_steps and webui_stream_max_steps > 0 then
-        turn_args.max_steps_override = webui_stream_max_steps
-    end
 
-    return agent_runtime.run_turn(turn_args)
+    local text = graph_runtime.run_turn(turn_args)
+    local debug_trace = (((graph_cfg or {}).cli or {}).debug_trace) == true
+    if debug_trace then
+        local trace_summary = _G.mori_last_trace_summary
+        if type(trace_summary) == "table" then
+            print(string.format("[GraphTrace] run_id=%s node_count=%s tool_loops=%s repair_attempts=%s",
+                tostring(trace_summary.run_id or ""),
+                tostring(trace_summary.node_count or 0),
+                tostring(trace_summary.tool_loops or 0),
+                tostring(trace_summary.repair_attempts or 0)
+            ))
+        end
+    end
+    return text
 end
 
 _G.mori_handle_user_input = process_user_input

@@ -915,9 +915,9 @@ class MessagesArea extends HTMLElement {
     const lines = ['文件已保存:'];
     files.forEach(item => {
       const name = item && item.name ? item.name : 'unknown';
-      const toolPath = item && item.tool_path ? item.tool_path : '';
+      const path = item && item.path ? item.path : '';
       const bytes = item && item.bytes ? item.bytes : 0;
-      lines.push(`- ${name} (${toolPath}, ${this.formatBytes(bytes)})`);
+      lines.push(`- ${name} (${path}, ${this.formatBytes(bytes)})`);
     });
     
     this.appendSystemMessage(lines.join('\n'));

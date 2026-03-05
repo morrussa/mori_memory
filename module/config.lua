@@ -16,6 +16,93 @@ local DEFAULT_SETTINGS = {
             seed_max = 514,
         },
     },
+    graph = {
+        input_token_budget = 12000,
+        tool_loop_max = 5,
+        max_nodes_per_run = 128,
+        router = {
+            max_tokens = 48,
+            temperature = 0.0,
+            seed = 7,
+        },
+        planner = {
+            max_tokens = 256,
+            temperature = 0.1,
+            seed = 11,
+            max_calls_per_loop = 6,
+        },
+        repair = {
+            max_attempts = 2,
+            max_tokens = 256,
+            temperature = 0.0,
+            seed = 29,
+        },
+        responder = {
+            max_tokens = 1024,
+            temperature = 0.75,
+            seed = 42,
+        },
+        recall = {
+            enable_on_respond = false,
+        },
+        streaming = {
+            token_chunk_chars = 24,
+        },
+        tools = {
+            file_context_max_chars = 1600,
+        },
+        file_tools = {
+            list_default_limit = 12,
+            list_hard_limit = 64,
+            read_default_max_chars = 3000,
+            read_hard_max_chars = 12000,
+            read_lines_default_max_lines = 220,
+            read_lines_hard_max_lines = 1200,
+            search_default_max_hits = 20,
+            search_hard_max_hits = 200,
+            search_files_default_max_hits = 30,
+            search_files_hard_max_hits = 400,
+            search_files_default_max_files = 24,
+            search_files_hard_max_files = 200,
+            search_files_default_per_file_hits = 5,
+            search_files_hard_per_file_hits = 20,
+        },
+        fact_extractor = {
+            verify_pass = true,
+            max_facts = 8,
+            max_parse_items = 12,
+            max_item_chars = 96,
+            extract_max_tokens = 320,
+            extract_temperature = 0.15,
+            extract_seed = 42,
+            repair_max_tokens = 192,
+            repair_temperature = 0.0,
+            repair_seed = 43,
+            verify_max_tokens = 192,
+            verify_temperature = 0.0,
+            verify_seed = 46,
+        },
+        providers = {
+            external = {
+                enabled = false,
+                provider = "qwen",
+                allowlist = {
+                    "web_search",
+                    "web_extractor",
+                    "amap_weather",
+                },
+                context_inject = true,
+                context_max_chars = 1200,
+            },
+        },
+        cli = {
+            debug_trace = false,
+        },
+    },
+    api = {
+        multipart_only = true,
+        stream_event_mode = "sse_event",
+    },
     heat = {
         total_heat = 10000000,--总热力池大小
         new_memory_heat = 43000,--新记忆的热力
@@ -186,189 +273,6 @@ local DEFAULT_SETTINGS = {
         cold_rescue_batch = 24, -- 每次 maintenance tick 最多执行多少条到期救援任务。
         cold_rescue_on_empty_only = false, -- true=仅空召回时入队；false=命中不足(hits<=0)也会入队。
         cold_rescue_max_queue = 50000, -- 冷救援队列硬上限，超过后停止入队以保护内存与I/O。
-    },
-    keyring = {
-        long_term_plan = {
-            max_value_chars = 200,     -- 单条计划 value 最大长度
-            max_evidence_chars = 160,  -- 单条计划 evidence 最大长度
-            bom_max_items = 3,         -- 每轮注入 BOM 的最多条数
-            bom_max_chars = 800,       -- BOM 注入文本最大长度
-        },
-        notebook = {
-            bm25_k1 = 1.2,
-            bm25_b = 0.75,
-        },
-        tool_calling = {
-            upsert_min_confidence = 0.82,   -- upsert 最低置信度
-            upsert_max_per_turn = 1,        -- 每轮最多 upsert 次数
-            query_max_per_turn = 2,         -- 每轮最多 query 次数
-            delete_enabled = false,         -- 4B 默认禁用 delete
-            query_max_types = 3,            -- query types 最多允许几个
-            query_fetch_limit = 18,         -- query 先取较大召回池
-            query_inject_top = 3,           -- 注入前重排后只保留 top N
-            query_inject_max_chars = 800,   -- query 注入文本最大字符数
-            tool_pass_temperature = 0.15,   -- 二阶段工具调用温度
-            tool_pass_max_tokens = 128,     -- 二阶段工具调用长度
-            tool_pass_seed = 42,            -- 二阶段工具调用随机种子
-            parallel_execute_enabled = true, -- 多 query_record 按批次并行调度（同批独立执行）
-            parallel_query_batch_size = 4,   -- 并行批次最大调用数
-            retry_transient_max = 1,         -- 可恢复错误最大重试次数
-            retry_unknown_max = 0,           -- 未知错误最大重试次数
-            retry_validation_max = 0,        -- 参数/校验错误默认不重试
-            retry_budget_max = 0,            -- 预算错误默认不重试
-            retry_total_cap = 2,             -- 单调用总重试上限
-            agent_file_list_max_per_turn = 2, -- 每轮最多列目录次数
-            agent_file_list_default_limit = 12, -- list_agent_files 默认返回条数
-            agent_file_list_hard_limit = 64, -- list_agent_files 最大返回条数
-            agent_file_read_max_per_turn = 4, -- 每轮最多读取附件次数
-            agent_file_read_default_max_chars = 3000, -- read_agent_file 默认读取长度
-            agent_file_read_hard_max_chars = 12000, -- read_agent_file 单次读取硬上限
-            agent_file_read_lines_max_per_turn = 4, -- 每轮最多按行读取次数
-            agent_file_read_lines_default_max_lines = 220, -- read_agent_file_lines 默认最大行数
-            agent_file_read_lines_hard_max_lines = 1200, -- read_agent_file_lines 单次读取硬上限
-            agent_file_search_max_per_turn = 4, -- 每轮最多文件搜索次数
-            agent_file_search_default_max_hits = 20, -- search_agent_file 默认命中上限
-            agent_file_search_hard_max_hits = 200, -- search_agent_file 命中硬上限
-            agent_file_multi_search_max_per_turn = 3, -- 每轮最多跨文件搜索次数
-            agent_file_multi_search_default_max_hits = 30, -- search_agent_files 默认总命中上限
-            agent_file_multi_search_hard_max_hits = 400, -- search_agent_files 总命中硬上限
-            agent_file_multi_search_default_max_files = 24, -- search_agent_files 默认扫描文件数
-            agent_file_multi_search_hard_max_files = 200, -- search_agent_files 最大扫描文件数
-            agent_file_multi_search_default_per_file_hits = 5, -- search_agent_files 单文件默认命中上限
-            agent_file_multi_search_hard_per_file_hits = 20, -- search_agent_files 单文件命中硬上限
-            agent_file_context_max_chars = 1600, -- 文件工具结果注入上下文上限
-        },
-        memory_input = {
-            -- 专业策略：对“记忆检索/原子事实提取”走独立输入通道，默认忽略附件正文。
-            file_payload_mode = "ignore",      -- 全局默认：ignore | filename_only | keep
-            recall_file_payload_mode = "ignore", -- 召回搜索阶段文件处理
-            fact_file_payload_mode = "ignore",   -- 原子事实提取阶段文件处理
-            max_chars = 2048,                  -- 记忆通道硬上限（避免炸预算）
-            manifest_max_items = 8,            -- filename_only 时最多保留的文件名条数
-            manifest_name_max_chars = 96,      -- filename_only 时单文件名最大长度
-        },
-        fact_extractor = {
-            -- 默认对齐 simu/dialog_hf_realflow_pipeline.py 的 high_recall_v1 + verify pass。
-            prompt_style = "balanced_v3", -- 可选：high_recall_v1 / strict_v2 / balanced_v3 / balanced_en_v1 / baseline
-            file_payload_mode = "ignore",   -- 兼容旧配置：未设置 keyring.memory_input 时作为 fallback
-            verify_pass = true,              -- 开启二次质检，控制噪声
-            max_facts = 8,                   -- 单轮最多入库原子事实数
-            max_parse_items = 12,            -- 单次解析最多保留候选数量
-            max_item_chars = 64,             -- 单条事实长度上限
-            extract_max_tokens = 320,        -- 首轮抽取长度
-            extract_temperature = 0.15,
-            extract_seed = 42,
-            repair_max_tokens = 192,         -- 修复轮长度
-            repair_temperature = 0.0,
-            repair_seed = 43,
-            verify_max_tokens = 192,         -- 质检轮长度
-            verify_temperature = 0.0,
-            verify_seed = 46,
-        },
-        external_tools = {
-            enabled = false, -- qwen-agent 工具生态开关（true 后可调用 qwen_agent 内置工具）
-            include_memory_tools = true, -- 是否保留 query/upsert/delete 内置记忆工具
-            context_inject = true, -- 外部工具结果是否注入下一步上下文
-            context_max_chars = 1200, -- 外部工具结果注入上限
-            names = { -- 为空时加载 qwen-agent 全部可用工具；建议按需启用
-                "web_search",
-                "web_extractor",
-                "amap_weather",
-            },
-        },
-    },
-    agent = {
-        max_steps = 4,
-        input_token_budget = 12000,
-        completion_reserve_tokens = 1024,
-        substep_default = "general-purpose", -- 默认子步骤：general-purpose|explore|plan（可扩展）
-        substep_auto_route = true, -- 根据用户意图自动路由到 plan/explore；关闭则固定走 substep_default
-        substep_route = {
-            auto_route = true,
-            plan_keywords = {
-                "架构",
-                "规划",
-                "方案",
-                "设计",
-                "plan",
-                "roadmap",
-                "architecture",
-            },
-            explore_keywords = {
-                "探索",
-                "搜索",
-                "查找",
-                "定位",
-                "关键词",
-                "代码库",
-                "文件",
-                "grep",
-                "rg",
-                "ripgrep",
-            },
-        },
-        substeps = {
-            ["general-purpose"] = {
-                label = "general-purpose",
-                description = "通用任务处理、代码搜索、多步骤任务",
-                system_prompt = "优先给出可执行结果；必要时分步推进，并保持每一步可验证。",
-                planner = {},
-            },
-            explore = {
-                label = "Explore",
-                description = "快速探索代码库、查找文件、搜索关键词",
-                system_prompt = "先快速定位范围并收集证据，再基于证据给出结论。",
-                planner = {
-                    planner_gate_mode = "always",
-                    planner_default_when_missing = true,
-                },
-            },
-            plan = {
-                label = "Plan",
-                description = "架构规划、实现方案设计",
-                system_prompt = "先给出架构与实施路径，再细化模块边界、风险和验收方法。",
-                planner = {},
-            },
-        },
-        token_count_mode = "templated_exact", -- 固定：模板后精确计数
-        context_drop_order = "memory_tool_plan", -- 超预算时先丢 memory_context，再 tool_context，再 plan_bom
-        plan_bom_pinned = true, -- true=滑窗时尽量保留 plan_bom，不可接受的情况下先压缩而不是直接丢弃
-        plan_bom_compact_min_chars = 120, -- plan 保底压缩长度
-        history_auto_compress = true, -- 超预算丢弃历史时，自动生成历史压缩块注入上下文
-        history_auto_compress_min_dropped_pairs = 1, -- 至少丢弃多少历史 pair 才触发自动压缩
-        history_auto_compress_max_pairs = 24, -- 自动压缩最多覆盖多少条被丢弃历史 pair
-        history_auto_compress_user_chars = 64, -- 压缩块内单条 user 文本截断长度
-        history_auto_compress_assistant_chars = 96, -- 压缩块内单条 assistant 文本截断长度
-        history_auto_compress_max_chars = 1400, -- 压缩块初始最大长度
-        history_auto_compress_min_chars = 220, -- 压缩块最小长度下限
-        continue_on_tool_context = true, -- 工具产生新上下文时继续下一步重生成
-        max_context_refine_steps = 2, -- 单轮最多因工具上下文增量触发多少次重生成
-        continue_on_tool_failure = true, -- 工具失败时触发自修正重试
-        max_failure_refine_steps = 2, -- 单轮最多因工具失败触发多少次重修
-        llm_retry_max = 2, -- qwen-agent 对齐：主生成失败后的最大重试次数（不含首轮）
-        llm_retry_backoff_sec = 0.35, -- 重试指数退避基线秒数
-        llm_temperature = 0.75, -- 主回复生成温度
-        llm_seed_min = 1, -- 主回复随机种子下界（含）
-        llm_seed_max = 2147483647, -- 主回复随机种子上界（含）
-        planner_retry_max = 1, -- 二阶段 planner 失败时最大重试次数
-        planner_retry_backoff_sec = 0.2, -- planner 重试退避秒数
-        planner_gate_mode = "assistant_signal", -- assistant_signal|always：是否由主回复 Lua table 计划信号决定要不要做 planner
-        planner_default_when_missing = false, -- assistant_signal 模式下，缺少 {act="plan"} / {act="no_plan"} 信号时是否默认进入 planner
-        function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record|list_agent_files|read_agent_file|read_agent_file_lines|search_agent_file|search_agent_files
-        supported_tool_acts = {
-            upsert_record = true,
-            query_record = true,
-            delete_record = true,
-            list_agent_files = true,
-            read_agent_file = true,
-            read_agent_file_lines = true,
-            search_agent_file = true,
-            search_agent_files = true,
-        },
-        parallel_function_calls = true, -- qwen-agent 对齐：false 时单轮最多执行 1 条工具调用
-        include_tool_observation_trace = true, -- 把 Action/Observation 轨迹注入下一步上下文
-        tool_trace_max_steps = 4, -- 轨迹最多保留多少个 step
-        tool_trace_max_chars = 1200, -- 轨迹注入文本最大长度
     },
     topic = {--在退出时，如果topic没有闭合，在topic.bin的第一行写下 current_turn\x1F<topic_head_vec>\x1F<topic_now_vec> ，topic.bin的第一行永远留给这个用途。
         make_cluster1 = 4,--当一个topic建立时，它向前make_cluster1步以建立头质心，

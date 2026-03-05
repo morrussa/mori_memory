@@ -14,7 +14,6 @@ function M.flush_all(force)
     local cluster = require("module.memory.cluster")
     local history = require("module.memory.history")
     local heat = require("module.memory.heat")   -- 延迟加载 heat 模块
-    local notebook = require("module.agent.notebook")
     local adaptive = require("module.memory.adaptive")
 
     print("[Saver] === 开始原子保存 raw 文件 ===")
@@ -33,7 +32,6 @@ function M.flush_all(force)
     if not run_save("cluster_index.bin", cluster.save_to_disk) then return false end
     if not run_save("cluster_shards", memory.save_dirty_shards) then return false end
     if not run_save("history.txt", history.save_to_disk) then return false end
-    if not run_save("notebook.txt", notebook.save_to_disk) then return false end
     if not run_save("adaptive_state.txt", adaptive.save_to_disk) then return false end
 
     -- 保存 pending_cold 任务队列
@@ -55,7 +53,7 @@ end
 
 -- 程序正常退出时自动调用
 function M.on_exit()
-    print("[Saver] 正在原子保存并最终归档...")
+    print("[Saver] 正在原子保存（Graph V1 保留 raw + checkpoint + trace）...")
     local topic = require("module.memory.topic")
     topic.finalize()
     local ok = M.flush_all(true)
@@ -63,9 +61,7 @@ function M.on_exit()
         print("[Saver][ERROR] 退出保存失败，跳过 raw 清理以避免数据丢失")
         return false
     end
-    py_pipeline:cleanup_raw_files()
     return true
-    -- print("[Saver] 程序退出完成，仅保留 state.zst")
 end
 
 return M

@@ -107,8 +107,8 @@
     });
 
   // ===== Worker Message Handler =====
-  // Track current tool call for status updates
-  let currentToolEl = null;
+  // Track tool call elements by call id
+  const toolElsById = new Map();
 
   worker.onmessage = function(event) {
     const { type, payload } = event.data;
@@ -124,12 +124,12 @@
 
       case 'tokensDone':
         messagesArea.handleTokensDone();
-        currentToolEl = null;
+        toolElsById.clear();
         break;
 
       case 'error':
         messagesArea.handleError(payload && payload.message ? payload.message : '未知错误');
-        currentToolEl = null;
+        toolElsById.clear();
         break;
 
       case 'uploads':
@@ -138,26 +138,64 @@
         }
         break;
 
+      case 'runStart': {
+        const runId = payload && payload.run_id ? payload.run_id : '';
+        messagesArea.appendSystemMessage(`Run started${runId ? `: ${runId}` : ''}`);
+        break;
+      }
+
+      case 'nodeStart': {
+        const nodeName = payload && payload.node ? payload.node : 'unknown_node';
+        messagesArea.appendSystemMessage(`Node start: ${nodeName}`);
+        break;
+      }
+
+      case 'nodeEnd': {
+        const nodeName = payload && payload.node ? payload.node : 'unknown_node';
+        const duration = payload && payload.duration_ms ? ` (${payload.duration_ms}ms)` : '';
+        messagesArea.appendSystemMessage(`Node end: ${nodeName}${duration}`);
+        break;
+      }
+
+      case 'runDone': {
+        const runId = payload && payload.run_id ? payload.run_id : '';
+        messagesArea.appendSystemMessage(`Run done${runId ? `: ${runId}` : ''}`);
+        break;
+      }
+
       // Agent-specific events
       case 'toolCall':
         // Tool call started
-        currentToolEl = messagesArea.appendToolCall(
+        const toolEl = messagesArea.appendToolCall(
           payload.name || 'unknown',
           payload.arguments || {},
           'running'
         );
+        if (payload.callId) {
+          toolElsById.set(String(payload.callId), toolEl);
+        }
         break;
 
       case 'toolResult':
         // Tool call completed
-        if (currentToolEl) {
+        let resultEl = null;
+        if (payload.callId && toolElsById.has(String(payload.callId))) {
+          resultEl = toolElsById.get(String(payload.callId));
+          toolElsById.delete(String(payload.callId));
+        } else {
+          const first = toolElsById.entries().next();
+          if (!first.done) {
+            resultEl = first.value[1];
+            toolElsById.delete(first.value[0]);
+          }
+        }
+        if (resultEl) {
           messagesArea.updateToolStatus(
-            currentToolEl,
+            resultEl,
             payload.error ? 'error' : 'success',
             payload.result || payload.error
           );
         }
-        currentToolEl = null;
         break;
 
       case 'thinking':

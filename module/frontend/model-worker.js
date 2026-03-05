@@ -1,104 +1,123 @@
 /**
- * Model Worker
- * Handles streaming chat and Agent events from backend
- * No build required - Pure JavaScript Web Worker
+ * Model Worker (Graph V1)
+ * Multipart upload + SSE event protocol
  */
 
 const STREAM_API_URL = "/mori/chat/stream";
-const DEFAULT_THREAD_ID = "mori";
-
-// ===== Utility Functions =====
 
 function postWorkerError(message) {
   postMessage({ type: "error", payload: { message: String(message || "Unknown error") } });
 }
 
-function parseSseEvent(rawEvent) {
-  const lines = String(rawEvent || "")
-    .replace(/\r/g, "")
-    .split("\n");
-  const dataLines = [];
-  for (const line of lines) {
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice(5).trim());
+function appendFormDataFiles(form, files) {
+  if (!Array.isArray(files)) return;
+  for (const file of files) {
+    if (!file || typeof file !== "object") continue;
+    if (typeof file.arrayBuffer === "function") {
+      const name = String(file.name || "upload.bin");
+      form.append("files[]", file, name);
     }
   }
-  if (dataLines.length === 0) {
-    return "";
-  }
-  return dataLines.join("\n");
 }
 
-function bytesToBase64(bytes) {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode.apply(null, chunk);
+function dispatchEvent(eventName, payload, doneState) {
+  const event = String(eventName || "").trim();
+  const data = (payload && typeof payload === "object") ? payload : {};
+
+  if (event === "token") {
+    const token = typeof data.token === "string" ? data.token : "";
+    if (token) {
+      postMessage({ type: "newToken", payload: { token } });
+    }
+    return;
   }
-  return btoa(binary);
+
+  if (event === "uploads") {
+    postMessage({ type: "uploads", payload: { files: Array.isArray(data.files) ? data.files : [] } });
+    return;
+  }
+
+  if (event === "run_start") {
+    postMessage({ type: "runStart", payload: data });
+    return;
+  }
+
+  if (event === "node_start") {
+    postMessage({ type: "nodeStart", payload: data });
+    return;
+  }
+
+  if (event === "node_end") {
+    postMessage({ type: "nodeEnd", payload: data });
+    return;
+  }
+
+  if (event === "tool_call") {
+    postMessage({
+      type: "toolCall",
+      payload: {
+        name: data.tool || data.name || "unknown",
+        arguments: data.args || data.arguments || {},
+        callId: data.call_id || data.callId || "",
+      }
+    });
+    return;
+  }
+
+  if (event === "tool_result") {
+    postMessage({
+      type: "toolResult",
+      payload: {
+        name: data.tool || data.name || "unknown",
+        callId: data.call_id || data.callId || "",
+        result: data.result,
+        error: data.error,
+        ok: data.ok,
+      }
+    });
+    return;
+  }
+
+  if (event === "status") {
+    postMessage({ type: "status", payload: { message: String(data.message || "") } });
+    return;
+  }
+
+  if (event === "error") {
+    postWorkerError(data.message || "Backend stream error.");
+    return;
+  }
+
+  if (event === "done") {
+    if (!doneState.done) {
+      doneState.done = true;
+      postMessage({ type: "runDone", payload: data });
+      postMessage({ type: "tokensDone" });
+    }
+    return;
+  }
+
+  // Unknown event -> status fallback
+  if (event) {
+    postMessage({ type: "status", payload: { message: `[${event}] ${JSON.stringify(data)}` } });
+  }
 }
-
-async function normalizeUploadFiles(rawFiles) {
-  if (!Array.isArray(rawFiles) || rawFiles.length === 0) {
-    return [];
-  }
-  const out = [];
-  for (const item of rawFiles) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    if (typeof item.arrayBuffer === "function") {
-      const ab = await item.arrayBuffer();
-      const bytes = new Uint8Array(ab);
-      out.push({
-        name: String(item.name || "upload.bin"),
-        mime: String(item.type || "application/octet-stream"),
-        size: Number(item.size || bytes.length || 0),
-        content_base64: bytesToBase64(bytes),
-      });
-      continue;
-    }
-
-    if (typeof item.content_base64 === "string" && item.content_base64) {
-      out.push({
-        name: String(item.name || "upload.bin"),
-        mime: String(item.mime || "application/octet-stream"),
-        size: Number(item.size || 0),
-        content_base64: item.content_base64,
-      });
-    }
-  }
-  return out;
-}
-
-// ===== Main Streaming Function =====
 
 async function streamChat(message, files, onSent) {
-  const payload = {
-    message: String(message || ""),
-    thread_id: DEFAULT_THREAD_ID,
-  };
-  
-  const normalizedFiles = await normalizeUploadFiles(files);
-  if (normalizedFiles.length > 0) {
-    payload.files = normalizedFiles;
-  }
+  const form = new FormData();
+  form.append("message", String(message || ""));
+  appendFormDataFiles(form, files);
 
   const response = await fetch(STREAM_API_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
+    body: form,
   });
 
   if (!response.ok) {
     const bodyText = await response.text();
     throw new Error(`HTTP ${response.status}: ${bodyText || "empty response"}`);
   }
-  
+
   if (!response.body) {
     throw new Error("Missing stream body.");
   }
@@ -111,205 +130,85 @@ async function streamChat(message, files, onSent) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
-  let doneNotified = false;
+  const doneState = { done: false };
+
+  let curEvent = "message";
+  let dataLines = [];
+
+  function flushEvent() {
+    if (dataLines.length === 0) {
+      curEvent = "message";
+      dataLines = [];
+      return;
+    }
+    const rawData = dataLines.join("\n");
+    let payload = {};
+    try {
+      payload = rawData ? JSON.parse(rawData) : {};
+    } catch (_e) {
+      payload = { message: rawData };
+    }
+    dispatchEvent(curEvent, payload, doneState);
+    curEvent = "message";
+    dataLines = [];
+  }
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
+    if (done) break;
+
     buffer += decoder.decode(value, { stream: true });
     buffer = buffer.replace(/\r/g, "");
 
     while (true) {
-      const idx = buffer.indexOf("\n\n");
-      if (idx < 0) {
-        break;
-      }
-      const rawEvent = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
 
-      const data = parseSseEvent(rawEvent);
-      if (!data) {
+      if (line === "") {
+        flushEvent();
         continue;
       }
-      if (data === "[DONE]") {
-        if (!doneNotified) {
-          doneNotified = true;
-          postMessage({ type: "tokensDone" });
-        }
-        return;
-      }
-
-      let payload;
-      try {
-        payload = JSON.parse(data);
-      } catch (_e) {
+      if (line.startsWith(":")) {
         continue;
       }
-      if (!payload || typeof payload !== "object") {
+      if (line.startsWith("event:")) {
+        curEvent = line.slice(6).trim() || "message";
         continue;
       }
-
-      // Handle different event types
-      handleEventPayload(payload, doneNotified, () => { doneNotified = true; });
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trim());
+        continue;
+      }
     }
   }
 
-  if (!doneNotified) {
+  flushEvent();
+
+  if (!doneState.done) {
     postMessage({ type: "tokensDone" });
   }
 }
-
-// ===== Event Payload Handler =====
-
-function handleEventPayload(payload, doneNotified, markDone) {
-  // Standard token event
-  if (payload.type === "token" && payload.token) {
-    postMessage({ type: "newToken", payload: { token: String(payload.token) } });
-    return;
-  }
-
-  // Error event
-  if (payload.type === "error") {
-    postWorkerError(payload.message || "Backend stream error.");
-    return;
-  }
-
-  // File uploads event
-  if (payload.type === "uploads" && Array.isArray(payload.files)) {
-    postMessage({ type: "uploads", payload: { files: payload.files } });
-    return;
-  }
-
-  // Done event
-  if (payload.type === "done") {
-    if (!doneNotified) {
-      markDone();
-      postMessage({ type: "tokensDone" });
-    }
-    return;
-  }
-
-  // ===== Agent-specific events =====
-
-  // Tool call started
-  if (payload.type === "tool_call" || payload.type === "toolCall" || payload.type === "tool_use") {
-    postMessage({
-      type: "toolCall",
-      payload: {
-        name: payload.name || payload.tool_name || payload.tool || "unknown",
-        arguments: payload.arguments || payload.args || payload.parameters || {}
-      }
-    });
-    return;
-  }
-
-  // Tool call result
-  if (payload.type === "tool_result" || payload.type === "toolResult" || payload.type === "tool_response") {
-    postMessage({
-      type: "toolResult",
-      payload: {
-        result: payload.result || payload.output || payload.response,
-        error: payload.error || payload.err
-      }
-    });
-    return;
-  }
-
-  // Thinking/reasoning event
-  if (payload.type === "thinking" || payload.type === "reasoning" || payload.type === "thought") {
-    postMessage({
-      type: "thinking",
-      payload: {
-        content: payload.content || payload.text || payload.thought || ""
-      }
-    });
-    return;
-  }
-
-  // Status/message event
-  if (payload.type === "status" || payload.type === "message" || payload.type === "info") {
-    postMessage({
-      type: "status",
-      payload: {
-        message: payload.message || payload.text || payload.info || ""
-      }
-    });
-    return;
-  }
-
-  // Code execution event
-  if (payload.type === "code_execution" || payload.type === "codeExecution") {
-    postMessage({
-      type: "toolCall",
-      payload: {
-        name: "code_execution",
-        arguments: { code: payload.code || payload.source || "" }
-      }
-    });
-    
-    if (payload.output || payload.result) {
-      postMessage({
-        type: "toolResult",
-        payload: {
-          result: payload.output || payload.result,
-          error: payload.error
-        }
-      });
-    }
-    return;
-  }
-
-  // File operation event
-  if (payload.type === "file_operation" || payload.type === "fileOperation") {
-    postMessage({
-      type: "toolCall",
-      payload: {
-        name: payload.operation || "file_operation",
-        arguments: {
-          path: payload.path || "",
-          content: payload.content || ""
-        }
-      }
-    });
-    return;
-  }
-
-  // Generic event with content - treat as token if it has content
-  if (payload.content || payload.text || payload.delta) {
-    const token = payload.content || payload.text || payload.delta;
-    if (typeof token === "string") {
-      postMessage({ type: "newToken", payload: { token } });
-    }
-    return;
-  }
-
-  // Unknown event type - log for debugging
-  console.log("Unknown event payload:", payload);
-}
-
-// ===== Worker Message Handler =====
 
 self.onmessage = async function(event) {
-  if (event.data.type === "init") {
-    return;
-  }
-  
-  if (event.data.type !== "chatMessage") {
+  const data = event.data || {};
+
+  if (data.type === "init") {
     return;
   }
 
-  let sentNotified = false;
+  if (data.type !== "chatMessage") {
+    postWorkerError(`Unsupported message type: ${data.type}`);
+    return;
+  }
+
+  const message = String(data.message || "");
+  const files = Array.isArray(data.files) ? data.files : [];
+
   try {
-    await streamChat(event.data.message, event.data.files, () => {
-      sentNotified = true;
-    });
-  } catch (e) {
-    postWorkerError(e && e.message ? e.message : String(e));
-    if (!sentNotified) {
-      postMessage({ type: "messageSent" });
-    }
-    postMessage({ type: "tokensDone" });
+    await streamChat(message, files, null);
+  } catch (err) {
+    postWorkerError(err && err.message ? err.message : String(err || "Unknown error"));
   }
 };

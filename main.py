@@ -11,7 +11,7 @@ import atexit
 import json
 import gzip
 import hashlib
-import base64
+import cgi
 import mimetypes
 import re
 import socket
@@ -1142,6 +1142,51 @@ class AIPipeline:
                 return False
         return bool(default)
 
+    @staticmethod
+    def _alias_tool_output(text: str, old_name: str, new_name: str) -> str:
+        value = str(text or "")
+        if not old_name or not new_name:
+            return value
+        return value.replace(str(old_name), str(new_name))
+
+    # Graph V1 file tools (new names)
+    def list_files(self, args_raw="{}", default_limit=12, hard_limit=64):
+        out = self.list_agent_files(args_raw, default_limit, hard_limit)
+        return self._alias_tool_output(out, "list_agent_files", "list_files")
+
+    def read_file(self, args_raw="{}", default_max_chars=3000, hard_max_chars=12000):
+        out = self.read_agent_file(args_raw, default_max_chars, hard_max_chars)
+        return self._alias_tool_output(out, "read_agent_file", "read_file")
+
+    def read_lines(self, args_raw="{}", default_max_lines=220, hard_max_lines=1200):
+        out = self.read_agent_file_lines(args_raw, default_max_lines, hard_max_lines)
+        return self._alias_tool_output(out, "read_agent_file_lines", "read_lines")
+
+    def search_file(self, args_raw="{}", default_max_hits=20, hard_max_hits=200):
+        out = self.search_agent_file(args_raw, default_max_hits, hard_max_hits)
+        return self._alias_tool_output(out, "search_agent_file", "search_file")
+
+    def search_files(
+        self,
+        args_raw="{}",
+        default_max_hits=30,
+        hard_max_hits=400,
+        default_max_files=24,
+        hard_max_files=200,
+        default_per_file_hits=5,
+        hard_per_file_hits=20,
+    ):
+        out = self.search_agent_files(
+            args_raw,
+            default_max_hits,
+            hard_max_hits,
+            default_max_files,
+            hard_max_files,
+            default_per_file_hits,
+            hard_per_file_hits,
+        )
+        return self._alias_tool_output(out, "search_agent_files", "search_files")
+
     def list_agent_files(self, args_raw="{}", default_limit=12, hard_limit=64):
         args = self._parse_tool_arguments_relaxed(args_raw)
         if not isinstance(args, dict):
@@ -1793,35 +1838,10 @@ class AIPipeline:
 
     def unpack_state(self):
         zst_path = "memory/state.zst"
-        if not os.path.exists(zst_path):
-            print("[Python] 未找到 state.zst，使用现有 raw 或全新启动")
-            return
-
-        v3_manifest = "memory/v3/manifest.txt"
-        raw_files = [
-            v3_manifest,
-            "memory/history.txt",
-            "memory/topic.bin",
-            "memory/pending_cold.txt",
-            "memory/notebook.txt",
-            "memory/adaptive_state.txt",
-        ]
-
-        if not all(os.path.exists(f) for f in raw_files):
-            print("[Python] 检测到归档状态，正在解压 state.zst...")
-            self._do_decompress(zst_path)
-            self._ensure_v3_state(zst_path)
-            return
-
-        zst_mtime = os.path.getmtime(zst_path)
-        raw_mtime = max((os.path.getmtime(f) for f in raw_files), default=0)
-        if zst_mtime > raw_mtime + 3:
-            print("[Python] zst 比 raw 更新 → 强制解压覆盖")
-            self._do_decompress(zst_path)
-            self._ensure_v3_state(zst_path)
-        else:
-            print("[Python] raw 文件已是最新的，直接使用")
-            self._ensure_v3_state(zst_path)
+        if os.path.exists(zst_path):
+            print("[Python] 检测到旧 state.zst，Graph V1 启动策略为忽略旧执行态，不做解压迁移。")
+        os.makedirs("memory/v3/graph/checkpoints", exist_ok=True)
+        os.makedirs("memory/v3/graph/traces", exist_ok=True)
 
     def _ensure_v3_state(self, zst_path):
         v3_manifest = "memory/v3/manifest.txt"
@@ -1875,7 +1895,6 @@ class AIPipeline:
                 "history.txt",
                 "topic.bin",
                 "pending_cold.txt",
-                "notebook.txt",
                 "adaptive_state.txt",
             ]:
                 path = f"memory/{name}"
@@ -1905,7 +1924,6 @@ class AIPipeline:
             "history.txt",
             "topic.bin",
             "pending_cold.txt",
-            "notebook.txt",
             "adaptive_state.txt",
         ]:
             path = f"memory/{name}"
@@ -1931,7 +1949,6 @@ class AIPipeline:
             "history.txt",
             "topic.bin",
             "pending_cold.txt",
-            "notebook.txt",
             "adaptive_state.txt",
         ]:
             path = f"memory/{name}"
@@ -2084,65 +2101,27 @@ class MoriLocalWebUIBridge:
             safe = safe + ".bin"
         return safe
 
-    @staticmethod
-    def _decode_uploaded_file_bytes(file_payload):
-        if not isinstance(file_payload, dict):
-            return None, "file payload must be an object"
-
-        b64 = (
-            file_payload.get("content_base64")
-            or file_payload.get("content_b64")
-            or file_payload.get("data_base64")
-        )
-        if isinstance(b64, str) and b64.strip():
-            raw = b64.strip()
-            if raw.startswith("data:") and "," in raw:
-                raw = raw.split(",", 1)[1]
-            try:
-                return base64.b64decode(raw, validate=True), None
-            except Exception as e:
-                return None, f"invalid base64 payload: {e}"
-
-        if "text" in file_payload:
-            return str(file_payload.get("text") or "").encode("utf-8"), None
-
-        raw_content = file_payload.get("content")
-        if isinstance(raw_content, str):
-            return raw_content.encode("utf-8"), None
-        if isinstance(raw_content, list):
-            try:
-                arr = bytearray()
-                for item in raw_content:
-                    arr.append(max(0, min(255, int(item))))
-                return bytes(arr), None
-            except Exception as e:
-                return None, f"invalid byte array payload: {e}"
-
-        return None, "missing file content (content_base64/text/content)"
-
-    def _store_uploaded_files(self, raw_files, thread_id: str):
-        if raw_files is None:
-            return [], None
-        if not isinstance(raw_files, list):
-            return None, "Field 'files' must be an array."
-        if len(raw_files) > self.upload_max_files:
-            return None, f"Too many files: {len(raw_files)} > max {self.upload_max_files}"
+    def _store_uploaded_files(self, raw_files):
+        files = list(raw_files or [])
+        if len(files) > self.upload_max_files:
+            return None, f"Too many files: {len(files)} > max {self.upload_max_files}"
 
         saved = []
         total_bytes = 0
-        thread_tag = self._sanitize_upload_token(thread_id or self.session_key, fallback=self.session_key, limit=24)
+        thread_tag = self._sanitize_upload_token(self.session_key, fallback=self.session_key, limit=24)
 
-        for idx, item in enumerate(raw_files, 1):
+        for idx, item in enumerate(files, 1):
             if not isinstance(item, dict):
                 return None, f"files[{idx}] must be an object"
 
-            original_name = str(item.get("name") or item.get("filename") or f"upload_{idx}.bin")
+            original_name = str(item.get("name") or f"upload_{idx}.bin")
             safe_name = self._sanitize_upload_filename(original_name)
-            file_bytes, decode_err = self._decode_uploaded_file_bytes(item)
-            if decode_err:
-                return None, f"files[{idx}] decode failed: {decode_err}"
+            raw_bytes = item.get("content")
+            if not isinstance(raw_bytes, (bytes, bytearray)):
+                return None, f"files[{idx}] has invalid binary payload"
+            file_bytes = bytes(raw_bytes)
 
-            size = len(file_bytes or b"")
+            size = len(file_bytes)
             if size > self.upload_max_file_bytes:
                 return None, f"files[{idx}] is too large: {size} bytes > max {self.upload_max_file_bytes}"
             total_bytes += size
@@ -2155,7 +2134,7 @@ class MoriLocalWebUIBridge:
             final_name = f"{thread_tag}_{stamp}_{uuid.uuid4().hex[:8]}_{safe_name}"
             abs_path = os.path.join(self.upload_download_root, final_name)
             with open(abs_path, "wb") as f:
-                f.write(file_bytes or b"")
+                f.write(file_bytes)
 
             rel_to_agent_root = os.path.relpath(abs_path, self.agent_files_root).replace("\\", "/")
             saved.append(
@@ -2178,7 +2157,7 @@ class MoriLocalWebUIBridge:
                 f"- {item.get('original_name')}: {item.get('path')} "
                 f"(tool_path={item.get('tool_path')}, bytes={int(item.get('bytes') or 0)})"
             )
-        lines.append("如需读取附件内容，请调用 list_agent_files(prefix='download') 并按需 read_agent_file。")
+        lines.append("如需读取附件内容，请调用 list_files(prefix='download') 并按需 read_file。")
         return "\n".join(lines)
 
     @staticmethod
@@ -2253,31 +2232,60 @@ class MoriLocalWebUIBridge:
             return None, f"Request body too large: {len(body)} bytes > max {self.max_body_bytes} bytes."
         return body, None
 
-    def _read_json_payload(self, handler: BaseHTTPRequestHandler):
+    def _read_multipart_payload(self, handler: BaseHTTPRequestHandler):
         body, body_err = self._read_body(handler)
         if body_err:
             return None, body_err
         if not body:
-            return {}, None
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as e:
-            return None, f"Invalid JSON payload: {e}"
-        if not isinstance(payload, dict):
-            return None, "JSON payload must be an object."
-        return payload, None
+            return None, "Missing multipart form data."
+
+        content_type = str(handler.headers.get("Content-Type", "") or "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            return None, "Only multipart/form-data is supported."
+
+        env = {
+            "REQUEST_METHOD": "POST",
+            "CONTENT_TYPE": content_type,
+            "CONTENT_LENGTH": str(len(body)),
+        }
+        fs = cgi.FieldStorage(
+            fp=io.BytesIO(body),
+            environ=env,
+            headers=handler.headers,
+            keep_blank_values=True,
+        )
+
+        message = str(fs.getfirst("message", "") or "").strip()
+        raw_files = []
+        file_fields = []
+        if "files[]" in fs:
+            file_fields.append(fs["files[]"])
+        if "files" in fs:
+            file_fields.append(fs["files"])
+
+        for field in file_fields:
+            entries = field if isinstance(field, list) else [field]
+            for item in entries:
+                if not getattr(item, "filename", None):
+                    continue
+                file_bytes = item.file.read() if item.file is not None else b""
+                raw_files.append(
+                    {
+                        "name": str(item.filename or "upload.bin"),
+                        "content": bytes(file_bytes or b""),
+                    }
+                )
+        return {"message": message, "files": raw_files}, None
 
     def _extract_chat_input(self, payload):
+        payload = payload or {}
         message = str(payload.get("message", "")).strip()
-        if message == "":
-            message = ""
-        thread_id = str(payload.get("thread_id", "")).strip() or self.session_key
-        saved_files, file_err = self._store_uploaded_files(payload.get("files"), thread_id)
+        saved_files, file_err = self._store_uploaded_files(payload.get("files"))
         if file_err:
-            return None, None, None, file_err
+            return None, None, file_err
 
         if message == "" and not saved_files:
-            return None, None, None, "Either 'message' or 'files' must be provided."
+            return None, None, "Either 'message' or 'files[]' must be provided."
 
         manifest = self._build_upload_manifest_text(saved_files)
         if manifest:
@@ -2285,14 +2293,14 @@ class MoriLocalWebUIBridge:
                 message = message + "\n\n" + manifest
             else:
                 message = "我上传了附件，请先读取后再回答。\n\n" + manifest
-        return message, thread_id, saved_files, None
+        return message, saved_files, None
 
-    def _send_sse_data(self, handler: BaseHTTPRequestHandler, payload) -> bool:
+    def _send_sse_event(self, handler: BaseHTTPRequestHandler, event_name: str, payload) -> bool:
         try:
-            if payload is None:
-                line = b"data: [DONE]\n\n"
-            else:
-                line = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+            line = (
+                f"event: {event_name}\n"
+                f"data: {json.dumps(payload or {}, ensure_ascii=False)}\n\n"
+            ).encode("utf-8")
             handler.wfile.write(line)
             handler.wfile.flush()
         except Exception as e:
@@ -2302,19 +2310,27 @@ class MoriLocalWebUIBridge:
         return True
 
     def _handle_chat_sync(self, handler: BaseHTTPRequestHandler):
-        payload, err = self._read_json_payload(handler)
+        payload, err = self._read_multipart_payload(handler)
         if err:
             status = 413 if str(err).lower().startswith("request body too large") else 400
             self._send_oai_error(handler, status, err)
             return
 
-        user_text, thread_id, saved_files, input_err = self._extract_chat_input(payload)
+        user_text, saved_files, input_err = self._extract_chat_input(payload)
         if input_err:
             self._send_oai_error(handler, 400, input_err)
             return
 
         try:
-            assistant_text = str(self.chat_handler(user_text, None, thread_id, False) or "")
+            result = self.chat_handler(user_text, None, None, False, saved_files or [])
+            if isinstance(result, tuple):
+                assistant_text = str(result[0] or "")
+                run_id = str(result[1] or "")
+                trace = result[2] if len(result) > 2 else {}
+            else:
+                assistant_text = str(result or "")
+                run_id = ""
+                trace = {}
         except Exception as e:
             self._send_oai_error(handler, 500, f"Chain execution failed: {e}")
             return
@@ -2323,21 +2339,28 @@ class MoriLocalWebUIBridge:
             handler,
             200,
             {
-                "text": assistant_text,
-                "thread_id": thread_id,
-                "model": self.model_name,
-                "uploaded_files": saved_files or [],
+                "message": assistant_text,
+                "run_id": run_id,
+                "trace": trace or {},
+                "uploads": [
+                    {
+                        "name": item.get("name"),
+                        "path": item.get("path"),
+                        "bytes": int(item.get("bytes") or 0),
+                    }
+                    for item in (saved_files or [])
+                ],
             },
         )
 
     def _handle_chat_stream(self, handler: BaseHTTPRequestHandler):
-        payload, err = self._read_json_payload(handler)
+        payload, err = self._read_multipart_payload(handler)
         if err:
             status = 413 if str(err).lower().startswith("request body too large") else 400
             self._send_oai_error(handler, status, err)
             return
 
-        user_text, thread_id, saved_files, input_err = self._extract_chat_input(payload)
+        user_text, saved_files, input_err = self._extract_chat_input(payload)
         if input_err:
             self._send_oai_error(handler, 400, input_err)
             return
@@ -2354,17 +2377,17 @@ class MoriLocalWebUIBridge:
             raise
 
         streamed = []
+        run_done = False
 
         if saved_files:
-            self._send_sse_data(
+            self._send_sse_event(
                 handler,
+                "uploads",
                 {
-                    "type": "uploads",
                     "files": [
                         {
                             "name": item.get("name"),
                             "path": item.get("path"),
-                            "tool_path": item.get("tool_path"),
                             "bytes": int(item.get("bytes") or 0),
                         }
                         for item in saved_files
@@ -2373,6 +2396,7 @@ class MoriLocalWebUIBridge:
             )
 
         def emit_piece(piece):
+            nonlocal run_done
             try:
                 coerced = AIPipeline._coerce_lua_value(piece)
             except Exception:
@@ -2382,16 +2406,19 @@ class MoriLocalWebUIBridge:
                 coerced = bytes(coerced).decode("utf-8", errors="replace")
 
             if isinstance(coerced, dict):
-                event_type = str(coerced.get("type", "") or "").strip()
+                event_type = str(coerced.get("event", "") or "").strip()
                 if event_type:
-                    payload_obj = dict(coerced)
-                    payload_obj["type"] = event_type
-                    if not self._send_sse_data(handler, payload_obj):
+                    payload_obj = coerced.get("data")
+                    if not isinstance(payload_obj, dict):
+                        payload_obj = {}
+                    if not self._send_sse_event(handler, event_type, payload_obj):
                         raise BrokenPipeError("client disconnected during stream")
                     if event_type == "token":
                         token_piece = payload_obj.get("token")
                         if isinstance(token_piece, str) and token_piece:
                             streamed.append(token_piece)
+                    if event_type == "done":
+                        run_done = True
                     return
 
                 text_like = coerced.get("token")
@@ -2400,7 +2427,7 @@ class MoriLocalWebUIBridge:
                 if not isinstance(text_like, str) or not text_like:
                     text_like = coerced.get("content")
                 if isinstance(text_like, str) and text_like:
-                    if not self._send_sse_data(handler, {"type": "token", "token": text_like}):
+                    if not self._send_sse_event(handler, "token", {"token": text_like}):
                         raise BrokenPipeError("client disconnected during stream")
                     streamed.append(text_like)
                     return
@@ -2409,23 +2436,30 @@ class MoriLocalWebUIBridge:
                     fallback_msg = json.dumps(coerced, ensure_ascii=False)
                 except Exception:
                     fallback_msg = str(coerced)
-                if not self._send_sse_data(handler, {"type": "status", "message": fallback_msg}):
+                if not self._send_sse_event(handler, "status", {"message": fallback_msg}):
                     raise BrokenPipeError("client disconnected during stream")
                 return
 
             text = str(coerced or "")
             if not text:
                 return
-            if not self._send_sse_data(handler, {"type": "token", "token": text}):
+            if not self._send_sse_event(handler, "token", {"token": text}):
                 raise BrokenPipeError("client disconnected during stream")
             streamed.append(text)
 
         try:
-            assistant_text = str(self.chat_handler(user_text, emit_piece, thread_id, False) or "")
+            result = self.chat_handler(user_text, emit_piece, None, False, saved_files or [])
+            if isinstance(result, tuple):
+                assistant_text = str(result[0] or "")
+                run_id = str(result[1] or "")
+                trace = result[2] if len(result) > 2 else {}
+            else:
+                assistant_text = str(result or "")
+                run_id = ""
+                trace = {}
         except Exception as e:
-            self._send_sse_data(handler, {"type": "error", "message": f"Chain execution failed: {e}"})
-            self._send_sse_data(handler, {"type": "done"})
-            self._send_sse_data(handler, None)
+            self._send_sse_event(handler, "error", {"message": f"Chain execution failed: {e}"})
+            self._send_sse_event(handler, "done", {"message": "", "run_id": "", "trace": {}})
             handler.close_connection = True
             return
 
@@ -2439,8 +2473,16 @@ class MoriLocalWebUIBridge:
         elif assistant_text and assistant_text != joined:
             print("[LocalWebUI][WARN] stream token text mismatch with final response.")
 
-        self._send_sse_data(handler, {"type": "done"})
-        self._send_sse_data(handler, None)
+        if not run_done:
+            self._send_sse_event(
+                handler,
+                "done",
+                {
+                    "message": assistant_text,
+                    "run_id": run_id,
+                    "trace": trace or {},
+                },
+            )
         handler.close_connection = True
 
     def _resolve_static_path(self, request_path: str):
@@ -2493,10 +2535,8 @@ class MoriLocalWebUIBridge:
             handler,
             200,
             {
-                "mode": "single",
-                "session": self.session_key,
-                "thread": self.session_key,
-                "policy": "single_write",
+                "api_version": "graph_v1",
+                "session_mode": "single",
                 "model_name": self.model_name,
                 "upload_dir": self._display_path(self.upload_download_root),
                 "upload_limits": {
@@ -2604,16 +2644,6 @@ def _read_env_int(name: str, default: int) -> int:
     return val if val > 0 else int(default)
 
 
-def _read_env_int_allow_zero(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return int(default)
-    try:
-        return int(raw)
-    except ValueError:
-        return int(default)
-
-
 def _read_env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -2627,13 +2657,11 @@ def main():
     if run_mode not in {"cli", "webui"}:
         print(f"[Python][WARN] Unknown MORI_RUN_MODE={run_mode}, fallback to cli")
         run_mode = "cli"
-    webui_stream_max_steps = _read_env_int_allow_zero("MORI_WEBUI_STREAM_MAX_STEPS", 3)
 
     lua = LuaRuntime(unpack_returned_tuples=True)
     pipeline = AIPipeline()
     lua.globals()['py_pipeline'] = pipeline
     lua.globals()['MORI_RUN_MODE'] = run_mode
-    lua.globals()['MORI_WEBUI_STREAM_MAX_STEPS'] = int(webui_stream_max_steps)
 
     bridge = None
     bridge_host = os.environ.get("MORI_WEBUI_BRIDGE_HOST", "127.0.0.1")
@@ -2690,26 +2718,26 @@ def main():
             if pipeline.llm_large is None:
                 raise RuntimeError("Large model server is not loaded.")
 
+            def bridge_chat(user_text, on_piece=None, _ignored=None, read_only=False, uploads=None):
+                assistant_text = str(lua_handler(user_text, on_piece, "", read_only, uploads or []) or "")
+                run_id = str(lua.globals().mori_last_run_id or "")
+                trace = AIPipeline._coerce_lua_value(lua.globals().mori_last_trace_summary)
+                if not isinstance(trace, dict):
+                    trace = {}
+                return assistant_text, run_id, trace
+
             bridge = MoriLocalWebUIBridge(
                 host=bridge_host,
                 port=bridge_port,
                 frontend_root=frontend_root,
-                chat_handler=lambda user_text, on_piece=None, thread_id=None, read_only=False: lua_handler(
-                    user_text, on_piece, thread_id, read_only
-                ),
+                chat_handler=bridge_chat,
                 model_name=pipeline.llm_large.model_name,
                 agent_files_root=pipeline.agent_files_root,
             )
             print(f"[Python] Local no-build WebUI ready at http://{bridge_host}:{bridge_port}")
             print(f"[Python] Frontend root: {os.path.abspath(frontend_root)}")
             print(f"[Python] Uploaded files dir: {bridge._display_path(bridge.upload_download_root)}")
-            if webui_stream_max_steps > 0:
-                print(
-                    "[Python] Streaming sync mode: stream requests use "
-                    f"max_steps={webui_stream_max_steps}."
-                )
-            else:
-                print("[Python] Streaming sync mode disabled (MORI_WEBUI_STREAM_MAX_STEPS<=0).")
+            print("[Python] Stream mode: SSE event protocol enabled.")
             print("[Python] /v1/chat/completions is deprecated in webui mode; use /mori/chat or /mori/chat/stream.")
             print("[Python] Press Ctrl+C to stop.")
 
