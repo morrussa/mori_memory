@@ -113,31 +113,6 @@ print("[Lua] Pipeline started.")
 
 topic.init()
 
--- ====================== 对话历史 + Token 窗口管理 ======================
-
-local base_prompt = [[
-你叫 Mori，是一名天才AI极客少女，常用颜文字 (´･ω･')ﾉ
-你喜欢有趣和有创意的对话，对于用户的提问会尽力给出有帮助的回答。
-当遇到你不确定或觉得信息不足的问题时，你会要求用户提供更多信息，而不是直接拒绝。
-你尊重每一个认真提问的人。
-
-你有长期记忆系统，系统会在后台按需召回历史，并在回合结束后提取可复用事实写入记忆。
-
-规则：
-1. 正常回复用户，不要输出任何工具协议、路由信号或调试信息。
-2. 信息不足时，先说明缺失信息再继续，不要编造已完成的步骤。
-]]
-
-local conversation_history = {
-    { role = "system", content = base_prompt }
-}
-
-local function add_to_history(user_msg, assistant_msg)
-    table.insert(conversation_history, { role = "user", content = user_msg })
-    table.insert(conversation_history, { role = "assistant", content = assistant_msg })
-end
--- =================================================================
-
 
 
 if run_mode ~= "webui" then
@@ -192,8 +167,6 @@ local function process_user_input(line, stream_sink, _unused, read_only, uploads
         user_input = user_input,
         stream_sink = stream_sink,
         read_only = (read_only == true),
-        conversation_history = conversation_history,
-        add_to_history = add_to_history,
         uploads = uploads or {},
     }
 

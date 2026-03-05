@@ -5,8 +5,7 @@ local memory_core = require("module.graph.memory_core")
 
 local M = {}
 
-function M.run(state, ctx)
-    ctx = ctx or {}
+function M.run(state, _ctx)
     local read_only = (((state or {}).input or {}).read_only) == true
     if read_only then
         return state
@@ -20,10 +19,6 @@ function M.run(state, ctx)
 
     history.add_history(user_input, final_text)
     topic.update_assistant(current_turn, final_text)
-
-    if type(ctx.add_to_history) == "function" then
-        pcall(ctx.add_to_history, user_input, final_text)
-    end
 
     local facts = (((state or {}).writeback or {}).facts) or {}
     local saved = memory_core.save_turn_memory(facts, current_turn)

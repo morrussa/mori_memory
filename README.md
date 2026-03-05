@@ -36,6 +36,7 @@
 - `module/graph/state_schema.lua`：`GraphStateV1`
 - `module/graph/graph_runtime.lua`：图执行引擎
 - `module/graph/graph_builder.lua`：节点与转移
+- `module/graph/conversation_source.lua`：会话历史与系统提示词装配
 - `module/graph/nodes/*`：节点实现
 - `module/graph/checkpoint_store.lua`：FFI 二进制快照
 - `module/graph/trace_writer.lua`：JSONL trace

@@ -2,6 +2,7 @@ local state_schema = require("module.graph.state_schema")
 local graph_builder = require("module.graph.graph_builder")
 local checkpoint_store = require("module.graph.checkpoint_store")
 local trace_writer = require("module.graph.trace_writer")
+local conversation_source = require("module.graph.conversation_source")
 local util = require("module.graph.util")
 local config = require("module.config")
 
@@ -120,11 +121,10 @@ function M.run_turn(args)
 
     local cfg = graph_cfg()
     local stream_sink = args.stream_sink
-    local conversation_history = args.conversation_history or {}
-    local base_system_prompt = ""
-    if type(conversation_history[1]) == "table" and tostring(conversation_history[1].role or "") == "system" then
-        base_system_prompt = tostring(conversation_history[1].content or "")
-    end
+    local conversation_history, base_system_prompt = conversation_source.resolve_conversation(
+        args.conversation_history,
+        args.system_prompt
+    )
 
     local state = state_schema.new_state({
         user_input = user_input,
@@ -176,9 +176,7 @@ function M.run_turn(args)
             seq = guard,
         })
 
-        state = node.run(state, {
-            add_to_history = args.add_to_history,
-        })
+        state = node.run(state, {})
         state_schema.assert_valid(state)
 
         local node_end_ms = util.now_ms()
