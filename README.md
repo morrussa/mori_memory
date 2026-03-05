@@ -40,19 +40,12 @@ pip install lupa --no-binary :all: --verbose --no-cache-dir --force-reinstall
 
 qwen3.5支持pr：
 
-## llama.cpp WebUI 接入（已接到当前链路）
+## 本地 No-Build WebUI（当前默认 webui 模式）
 
-现在有两种 WebUI 方式：
+`MORI_RUN_MODE=webui` 现在不再代理 `llama.cpp` 自带页面，而是直接托管仓库内
+`module/frontend`（no-build 前端），聊天走 Mori 原生接口。
 
-1) 直连模式（不经过 Mori 链路）  
-默认 `python main.py`（CLI 交互）时，主模型 `llama-server` 仍可开启自带 WebUI。
-
-2) 链路模式（经过 Mori 实际链路，推荐）  
-启动 `MORI_RUN_MODE=webui` 后，会起一个 HTTP 代理：
-- 页面与静态资源仍来自 `llama-server` 自带 WebUI
-- 但 `/v1/chat/completions` 会改走 `pipeline.lua` 的真实链路（记忆/召回/tool_calling）
-
-链路模式启动示例：
+启动示例：
 
 ```bash
 MORI_RUN_MODE=webui \
@@ -61,7 +54,7 @@ MORI_WEBUI_BRIDGE_PORT=8080 \
 python main.py
 ```
 
-启动后访问：
+访问：
 
 ```text
 http://127.0.0.1:8080
@@ -70,70 +63,34 @@ http://127.0.0.1:8080
 常用环境变量：
 
 - `MORI_RUN_MODE=cli|webui`：运行模式（默认 `cli`）
-- `MORI_WEBUI_BRIDGE_HOST` / `MORI_WEBUI_BRIDGE_PORT`：链路模式下对外 WebUI 地址（默认 `127.0.0.1:8080`）
-- `MORI_WEBUI_PRIMARY_SESSION`：固定主会话 key（设置后仅该会话写入 Mori 链路）
-- `MORI_WEBUI_NON_PRIMARY_POLICY=readonly_chain|readonly_upstream|reject`：非主会话策略（默认 `readonly_chain`，`readonly_upstream` 兼容映射为 `readonly_chain`）
-- `MORI_WEBUI_SESSION_HEADER`：自定义会话 header（默认 `X-Mori-Session`）
-- `MORI_WEBUI_THREAD_HEADER`：自定义 thread header（默认 `X-Mori-Thread`）
-- `MORI_WEBUI_PRIMARY_IDLE_TTL_SEC`：自动占有模式下主会话空闲接管 TTL（默认 `1800` 秒）
-- `MORI_WEBUI_SESSION_DEBUG=0|1`：打印会话 key 来源与主/非主判定（默认 `0`）
+- `MORI_WEBUI_BRIDGE_HOST` / `MORI_WEBUI_BRIDGE_PORT`：本地 WebUI 监听地址（默认 `127.0.0.1:8080`）
+- `MORI_FRONTEND_ROOT`：本地前端目录（默认 `module/frontend`）
 - `MORI_LARGE_SERVER_HOST` / `MORI_LARGE_SERVER_PORT`：底层主模型 `llama-server` 地址（默认 `127.0.0.1` + 自动端口）
-- `MORI_LARGE_SERVER_WEBUI=1`：主模型服务启用 WebUI（链路模式会强制开启）
-- `MORI_LARGE_SERVER_JINJA=1`：主模型启用 `--jinja`（默认开启）
-- `MORI_LARGE_SERVER_API_KEY`：上游 `llama-server` API key（链路模式默认自动生成随机 key）
-- `MORI_LLAMA_SERVER_LOG_TO_FILE=0|1`：是否将 `llama-server` 输出写入 `logs/llama_server_*.log`（默认 `1`；设 `0` 则不创建 `logs/` 且丢弃输出）
-- `MORI_AGENT_FILES_DIR`：附件落盘目录（默认 `./workspace`）
-- `MORI_AGENT_FILE_MANIFEST_MAX_ITEMS`：单轮向模型展示的附件路径条数（默认 `8`）
-- `MORI_RUN_MODE=webui` 时默认不打印上游端口 URL，避免误进直连口
+- `MORI_LARGE_SERVER_WEBUI=0|1`：主模型服务是否启用自带 WebUI（`MORI_RUN_MODE=webui` 时强制 `0`）
+- `MORI_LARGE_SERVER_JINJA=0|1`：主模型 `--jinja`（默认 `1`）
+- `MORI_LARGE_SERVER_API_KEY`：上游 `llama-server` API key（未设置时自动生成）
+- `MORI_LLAMA_SERVER_LOG_TO_FILE=0|1`：是否将 `llama-server` 输出写入 `logs/llama_server_*.log`（默认 `1`）
 
-会话路由说明（WebUI 模式）：
+本地 WebUI API：
 
-- 主会话：走 Mori 链路（会写入 topic/history/memory/tool_calling）
-- 非主会话：
-  - 默认 `readonly_chain`：仍走 Mori 链路，但启用只读（只读记忆，不写 history/topic/memory/tool_calling）
-  - 可选 `reject`：直接返回 409
-- 会话 key 提取顺序：
-  - `payload.metadata.{conversation_id,chat_id,session_id}`
-  - `payload.{conversation_id,chat_id,session_id}`
-  - `header[MORI_WEBUI_SESSION_HEADER]`
-  - 若设置了固定主会话 key：回退到主会话 key（默认 `mori`）
-  - 否则回退到指纹 `sha1(first_system + first_user + client_ip + user_agent)` 并告警
-- 线程 key（用于前端透传显示，不参与后端状态分桶）提取顺序：
-  - `payload.metadata.thread_id`
-  - `payload.thread_id`
-  - `header[MORI_WEBUI_THREAD_HEADER]`
-  - 缺失时回退到当前会话 key（`fallback.session_key`）
-- WebUI 启动引导（桥接层自动注入到 `/`）：
-  - 检查前端 IndexedDB `Conversations` 是否存在名为 `Mori` 的会话
-  - 不存在则创建主会话（ID = 主会话 key，默认 `mori`）
-  - 若 `memory/history.txt` 存在且为 `HIST_V2`，会从该文件重建 `Mori` 会话消息树
-- WebUI 请求自动透传当前会话：
-  - 请求头：`X-Mori-Session`、`X-Mori-Thread`
-  - 请求体 metadata：`conversation_id`、`thread_id`
-  - 值来源：当前 URL hash `#/chat/<id>`，缺失时回退主会话 key
-- 后端状态模式：单进程单会话（不按前端会话分桶）
-- 长期记忆策略：
-  - 非主会话只读，不写全局长期记忆
-  - 主会话提取到的事实按现有流程全部写入全局长期记忆
+- `GET /health` -> `{"status":"ok"}`
+- `GET /mori/session/status` -> 单会话状态（`mode=single`, `session=mori`），并包含 `upload_dir` 与 `upload_limits`
+- `POST /mori/chat`：非流式  
+  请求：`{"message":"...", "thread_id":"mori", "files":[...]}`  
+  `files[]` 支持 `{"name":"a.txt","content_base64":"..."}`（可仅上传文件不填 message）
+- `POST /mori/chat/stream`：SSE 流式  
+  请求同上；事件：`{"type":"token","token":"..."}`，结束 `{"type":"done"}` + `[DONE]`
+- `POST /v1/chat/completions`：已废弃，返回 `410` 并提示迁移到 `/mori/chat` 或 `/mori/chat/stream`
 
-诊断接口：
+说明：
 
-- `GET /mori/session/status`
-  - 返回：`{ primary_session, policy, mode, ttl_sec, last_seen_ts, session_header, thread_header, primary_alias }`
-- 聊天响应头：
-  - `X-Mori-Session-Key`
-  - `X-Mori-Session-Role=primary|observer`
-  - `X-Mori-Session-Source`
-  - `X-Mori-Thread-Key`
-  - `X-Mori-Thread-Source`
-
-### 额外依赖（venv）
-
-- 对 `llama-server` 自带 WebUI 本身：通常不需要额外 Python 依赖（不是 venv 里的包）
-- 关键是你已经正确编译了 `llama-server` 可执行文件，并确保当前 `LLAMA_SERVER_BIN` 指向它
-- 建议确保在 `llama.cpp` 目录执行过：`cmake --build build -j --target llama-server`
-- 已修复 `Jinja Exception: No user query found in messages`（内部二阶段调用已改为带 `user` 消息）
-- 在 `MORI_RUN_MODE=webui` 下，底层上游端口会被 API key 保护（避免误打开直连端口绕过 Mori 链路）
+- `MORI_RUN_MODE=webui` 下，后端是单会话写入模型（固定会话 `mori`），不再使用 primary/observer 分流。
+- 不再依赖 `llama.cpp` 自带 WebUI 页面注入与 IndexedDB 历史回灌。
+- WebUI 上传文件会自动写入 `./workspace/download/`（可用文件工具从 `download/` 前缀读取）。
+- 上传限额可通过环境变量调整：  
+  `MORI_WEBUI_UPLOAD_MAX_FILES`、`MORI_WEBUI_UPLOAD_MAX_FILE_BYTES`、`MORI_WEBUI_UPLOAD_MAX_TOTAL_BYTES`、`MORI_WEBUI_MAX_BODY_BYTES`
+- 以下变量在新 webui 模式下已废弃并忽略：  
+  `MORI_WEBUI_PRIMARY_SESSION`、`MORI_WEBUI_NON_PRIMARY_POLICY`、`MORI_WEBUI_SESSION_HEADER`、`MORI_WEBUI_THREAD_HEADER`、`MORI_WEBUI_PRIMARY_IDLE_TTL_SEC`、`MORI_WEBUI_SESSION_DEBUG`。
 
 ## AgentRuntime / ToolRegistry（一次性替换版）
 

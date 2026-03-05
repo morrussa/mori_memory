@@ -11,12 +11,15 @@ import atexit
 import json
 import gzip
 import hashlib
+import base64
+import mimetypes
 import re
 import socket
 import subprocess
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -1972,76 +1975,171 @@ class AIPipeline:
         return text_result
 
 
-class MoriWebUIChainBridge:
-    """HTTP bridge that keeps llama.cpp WebUI assets but routes chat through Mori chain."""
-
-    HISTORY_HEADER = "HIST_V2"
-    HISTORY_FIELD_SEP = "\x1F"
-    SESSION_ID_FIELDS = ("conversation_id", "chat_id", "session_id")
-    THREAD_ID_FIELD = "thread_id"
-    HOP_BY_HOP_HEADERS = {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-    }
+class MoriLocalWebUIBridge:
+    """Serve local no-build frontend assets and Mori native chat endpoints."""
 
     def __init__(
         self,
         host: str,
         port: int,
-        upstream_base_url: str,
+        frontend_root: str,
         chat_handler,
         model_name: str,
-        upstream_api_key: str = "",
-        primary_session_key: str = "",
-        non_primary_policy: str = "readonly_upstream",
-        session_header_name: str = "X-Mori-Session",
-        thread_header_name: str = "X-Mori-Thread",
-        primary_idle_ttl_sec: int = 1800,
-        session_debug: bool = False,
-        history_file_path: str = "memory/history.txt",
+        session_key: str = "mori",
         agent_files_root: str = "workspace",
     ):
         self.host = str(host or "127.0.0.1")
         self.port = int(port)
-        self.upstream_base_url = str(upstream_base_url).rstrip("/")
+        self.frontend_root = os.path.abspath(str(frontend_root or "module/frontend"))
         self.chat_handler = chat_handler
         self.model_name = str(model_name or "mori-chain")
-        self.upstream_api_key = str(upstream_api_key or "").strip()
-        self.primary_session_key = str(primary_session_key or "").strip()
-        policy = str(non_primary_policy or "readonly_upstream").strip().lower()
-        if policy in {"readonly_upstream", "readonly_chain"}:
-            policy = "readonly_chain"
-        self.non_primary_policy = policy if policy in {"readonly_chain", "reject"} else "readonly_chain"
-        self.session_header_name = str(session_header_name or "X-Mori-Session").strip() or "X-Mori-Session"
-        self.thread_header_name = str(thread_header_name or "X-Mori-Thread").strip() or "X-Mori-Thread"
-        self.primary_idle_ttl_sec = max(1, int(primary_idle_ttl_sec or 1800))
-        self.session_debug = bool(session_debug)
-        self.primary_conversation_name = "Mori"
-        self.history_file_path = str(history_file_path or "memory/history.txt")
+        self.session_key = str(session_key or "mori").strip() or "mori"
         self.agent_files_root = os.path.abspath(str(agent_files_root or "workspace"))
-        os.makedirs(self.agent_files_root, exist_ok=True)
-        self.agent_file_manifest_max_items = max(
-            1,
-            _read_env_int("MORI_AGENT_FILE_MANIFEST_MAX_ITEMS", 8),
+        self.upload_download_root = os.path.abspath(os.path.join(self.agent_files_root, "download"))
+        self.upload_max_files = max(1, _read_env_int("MORI_WEBUI_UPLOAD_MAX_FILES", 8))
+        self.upload_max_file_bytes = max(1024, _read_env_int("MORI_WEBUI_UPLOAD_MAX_FILE_BYTES", 10 * 1024 * 1024))
+        self.upload_max_total_bytes = max(
+            self.upload_max_file_bytes,
+            _read_env_int("MORI_WEBUI_UPLOAD_MAX_TOTAL_BYTES", 30 * 1024 * 1024),
         )
-        self.webui_input_chunk_chars = max(256, _read_env_int("MORI_WEBUI_INPUT_CHUNK_CHARS", 4096))
-        self.webui_user_text_max_chars = max(2048, _read_env_int("MORI_WEBUI_USER_TEXT_MAX_CHARS", 120000))
-        self.webui_fingerprint_text_max_chars = max(
-            256, _read_env_int("MORI_WEBUI_FINGERPRINT_TEXT_MAX_CHARS", 4096)
+        self.max_body_bytes = max(
+            self.upload_max_total_bytes,
+            _read_env_int("MORI_WEBUI_MAX_BODY_BYTES", 64 * 1024 * 1024),
         )
-        self._auto_primary_session = None
-        self._primary_session_alias = None
-        self._primary_last_seen_ts = 0.0
-        self._fallback_warned = set()
-        self._thread_fallback_warned = set()
         self._httpd = None
+
+        if not os.path.isdir(self.frontend_root):
+            raise FileNotFoundError(f"Frontend root not found: {self.frontend_root}")
+        index_path = os.path.join(self.frontend_root, "index.html")
+        if not os.path.isfile(index_path):
+            raise FileNotFoundError(f"Frontend index not found: {index_path}")
+        os.makedirs(self.upload_download_root, exist_ok=True)
+
+    @staticmethod
+    def _display_path(path: str) -> str:
+        abs_path = os.path.abspath(str(path or ""))
+        rel = os.path.relpath(abs_path, os.getcwd()).replace("\\", "/")
+        if rel == ".":
+            return "."
+        if not rel.startswith("../"):
+            return f"./{rel}"
+        return abs_path.replace("\\", "/")
+
+    @staticmethod
+    def _sanitize_upload_token(value: str, fallback: str = "x", limit: int = 48) -> str:
+        raw = str(value or "").strip()
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", raw).strip("._-")
+        if not safe:
+            safe = str(fallback or "x")
+        if len(safe) > int(limit):
+            safe = safe[: int(limit)]
+        return safe
+
+    @classmethod
+    def _sanitize_upload_filename(cls, filename: str) -> str:
+        raw = str(filename or "").strip().replace("\\", "/")
+        base = os.path.basename(raw) or "upload.bin"
+        safe = cls._sanitize_upload_token(base, fallback="upload.bin", limit=120)
+        if "." not in safe:
+            safe = safe + ".bin"
+        return safe
+
+    @staticmethod
+    def _decode_uploaded_file_bytes(file_payload):
+        if not isinstance(file_payload, dict):
+            return None, "file payload must be an object"
+
+        b64 = (
+            file_payload.get("content_base64")
+            or file_payload.get("content_b64")
+            or file_payload.get("data_base64")
+        )
+        if isinstance(b64, str) and b64.strip():
+            raw = b64.strip()
+            if raw.startswith("data:") and "," in raw:
+                raw = raw.split(",", 1)[1]
+            try:
+                return base64.b64decode(raw, validate=True), None
+            except Exception as e:
+                return None, f"invalid base64 payload: {e}"
+
+        if "text" in file_payload:
+            return str(file_payload.get("text") or "").encode("utf-8"), None
+
+        raw_content = file_payload.get("content")
+        if isinstance(raw_content, str):
+            return raw_content.encode("utf-8"), None
+        if isinstance(raw_content, list):
+            try:
+                arr = bytearray()
+                for item in raw_content:
+                    arr.append(max(0, min(255, int(item))))
+                return bytes(arr), None
+            except Exception as e:
+                return None, f"invalid byte array payload: {e}"
+
+        return None, "missing file content (content_base64/text/content)"
+
+    def _store_uploaded_files(self, raw_files, thread_id: str):
+        if raw_files is None:
+            return [], None
+        if not isinstance(raw_files, list):
+            return None, "Field 'files' must be an array."
+        if len(raw_files) > self.upload_max_files:
+            return None, f"Too many files: {len(raw_files)} > max {self.upload_max_files}"
+
+        saved = []
+        total_bytes = 0
+        thread_tag = self._sanitize_upload_token(thread_id or self.session_key, fallback=self.session_key, limit=24)
+
+        for idx, item in enumerate(raw_files, 1):
+            if not isinstance(item, dict):
+                return None, f"files[{idx}] must be an object"
+
+            original_name = str(item.get("name") or item.get("filename") or f"upload_{idx}.bin")
+            safe_name = self._sanitize_upload_filename(original_name)
+            file_bytes, decode_err = self._decode_uploaded_file_bytes(item)
+            if decode_err:
+                return None, f"files[{idx}] decode failed: {decode_err}"
+
+            size = len(file_bytes or b"")
+            if size > self.upload_max_file_bytes:
+                return None, f"files[{idx}] is too large: {size} bytes > max {self.upload_max_file_bytes}"
+            total_bytes += size
+            if total_bytes > self.upload_max_total_bytes:
+                return None, (
+                    f"Total uploaded bytes exceed limit: {total_bytes} > max {self.upload_max_total_bytes}"
+                )
+
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            final_name = f"{thread_tag}_{stamp}_{uuid.uuid4().hex[:8]}_{safe_name}"
+            abs_path = os.path.join(self.upload_download_root, final_name)
+            with open(abs_path, "wb") as f:
+                f.write(file_bytes or b"")
+
+            rel_to_agent_root = os.path.relpath(abs_path, self.agent_files_root).replace("\\", "/")
+            saved.append(
+                {
+                    "name": safe_name,
+                    "original_name": original_name,
+                    "path": self._display_path(abs_path),
+                    "tool_path": rel_to_agent_root,
+                    "bytes": size,
+                }
+            )
+        return saved, None
+
+    def _build_upload_manifest_text(self, saved_files):
+        if not saved_files:
+            return ""
+        lines = [f"[上传文件已保存到 {self._display_path(self.upload_download_root)}]"]
+        for item in saved_files:
+            lines.append(
+                f"- {item.get('original_name')}: {item.get('path')} "
+                f"(tool_path={item.get('tool_path')}, bytes={int(item.get('bytes') or 0)})"
+            )
+        lines.append("如需读取附件内容，请调用 list_agent_files(prefix='download') 并按需 read_agent_file。")
+        return "\n".join(lines)
 
     @staticmethod
     def _is_client_disconnect_error(exc: Exception) -> bool:
@@ -2051,867 +2149,22 @@ class MoriWebUIChainBridge:
             return exc.errno in {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED}
         return False
 
-    @staticmethod
-    def _iter_text_chunks(text: str, chunk_chars: int):
-        value = str(text or "")
-        if not value:
-            return
-        step = max(1, int(chunk_chars or 4096))
-        for i in range(0, len(value), step):
-            yield value[i : i + step]
-
-    @classmethod
-    def _iter_content_text_chunks(cls, content, chunk_chars: int = 4096):
-        if isinstance(content, str):
-            for chunk in cls._iter_text_chunks(content, chunk_chars):
-                yield chunk
-            return
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                item_type = str(item.get("type", "") or "").strip().lower()
-                is_file_item = (
-                    item_type in {"file", "input_file", "uploaded_file"}
-                    or item.get("file") is not None
-                    or item.get("filename") is not None
-                    or item.get("file_name") is not None
-                )
-                text = ""
-                if is_file_item:
-                    file_name = (
-                        item.get("name")
-                        or item.get("filename")
-                        or item.get("file_name")
-                    )
-                    file_obj = item.get("file")
-                    if isinstance(file_obj, dict):
-                        if not file_name:
-                            file_name = (
-                                file_obj.get("name")
-                                or file_obj.get("filename")
-                                or file_obj.get("file_name")
-                            )
-                        payload = file_obj.get("text")
-                        if payload is None:
-                            payload = file_obj.get("content")
-                    else:
-                        payload = item.get("text")
-                        if payload is None:
-                            payload = item.get("content")
-
-                    file_name = str(file_name or "upload.txt").strip() or "upload.txt"
-                    body = str(payload or "")
-                    if body == "":
-                        body = "[binary or unavailable inline payload]"
-                    text = f"--- File: {file_name} ---\n{body}\n"
-                elif item_type in {"text", "input_text"}:
-                    text = str(item.get("text", ""))
-                elif "text" in item and item.get("text") is not None:
-                    text = str(item.get("text"))
-                if not text:
-                    continue
-                for chunk in cls._iter_text_chunks(text, chunk_chars):
-                    yield chunk
-            return
-        if content is None:
-            return
-        for chunk in cls._iter_text_chunks(str(content), chunk_chars):
-            yield chunk
-
-    @classmethod
-    def _content_to_text_limited(cls, content, chunk_chars: int = 4096, max_chars=None):
-        limit = None
-        if max_chars is not None:
-            limit = max(0, int(max_chars))
-        out = io.StringIO()
-        written = 0
-        truncated = False
-        for piece in cls._iter_content_text_chunks(content, chunk_chars=chunk_chars):
-            if limit is not None and written >= limit:
-                truncated = True
-                break
-            if limit is None:
-                out.write(piece)
-                written += len(piece)
-                continue
-            remaining = limit - written
-            if len(piece) <= remaining:
-                out.write(piece)
-                written += len(piece)
-                continue
-            if remaining > 0:
-                out.write(piece[:remaining])
-                written += remaining
-            truncated = True
-            break
-        return out.getvalue(), truncated
-
-    @classmethod
-    def _content_to_text(cls, content, chunk_chars: int = 4096, max_chars=None) -> str:
-        text, _truncated = cls._content_to_text_limited(content, chunk_chars=chunk_chars, max_chars=max_chars)
-        return text
-
-    @staticmethod
-    def _is_file_attachment_label(label: str) -> bool:
-        raw = str(label or "").strip()
-        if not raw:
-            return False
-        low = raw.lower()
-        if "file" in low or "pdf" in low:
-            return True
-        if ("文件" in raw) or ("附件" in raw):
-            return True
-        return False
-
-    @staticmethod
-    def _sanitize_agent_scope(value: str) -> str:
-        raw = str(value or "").strip()
-        if not raw:
-            return "default"
-        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", raw).strip("._-")
-        if not safe:
-            return "default"
-        if len(safe) > 48:
-            safe = safe[:48]
-        return safe
-
-    @staticmethod
-    def _sanitize_agent_filename(name: str) -> str:
-        raw = str(name or "").strip().replace("\\", "/")
-        base = os.path.basename(raw)
-        if not base:
-            base = "upload.txt"
-        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", base).strip("._")
-        if not safe:
-            safe = "upload.txt"
-        if len(safe) > 96:
-            root, ext = os.path.splitext(safe)
-            if ext:
-                keep_root = max(1, 96 - len(ext))
-                safe = root[:keep_root] + ext
-            else:
-                safe = safe[:96]
-        return safe
-
-    def _agent_root_display(self) -> str:
-        root = os.path.abspath(self.agent_files_root)
-        rel = os.path.relpath(root, os.getcwd()).replace("\\", "/")
-        if rel == ".":
-            return "."
-        if not rel.startswith("../"):
-            return f"./{rel}"
-        return root.replace("\\", "/")
-
-    def _store_agent_file_block(self, file_name: str, payload: str, thread_key: str):
-        scope = self._sanitize_agent_scope(thread_key)
-        target_dir = os.path.join(self.agent_files_root, scope)
-        os.makedirs(target_dir, exist_ok=True)
-
-        safe_name = self._sanitize_agent_filename(file_name)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        final_name = f"{stamp}_{uuid.uuid4().hex[:8]}_{safe_name}"
-        abs_path = os.path.join(target_dir, final_name)
-
-        text = str(payload or "")
-        with open(abs_path, "w", encoding="utf-8", errors="replace") as f:
-            f.write(text)
-
-        rel = os.path.relpath(abs_path, start=os.getcwd()).replace("\\", "/")
-        display_path = abs_path if rel.startswith("..") else f"./{rel}"
-        return {
-            "name": safe_name,
-            "path": display_path,
-            "chars": len(text),
-        }
-
-    def _extract_and_store_file_blocks(self, text: str, thread_key: str):
-        raw = str(text or "")
-        if raw == "" or "---" not in raw:
-            return raw, []
-
-        header_re = re.compile(r"^\s*---\s*([^:]+)\s*:\s*(.*?)\s*---\s*$")
-        kept = []
-        saved = []
-        in_file = False
-        current_name = ""
-        current_lines = []
-
-        def flush_file_block():
-            nonlocal in_file, current_name, current_lines
-            if not in_file:
-                return
-            payload = "\n".join(current_lines)
-            saved.append(self._store_agent_file_block(current_name or "upload.txt", payload, thread_key))
-            in_file = False
-            current_name = ""
-            current_lines = []
-
-        for line in raw.splitlines():
-            m = header_re.match(line.strip())
-            if m:
-                label = str(m.group(1) or "").strip()
-                name = str(m.group(2) or "").strip()
-                if self._is_file_attachment_label(label):
-                    flush_file_block()
-                    in_file = True
-                    current_name = name or "upload.txt"
-                    current_lines = []
-                    continue
-
-                if in_file:
-                    flush_file_block()
-                kept.append(line)
-                continue
-
-            if in_file:
-                current_lines.append(line)
-            else:
-                kept.append(line)
-
-        if in_file:
-            flush_file_block()
-
-        return "\n".join(kept).strip(), saved
-
-    def _build_file_manifest_note(self, saved_files):
-        if not saved_files:
-            return ""
-        listed = saved_files[: self.agent_file_manifest_max_items]
-        lines = [
-            f"[附件已保存到 {self._agent_root_display()}，正文未直接注入上下文]",
-        ]
-        for item in listed:
-            lines.append(
-                f"- {item.get('name')}: {item.get('path')} (chars={int(item.get('chars') or 0)})"
-            )
-        rest = len(saved_files) - len(listed)
-        if rest > 0:
-            lines.append(f"- ... ({rest} more files)")
-        lines.append("如果需要读取内容，请先规划，再调用 list_agent_files / read_agent_file 按需分段读取。")
-        return "\n".join(lines)
-
-    def _extract_last_user_text(self, messages, chunk_chars: int = 4096, max_chars=None, thread_key: str = "") -> str:
-        if not isinstance(messages, list):
-            return ""
-        for msg in reversed(messages):
-            if not isinstance(msg, dict):
-                continue
-            if str(msg.get("role", "")).lower() != "user":
-                continue
-            text = self._content_to_text(
-                msg.get("content"),
-                chunk_chars=chunk_chars,
-            )
-            stripped, saved_files = self._extract_and_store_file_blocks(text, thread_key)
-            stripped = stripped.strip()
-            truncated = False
-
-            if not stripped and not saved_files:
-                continue
-
-            manifest_note = self._build_file_manifest_note(saved_files)
-            if manifest_note:
-                if stripped:
-                    stripped = stripped + "\n\n" + manifest_note
-                else:
-                    stripped = manifest_note
-
-            if max_chars is not None:
-                limit = max(0, int(max_chars))
-                if len(stripped) > limit:
-                    stripped = stripped[:limit].rstrip()
-                    truncated = True
-
-            if truncated:
-                stripped = (
-                    stripped
-                    + "\n\n[Input truncated for this turn after chunked read to protect context limits. "
-                    + "If needed, send the next chunk.]"
-                )
-            return stripped
-        return ""
-
-    @classmethod
-    def _extract_first_role_text(cls, messages, role: str, chunk_chars: int = 4096, max_chars=None) -> str:
-        if not isinstance(messages, list):
-            return ""
-        role_l = str(role or "").lower()
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if str(msg.get("role", "")).lower() != role_l:
-                continue
-            text = cls._content_to_text(
-                msg.get("content"),
-                chunk_chars=chunk_chars,
-                max_chars=max_chars,
-            )
-            if text.strip():
-                return text.strip()
-        return ""
-
-    def _debug_session_log(self, text: str):
-        if self.session_debug:
-            print(f"[WebUIBridge][Session] {text}")
-
-    def _resolve_session_key(self, payload, handler: BaseHTTPRequestHandler):
-        if isinstance(payload, dict):
-            metadata = payload.get("metadata")
-            if isinstance(metadata, dict):
-                for field in self.SESSION_ID_FIELDS:
-                    raw = metadata.get(field)
-                    if raw is None:
-                        continue
-                    value = str(raw).strip()
-                    if value:
-                        return value, f"metadata.{field}"
-
-            for field in self.SESSION_ID_FIELDS:
-                raw = payload.get(field)
-                if raw is None:
-                    continue
-                value = str(raw).strip()
-                if value:
-                    return value, f"payload.{field}"
-
-        header_value = handler.headers.get(self.session_header_name)
-        if header_value and str(header_value).strip():
-            return str(header_value).strip(), f"header.{self.session_header_name}"
-
-        fixed = str(self.primary_session_key or "").strip()
-        if fixed:
-            return fixed, "fallback.primary_session"
-
-        messages = payload.get("messages") if isinstance(payload, dict) else None
-        first_system = self._extract_first_role_text(
-            messages,
-            "system",
-            chunk_chars=self.webui_input_chunk_chars,
-            max_chars=self.webui_fingerprint_text_max_chars,
-        )
-        first_user = self._extract_first_role_text(
-            messages,
-            "user",
-            chunk_chars=self.webui_input_chunk_chars,
-            max_chars=self.webui_fingerprint_text_max_chars,
-        )
-        user_agent = str(handler.headers.get("User-Agent", "") or "")
-        client_ip = ""
-        try:
-            client_ip = str(handler.client_address[0] or "")
-        except Exception:
-            client_ip = ""
-        key_src = "\x1f".join([first_system, first_user, client_ip, user_agent])
-        digest = hashlib.sha1(key_src.encode("utf-8", errors="ignore")).hexdigest()
-        session_key = f"fb-{digest}"
-        if session_key not in self._fallback_warned:
-            self._fallback_warned.add(session_key)
-            print(f"[WebUIBridge][WARN] Session key missing, fallback fingerprint used: {session_key}")
-        return session_key, "fallback.sha1"
-
-    def _resolve_thread_key(self, payload, handler: BaseHTTPRequestHandler, session_key: str):
-        if isinstance(payload, dict):
-            metadata = payload.get("metadata")
-            if isinstance(metadata, dict):
-                raw = metadata.get(self.THREAD_ID_FIELD)
-                if raw is not None:
-                    value = str(raw).strip()
-                    if value:
-                        return value, f"metadata.{self.THREAD_ID_FIELD}"
-
-            raw = payload.get(self.THREAD_ID_FIELD)
-            if raw is not None:
-                value = str(raw).strip()
-                if value:
-                    return value, f"payload.{self.THREAD_ID_FIELD}"
-
-        header_value = handler.headers.get(self.thread_header_name)
-        if header_value and str(header_value).strip():
-            return str(header_value).strip(), f"header.{self.thread_header_name}"
-
-        fallback_key = str(session_key or "").strip()
-        if not fallback_key:
-            fallback_key = "default"
-        warn_key = f"{fallback_key}"
-        if warn_key not in self._thread_fallback_warned:
-            self._thread_fallback_warned.add(warn_key)
-            print(f"[WebUIBridge][WARN] Thread key missing, fallback to session key: {fallback_key}")
-        return fallback_key, "fallback.session_key"
-
-    def _resolve_session_role(self, session_key: str):
-        now = float(time.time())
-        fixed = str(self.primary_session_key or "").strip()
-        if fixed:
-            if session_key == fixed:
-                self._primary_session_alias = None
-                role = "primary"
-            elif self._primary_session_alias and session_key == self._primary_session_alias:
-                role = "primary"
-            elif self._primary_last_seen_ts <= 0 and not self._primary_session_alias:
-                self._primary_session_alias = session_key
-                role = "primary"
-                print(
-                    "[WebUIBridge][Session] Primary session bootstrap: "
-                    f"{session_key} -> {fixed}"
-                )
-            else:
-                role = "observer"
-            if role == "primary":
-                self._primary_last_seen_ts = now
-            mode = "fixed_bootstrap" if self._primary_session_alias else "fixed"
-            return role, mode, fixed, self._primary_last_seen_ts
-
-        if (
-            (not self._auto_primary_session)
-            or self._primary_last_seen_ts <= 0
-            or (now - self._primary_last_seen_ts) > float(self.primary_idle_ttl_sec)
-        ):
-            self._auto_primary_session = session_key
-            self._primary_last_seen_ts = now
-
-        role = "primary" if session_key == self._auto_primary_session else "observer"
-        if role == "primary":
-            self._primary_last_seen_ts = now
-        return role, "auto", self._auto_primary_session, self._primary_last_seen_ts
-
-    @staticmethod
-    def _header_safe(value) -> str:
-        return str(value or "").replace("\r", " ").replace("\n", " ").strip()
-
-    def _build_session_response_headers(
-        self,
-        session_key: str,
-        session_role: str,
-        session_source: str,
-        thread_key: str,
-        thread_source: str,
-    ):
-        return [
-            ("X-Mori-Session-Key", self._header_safe(session_key)),
-            ("X-Mori-Session-Role", self._header_safe(session_role)),
-            ("X-Mori-Session-Source", self._header_safe(session_source)),
-            ("X-Mori-Thread-Key", self._header_safe(thread_key)),
-            ("X-Mori-Thread-Source", self._header_safe(thread_source)),
-        ]
-
-    def _session_status_payload(self):
-        mode = "fixed" if self.primary_session_key else "auto"
-        primary = self.primary_session_key if mode == "fixed" else self._auto_primary_session
-        last_seen = int(self._primary_last_seen_ts) if self._primary_last_seen_ts > 0 else None
-        return {
-            "primary_session": primary,
-            "policy": self.non_primary_policy,
-            "mode": mode,
-            "ttl_sec": int(self.primary_idle_ttl_sec),
-            "last_seen_ts": last_seen,
-            "session_header": self.session_header_name,
-            "thread_header": self.thread_header_name,
-            "primary_alias": self._primary_session_alias,
-        }
-
-    @classmethod
-    def _history_unescape_field(cls, value: str) -> str:
-        s = str(value or "")
-        out = []
-        i = 0
-        n = len(s)
-        while i < n:
-            ch = s[i]
-            if ch != "\\":
-                out.append(ch)
-                i += 1
-                continue
-
-            if i + 1 >= n:
-                out.append("\\")
-                i += 1
-                continue
-
-            n1 = s[i + 1]
-            if n1 == "\\":
-                out.append("\\")
-                i += 2
-            elif n1 == "n":
-                out.append("\n")
-                i += 2
-            elif n1 == "x" and i + 3 < n:
-                hx = s[i + 2 : i + 4]
-                if hx == "1F":
-                    out.append(cls.HISTORY_FIELD_SEP)
-                    i += 4
-                elif hx == "1E":
-                    out.append("\x1E")
-                    i += 4
-                else:
-                    out.append("\\")
-                    i += 1
-            else:
-                out.append("\\")
-                i += 1
-        return "".join(out)
-
-    @classmethod
-    def _parse_history_line(cls, line: str):
-        raw = str(line or "")
-        if cls.HISTORY_FIELD_SEP not in raw:
-            return cls._history_unescape_field(raw), ""
-        user_part, assistant_part = raw.split(cls.HISTORY_FIELD_SEP, 1)
-        return cls._history_unescape_field(user_part), cls._history_unescape_field(assistant_part)
-
-    def _load_history_pairs(self):
-        path = self.history_file_path
-        if not path or not os.path.exists(path):
-            return []
-        out = []
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                header = f.readline().rstrip("\r\n")
-                if header != self.HISTORY_HEADER:
-                    return []
-                for line in f:
-                    raw = line.rstrip("\r\n")
-                    if raw == "":
-                        continue
-                    user_text, assistant_text = self._parse_history_line(raw)
-                    out.append({"user": user_text, "assistant": assistant_text})
-        except Exception as e:
-            print(f"[WebUIBridge][WARN] Failed to read history for bootstrap: {e}")
-            return []
-        return out
-
-    def _build_webui_bootstrap_payload(self):
-        primary = str(self.primary_session_key or "").strip() or "mori"
-        return {
-            "primary_session": primary,
-            "conversation_name": self.primary_conversation_name,
-            "history": self._load_history_pairs(),
-        }
-
-    def _build_webui_bootstrap_script(self) -> str:
-        payload_json = json.dumps(self._build_webui_bootstrap_payload(), ensure_ascii=False).replace("</", "<\\/")
-        session_header_json = json.dumps(self.session_header_name, ensure_ascii=False).replace("</", "<\\/")
-        thread_header_json = json.dumps(self.thread_header_name, ensure_ascii=False).replace("</", "<\\/")
-        return (
-            "<script data-mori-webui-bootstrap=\"1\">\n"
-            "(function () {\n"
-            "  if (window.__moriWebuiBootstrapInstalled) return;\n"
-            "  window.__moriWebuiBootstrapInstalled = true;\n"
-            "  const BOOT = "
-            + payload_json
-            + ";\n"
-            "  const DB_NAME = 'LlamacppWebui';\n"
-            "  const DB_VERSION = 1;\n"
-            "  const PRIMARY_ID = String(BOOT.primary_session || 'mori').trim() || 'mori';\n"
-            "  const PRIMARY_NAME = String(BOOT.conversation_name || 'Mori').trim() || 'Mori';\n"
-            "  const HISTORY = Array.isArray(BOOT.history) ? BOOT.history : [];\n"
-            "  const SESSION_HEADER = "
-            + session_header_json
-            + ";\n"
-            "  const THREAD_HEADER = "
-            + thread_header_json
-            + ";\n"
-            "  const RELOAD_KEY = '__mori_bootstrap_reload_once__';\n"
-            "  const makeId = function () {\n"
-            "    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {\n"
-            "      return globalThis.crypto.randomUUID();\n"
-            "    }\n"
-            "    return 'mori-' + Math.random().toString(16).slice(2) + Date.now().toString(16);\n"
-            "  };\n"
-            "  const reqToPromise = function (req) {\n"
-            "    return new Promise(function (resolve, reject) {\n"
-            "      req.onsuccess = function () { resolve(req.result); };\n"
-            "      req.onerror = function () { reject(req.error || new Error('IndexedDB request failed')); };\n"
-            "    });\n"
-            "  };\n"
-            "  const txDone = function (tx) {\n"
-            "    return new Promise(function (resolve, reject) {\n"
-            "      tx.oncomplete = function () { resolve(); };\n"
-            "      tx.onerror = function () { reject(tx.error || new Error('IndexedDB transaction failed')); };\n"
-            "      tx.onabort = function () { reject(tx.error || new Error('IndexedDB transaction aborted')); };\n"
-            "    });\n"
-            "  };\n"
-            "  const openDb = function () {\n"
-            "    return new Promise(function (resolve, reject) {\n"
-            "      const req = indexedDB.open(DB_NAME, DB_VERSION);\n"
-            "      req.onupgradeneeded = function () {\n"
-            "        const db = req.result;\n"
-            "        const tx = req.transaction;\n"
-            "        let convStore = null;\n"
-            "        let msgStore = null;\n"
-            "        if (!db.objectStoreNames.contains('conversations')) {\n"
-            "          convStore = db.createObjectStore('conversations', { keyPath: 'id' });\n"
-            "        } else if (tx) {\n"
-            "          convStore = tx.objectStore('conversations');\n"
-            "        }\n"
-            "        if (convStore) {\n"
-            "          if (!convStore.indexNames.contains('lastModified')) convStore.createIndex('lastModified', 'lastModified');\n"
-            "          if (!convStore.indexNames.contains('currNode')) convStore.createIndex('currNode', 'currNode');\n"
-            "          if (!convStore.indexNames.contains('name')) convStore.createIndex('name', 'name');\n"
-            "        }\n"
-            "        if (!db.objectStoreNames.contains('messages')) {\n"
-            "          msgStore = db.createObjectStore('messages', { keyPath: 'id' });\n"
-            "        } else if (tx) {\n"
-            "          msgStore = tx.objectStore('messages');\n"
-            "        }\n"
-            "        if (msgStore) {\n"
-            "          if (!msgStore.indexNames.contains('convId')) msgStore.createIndex('convId', 'convId');\n"
-            "          if (!msgStore.indexNames.contains('type')) msgStore.createIndex('type', 'type');\n"
-            "          if (!msgStore.indexNames.contains('role')) msgStore.createIndex('role', 'role');\n"
-            "          if (!msgStore.indexNames.contains('timestamp')) msgStore.createIndex('timestamp', 'timestamp');\n"
-            "          if (!msgStore.indexNames.contains('parent')) msgStore.createIndex('parent', 'parent');\n"
-            "          if (!msgStore.indexNames.contains('children')) msgStore.createIndex('children', 'children');\n"
-            "        }\n"
-            "      };\n"
-            "      req.onsuccess = function () { resolve(req.result); };\n"
-            "      req.onerror = function () { reject(req.error || new Error('Open IndexedDB failed')); };\n"
-            "    });\n"
-            "  };\n"
-            "  const hasRequiredStores = function (db) {\n"
-            "    if (!db || !db.objectStoreNames) return false;\n"
-            "    return db.objectStoreNames.contains('conversations') && db.objectStoreNames.contains('messages');\n"
-            "  };\n"
-            "  const deleteDb = function () {\n"
-            "    return new Promise(function (resolve, reject) {\n"
-            "      const req = indexedDB.deleteDatabase(DB_NAME);\n"
-            "      req.onsuccess = function () { resolve(); };\n"
-            "      req.onerror = function () { reject(req.error || new Error('Delete IndexedDB failed')); };\n"
-            "      req.onblocked = function () { reject(new Error('Delete IndexedDB blocked by another tab')); };\n"
-            "    });\n"
-            "  };\n"
-            "  const openDbWithSchema = async function () {\n"
-            "    let db = await openDb();\n"
-            "    if (hasRequiredStores(db)) return db;\n"
-            "    try { db.close(); } catch (_e) {}\n"
-            "    await deleteDb();\n"
-            "    db = await openDb();\n"
-            "    if (!hasRequiredStores(db)) {\n"
-            "      try { db.close(); } catch (_e) {}\n"
-            "      throw new Error('IndexedDB schema is invalid');\n"
-            "    }\n"
-            "    return db;\n"
-            "  };\n"
-            "  const sleep = function (ms) {\n"
-            "    return new Promise(function (resolve) { setTimeout(resolve, ms); });\n"
-            "  };\n"
-            "  const waitForStores = async function (maxAttempts, intervalMs) {\n"
-            "    let lastError = null;\n"
-            "    for (let i = 0; i < maxAttempts; i += 1) {\n"
-            "      try {\n"
-            "        return await openDbWithSchema();\n"
-            "      } catch (err) {\n"
-            "        lastError = err;\n"
-            "      }\n"
-            "      await sleep(intervalMs);\n"
-            "    }\n"
-            "    if (lastError) throw lastError;\n"
-            "    throw new Error('IndexedDB stores are not ready');\n"
-            "  };\n"
-            "  const extractActiveChatId = function () {\n"
-            "    const hash = String(window.location.hash || '');\n"
-            "    const m = hash.match(/^#\\/chat\\/([^/?#]+)/);\n"
-            "    if (!m || !m[1]) return '';\n"
-            "    try { return decodeURIComponent(m[1]); } catch (_e) { return m[1]; }\n"
-            "  };\n"
-            "  const patchFetch = function () {\n"
-            "    if (window.__moriFetchPatched) return;\n"
-            "    const originalFetch = (typeof window.fetch === 'function') ? window.fetch.bind(window) : null;\n"
-            "    if (!originalFetch) return;\n"
-            "    window.__moriFetchPatched = true;\n"
-            "    window.fetch = function (input, init) {\n"
-            "      try {\n"
-            "        const rawUrl = (typeof input === 'string') ? input : ((input && input.url) ? input.url : '');\n"
-            "        const url = new URL(rawUrl, window.location.href);\n"
-            "        if (url.pathname.endsWith('/v1/chat/completions')) {\n"
-            "          const activeId = extractActiveChatId() || PRIMARY_ID;\n"
-            "          const nextInit = Object.assign({}, init || {});\n"
-            "          const baseHeaders = (nextInit && nextInit.headers) || ((input instanceof Request) ? input.headers : undefined);\n"
-            "          const headers = new Headers(baseHeaders || {});\n"
-            "          headers.set(SESSION_HEADER, activeId);\n"
-            "          headers.set(THREAD_HEADER, activeId);\n"
-            "          nextInit.headers = headers;\n"
-            "          if (typeof nextInit.body === 'string') {\n"
-            "            try {\n"
-            "              const payload = JSON.parse(nextInit.body);\n"
-            "              if (payload && typeof payload === 'object') {\n"
-            "                if (!payload.metadata || typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)) {\n"
-            "                  payload.metadata = {};\n"
-            "                }\n"
-            "                if (!payload.metadata.conversation_id) payload.metadata.conversation_id = activeId;\n"
-            "                if (!payload.metadata.thread_id) payload.metadata.thread_id = activeId;\n"
-            "                nextInit.body = JSON.stringify(payload);\n"
-            "              }\n"
-            "            } catch (_e) {}\n"
-            "          }\n"
-            "          return originalFetch(input, nextInit);\n"
-            "        }\n"
-            "      } catch (_e) {}\n"
-            "      return originalFetch(input, init);\n"
-            "    };\n"
-            "  };\n"
-            "  const normalizeHistory = function () {\n"
-            "    const turns = [];\n"
-            "    for (let i = 0; i < HISTORY.length; i += 1) {\n"
-            "      const item = HISTORY[i] || {};\n"
-            "      const user = typeof item.user === 'string' ? item.user : '';\n"
-            "      const assistant = typeof item.assistant === 'string' ? item.assistant : '';\n"
-            "      if (!user && !assistant) continue;\n"
-            "      turns.push({ user: user, assistant: assistant, userId: makeId(), assistantId: makeId() });\n"
-            "    }\n"
-            "    return turns;\n"
-            "  };\n"
-            "  const createConversationFromHistory = async function () {\n"
-            "    if (typeof indexedDB === 'undefined') return false;\n"
-            "    const db = await waitForStores(30, 120);\n"
-            "    try {\n"
-            "      const tx = db.transaction(['conversations', 'messages'], 'readwrite');\n"
-            "      const done = txDone(tx);\n"
-            "      const convStore = tx.objectStore('conversations');\n"
-            "      const msgStore = tx.objectStore('messages');\n"
-            "      const byId = await reqToPromise(convStore.get(PRIMARY_ID));\n"
-            "      if (byId) {\n"
-            "        await done;\n"
-            "        return false;\n"
-            "      }\n"
-            "      const allConversations = await reqToPromise(convStore.getAll());\n"
-            "      if (Array.isArray(allConversations)) {\n"
-            "        for (let i = 0; i < allConversations.length; i += 1) {\n"
-            "          const conv = allConversations[i];\n"
-            "          if (conv && String(conv.name || '').trim() === PRIMARY_NAME) {\n"
-            "            await done;\n"
-            "            return false;\n"
-            "          }\n"
-            "        }\n"
-            "      }\n"
-            "      let ts = Date.now();\n"
-            "      if (!Number.isFinite(ts)) ts = 0;\n"
-            "      const turns = normalizeHistory();\n"
-            "      const conversation = { id: PRIMARY_ID, name: PRIMARY_NAME, lastModified: ts, currNode: '' };\n"
-            "      await reqToPromise(convStore.add(conversation));\n"
-            "      if (turns.length > 0) {\n"
-            "        const rootId = makeId();\n"
-            "        const firstUserId = turns[0].userId;\n"
-            "        await reqToPromise(msgStore.add({\n"
-            "          id: rootId,\n"
-            "          convId: PRIMARY_ID,\n"
-            "          type: 'root',\n"
-            "          timestamp: ts,\n"
-            "          role: 'system',\n"
-            "          content: '',\n"
-            "          parent: null,\n"
-            "          toolCalls: '',\n"
-            "          children: [firstUserId]\n"
-            "        }));\n"
-            "        for (let i = 0; i < turns.length; i += 1) {\n"
-            "          const turn = turns[i];\n"
-            "          const prevAssistantId = i > 0 ? turns[i - 1].assistantId : rootId;\n"
-            "          const nextUserId = i + 1 < turns.length ? turns[i + 1].userId : null;\n"
-            "          ts += 1;\n"
-            "          await reqToPromise(msgStore.add({\n"
-            "            id: turn.userId,\n"
-            "            convId: PRIMARY_ID,\n"
-            "            type: 'text',\n"
-            "            timestamp: ts,\n"
-            "            role: 'user',\n"
-            "            content: String(turn.user || ''),\n"
-            "            parent: prevAssistantId,\n"
-            "            toolCalls: '',\n"
-            "            children: [turn.assistantId]\n"
-            "          }));\n"
-            "          ts += 1;\n"
-            "          await reqToPromise(msgStore.add({\n"
-            "            id: turn.assistantId,\n"
-            "            convId: PRIMARY_ID,\n"
-            "            type: 'text',\n"
-            "            timestamp: ts,\n"
-            "            role: 'assistant',\n"
-            "            content: String(turn.assistant || ''),\n"
-            "            parent: turn.userId,\n"
-            "            toolCalls: '',\n"
-            "            children: nextUserId ? [nextUserId] : []\n"
-            "          }));\n"
-            "        }\n"
-            "        conversation.currNode = turns[turns.length - 1].assistantId;\n"
-            "        conversation.lastModified = ts;\n"
-            "        await reqToPromise(convStore.put(conversation));\n"
-            "      }\n"
-            "      await done;\n"
-            "      return true;\n"
-            "    } finally {\n"
-            "      db.close();\n"
-            "    }\n"
-            "  };\n"
-            "  patchFetch();\n"
-            "  createConversationFromHistory()\n"
-            "    .then(function (created) {\n"
-            "      if (!created) return;\n"
-            "      if (!window.sessionStorage) return;\n"
-            "      if (sessionStorage.getItem(RELOAD_KEY) === '1') return;\n"
-            "      sessionStorage.setItem(RELOAD_KEY, '1');\n"
-            "      window.location.reload();\n"
-            "    })\n"
-            "    .catch(function (err) {\n"
-            "      console.warn('[MoriWebUI] bootstrap failed:', err);\n"
-            "    });\n"
-            "})();\n"
-            "</script>"
-        )
-
-    def _inject_webui_bootstrap_html(self, body: bytes) -> bytes:
-        if not body:
-            return body
-        html = body.decode("utf-8", errors="replace")
-        if "__moriWebuiBootstrapInstalled" in html:
-            return body
-        script = self._build_webui_bootstrap_script()
-        lower = html.lower()
-        head_pos = lower.rfind("</head>")
-        if head_pos >= 0:
-            html = html[:head_pos] + script + "\n" + html[head_pos:]
-        else:
-            body_pos = lower.rfind("</body>")
-            if body_pos >= 0:
-                html = html[:body_pos] + script + "\n" + html[body_pos:]
-            else:
-                html = html + "\n" + script
-        return html.encode("utf-8")
-
-    def _inject_webui_bootstrap_body(self, body: bytes, content_encoding: str) -> bytes:
-        enc = str(content_encoding or "").lower()
-        if "gzip" not in enc:
-            return self._inject_webui_bootstrap_html(body)
-
-        try:
-            decoded = gzip.decompress(body)
-        except Exception as e:
-            print(f"[WebUIBridge][WARN] Failed to decode gzip HTML for bootstrap injection: {e}")
-            return body
-
-        injected = self._inject_webui_bootstrap_html(decoded)
-        try:
-            return gzip.compress(injected)
-        except Exception as e:
-            print(f"[WebUIBridge][WARN] Failed to encode gzip HTML after bootstrap injection: {e}")
-            return body
-
-    def _send_json(self, handler: BaseHTTPRequestHandler, status: int, payload, extra_headers=None):
+    def _send_json(self, handler: BaseHTTPRequestHandler, status: int, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
             handler.send_response(int(status))
             handler.send_header("Content-Type", "application/json; charset=utf-8")
-            if extra_headers:
-                for key, value in extra_headers:
-                    handler.send_header(str(key), str(value))
             handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
-            handler.wfile.write(body)
+            if handler.command != "HEAD":
+                handler.wfile.write(body)
         except Exception as e:
             if self._is_client_disconnect_error(e):
                 return False
             raise
         return True
 
-    def _send_oai_error(self, handler: BaseHTTPRequestHandler, status: int, message: str, extra_headers=None):
+    def _send_oai_error(self, handler: BaseHTTPRequestHandler, status: int, message: str):
         err_type = "server_error" if int(status) >= 500 else "invalid_request_error"
         payload = {
             "error": {
@@ -2920,127 +2173,81 @@ class MoriWebUIChainBridge:
                 "type": err_type,
             }
         }
-        return self._send_json(handler, status, payload, extra_headers=extra_headers)
+        return self._send_json(handler, status, payload)
 
-    def _relay_response(self, handler: BaseHTTPRequestHandler, status: int, headers, body: bytes, extra_headers=None):
-        try:
-            handler.send_response(int(status))
-            for key, value in headers:
-                low = str(key).lower()
-                if low in self.HOP_BY_HOP_HEADERS:
-                    continue
-                if low in {"content-length", "server", "date"}:
-                    continue
-                handler.send_header(key, value)
-            if extra_headers:
-                for key, value in extra_headers:
-                    handler.send_header(str(key), str(value))
-            handler.send_header("Content-Length", str(len(body or b"")))
-            handler.end_headers()
-            if body:
-                handler.wfile.write(body)
-        except Exception as e:
-            if self._is_client_disconnect_error(e):
-                return False
-            raise
-        return True
-
-    def _relay_stream_response(self, handler: BaseHTTPRequestHandler, status: int, headers, stream, extra_headers=None):
-        try:
-            handler.send_response(int(status))
-            for key, value in headers:
-                low = str(key).lower()
-                if low in self.HOP_BY_HOP_HEADERS:
-                    continue
-                if low in {"content-length", "server", "date"}:
-                    continue
-                handler.send_header(key, value)
-            if extra_headers:
-                for key, value in extra_headers:
-                    handler.send_header(str(key), str(value))
-            handler.end_headers()
-
-            while True:
-                chunk = stream.read(4096)
-                if not chunk:
-                    break
-                handler.wfile.write(chunk)
-                handler.wfile.flush()
-        except Exception as e:
-            if self._is_client_disconnect_error(e):
-                return False
-            raise
-        return True
-
-    def _proxy_request(
+    def _send_bytes(
         self,
         handler: BaseHTTPRequestHandler,
+        status: int,
         body: bytes,
-        extra_response_headers=None,
-        stream_response: bool = False,
-        inject_webui_bootstrap: bool = False,
+        content_type: str,
     ):
-        url = f"{self.upstream_base_url}{handler.path}"
-        data = body if handler.command in {"POST", "PUT", "PATCH", "DELETE"} else None
-        req = urllib.request.Request(url, data=data, method=handler.command)
-
-        for key, value in handler.headers.items():
-            low = str(key).lower()
-            if low in self.HOP_BY_HOP_HEADERS:
-                continue
-            if low in {"host", "content-length"}:
-                continue
-            req.add_header(key, value)
-        if self.upstream_api_key:
-            req.add_header("Authorization", f"Bearer {self.upstream_api_key}")
-
+        payload = body or b""
         try:
-            with urllib.request.urlopen(req, timeout=3600) as resp:
-                content_type = str(resp.headers.get("Content-Type", "")).lower()
-                should_stream = bool(stream_response) or content_type.startswith("text/event-stream")
-                if should_stream:
-                    self._relay_stream_response(
-                        handler,
-                        int(resp.status),
-                        resp.getheaders(),
-                        resp,
-                        extra_headers=extra_response_headers,
-                    )
-                else:
-                    resp_body = resp.read()
-                    if inject_webui_bootstrap and "text/html" in content_type:
-                        content_encoding = str(resp.headers.get("Content-Encoding", "")).lower()
-                        resp_body = self._inject_webui_bootstrap_body(resp_body, content_encoding)
-                    self._relay_response(
-                        handler,
-                        int(resp.status),
-                        resp.getheaders(),
-                        resp_body,
-                        extra_headers=extra_response_headers,
-                    )
-                return
-        except urllib.error.HTTPError as e:
-            err_body = e.read()
-            hdrs = e.headers.items() if e.headers else []
-            self._relay_response(
-                handler,
-                int(e.code),
-                hdrs,
-                err_body,
-                extra_headers=extra_response_headers,
-            )
-            return
+            handler.send_response(int(status))
+            handler.send_header("Content-Type", str(content_type))
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            if payload and handler.command != "HEAD":
+                handler.wfile.write(payload)
         except Exception as e:
             if self._is_client_disconnect_error(e):
-                return
-            self._send_oai_error(
-                handler,
-                502,
-                f"Proxy upstream failed: {e}",
-                extra_headers=extra_response_headers,
-            )
+                return False
+            raise
+        return True
 
-    def _write_sse_data(self, handler: BaseHTTPRequestHandler, payload) -> bool:
+    def _read_body(self, handler: BaseHTTPRequestHandler):
+        content_length = handler.headers.get("Content-Length")
+        if not content_length:
+            return b"", None
+        try:
+            n = int(content_length)
+        except ValueError:
+            return None, "Invalid Content-Length header."
+        if n <= 0:
+            return b"", None
+        if n > self.max_body_bytes:
+            return None, f"Request body too large: {n} bytes > max {self.max_body_bytes} bytes."
+        body = handler.rfile.read(n)
+        if len(body) > self.max_body_bytes:
+            return None, f"Request body too large: {len(body)} bytes > max {self.max_body_bytes} bytes."
+        return body, None
+
+    def _read_json_payload(self, handler: BaseHTTPRequestHandler):
+        body, body_err = self._read_body(handler)
+        if body_err:
+            return None, body_err
+        if not body:
+            return {}, None
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            return None, f"Invalid JSON payload: {e}"
+        if not isinstance(payload, dict):
+            return None, "JSON payload must be an object."
+        return payload, None
+
+    def _extract_chat_input(self, payload):
+        message = str(payload.get("message", "")).strip()
+        if message == "":
+            message = ""
+        thread_id = str(payload.get("thread_id", "")).strip() or self.session_key
+        saved_files, file_err = self._store_uploaded_files(payload.get("files"), thread_id)
+        if file_err:
+            return None, None, None, file_err
+
+        if message == "" and not saved_files:
+            return None, None, None, "Either 'message' or 'files' must be provided."
+
+        manifest = self._build_upload_manifest_text(saved_files)
+        if manifest:
+            if message:
+                message = message + "\n\n" + manifest
+            else:
+                message = "我上传了附件，请先读取后再回答。\n\n" + manifest
+        return message, thread_id, saved_files, None
+
+    def _send_sse_data(self, handler: BaseHTTPRequestHandler, payload) -> bool:
         try:
             if payload is None:
                 line = b"data: [DONE]\n\n"
@@ -3054,245 +2261,184 @@ class MoriWebUIChainBridge:
             raise
         return True
 
-    @staticmethod
-    def _normalize_webui_text(text: str) -> str:
-        out = str(text or "")
-        # WebUI markdown 解析较激进：将常见语法符号做实体转义，避免误渲染
-        out = out.replace("&", "&amp;")
-        out = out.replace("`", "&#96;")
-        out = out.replace("*", "&#42;")
-        out = out.replace("_", "&#95;")
-        out = out.replace("[", "&#91;").replace("]", "&#93;")
-        out = out.replace("(", "&#40;").replace(")", "&#41;")
-        return out
+    def _handle_chat_sync(self, handler: BaseHTTPRequestHandler):
+        payload, err = self._read_json_payload(handler)
+        if err:
+            status = 413 if str(err).lower().startswith("request body too large") else 400
+            self._send_oai_error(handler, status, err)
+            return
 
-    def _send_stream_completion(self, handler: BaseHTTPRequestHandler, model: str, chat_payload, extra_headers=None):
-        created = int(time.time())
-        req_id = f"chatcmpl-{uuid.uuid4().hex}"
-        last_chunk = {
-            "id": req_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
+        user_text, thread_id, saved_files, input_err = self._extract_chat_input(payload)
+        if input_err:
+            self._send_oai_error(handler, 400, input_err)
+            return
+
+        try:
+            assistant_text = str(self.chat_handler(user_text, None, thread_id, False) or "")
+        except Exception as e:
+            self._send_oai_error(handler, 500, f"Chain execution failed: {e}")
+            return
+
+        self._send_json(
+            handler,
+            200,
+            {
+                "text": assistant_text,
+                "thread_id": thread_id,
+                "model": self.model_name,
+                "uploaded_files": saved_files or [],
+            },
+        )
+
+    def _handle_chat_stream(self, handler: BaseHTTPRequestHandler):
+        payload, err = self._read_json_payload(handler)
+        if err:
+            status = 413 if str(err).lower().startswith("request body too large") else 400
+            self._send_oai_error(handler, status, err)
+            return
+
+        user_text, thread_id, saved_files, input_err = self._extract_chat_input(payload)
+        if input_err:
+            self._send_oai_error(handler, 400, input_err)
+            return
 
         try:
             handler.send_response(200)
             handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
             handler.send_header("Cache-Control", "no-cache")
             handler.send_header("Connection", "close")
-            if extra_headers:
-                for key, value in extra_headers:
-                    handler.send_header(str(key), str(value))
             handler.end_headers()
         except Exception as e:
             if self._is_client_disconnect_error(e):
                 return
             raise
 
-        # 先发 role chunk，兼容依赖 OpenAI 风格首块的客户端
-        role_chunk = {
-            "id": req_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant"},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        if not self._write_sse_data(handler, role_chunk):
-            handler.close_connection = True
-            return
-
         streamed = []
-        carry = ""
 
-        def emit_piece(piece: str):
-            nonlocal carry
-            text = carry + str(piece or "")
+        if saved_files:
+            self._send_sse_data(
+                handler,
+                {
+                    "type": "uploads",
+                    "files": [
+                        {
+                            "name": item.get("name"),
+                            "path": item.get("path"),
+                            "tool_path": item.get("tool_path"),
+                            "bytes": int(item.get("bytes") or 0),
+                        }
+                        for item in saved_files
+                    ],
+                },
+            )
+
+        def emit_piece(piece):
+            text = str(piece or "")
             if not text:
                 return
-            if text.endswith("`"):
-                carry = "`"
-                text = text[:-1]
-            else:
-                carry = ""
-            text = self._normalize_webui_text(text)
-            if not text:
-                return
-            chunk = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": text},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            if not self._write_sse_data(handler, chunk):
+            if not self._send_sse_data(handler, {"type": "token", "token": text}):
                 raise BrokenPipeError("client disconnected during stream")
             streamed.append(text)
 
         try:
-            assistant_text = str(chat_payload(emit_piece) or "")
+            assistant_text = str(self.chat_handler(user_text, emit_piece, thread_id, False) or "")
         except Exception as e:
-            if not self._is_client_disconnect_error(e):
-                print(f"[WebUIBridge][WARN] Stream chain failed: {e}")
+            self._send_sse_data(handler, {"type": "error", "message": f"Chain execution failed: {e}"})
+            self._send_sse_data(handler, {"type": "done"})
+            self._send_sse_data(handler, None)
             handler.close_connection = True
             return
 
-        if carry:
-            tail = self._normalize_webui_text(carry)
-            carry = ""
-            if tail:
-                try:
-                    emit_piece(tail)
-                except Exception as e:
-                    if not self._is_client_disconnect_error(e):
-                        raise
-                    handler.close_connection = True
-                    return
-
-        assistant_text = self._normalize_webui_text(assistant_text)
         joined = "".join(streamed)
-        if assistant_text and assistant_text.startswith(joined):
+        if assistant_text and not joined:
+            emit_piece(assistant_text)
+        elif assistant_text and assistant_text.startswith(joined):
             remain = assistant_text[len(joined):]
             if remain:
-                try:
-                    emit_piece(remain)
-                except Exception as e:
-                    if not self._is_client_disconnect_error(e):
-                        raise
-                    handler.close_connection = True
-                    return
-        elif assistant_text and not joined:
-            try:
-                emit_piece(assistant_text)
-            except Exception as e:
-                if not self._is_client_disconnect_error(e):
-                    raise
-                handler.close_connection = True
-                return
+                emit_piece(remain)
         elif assistant_text and assistant_text != joined:
-            print("[WebUIBridge][WARN] Stream text mismatch with final post-processed result.")
+            print("[LocalWebUI][WARN] stream token text mismatch with final response.")
 
-        if not self._write_sse_data(handler, last_chunk):
-            handler.close_connection = True
-            return
-        self._write_sse_data(handler, None)
+        self._send_sse_data(handler, {"type": "done"})
+        self._send_sse_data(handler, None)
         handler.close_connection = True
 
-    def _handle_chat_completion(self, handler: BaseHTTPRequestHandler, body: bytes):
-        try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
-        except json.JSONDecodeError as e:
-            self._send_oai_error(handler, 400, f"Invalid JSON payload: {e}")
+    def _resolve_static_path(self, request_path: str):
+        raw = str(request_path or "/")
+        if raw in {"/", ""}:
+            rel = "index.html"
+        else:
+            rel = urllib.parse.unquote(raw.lstrip("/"))
+            if rel == "":
+                rel = "index.html"
+
+        rel = rel.replace("\\", "/")
+        normalized = os.path.normpath(rel)
+        if normalized in {"", "."}:
+            normalized = "index.html"
+        if normalized == ".." or normalized.startswith("../") or os.path.isabs(normalized):
+            return None
+
+        abs_path = os.path.abspath(os.path.join(self.frontend_root, normalized))
+        root_prefix = self.frontend_root + os.sep
+        if abs_path != self.frontend_root and not abs_path.startswith(root_prefix):
+            return None
+        return abs_path
+
+    def _serve_static(self, handler: BaseHTTPRequestHandler, request_path: str):
+        abs_path = self._resolve_static_path(request_path)
+        if not abs_path:
+            self._send_oai_error(handler, 403, "Forbidden static path.")
             return
-
-        session_key, session_source = self._resolve_session_key(payload, handler)
-        thread_key, thread_source = self._resolve_thread_key(payload, handler, session_key)
-        session_role, session_mode, primary_session, _ = self._resolve_session_role(session_key)
-        session_headers = self._build_session_response_headers(
-            session_key=session_key,
-            session_role=session_role,
-            session_source=session_source,
-            thread_key=thread_key,
-            thread_source=thread_source,
-        )
-        self._debug_session_log(
-            f"mode={session_mode} role={session_role} source={session_source} "
-            f"session={session_key} thread={thread_key} primary={primary_session}"
-        )
-
-        if session_role != "primary":
-            if self.non_primary_policy == "reject":
-                self._send_oai_error(
-                    handler,
-                    409,
-                    "This session is observer-only. Switch to the primary session to use Mori chain.",
-                    extra_headers=session_headers,
-                )
-                return
-
-        model = str(payload.get("model") or self.model_name)
-        stream = bool(payload.get("stream"))
-        read_only = session_role != "primary"
-        user_text = self._extract_last_user_text(
-            payload.get("messages"),
-            chunk_chars=self.webui_input_chunk_chars,
-            max_chars=self.webui_user_text_max_chars,
-            thread_key=thread_key,
-        )
-        if not user_text:
-            self._send_oai_error(
-                handler,
-                400,
-                "No user message found in request messages.",
-                extra_headers=session_headers,
-            )
-            return
-
-        if stream:
-            self._send_stream_completion(
-                handler,
-                model,
-                lambda on_piece: self.chat_handler(user_text, on_piece, thread_key, read_only),
-                extra_headers=session_headers,
-            )
+        if not os.path.isfile(abs_path):
+            self._send_oai_error(handler, 404, f"Static file not found: {request_path}")
             return
 
         try:
-            assistant_text = self._normalize_webui_text(
-                str(self.chat_handler(user_text, None, thread_key, read_only) or "")
-            )
+            with open(abs_path, "rb") as f:
+                body = f.read()
         except Exception as e:
-            self._send_oai_error(
-                handler,
-                500,
-                f"Chain execution failed: {e}",
-                extra_headers=session_headers,
-            )
+            self._send_oai_error(handler, 500, f"Failed to read static asset: {e}")
             return
 
-        created = int(time.time())
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": assistant_text},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
-        }
-        self._send_json(handler, 200, response, extra_headers=session_headers)
+        ctype, _encoding = mimetypes.guess_type(abs_path)
+        if not ctype:
+            ctype = "application/octet-stream"
+        if ctype.startswith("text/") or ctype in {"application/javascript", "application/json"}:
+            ctype = f"{ctype}; charset=utf-8"
+        self._send_bytes(handler, 200, body, ctype)
 
     def _handle_session_status(self, handler: BaseHTTPRequestHandler):
-        payload = self._session_status_payload()
-        self._send_json(handler, 200, payload)
+        self._send_json(
+            handler,
+            200,
+            {
+                "mode": "single",
+                "session": self.session_key,
+                "thread": self.session_key,
+                "policy": "single_write",
+                "upload_dir": self._display_path(self.upload_download_root),
+                "upload_limits": {
+                    "max_files": int(self.upload_max_files),
+                    "max_file_bytes": int(self.upload_max_file_bytes),
+                    "max_total_bytes": int(self.upload_max_total_bytes),
+                    "max_body_bytes": int(self.max_body_bytes),
+                },
+            },
+        )
+
+    def _handle_deprecated_openai_chat(self, handler: BaseHTTPRequestHandler):
+        payload = {
+            "error": {
+                "code": 410,
+                "type": "deprecated_endpoint",
+                "message": (
+                    "Deprecated endpoint '/v1/chat/completions' in MORI_RUN_MODE=webui. "
+                    "Use '/mori/chat' or '/mori/chat/stream'."
+                ),
+            }
+        }
+        self._send_json(handler, 410, payload)
 
     def _make_handler(self):
         bridge = self
@@ -3301,25 +2447,14 @@ class MoriWebUIChainBridge:
             protocol_version = "HTTP/1.1"
 
             def log_message(self, fmt, *args):
-                print(f"[WebUIBridge] {self.address_string()} - {fmt % args}")
-
-            def _read_body(self) -> bytes:
-                content_length = self.headers.get("Content-Length")
-                if not content_length:
-                    return b""
-                try:
-                    n = int(content_length)
-                except ValueError:
-                    n = 0
-                if n <= 0:
-                    return b""
-                return self.rfile.read(n)
+                print(f"[LocalWebUI] {self.address_string()} - {fmt % args}")
 
             def _dispatch(self):
-                path = self.path.split("?", 1)[0]
+                path = urllib.parse.urlsplit(self.path).path
+
                 if self.command == "OPTIONS":
                     self.send_response(204)
-                    self.send_header("Allow", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+                    self.send_header("Allow", "GET,POST,OPTIONS,HEAD")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
@@ -3332,27 +2467,31 @@ class MoriWebUIChainBridge:
                     bridge._handle_session_status(self)
                     return
 
-                body = self._read_body()
-                if self.command == "POST" and path == "/v1/chat/completions":
-                    bridge._handle_chat_completion(self, body)
+                if self.command == "POST" and path == "/mori/chat":
+                    bridge._handle_chat_sync(self)
                     return
 
-                inject_bootstrap = self.command == "GET" and path in {"/", "/index.html"}
-                bridge._proxy_request(self, body, inject_webui_bootstrap=inject_bootstrap)
+                if self.command == "POST" and path == "/mori/chat/stream":
+                    bridge._handle_chat_stream(self)
+                    return
+
+                if self.command == "POST" and path == "/v1/chat/completions":
+                    bridge._handle_deprecated_openai_chat(self)
+                    return
+
+                if self.command in {"GET", "HEAD"}:
+                    bridge._serve_static(self, path)
+                    return
+
+                bridge._send_oai_error(self, 404, f"Unknown path: {path}")
 
             def do_GET(self):
                 self._dispatch()
 
+            def do_HEAD(self):
+                self._dispatch()
+
             def do_POST(self):
-                self._dispatch()
-
-            def do_PUT(self):
-                self._dispatch()
-
-            def do_PATCH(self):
-                self._dispatch()
-
-            def do_DELETE(self):
                 self._dispatch()
 
             def do_OPTIONS(self):
@@ -3405,22 +2544,28 @@ def main():
     bridge = None
     bridge_host = os.environ.get("MORI_WEBUI_BRIDGE_HOST", "127.0.0.1")
     bridge_port = _read_env_int("MORI_WEBUI_BRIDGE_PORT", 8080)
-    bridge_primary_session = str(os.environ.get("MORI_WEBUI_PRIMARY_SESSION", "mori") or "mori").strip() or "mori"
-    bridge_non_primary_policy = str(
-        os.environ.get("MORI_WEBUI_NON_PRIMARY_POLICY", "readonly_upstream") or "readonly_upstream"
-    ).strip().lower()
-    bridge_session_header = str(os.environ.get("MORI_WEBUI_SESSION_HEADER", "X-Mori-Session") or "").strip()
-    bridge_thread_header = str(os.environ.get("MORI_WEBUI_THREAD_HEADER", "X-Mori-Thread") or "").strip()
-    bridge_primary_idle_ttl = _read_env_int("MORI_WEBUI_PRIMARY_IDLE_TTL_SEC", 1800)
-    bridge_session_debug = _read_env_bool("MORI_WEBUI_SESSION_DEBUG", False)
+    frontend_root = str(os.environ.get("MORI_FRONTEND_ROOT", "module/frontend") or "module/frontend")
 
-    # 2) In webui mode, force internal upstream protection and avoid port collisions.
+    # 2) In webui mode, force local no-build UI and avoid port collisions.
     if run_mode == "webui":
         pipeline.suppress_large_webui_log = True
         pipeline.quiet_server_urls = True
-        pipeline.large_server_webui = True
+        pipeline.large_server_webui = False
         if not pipeline.large_server_api_key:
             pipeline.large_server_api_key = uuid.uuid4().hex + uuid.uuid4().hex
+
+        deprecated_vars = [
+            "MORI_WEBUI_PRIMARY_SESSION",
+            "MORI_WEBUI_NON_PRIMARY_POLICY",
+            "MORI_WEBUI_SESSION_HEADER",
+            "MORI_WEBUI_THREAD_HEADER",
+            "MORI_WEBUI_PRIMARY_IDLE_TTL_SEC",
+            "MORI_WEBUI_SESSION_DEBUG",
+        ]
+        for name in deprecated_vars:
+            if os.environ.get(name) is not None:
+                print(f"[Python][WARN] {name} is deprecated in local webui mode and will be ignored.")
+
         if (
             pipeline.large_server_port is not None
             and int(pipeline.large_server_port) == bridge_port
@@ -3432,7 +2577,7 @@ def main():
             )
             pipeline.large_server_port = None
 
-    # 3) Restore persisted state, execute Lua pipeline, then optionally start WebUI bridge.
+    # 3) Restore persisted state, execute Lua pipeline, then optionally start local WebUI bridge.
     pipeline.unpack_state()
 
     lua_shutdown = None
@@ -3451,33 +2596,27 @@ def main():
             if pipeline.llm_large is None:
                 raise RuntimeError("Large model server is not loaded.")
 
-            upstream = pipeline.llm_large.base_url
-            bridge = MoriWebUIChainBridge(
+            bridge = MoriLocalWebUIBridge(
                 host=bridge_host,
                 port=bridge_port,
-                upstream_base_url=upstream,
+                frontend_root=frontend_root,
                 chat_handler=lambda user_text, on_piece=None, thread_id=None, read_only=False: lua_handler(
                     user_text, on_piece, thread_id, read_only
                 ),
                 model_name=pipeline.llm_large.model_name,
-                upstream_api_key=pipeline.large_server_api_key,
-                primary_session_key=bridge_primary_session,
-                non_primary_policy=bridge_non_primary_policy,
-                session_header_name=bridge_session_header,
-                thread_header_name=bridge_thread_header,
-                primary_idle_ttl_sec=bridge_primary_idle_ttl,
-                session_debug=bridge_session_debug,
                 agent_files_root=pipeline.agent_files_root,
             )
-            print(f"[Python] WebUI chain bridge ready at http://{bridge_host}:{bridge_port}")
-            print("[Python] Upstream llama-server is internal-only in webui mode.")
+            print(f"[Python] Local no-build WebUI ready at http://{bridge_host}:{bridge_port}")
+            print(f"[Python] Frontend root: {os.path.abspath(frontend_root)}")
+            print(f"[Python] Uploaded files dir: {bridge._display_path(bridge.upload_download_root)}")
+            print("[Python] /v1/chat/completions is deprecated in webui mode; use /mori/chat or /mori/chat/stream.")
             print("[Python] Press Ctrl+C to stop.")
 
             should_save_state = True
             try:
                 bridge.serve_forever()
             except KeyboardInterrupt:
-                print("\n[Python] KeyboardInterrupt received, stopping WebUI bridge...")
+                print("\n[Python] KeyboardInterrupt received, stopping local WebUI bridge...")
     finally:
         # 4) Graceful teardown order: bridge -> Lua state flush -> model servers.
         if bridge is not None:

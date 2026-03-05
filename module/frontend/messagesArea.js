@@ -18,6 +18,9 @@ messagesAreaTemplate.innerHTML = `
             margin-bottom: var(--margin);
             line-height: 1.3;
         }
+        .system {
+            color: #8b0000;
+        }
 
         .token {
             display: inline; /* Tokens are inline elements */
@@ -88,6 +91,18 @@ class MessagesArea extends HTMLElement {
         this.scrollToBottom();
     }
 
+    appendSystemMessage(messageText) {
+        const header = document.createElement('h2');
+        header.textContent = "System";
+        this.messages.appendChild(header);
+
+        const messageElement = document.createElement('div');
+        messageElement.classList.add('message', 'system');
+        messageElement.textContent = String(messageText || "");
+        this.messages.appendChild(messageElement);
+        this.scrollToBottom();
+    }
+
     handleNewToken(token) {
         if (!this.accumulatingMessageEl) {
             this.createNewAccumulatingMessage();
@@ -124,6 +139,26 @@ class MessagesArea extends HTMLElement {
             this.accumulatingMessageEl = null; // Clear the reference for the next message
         }
         //this.scrollToBottom();
+    }
+
+    handleError(messageText) {
+        this.flushAccumulatingMessage();
+        this.appendSystemMessage(messageText || "Unknown error.");
+    }
+
+    handleUploads(files) {
+        if (!Array.isArray(files) || files.length === 0) {
+            return;
+        }
+        const lines = [];
+        lines.push("Uploaded files saved:");
+        for (const item of files) {
+            const name = item && item.name ? item.name : "unknown";
+            const toolPath = item && item.tool_path ? item.tool_path : "";
+            const bytes = item && item.bytes ? item.bytes : 0;
+            lines.push(`- ${name} (${toolPath}, bytes=${bytes})`);
+        }
+        this.appendSystemMessage(lines.join('\n'));
     }
 }
 

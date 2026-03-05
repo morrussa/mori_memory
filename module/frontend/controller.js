@@ -10,14 +10,29 @@ const messageInput = document.querySelector('message-input');
 messageInput.init(worker);
 messageInput.setMessagesArea(messagesArea);
 
-const params = new URLSearchParams(window.location.search);
-const openaiApiKey = params.get('openapi-key');
-worker.postMessage({ type: 'init', openaiApiKey: openaiApiKey });
-if( openaiApiKey !== null ) {
-    messagesArea.appendUserMessage("Will attempt to connect to OpenAI using API key provided.", source="");
+worker.postMessage({ type: 'init' });
+if (typeof messagesArea.appendSystemMessage === 'function') {
+    messagesArea.appendSystemMessage("Connected to local Mori backend.");
 } else {
-    messagesArea.appendUserMessage("No OpenAI API key provided. Using mock data.", source="");
+    messagesArea.appendUserMessage("Connected to local Mori backend.", "System");
 }
+
+fetch('/mori/session/status')
+    .then((resp) => resp.ok ? resp.json() : null)
+    .then((status) => {
+        if (!status || typeof status !== 'object') {
+            return;
+        }
+        if (typeof messageInput.setUploadLimits === 'function' && status.upload_limits) {
+            messageInput.setUploadLimits(status.upload_limits);
+        }
+        if (typeof messagesArea.appendSystemMessage === 'function' && status.upload_dir) {
+            messagesArea.appendSystemMessage(`Upload dir: ${status.upload_dir}`);
+        }
+    })
+    .catch((_e) => {
+        // ignore bootstrap status fetch failures
+    });
 
 
 // Event listeners for worker messages
@@ -33,6 +48,14 @@ worker.onmessage = function(event) {
             break;
         case 'tokensDone':
             messagesArea.handleTokensDone();
+            break;
+        case 'error':
+            messagesArea.handleError(payload && payload.message ? payload.message : 'Unknown worker error.');
+            break;
+        case 'uploads':
+            if (typeof messagesArea.handleUploads === 'function') {
+                messagesArea.handleUploads(payload && payload.files ? payload.files : []);
+            }
             break;
         default:
             console.error('Unknown event type from worker:', type);
