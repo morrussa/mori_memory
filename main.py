@@ -2660,6 +2660,20 @@ def _read_env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _py_to_lua_value(lua_runtime: LuaRuntime, value):
+    if isinstance(value, dict):
+        t = lua_runtime.table()
+        for k, v in value.items():
+            t[str(k)] = _py_to_lua_value(lua_runtime, v)
+        return t
+    if isinstance(value, (list, tuple)):
+        t = lua_runtime.table()
+        for i, v in enumerate(value, start=1):
+            t[i] = _py_to_lua_value(lua_runtime, v)
+        return t
+    return value
+
+
 def main():
     # 1) Resolve run mode and initialize shared Python<->Lua bridge objects.
     run_mode = str(os.environ.get("MORI_RUN_MODE", "cli")).strip().lower()
@@ -2728,7 +2742,8 @@ def main():
                 raise RuntimeError("Large model server is not loaded.")
 
             def bridge_chat(user_text, on_piece=None, _ignored=None, read_only=False, uploads=None):
-                assistant_text = str(lua_handler(user_text, on_piece, "", read_only, uploads or []) or "")
+                uploads_lua = _py_to_lua_value(lua, uploads or [])
+                assistant_text = str(lua_handler(user_text, on_piece, "", read_only, uploads_lua) or "")
                 run_id = str(lua.globals().mori_last_run_id or "")
                 trace = AIPipeline._coerce_lua_value(lua.globals().mori_last_trace_summary)
                 if not isinstance(trace, dict):
