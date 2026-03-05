@@ -1,19 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
-    <!-- Other meta tags and stylesheets -->
-    <link rel="stylesheet" type="text/css" href="styles.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="description" content="Modern Agent Chat Interface">
+  <meta name="theme-color" content="#3b82f6">
+  
+  <title>Agent Chat</title>
+  
+  <!-- Favicon -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%233b82f6' rx='20' width='100' height='100'/><text x='50%' y='50%' dominant-baseline='central' text-anchor='middle' font-size='60' fill='white'>AI</text></svg>">
+  
+  <!-- Styles -->
+  <link rel="stylesheet" href="styles.css">
+  
+  <!-- Optional: Marked.js for better Markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" defer></script>
+  
+  <!-- Optional: Highlight.js for code syntax highlighting -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css" id="hljs-theme">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js" defer></script>
+  
+  <style>
+    /* Inline critical styles for header */
+    .header-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: var(--space-md) var(--space-lg);
+      background: var(--color-surface);
+      border-bottom: 1px solid var(--color-border);
+      min-height: 56px;
+      flex-shrink: 0;
+    }
     
+    .header-logo {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      font-weight: var(--font-weight-semibold);
+      font-size: var(--font-size-lg);
+      color: var(--color-text-primary);
+    }
+    
+    .header-logo-icon {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .header-logo-icon svg {
+      width: 20px;
+      height: 20px;
+      color: white;
+    }
+    
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+    }
+    
+    .icon-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border: none;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--color-text-secondary);
+      cursor: pointer;
+      transition: all var(--transition-fast);
+    }
+    
+    .icon-btn:hover {
+      background: var(--color-bg-hover);
+      color: var(--color-text-primary);
+    }
+    
+    .icon-btn:focus-visible {
+      outline: 2px solid var(--color-border-focus);
+      outline-offset: 2px;
+    }
+    
+    .icon-btn svg {
+      width: 20px;
+      height: 20px;
+    }
+    
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: var(--space-xs);
+      padding: var(--space-xs) var(--space-md);
+      background: var(--color-success-light);
+      border-radius: var(--radius-full);
+      font-size: var(--font-size-xs);
+      color: var(--color-success-dark);
+    }
+    
+    .status-badge-dot {
+      width: 6px;
+      height: 6px;
+      background: var(--color-success);
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    
+    .status-badge.disconnected {
+      background: var(--color-error-light);
+      color: var(--color-error-dark);
+    }
+    
+    .status-badge.disconnected .status-badge-dot {
+      background: var(--color-error);
+      animation: none;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    
+    @media (max-width: 640px) {
+      .header-bar {
+        padding: var(--space-sm) var(--space-md);
+      }
+      
+      .header-logo-text {
+        display: none;
+      }
+      
+      .status-badge span:last-child {
+        display: none;
+      }
+    }
+  </style>
 </head>
 <body>
-    <!-- Use the custom tags directly -->
-    <div id="appContainer">
-        <messages-area></messages-area>
-        <message-input></message-input>
-    </div>
-    <div id="content">
-    </div>
-
-    <!-- Include the JavaScript files at bottom to avoid blocking UI -->
-    <script src="messageInput.js" defer></script>
-    <script src="messagesArea.js" defer></script>
-    <script src="controller.js" defer></script>
+  <div id="appContainer">
+    <!-- Header Bar -->
+    <header class="header-bar">
+      <div class="header-logo">
+        <div class="header-logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+            <path d="M2 17l10 5 10-5"/>
+            <path d="M2 12l10 5 10-5"/>
+          </svg>
+        </div>
+        <span class="header-logo-text">Agent Chat</span>
+      </div>
+      
+      <div class="header-actions">
+        <!-- Status Badge -->
+        <div class="status-badge" id="statusBadge">
+          <span class="status-badge-dot"></span>
+          <span>已连接</span>
+        </div>
+        
+        <!-- Theme Toggle -->
+        <button class="icon-btn" id="themeToggle" title="切换主题" aria-label="切换深浅主题">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
+        
+        <!-- Clear Chat -->
+        <button class="icon-btn" id="clearChat" title="清空对话" aria-label="清空对话历史">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+    
+    <!-- Messages Area -->
+    <messages-area></messages-area>
+    
+    <!-- Message Input -->
+    <message-input></message-input>
+  </div>
+  
+  <!-- Scripts -->
+  <script src="messagesArea.js" defer></script>
+  <script src="messageInput.js" defer></script>
+  <script src="controller.js" defer></script>
+  
+  <!-- Initialize UI interactions -->
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      // Theme toggle button
+      const themeToggle = document.getElementById('themeToggle');
+      if (themeToggle) {
+        themeToggle.addEventListener('click', function() {
+          if (typeof window.toggleTheme === 'function') {
+            window.toggleTheme();
+          }
+        });
+      }
+      
+      // Clear chat button
+      const clearChatBtn = document.getElementById('clearChat');
+      if (clearChatBtn) {
+        clearChatBtn.addEventListener('click', function() {
+          if (confirm('确定要清空对话历史吗？')) {
+            location.reload();
+          }
+        });
+      }
+      
+      // Update hljs theme based on color scheme
+      function updateHljsTheme() {
+        const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        const link = document.getElementById('hljs-theme');
+        if (link) {
+          link.href = isDark 
+            ? 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css'
+            : 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css';
+        }
+      }
+      
+      // Initial theme setup
+      updateHljsTheme();
+      
+      // Observe theme changes
+      const observer = new MutationObserver(function(mutations) {
+        mutations.forEach(function(mutation) {
+          if (mutation.attributeName === 'data-theme') {
+            updateHljsTheme();
+            
+            // Update theme toggle button icon
+            const themeToggle = document.getElementById('themeToggle');
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            if (themeToggle) {
+              themeToggle.innerHTML = isDark
+                ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>'
+                : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+              themeToggle.title = isDark ? '切换到浅色模式' : '切换到深色模式';
+            }
+          }
+        });
+      });
+      
+      observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme']
+      });
+    });
+    
+    // Apply code highlighting when new content is added
+    if (typeof hljs !== 'undefined') {
+      const originalHighlightAll = hljs.highlightAll;
+      // We'll call highlightElement manually when needed
+    }
+  </script>
 </body>
+</html>
