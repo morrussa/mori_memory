@@ -440,6 +440,115 @@ local function push_pending_context(current_turn, payload)
     end
 end
 
+local function looks_like_path_token(value)
+    local s = trim(value)
+    if s == "" then
+        return false
+    end
+    if s:find("/", 1, true) or s:find("\\", 1, true) then
+        return true
+    end
+    if s:find("^%.") or s:find("^download[%w%._%-/]*$") then
+        return true
+    end
+    if s:find("%.[A-Za-z0-9_%-]+$") then
+        return true
+    end
+    return false
+end
+
+local function normalize_tool_argument_object(obj_in, call)
+    local obj = {}
+    for k, v in pairs(obj_in or {}) do
+        obj[k] = v
+    end
+
+    local c = call or {}
+    local act = trim(c.act or "")
+    local key_name = trim(obj.key or c.key or "")
+    local value_raw = obj.value
+    if value_raw == nil then
+        value_raw = c.value
+    end
+    local value_text = trim(value_raw or "")
+
+    local function get_text(v)
+        return trim(v or "")
+    end
+
+    local function set_if_missing(field, candidate)
+        if get_text(obj[field]) == "" then
+            local cdt = get_text(candidate)
+            if cdt ~= "" then
+                obj[field] = cdt
+            end
+        end
+    end
+
+    if key_name == "path" and value_text ~= "" then
+        set_if_missing("path", value_text)
+    elseif key_name == "prefix" and value_text ~= "" then
+        set_if_missing("prefix", value_text)
+    elseif key_name == "pattern" and value_text ~= "" then
+        set_if_missing("pattern", value_text)
+    end
+
+    if act == "read_agent_file" or act == "read_agent_file_lines" or act == "search_agent_file" then
+        set_if_missing("path", obj.file)
+        if get_text(obj.path) == "" then
+            if value_text ~= "" and looks_like_path_token(value_text) then
+                obj.path = value_text
+            elseif key_name ~= "" and value_text == "" and looks_like_path_token(key_name) then
+                obj.path = key_name
+            end
+        end
+        if get_text(obj.path) ~= "" and get_text(obj.value) == get_text(obj.path) then
+            obj.value = nil
+        end
+    end
+
+    if act == "list_agent_files" or act == "search_agent_files" then
+        if get_text(obj.prefix) == "" then
+            if value_text ~= "" and key_name ~= "path" and key_name ~= "pattern" then
+                obj.prefix = value_text
+            elseif key_name ~= "" and value_text == "" and looks_like_path_token(key_name) then
+                obj.prefix = key_name
+            end
+        end
+        if get_text(obj.prefix) ~= "" and get_text(obj.value) == get_text(obj.prefix) then
+            obj.value = nil
+        end
+    end
+
+    if act == "search_agent_file" or act == "search_agent_files" then
+        set_if_missing("pattern", obj.query)
+        set_if_missing("pattern", obj.string)
+        if get_text(obj.pattern) == "" and value_text ~= "" and (not looks_like_path_token(value_text)) then
+            obj.pattern = value_text
+        end
+    end
+
+    if key_name ~= "" then
+        local consumed = false
+        if key_name == "path" and get_text(obj.path) ~= "" then
+            consumed = true
+        elseif key_name == "prefix" and get_text(obj.prefix) ~= "" then
+            consumed = true
+        elseif key_name == "pattern" and get_text(obj.pattern) ~= "" then
+            consumed = true
+        elseif value_text == "" and looks_like_path_token(key_name) then
+            consumed = true
+        end
+        if consumed then
+            obj.key = nil
+            obj.value = nil
+            obj.arguments = nil
+        end
+    end
+
+    return obj
+end
+
 local function build_call_arguments_lua(call)
     local function normalize_key_value_args(tbl)
         if type(tbl) ~= "table" then
@@ -486,7 +595,10 @@ local function build_call_arguments_lua(call)
     if raw ~= "" then
         local parsed_lua = parse_lua_table_literal(raw)
         if type(parsed_lua) == "table" then
-            return encode_lua_value(normalize_key_value_args(parsed_lua), 0)
+            return encode_lua_value(
+                normalize_tool_argument_object(normalize_key_value_args(parsed_lua), c),
+                0
+            )
         end
     end
 
@@ -526,7 +638,7 @@ local function build_call_arguments_lua(call)
         obj.confidence = tonumber(c.confidence) or c.confidence
     end
 
-    return encode_lua_value(obj, 0)
+    return encode_lua_value(normalize_tool_argument_object(obj, c), 0)
 end
 
 local function is_tool_result_error_text(tool_name, result_text)

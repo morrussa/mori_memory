@@ -2627,7 +2627,7 @@ def main():
     if run_mode not in {"cli", "webui"}:
         print(f"[Python][WARN] Unknown MORI_RUN_MODE={run_mode}, fallback to cli")
         run_mode = "cli"
-    webui_stream_max_steps = _read_env_int_allow_zero("MORI_WEBUI_STREAM_MAX_STEPS", 2)
+    webui_stream_max_steps = _read_env_int_allow_zero("MORI_WEBUI_STREAM_MAX_STEPS", 3)
 
     lua = LuaRuntime(unpack_returned_tuples=True)
     pipeline = AIPipeline()

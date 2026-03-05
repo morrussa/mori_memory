@@ -473,7 +473,47 @@ local function emit_stream_status(stream_sink, message)
 end
 
 local function build_stream_tool_arguments(call, fallback_raw)
+    local function looks_like_path_token(value)
+        local s = trim(value)
+        if s == "" then
+            return false
+        end
+        if s:find("/", 1, true) or s:find("\\", 1, true) then
+            return true
+        end
+        if s:find("%.[A-Za-z0-9_%-]+$") then
+            return true
+        end
+        return false
+    end
+
+    local function parse_fallback_args(raw)
+        local text = trim(raw)
+        if text == "" then
+            return nil
+        end
+        local tbl_text = (tool.extract_first_lua_table and tool.extract_first_lua_table(text)) or text
+        tbl_text = trim(tbl_text)
+        if tbl_text == "" or (not tbl_text:match("^%b{}$")) then
+            return nil
+        end
+        local chunk = load("return " .. tbl_text, "tool_args", "t", {})
+        if not chunk then
+            return nil
+        end
+        local ok, parsed = pcall(chunk)
+        if not ok or type(parsed) ~= "table" then
+            return nil
+        end
+        return parsed
+    end
+
+    local fallback_tbl = parse_fallback_args(fallback_raw)
+
     if type(call) ~= "table" then
+        if type(fallback_tbl) == "table" then
+            return fallback_tbl
+        end
         local raw = trim(fallback_raw)
         if raw ~= "" then
             return raw
@@ -481,6 +521,7 @@ local function build_stream_tool_arguments(call, fallback_raw)
         return {}
     end
 
+    local act = trim(call.act or "")
     local args = {}
     for k, v in pairs(call) do
         local key = tostring(k or "")
@@ -488,6 +529,7 @@ local function build_stream_tool_arguments(call, fallback_raw)
             args[key] = v
         end
     end
+
     local key_name = trim(args.key or "")
     if key_name ~= "" and args.value ~= nil and args[key_name] == nil then
         args[key_name] = args.value
@@ -495,8 +537,51 @@ local function build_stream_tool_arguments(call, fallback_raw)
         args.value = nil
         args.arguments = nil
     end
+
+    if key_name ~= "" and (args.value == nil or trim(args.value) == "") and looks_like_path_token(key_name) then
+        if act == "read_agent_file" or act == "read_agent_file_lines" or act == "search_agent_file" then
+            if trim(args.path or "") == "" then
+                args.path = key_name
+                args.key = nil
+            end
+        elseif act == "list_agent_files" or act == "search_agent_files" then
+            if trim(args.prefix or "") == "" then
+                args.prefix = key_name
+                args.key = nil
+            end
+        end
+    end
+
+    if (act == "read_agent_file" or act == "read_agent_file_lines" or act == "search_agent_file")
+        and trim(args.path or "") ~= "" and trim(args.value or "") == trim(args.path or "") then
+        args.value = nil
+    end
+    if (act == "list_agent_files" or act == "search_agent_files")
+        and trim(args.prefix or "") ~= "" and trim(args.value or "") == trim(args.prefix or "") then
+        args.value = nil
+    end
+
+    if type(fallback_tbl) == "table" then
+        if trim(args.path or "") == "" and trim(fallback_tbl.path or "") ~= "" then
+            args.path = fallback_tbl.path
+        end
+        if trim(args.prefix or "") == "" and trim(fallback_tbl.prefix or "") ~= "" then
+            args.prefix = fallback_tbl.prefix
+        end
+        if trim(args.pattern or "") == "" and trim(fallback_tbl.pattern or "") ~= "" then
+            args.pattern = fallback_tbl.pattern
+        end
+        if next(args) == nil then
+            return fallback_tbl
+        end
+    end
+
     if next(args) ~= nil then
         return args
+    end
+
+    if type(fallback_tbl) == "table" then
+        return fallback_tbl
     end
 
     local raw = trim(fallback_raw or call.raw or "")

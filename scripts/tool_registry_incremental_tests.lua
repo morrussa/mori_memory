@@ -215,13 +215,14 @@ assert(c_file:find("Tool:search_agent_files", 1, true), "file context should con
 local kv_calls = {
     { act = "list_agent_files", key = "prefix", value = "t" },
     { act = "read_agent_file", key = "path", value = "./agent_files/t/a.txt" },
+    { act = "read_agent_file", key = "./agent_files/t/a.txt", arguments = "{key=\"./agent_files/t/a.txt\"}" },
     { act = "read_agent_file", value = "./agent_files/t/a.txt" },
 }
 local rk = registry.execute_calls(kv_calls, { current_turn = 51, read_only = false })
-assert(rk.executed == 2, "rk executed should be 2 (key/value normalized for first two)")
-assert(rk.failed == 1, "rk failed should be 1 (missing path should fail)")
+assert(rk.executed == 4, "rk executed should be 4 (key/value, key-only, value-only path normalized)")
+assert(rk.failed == 0, "rk failed should be 0 after path normalization")
 assert((rk.call_results[2] or {}).arguments:find("path", 1, true), "kv args should map to path")
-assert((rk.call_results[3] or {}).ok == false, "third kv call should fail")
-assert((rk.call_results[3] or {}).message:find("missing `path`", 1, true), "failed kv call should expose missing path")
+assert((rk.call_results[3] or {}).arguments:find("path", 1, true), "key-only args should map to path")
+assert((rk.call_results[4] or {}).arguments:find("path", 1, true), "value-only args should map to path")
 
 print("TOOL_REGISTRY_INCREMENTAL_TESTS_PASS")
