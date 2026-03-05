@@ -463,10 +463,26 @@ function M.run_turn(args)
     local agent_cfg = get_agent_cfg()
     local agent_defaults = get_agent_defaults()
     local supported_tool_acts = get_supported_tool_acts()
-    local max_steps = math.max(
+    local configured_max_steps = math.max(
         1,
         math.floor(tonumber(agent_cfg.max_steps) or tonumber(agent_defaults.max_steps) or 4)
     )
+    local max_steps_override = tonumber(args.max_steps_override)
+    if max_steps_override ~= nil then
+        max_steps_override = math.floor(max_steps_override)
+        if max_steps_override < 1 then
+            max_steps_override = nil
+        end
+    end
+    local max_steps = configured_max_steps
+    if max_steps_override ~= nil then
+        max_steps = max_steps_override
+        print(string.format(
+            "[AgentRuntime] max_steps override active: %d (configured=%d)",
+            max_steps,
+            configured_max_steps
+        ))
+    end
     local completion_reserve_tokens = math.max(
         64,
         math.floor(

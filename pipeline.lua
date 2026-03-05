@@ -22,6 +22,13 @@ local model_cfg = runtime_cfg.models or {}
 local model_defaults = runtime_defaults.models or {}
 local demo_cfg = runtime_cfg.demo_chat or {}
 local demo_defaults = runtime_defaults.demo_chat or {}
+local webui_stream_max_steps = tonumber(MORI_WEBUI_STREAM_MAX_STEPS)
+if run_mode == "webui" and webui_stream_max_steps == nil then
+    webui_stream_max_steps = 1
+end
+if webui_stream_max_steps ~= nil then
+    webui_stream_max_steps = math.floor(webui_stream_max_steps)
+end
 
 local function join_model_path(base_dir, path_or_name)
     local path = tostring(path_or_name or "")
@@ -144,13 +151,18 @@ local function process_user_input(line, stream_sink, _thread_id, read_only)
         return ""
     end
 
-    return agent_runtime.run_turn({
+    local turn_args = {
         user_input = user_input,
         stream_sink = stream_sink,
         read_only = (read_only == true),
         conversation_history = conversation_history,
         add_to_history = add_to_history,
-    })
+    }
+    if run_mode == "webui" and stream_sink and webui_stream_max_steps and webui_stream_max_steps > 0 then
+        turn_args.max_steps_override = webui_stream_max_steps
+    end
+
+    return agent_runtime.run_turn(turn_args)
 end
 
 _G.mori_handle_user_input = process_user_input

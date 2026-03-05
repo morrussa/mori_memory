@@ -2563,6 +2563,16 @@ def _read_env_int(name: str, default: int) -> int:
     return val if val > 0 else int(default)
 
 
+def _read_env_int_allow_zero(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
 def _read_env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -2576,11 +2586,13 @@ def main():
     if run_mode not in {"cli", "webui"}:
         print(f"[Python][WARN] Unknown MORI_RUN_MODE={run_mode}, fallback to cli")
         run_mode = "cli"
+    webui_stream_max_steps = _read_env_int_allow_zero("MORI_WEBUI_STREAM_MAX_STEPS", 1)
 
     lua = LuaRuntime(unpack_returned_tuples=True)
     pipeline = AIPipeline()
     lua.globals()['py_pipeline'] = pipeline
     lua.globals()['MORI_RUN_MODE'] = run_mode
+    lua.globals()['MORI_WEBUI_STREAM_MAX_STEPS'] = int(webui_stream_max_steps)
 
     bridge = None
     bridge_host = os.environ.get("MORI_WEBUI_BRIDGE_HOST", "127.0.0.1")
@@ -2650,6 +2662,13 @@ def main():
             print(f"[Python] Local no-build WebUI ready at http://{bridge_host}:{bridge_port}")
             print(f"[Python] Frontend root: {os.path.abspath(frontend_root)}")
             print(f"[Python] Uploaded files dir: {bridge._display_path(bridge.upload_download_root)}")
+            if webui_stream_max_steps > 0:
+                print(
+                    "[Python] Streaming sync mode: stream requests use "
+                    f"max_steps={webui_stream_max_steps}."
+                )
+            else:
+                print("[Python] Streaming sync mode disabled (MORI_WEBUI_STREAM_MAX_STEPS<=0).")
             print("[Python] /v1/chat/completions is deprecated in webui mode; use /mori/chat or /mori/chat/stream.")
             print("[Python] Press Ctrl+C to stop.")
 

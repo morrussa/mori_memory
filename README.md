@@ -73,6 +73,7 @@ http://127.0.0.1:8080
 - `MORI_EMBED_SERVER_GPU_LAYERS`：embedding 模型 `--gpu-layers`（默认 `0`）
 - `MORI_LARGE_SERVER_GPU_FALLBACK_CPU=0|1`：主模型 `gpu_layers=all` OOM 时是否自动回退 `0`（默认 `1`）
 - `MORI_LLAMA_SERVER_LOG_TO_FILE=0|1`：是否将 `llama-server` 输出写入 `logs/llama_server_*.log`（默认 `1`）
+- `MORI_WEBUI_STREAM_MAX_STEPS`：仅对流式请求生效的 `agent_runtime.max_steps` 覆盖（默认 `1`，设 `0` 关闭覆盖）
 
 本地 WebUI API：
 
