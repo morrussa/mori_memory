@@ -226,9 +226,9 @@ _G.py_pipeline = {
     generate_chat = function(_, _, _, cb, _)
         state.generate_calls = state.generate_calls + 1
         if state.generate_calls == 1 then
-            cb("第一步草稿 <<PLAN:YES>>")
+            cb("第一步草稿\n{act=\"plan\"}")
         else
-            cb("第二步终稿 <<PLAN:NO>>")
+            cb("第二步终稿\n{act=\"no_plan\"}")
         end
     end,
 }
@@ -251,8 +251,8 @@ local step1_system = tostring(state.system_prompts_by_step[1] or "")
 local step2_system = tostring(state.system_prompts_by_step[2] or "")
 assert(#step1_tail == 0, "step1 should not contain protocol tail messages")
 assert(#step2_tail == 0, "step2 should not append legacy assistant/tool protocol tail")
-assert(contains(step1_system, "<<PLAN:YES>>"), "step1 system prompt should contain plan marker instruction")
-assert(not contains(step2_system, "<<PLAN:YES>>"), "step2 system prompt should not repeat plan marker instruction")
+assert(contains(step1_system, "{act=\"plan\"}"), "step1 system prompt should contain plan luatable instruction")
+assert(not contains(step2_system, "{act=\"plan\"}"), "step2 system prompt should not repeat plan luatable instruction")
 assert(not contains(step1_system, "【当前子步骤】"), "step1 system prompt should not inject substep expansion")
 assert(not contains(step2_system, "【当前子步骤】"), "step2 system prompt should not inject substep expansion")
 assert((state.planner_ctxs[1] or {}).substep_name == "general-purpose", "planner ctx should receive substep name")

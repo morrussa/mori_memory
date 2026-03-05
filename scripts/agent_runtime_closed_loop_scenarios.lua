@@ -295,12 +295,12 @@ local scenarios = {
             {},
         },
         generate_outputs = {
-            "初版回答：我先给你一个大概结论。 <<PLAN:YES>>",
-            "最终答案（已结合工具检索） <<PLAN:NO>>",
+            "初版回答：我先给你一个大概结论。\n{act=\"plan\"}",
+            "最终答案（已结合工具检索）\n{act=\"no_plan\"}",
         },
         assertions = function(state, final)
             assert(state.generate_calls == 2, "tool_hit 应该触发第二步生成")
-            assert(state.plan_calls == 1, "tool_hit 在 <<PLAN:NO>> 收敛后不应继续规划")
+            assert(state.plan_calls == 1, "tool_hit 在 {act=\"no_plan\"} 收敛后不应继续规划")
             assert(state.history_adds == 1, "最终持久化应只写一次 history")
             assert(state.memory_save_calls == 1, "最终持久化应只写一次 memory")
             assert(contains(state.tool_contexts[2], "Tool:query_record"), "第二步上下文应包含工具检索结果")
@@ -317,7 +317,7 @@ local scenarios = {
             },
         },
         generate_outputs = {
-            "先给你结论。 <<PLAN:YES>>",
+            "先给你结论。\n{act=\"plan\"}",
         },
         assertions = function(state, final)
             assert(state.generate_calls == 1, "function_choice=none 不应触发下一步")
@@ -338,12 +338,12 @@ local scenarios = {
             {},
         },
         generate_outputs = {
-            "我先查。 <<PLAN:YES>>",
-            "最终答案：已按单调用约束收敛。 <<PLAN:NO>>",
+            "我先查。\n{act=\"plan\"}",
+            "最终答案：已按单调用约束收敛。\n{act=\"no_plan\"}",
         },
         assertions = function(state, final)
             assert(state.generate_calls == 2, "首轮命中工具后应触发下一步生成")
-            assert(state.plan_calls == 1, "收到 <<PLAN:NO>> 后第二步不应继续规划")
+            assert(state.plan_calls == 1, "收到 {act=\"no_plan\"} 后第二步不应继续规划")
             assert(state.exec_results[1] and state.exec_results[1].executed == 1, "parallel_function_calls=false 应仅执行首条调用")
             assert(final == "最终答案：已按单调用约束收敛。", "最终答案应来自第二步收敛结果")
         end,
@@ -359,8 +359,8 @@ local scenarios = {
             {},
         },
         generate_outputs = {
-            "初版回答：尝试执行工具。 <<PLAN:YES>>",
-            "修正版回答：工具失败，给出无工具依赖方案。 <<PLAN:NO>>",
+            "初版回答：尝试执行工具。\n{act=\"plan\"}",
+            "修正版回答：工具失败，给出无工具依赖方案。\n{act=\"no_plan\"}",
         },
         assertions = function(state, final)
             assert(state.generate_calls == 2, "tool_fail 应该触发失败后重修")
@@ -385,9 +385,9 @@ local scenarios = {
             },
         },
         generate_outputs = {
-            "草稿1 <<PLAN:YES>>",
-            "草稿2 <<PLAN:YES>>",
-            "草稿3 <<PLAN:NO>>",
+            "草稿1\n{act=\"plan\"}",
+            "草稿2\n{act=\"plan\"}",
+            "草稿3\n{act=\"no_plan\"}",
         },
         assertions = function(state, final)
             assert(state.generate_calls == 2, "重复同签名调用应在第2步收敛，避免死循环")
@@ -425,7 +425,7 @@ local scenarios = {
             {},
         },
         generate_outputs = {
-            "先做快速探索。 <<PLAN:YES>>",
+            "先做快速探索。\n{act=\"plan\"}",
         },
         assertions = function(state, final)
             local planner_ctx = state.plan_ctxs[1] or {}
@@ -442,7 +442,7 @@ local scenarios = {
             {},
         },
         generate_outputs = {
-            "我先快速扫一遍。 <<PLAN:NO>>",
+            "我先快速扫一遍。\n{act=\"no_plan\"}",
         },
         assertions = function(state, final)
             local planner_ctx = state.plan_ctxs[1] or {}
@@ -460,7 +460,7 @@ local scenarios = {
             {},
         },
         generate_outputs = {
-            "我先给出架构方案。 <<PLAN:YES>>",
+            "我先给出架构方案。\n{act=\"plan\"}",
         },
         assertions = function(state, final)
             local planner_ctx = state.plan_ctxs[1] or {}

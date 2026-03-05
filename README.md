@@ -254,13 +254,13 @@ agent = {
 
 补充语义：
 - `upsert_max_per_turn` / `query_max_per_turn` 为同一 `turn` 内跨 `step` 累计预算，不会在多步循环中按 step 重置。
-- 工具调用统一走二阶段 planner；主回复只负责给出 `<<PLAN:YES|NO>>` 计划信号。
+- 工具调用统一走二阶段 planner；主回复只负责给出 Lua table 计划信号（`{act="plan"}` / `{act="no_plan"}`）。
 - 计划信号提示采用运行时动态注入：仅首轮注入，进入后续子步骤轮后不再重复注入。
 - 子步骤为平级架构：`general-purpose`（通用任务）、`explore`（快速探索代码/文件/关键词）、`plan`（架构与实现方案）。
 - 子步骤只影响 planner/tool 策略，不会把“子步骤展开文本”注入主 LLM 上下文；主 LLM 只消费常规上下文与工具返回结果。
 - `settings.agent.substeps` 可注册更多子步骤；`settings.agent.substep_default` 控制默认类型；`settings.agent.substep_route` 控制自动路由关键词；每个子步骤可通过 `planner` 字段覆盖规划策略。
-- `settings.agent.planner_gate_mode = "assistant_signal"`：按主回复信号决定是否进入 planner（可选 `always`）。
-- `settings.agent.planner_default_when_missing = false`：缺失计划信号时默认不进入 planner（建议保持 `false`）。
+- `settings.agent.planner_gate_mode = "assistant_signal"`：按主回复末行 Lua table 计划信号决定是否进入 planner（可选 `always`）。
+- `settings.agent.planner_default_when_missing = false`：缺失 `{act="plan"}` / `{act="no_plan"}` 时默认不进入 planner（建议保持 `false`）。
 - `settings.agent.function_choice`：`auto|none|query_record|upsert_record|delete_record`，用于约束本轮可执行工具。
 - `settings.agent.parallel_function_calls=false`：单轮只保留第一条工具调用（qwen-agent 对齐）。
 - `settings.keyring.tool_calling.parallel_execute_enabled = true`：连续 `query_record` 会按批次并行调度（默认批大小 `parallel_query_batch_size=4`）。

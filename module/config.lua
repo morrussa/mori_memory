@@ -352,8 +352,8 @@ local DEFAULT_SETTINGS = {
         llm_seed_max = 2147483647, -- 主回复随机种子上界（含）
         planner_retry_max = 1, -- 二阶段 planner 失败时最大重试次数
         planner_retry_backoff_sec = 0.2, -- planner 重试退避秒数
-        planner_gate_mode = "assistant_signal", -- assistant_signal|always：是否由主回复信号决定要不要做 planner
-        planner_default_when_missing = false, -- assistant_signal 模式下，缺少信号时是否默认进入 planner
+        planner_gate_mode = "assistant_signal", -- assistant_signal|always：是否由主回复 Lua table 计划信号决定要不要做 planner
+        planner_default_when_missing = false, -- assistant_signal 模式下，缺少 {act="plan"} / {act="no_plan"} 信号时是否默认进入 planner
         function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record|list_agent_files|read_agent_file|read_agent_file_lines|search_agent_file|search_agent_files
         supported_tool_acts = {
             upsert_record = true,

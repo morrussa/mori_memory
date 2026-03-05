@@ -14,12 +14,17 @@ local config = require("module.config")
 
 local PLAN_SIGNAL_PROMPT = [[
 【计划信号】
-仅在回复最后一行输出一个隐藏标记：<<PLAN:YES>> 或 <<PLAN:NO>>。
-- 需要后台二阶段 planner 调用工具：YES
-- 不需要工具：NO
-禁止输出任何工具调用格式（包括 {act=...} / <tool_call> / ✿FUNCTION✿）。
-不要输出其它 PLAN 标记。
+仅在回复最后一行输出一个 Lua table 计划信号：{act="plan"} 或 {act="no_plan"}。
+- 需要后台二阶段 planner 调用工具：{act="plan"}
+- 不需要工具：{act="no_plan"}
+禁止输出其它工具调用格式（包括 query_record/upsert_record/delete_record 等）。
+不要输出解释或其它计划信号。
 ]]
+
+local PLAN_SIGNAL_SUPPORTED_ACTS = {
+    plan = true,
+    no_plan = true,
+}
 
 local function get_supported_tool_acts()
     local acts = tool_parser.clone_supported_acts()
@@ -57,15 +62,24 @@ local function normalize_result_text(result)
     return visible
 end
 
-local function normalize_plan_signal_token(token)
-    local s = trim(token):lower()
-    if s == "" then
+local function parse_plan_signal_line(line)
+    local raw = trim(line)
+    if raw == "" or not raw:match("^%b{}$") then
         return nil
     end
-    if s == "yes" or s == "true" or s == "1" or s == "on" or s == "need" then
+
+    local call = tool_parser.parse_tool_call_line(line, {
+        supported_acts = PLAN_SIGNAL_SUPPORTED_ACTS,
+    })
+    if type(call) ~= "table" then
+        return nil
+    end
+
+    local act = trim(call.act):lower()
+    if act == "plan" then
         return true
     end
-    if s == "no" or s == "false" or s == "0" or s == "off" or s == "none" then
+    if act == "no_plan" then
         return false
     end
     return nil
@@ -74,16 +88,29 @@ end
 local function extract_plan_signal(text)
     local raw = tostring(text or "")
     local signal = nil
+    local signal_line_idx = nil
+    local lines = {}
 
-    local function consume_signal(token)
-        local parsed = normalize_plan_signal_token(token)
-        if parsed ~= nil and signal == nil then
-            signal = parsed
-        end
-        return ""
+    for line in (raw .. "\n"):gmatch("(.-)\n") do
+        lines[#lines + 1] = line
     end
 
-    raw = raw:gsub("<<PLAN:%s*([%w_%-]+)%s*>>", consume_signal)
+    for i = #lines, 1, -1 do
+        if trim(lines[i]) ~= "" then
+            local parsed = parse_plan_signal_line(lines[i])
+            if parsed ~= nil then
+                signal = parsed
+                signal_line_idx = i
+            end
+            break
+        end
+    end
+
+    if signal_line_idx then
+        table.remove(lines, signal_line_idx)
+        raw = table.concat(lines, "\n")
+    end
+
     raw = trim(raw)
     return raw, signal
 end
