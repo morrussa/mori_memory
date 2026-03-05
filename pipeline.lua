@@ -54,7 +54,7 @@ local base_prompt = [[
 1. 正常回复用户，不要输出任何 {act="..."} 工具调用行。
 2. 若你判断需要长期保存事实、更新计划、或检索旧记录，直接在正文自然表达意图即可，后台会自动处理。
 3. 回答时优先保持与 LongTermPlan BOM 一致；若信息冲突，先向用户确认。
-4. 若用户上传文件且上下文给出了 ./agent_files 路径，不要假设你已读完整正文；先规划，再按需调用 list_agent_files/read_agent_file/read_agent_file_lines/search_agent_file/search_agent_files 分段读取或定位。
+4. 若用户上传文件且上下文给出了附件目录路径（MORI_AGENT_FILES_DIR，默认 ./workspace），不要假设你已读完整正文；先规划，再按需调用 list_agent_files/read_agent_file/read_agent_file_lines/search_agent_file/search_agent_files 分段读取或定位。
 ]]
 
 local conversation_history = {

@@ -1222,7 +1222,7 @@ local function get_memory_openai_tools(policy)
             type = "function",
             ["function"] = {
                 name = "list_agent_files",
-                description = "列出 ./agent_files 下可读取的附件文件，支持 prefix 与 limit。",
+                description = "列出附件目录（MORI_AGENT_FILES_DIR，默认 ./workspace）下可读取的文件，支持 prefix 与 limit。",
                 parameters = {
                     type = "object",
                     properties = {
@@ -1237,11 +1237,11 @@ local function get_memory_openai_tools(policy)
             type = "function",
             ["function"] = {
                 name = "read_agent_file",
-                description = "读取 ./agent_files 下指定文件的文本片段，按需分段读取。",
+                description = "读取附件目录下指定文件的文本片段，按需分段读取。",
                 parameters = {
                     type = "object",
                     properties = {
-                        path = { type = "string", description = "文件路径（例如 ./agent_files/<scope>/<name>）" },
+                        path = { type = "string", description = "文件路径（例如 ./workspace/<scope>/<name>）" },
                         start_char = { type = "number", description = "可选，1-based 起始字符位置" },
                         max_chars = { type = "number", description = "可选，本次读取最大字符数" },
                     },
@@ -1254,11 +1254,11 @@ local function get_memory_openai_tools(policy)
             type = "function",
             ["function"] = {
                 name = "read_agent_file_lines",
-                description = "按行范围读取 ./agent_files 文本文件，返回带行号结果。",
+                description = "按行范围读取附件目录文本文件，返回带行号结果。",
                 parameters = {
                     type = "object",
                     properties = {
-                        path = { type = "string", description = "文件路径（例如 ./agent_files/<scope>/<name>）" },
+                        path = { type = "string", description = "文件路径（例如 ./workspace/<scope>/<name>）" },
                         start_line = { type = "number", description = "可选，1-based 起始行号" },
                         end_line = { type = "number", description = "可选，结束行号（包含）" },
                         max_lines = { type = "number", description = "可选，本次最多返回行数" },
@@ -1272,11 +1272,11 @@ local function get_memory_openai_tools(policy)
             type = "function",
             ["function"] = {
                 name = "search_agent_file",
-                description = "在 ./agent_files 文本文件中搜索关键词或正则，返回命中行号与上下文。",
+                description = "在附件目录文本文件中搜索关键词或正则，返回命中行号与上下文。",
                 parameters = {
                     type = "object",
                     properties = {
-                        path = { type = "string", description = "文件路径（例如 ./agent_files/<scope>/<name>）" },
+                        path = { type = "string", description = "文件路径（例如 ./workspace/<scope>/<name>）" },
                         pattern = { type = "string", description = "搜索关键词或正则表达式" },
                         regex = { type = "boolean", description = "可选，true=按正则匹配" },
                         case_sensitive = { type = "boolean", description = "可选，true=区分大小写" },
@@ -1294,7 +1294,7 @@ local function get_memory_openai_tools(policy)
             type = "function",
             ["function"] = {
                 name = "search_agent_files",
-                description = "跨文件搜索 ./agent_files 下文本内容，返回文件路径+行号+上下文。",
+                description = "跨文件搜索附件目录下文本内容，返回文件路径+行号+上下文。",
                 parameters = {
                     type = "object",
                     properties = {

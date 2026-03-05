@@ -398,7 +398,7 @@ class AIPipeline:
         self.large_server_api_key = str(os.environ.get("MORI_LARGE_SERVER_API_KEY", "") or "").strip()
         self.llama_server_log_to_file = self._get_env_bool("MORI_LLAMA_SERVER_LOG_TO_FILE", True)
         self.agent_files_root = os.path.abspath(
-            str(os.environ.get("MORI_AGENT_FILES_DIR", "agent_files") or "agent_files")
+            str(os.environ.get("MORI_AGENT_FILES_DIR", "workspace") or "workspace")
         )
         os.makedirs(self.agent_files_root, exist_ok=True)
         self.llama_server_bin = os.environ.get(
@@ -1141,17 +1141,75 @@ class AIPipeline:
             raise RuntimeError(f"qwen tool `{name}` call failed: {e}") from e
         return self._normalize_qwen_tool_result(result)
 
-    @staticmethod
-    def _normalize_agent_rel_path(raw_path: str) -> str:
+    def _agent_root_display(self) -> str:
+        root = os.path.abspath(self.agent_files_root)
+        rel = os.path.relpath(root, os.getcwd()).replace("\\", "/")
+        if rel == ".":
+            return "."
+        if not rel.startswith("../"):
+            return f"./{rel}"
+        return root.replace("\\", "/")
+
+    def _agent_display_path(self, rel_path: str = "") -> str:
+        base = self._agent_root_display().rstrip("/")
+        rel = str(rel_path or "").strip().replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        rel = rel.lstrip("/")
+        if not rel:
+            return base
+        if base == ".":
+            return "./" + rel
+        return base + "/" + rel
+
+    def _agent_root_aliases(self):
+        aliases = []
+        root_name = os.path.basename(os.path.normpath(self.agent_files_root)).replace("\\", "/")
+        if root_name:
+            aliases.append(root_name + "/")
+
+        rel_root = os.path.relpath(self.agent_files_root, os.getcwd()).replace("\\", "/").strip()
+        while rel_root.startswith("./"):
+            rel_root = rel_root[2:]
+        if rel_root and rel_root != "." and not rel_root.startswith("../"):
+            aliases.append(rel_root.rstrip("/") + "/")
+
+        aliases.extend(["workspace/", "agent_files/"])
+
+        deduped = []
+        seen = set()
+        for item in aliases:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _normalize_agent_rel_path(self, raw_path: str) -> str:
         rel = str(raw_path or "").strip().replace("\\", "/")
         while rel.startswith("./"):
             rel = rel[2:]
-        if rel.startswith("agent_files/"):
-            rel = rel[len("agent_files/") :]
+        for prefix in self._agent_root_aliases():
+            if rel.startswith(prefix):
+                rel = rel[len(prefix) :]
+                break
         return rel
 
     def _resolve_agent_fs_path(self, raw_path: str):
-        rel = self._normalize_agent_rel_path(raw_path)
+        raw = str(raw_path or "").strip()
+        if not raw:
+            return "", ""
+
+        root = os.path.abspath(self.agent_files_root)
+        direct_abs = os.path.abspath(raw)
+        if direct_abs != root and direct_abs.startswith(root + os.sep):
+            rel = os.path.relpath(direct_abs, root).replace("\\", "/")
+            rel = os.path.normpath(rel).replace("\\", "/")
+            if rel in {".", ".."} or rel.startswith("../") or rel.startswith("/"):
+                return "", ""
+            return rel, direct_abs
+
+        rel = self._normalize_agent_rel_path(raw)
         if not rel:
             return "", ""
 
@@ -1159,7 +1217,6 @@ class AIPipeline:
         if rel in {".", ".."} or rel.startswith("../") or rel.startswith("/"):
             return "", ""
 
-        root = os.path.abspath(self.agent_files_root)
         abs_path = os.path.abspath(os.path.join(root, rel))
         if abs_path == root:
             return "", ""
@@ -1208,8 +1265,9 @@ class AIPipeline:
             return "list_agent_files error: invalid prefix"
 
         root = os.path.abspath(self.agent_files_root)
+        root_display = self._agent_root_display()
         if not os.path.isdir(root):
-            return "list_agent_files: ./agent_files is empty"
+            return f"list_agent_files: {root_display} is empty"
 
         rows = []
         for dirpath, _, filenames in os.walk(root):
@@ -1229,14 +1287,14 @@ class AIPipeline:
 
         if not rows:
             if prefix_norm:
-                return f"list_agent_files: no files under ./agent_files/{prefix_norm}"
-            return "list_agent_files: no files in ./agent_files"
+                return f"list_agent_files: no files under {self._agent_display_path(prefix_norm)}"
+            return f"list_agent_files: no files in {root_display}"
 
         rows.sort(key=lambda x: x[0], reverse=True)
         shown = rows[:limit]
-        lines = [f"[agent_files] showing {len(shown)}/{len(rows)} files"]
+        lines = [f"[agent_files] root={root_display} showing {len(shown)}/{len(rows)} files"]
         for idx, (_mtime, rel, size) in enumerate(shown, 1):
-            lines.append(f"{idx}) ./agent_files/{rel} | bytes={size}")
+            lines.append(f"{idx}) {self._agent_display_path(rel)} | bytes={size}")
         if len(rows) > len(shown):
             lines.append(f"... ({len(rows) - len(shown)} more)")
         return "\n".join(lines)
@@ -1251,10 +1309,11 @@ class AIPipeline:
             return "read_agent_file error: missing `path`"
 
         rel, abs_path = self._resolve_agent_fs_path(raw_path)
+        root_display = self._agent_root_display()
         if not abs_path:
-            return "read_agent_file error: path is outside ./agent_files"
+            return f"read_agent_file error: path is outside {root_display}"
         if not os.path.isfile(abs_path):
-            return f"read_agent_file error: file not found: ./agent_files/{rel}"
+            return f"read_agent_file error: file not found: {self._agent_display_path(rel)}"
 
         max_chars = int(args.get("max_chars") or default_max_chars or 3000)
         hard = max(128, int(hard_max_chars or 12000))
@@ -1279,7 +1338,7 @@ class AIPipeline:
         truncated = end_idx < total
 
         header = (
-            f"[read_agent_file] path=./agent_files/{rel} "
+            f"[read_agent_file] path={self._agent_display_path(rel)} "
             f"start_char={start_char} max_chars={max_chars} "
             f"returned_chars={len(chunk)} total_chars={total} truncated={'yes' if truncated else 'no'}"
         )
@@ -1297,10 +1356,11 @@ class AIPipeline:
             return "read_agent_file_lines error: missing `path`"
 
         rel, abs_path = self._resolve_agent_fs_path(raw_path)
+        root_display = self._agent_root_display()
         if not abs_path:
-            return "read_agent_file_lines error: path is outside ./agent_files"
+            return f"read_agent_file_lines error: path is outside {root_display}"
         if not os.path.isfile(abs_path):
-            return f"read_agent_file_lines error: file not found: ./agent_files/{rel}"
+            return f"read_agent_file_lines error: file not found: {self._agent_display_path(rel)}"
 
         max_lines = self._coerce_int_arg(args.get("max_lines"), int(default_max_lines or 220))
         hard = max(16, int(hard_max_lines or 1200))
@@ -1340,7 +1400,7 @@ class AIPipeline:
         returned_lines = len(out_rows)
         truncated = (requested_end > effective_end) or ((not has_end) and effective_end < total_lines)
         header = (
-            f"[read_agent_file_lines] path=./agent_files/{rel} "
+            f"[read_agent_file_lines] path={self._agent_display_path(rel)} "
             f"start_line={start_line} end_line={effective_end if effective_end > 0 else 0} "
             f"max_lines={max_lines} returned_lines={returned_lines} total_lines={total_lines} "
             f"truncated={'yes' if truncated else 'no'}"
@@ -1362,10 +1422,11 @@ class AIPipeline:
             return "search_agent_file error: missing `pattern`"
 
         rel, abs_path = self._resolve_agent_fs_path(raw_path)
+        root_display = self._agent_root_display()
         if not abs_path:
-            return "search_agent_file error: path is outside ./agent_files"
+            return f"search_agent_file error: path is outside {root_display}"
         if not os.path.isfile(abs_path):
-            return f"search_agent_file error: file not found: ./agent_files/{rel}"
+            return f"search_agent_file error: file not found: {self._agent_display_path(rel)}"
 
         max_hits = self._coerce_int_arg(args.get("max_hits"), int(default_max_hits or 20))
         hard = max(8, int(hard_max_hits or 200))
@@ -1446,7 +1507,7 @@ class AIPipeline:
 
         pattern_view = pattern if len(pattern) <= 120 else (pattern[:120] + "...")
         header = (
-            f"[search_agent_file] path=./agent_files/{rel} pattern={json.dumps(pattern_view, ensure_ascii=False)} "
+            f"[search_agent_file] path={self._agent_display_path(rel)} pattern={json.dumps(pattern_view, ensure_ascii=False)} "
             f"regex={'yes' if regex_mode else 'no'} case_sensitive={'yes' if case_sensitive else 'no'} "
             f"start_line={scan_start if total_lines > 0 else 0} end_line={scan_end if total_lines > 0 else 0} "
             f"hits={total_hits} shown={shown} context_lines={context_lines} truncated={'yes' if total_hits > shown else 'no'}"
@@ -1518,8 +1579,9 @@ class AIPipeline:
         end_line = self._coerce_int_arg(raw_end, 0)
 
         root = os.path.abspath(self.agent_files_root)
+        root_display = self._agent_root_display()
         if not os.path.isdir(root):
-            return "search_agent_files: ./agent_files is empty"
+            return f"search_agent_files: {root_display} is empty"
 
         rows = []
         for dirpath, _, filenames in os.walk(root):
@@ -1539,8 +1601,8 @@ class AIPipeline:
 
         if not rows:
             if prefix_norm:
-                return f"search_agent_files: no files under ./agent_files/{prefix_norm}"
-            return "search_agent_files: no files in ./agent_files"
+                return f"search_agent_files: no files under {self._agent_display_path(prefix_norm)}"
+            return f"search_agent_files: no files in {root_display}"
 
         rows.sort(key=lambda x: x[0], reverse=True)
         scan_rows = rows[:max_files]
@@ -1598,7 +1660,7 @@ class AIPipeline:
 
                 from_no = max(scan_start, line_no - context_lines)
                 to_no = min(scan_end, line_no + context_lines)
-                block = [f"#{shown} file=./agent_files/{rel} line={line_no}"]
+                block = [f"#{shown} file={self._agent_display_path(rel)} line={line_no}"]
                 for n in range(from_no, to_no + 1):
                     mark = ">" if n == line_no else " "
                     block.append(f"{mark}{n:>{width}} | {lines[n - 1]}")
@@ -2108,7 +2170,7 @@ class MoriWebUIChainBridge:
         primary_idle_ttl_sec: int = 1800,
         session_debug: bool = False,
         history_file_path: str = "memory/history.txt",
-        agent_files_root: str = "agent_files",
+        agent_files_root: str = "workspace",
     ):
         self.host = str(host or "127.0.0.1")
         self.port = int(port)
@@ -2127,7 +2189,7 @@ class MoriWebUIChainBridge:
         self.session_debug = bool(session_debug)
         self.primary_conversation_name = "Mori"
         self.history_file_path = str(history_file_path or "memory/history.txt")
-        self.agent_files_root = os.path.abspath(str(agent_files_root or "agent_files"))
+        self.agent_files_root = os.path.abspath(str(agent_files_root or "workspace"))
         os.makedirs(self.agent_files_root, exist_ok=True)
         self.agent_file_manifest_max_items = max(
             1,
@@ -2296,6 +2358,15 @@ class MoriWebUIChainBridge:
                 safe = safe[:96]
         return safe
 
+    def _agent_root_display(self) -> str:
+        root = os.path.abspath(self.agent_files_root)
+        rel = os.path.relpath(root, os.getcwd()).replace("\\", "/")
+        if rel == ".":
+            return "."
+        if not rel.startswith("../"):
+            return f"./{rel}"
+        return root.replace("\\", "/")
+
     def _store_agent_file_block(self, file_name: str, payload: str, thread_key: str):
         scope = self._sanitize_agent_scope(thread_key)
         target_dir = os.path.join(self.agent_files_root, scope)
@@ -2372,7 +2443,7 @@ class MoriWebUIChainBridge:
             return ""
         listed = saved_files[: self.agent_file_manifest_max_items]
         lines = [
-            "[附件已保存到 ./agent_files，正文未直接注入上下文]",
+            f"[附件已保存到 {self._agent_root_display()}，正文未直接注入上下文]",
         ]
         for item in listed:
             lines.append(

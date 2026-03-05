@@ -82,7 +82,7 @@ http://127.0.0.1:8080
 - `MORI_LARGE_SERVER_JINJA=1`：主模型启用 `--jinja`（默认开启）
 - `MORI_LARGE_SERVER_API_KEY`：上游 `llama-server` API key（链路模式默认自动生成随机 key）
 - `MORI_LLAMA_SERVER_LOG_TO_FILE=0|1`：是否将 `llama-server` 输出写入 `logs/llama_server_*.log`（默认 `1`；设 `0` 则不创建 `logs/` 且丢弃输出）
-- `MORI_AGENT_FILES_DIR`：附件落盘目录（默认 `./agent_files`）
+- `MORI_AGENT_FILES_DIR`：附件落盘目录（默认 `./workspace`）
 - `MORI_AGENT_FILE_MANIFEST_MAX_ITEMS`：单轮向模型展示的附件路径条数（默认 `8`）
 - `MORI_RUN_MODE=webui` 时默认不打印上游端口 URL，避免误进直连口
 
@@ -205,7 +205,7 @@ agent = {
   - `settings.keyring.memory_input.fact_file_payload_mode = "ignore"`：原子事实提取阶段忽略附件正文
   - 可选 `filename_only`：仅保留文件名清单，不传正文
 - WebUI 附件策略（默认）：
-  - 用户附件正文会被抽离并保存到 `./agent_files/<thread>/...`
+  - 用户附件正文会被抽离并保存到 `./workspace/<thread>/...`
   - 用户输入上下文仅保留“附件清单 + 路径”，不再整段注入正文
   - agent 可通过 `list_agent_files` / `read_agent_file` / `read_agent_file_lines` / `search_agent_file` / `search_agent_files` 按需读取与定位
 
