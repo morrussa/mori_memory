@@ -1742,6 +1742,114 @@ class AIPipeline:
         )
         return self._extract_chat_text(output)
 
+    def _normalize_tool_choice(self, tool_choice):
+        raw = self._coerce_lua_value(tool_choice)
+        if raw is None:
+            return "auto"
+        if isinstance(raw, str):
+            choice = raw.strip()
+            if choice in {"", "auto"}:
+                return "auto"
+            if choice in {"none", "required"}:
+                return choice
+            return {
+                "type": "function",
+                "function": {"name": choice},
+            }
+        if isinstance(raw, dict):
+            return raw
+        return "auto"
+
+    def generate_chat_with_tools_sync(
+        self,
+        messages,
+        params,
+        tools,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    ):
+        if not self.llm_large:
+            raise RuntimeError("Large model not loaded")
+
+        messages_list = self._coerce_messages(messages)
+        if not messages_list:
+            raise ValueError("Invalid messages format")
+
+        params_dict = dict(params) if hasattr(params, "keys") else params
+        max_tokens = int(params_dict.get("max_tokens", 1024))
+        temperature = float(params_dict.get("temperature", 0.6))
+        stop = [str(s) for s in params_dict.get("stop", []) if s is not None]
+
+        seed = params_dict.get("seed")
+        if seed is not None:
+            try:
+                seed = int(seed)
+                if seed < 0:
+                    seed = None
+            except (TypeError, ValueError):
+                seed = None
+
+        raw_tools = self._coerce_lua_value(tools)
+        if isinstance(raw_tools, dict):
+            if "type" in raw_tools or "function" in raw_tools:
+                tools_list = [raw_tools]
+            else:
+                indexed = []
+                for key, value in raw_tools.items():
+                    try:
+                        idx = int(key)
+                    except (TypeError, ValueError):
+                        idx = None
+                    if idx is None:
+                        continue
+                    indexed.append((idx, value))
+                indexed.sort(key=lambda x: x[0])
+                tools_list = [v for _, v in indexed if isinstance(v, dict)]
+        elif isinstance(raw_tools, list):
+            tools_list = [x for x in raw_tools if isinstance(x, dict)]
+        else:
+            tools_list = []
+
+        output = self.llm_large.create_chat_completion(
+            messages=messages_list,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            seed=seed,
+            tools=tools_list if tools_list else None,
+            tool_choice=self._normalize_tool_choice(tool_choice) if tools_list else None,
+            parallel_tool_calls=self._coerce_bool_arg(parallel_tool_calls, True),
+        )
+
+        text, tool_calls = self._extract_chat_text_and_tool_calls(output)
+        normalized_calls = []
+        for idx, call in enumerate(tool_calls or [], 1):
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name", "") or "").strip()
+            if not name:
+                continue
+            arguments = fn.get("arguments", "{}")
+            args = self._parse_tool_arguments_relaxed(arguments)
+            if not isinstance(args, dict):
+                args = {}
+            normalized_calls.append(
+                {
+                    "id": str(call.get("id", "") or f"tool_call_{idx}"),
+                    "type": "tool_call",
+                    "name": name,
+                    "args": args,
+                }
+            )
+
+        return {
+            "content": str(text or ""),
+            "tool_calls": normalized_calls,
+        }
+
     def load_models(self, large_model_path: str, embedding_model_path: str):
         print("[Python] Loading models...")
 

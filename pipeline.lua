@@ -46,6 +46,17 @@ end
 do
     graph_cfg.tool_loop_max = read_env_int("MORI_GRAPH_TOOL_LOOP_MAX", graph_cfg.tool_loop_max or 5, 1)
     graph_cfg.max_nodes_per_run = read_env_int("MORI_GRAPH_MAX_NODES_PER_RUN", graph_cfg.max_nodes_per_run or 128, 20)
+    graph_cfg.agent = graph_cfg.agent or {}
+    graph_cfg.agent.remaining_steps = read_env_int(
+        "MORI_GRAPH_AGENT_REMAINING_STEPS",
+        (graph_cfg.agent or {}).remaining_steps or 25,
+        1
+    )
+    graph_cfg.agent.max_tokens = read_env_int(
+        "MORI_GRAPH_AGENT_MAX_TOKENS",
+        (graph_cfg.agent or {}).max_tokens or 1024,
+        64
+    )
     graph_cfg.streaming = graph_cfg.streaming or {}
     graph_cfg.streaming.token_chunk_chars = read_env_int(
         "MORI_GRAPH_STREAM_TOKEN_CHUNK_CHARS",

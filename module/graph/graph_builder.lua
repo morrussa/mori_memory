@@ -2,12 +2,10 @@ local config = require("module.config")
 
 local ingest_node = require("module.graph.nodes.ingest_node")
 local context_node = require("module.graph.nodes.context_node")
-local router_node = require("module.graph.nodes.router_node")
 local recall_node = require("module.graph.nodes.recall_node")
-local planner_node = require("module.graph.nodes.planner_node")
-local tool_exec_node = require("module.graph.nodes.tool_exec_node")
-local repair_node = require("module.graph.nodes.repair_node")
-local responder_node = require("module.graph.nodes.responder_node")
+local agent_node = require("module.graph.nodes.agent_node")
+local tools_node = require("module.graph.nodes.tools_node")
+local finalize_node = require("module.graph.nodes.finalize_node")
 local writeback_node = require("module.graph.nodes.writeback_node")
 local persist_node = require("module.graph.nodes.persist_node")
 local end_node = require("module.graph.nodes.end_node")
@@ -21,13 +19,11 @@ end
 function M.build()
     local nodes = {
         ingest_node = ingest_node,
-        context_node = context_node,
-        router_node = router_node,
         recall_node = recall_node,
-        planner_node = planner_node,
-        tool_exec_node = tool_exec_node,
-        repair_node = repair_node,
-        responder_node = responder_node,
+        context_node = context_node,
+        agent_node = agent_node,
+        tools_node = tools_node,
+        finalize_node = finalize_node,
         writeback_node = writeback_node,
         persist_node = persist_node,
         ["end"] = end_node,
@@ -38,65 +34,39 @@ function M.build()
         local tool_loop_max = math.max(1, math.floor(tonumber(cfg.tool_loop_max) or 5))
 
         if current == "ingest_node" then
+            return "recall_node"
+        end
+        if current == "recall_node" then
             return "context_node"
         end
         if current == "context_node" then
-            return "router_node"
+            return "agent_node"
         end
-        if current == "router_node" then
-            local route = tostring((((state or {}).router_decision or {}).route) or "respond")
-            if route == "tool_loop" then
-                return "recall_node"
-            end
-            return "responder_node"
-        end
-        if current == "recall_node" then
-            return "planner_node"
-        end
-        if current == "planner_node" then
+        if current == "agent_node" then
             local loop_count = tonumber((((state or {}).tool_exec or {}).loop_count) or 0) or 0
-            local calls = (((state or {}).planner or {}).tool_calls) or {}
-            if #calls <= 0 then
-                return "responder_node"
+            local pending_calls = (((state or {}).agent_loop or {}).pending_tool_calls) or {}
+            local stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or "")
+
+            if stop_reason ~= "" then
+                return "finalize_node"
             end
-            if loop_count >= tool_loop_max then
-                return "responder_node"
-            end
-            return "tool_exec_node"
-        end
-        if current == "tool_exec_node" then
-            local failed = tonumber((((state or {}).tool_exec or {}).failed) or 0) or 0
-            local loop_count = tonumber((((state or {}).tool_exec or {}).loop_count) or 0) or 0
-            local repair_attempts = tonumber((((state or {}).repair or {}).attempts) or 0) or 0
-            local repair_max = tonumber((((state or {}).repair or {}).max_attempts) or 2) or 2
-            if failed > 0 then
-                if repair_attempts < repair_max then
-                    return "repair_node"
+
+            if #pending_calls > 0 then
+                if loop_count >= tool_loop_max then
+                    state.agent_loop = state.agent_loop or {}
+                    state.agent_loop.pending_tool_calls = {}
+                    state.agent_loop.stop_reason = "tool_loop_max_exceeded"
+                    return "finalize_node"
                 end
-                return "responder_node"
+                return "tools_node"
             end
-            if loop_count >= tool_loop_max then
-                return "responder_node"
-            end
-            return "planner_node"
+
+            return "finalize_node"
         end
-        if current == "repair_node" then
-            local loop_count = tonumber((((state or {}).tool_exec or {}).loop_count) or 0) or 0
-            if loop_count >= tool_loop_max then
-                return "responder_node"
-            end
-            local failed = tonumber((((state or {}).tool_exec or {}).failed) or 0) or 0
-            if failed > 0 then
-                local calls = (((state or {}).planner or {}).tool_calls) or {}
-                if #calls > 0 then
-                    return "tool_exec_node"
-                end
-                return "responder_node"
-            end
-            -- If failures were repaired to zero, continue planning.
-            return "planner_node"
+        if current == "tools_node" then
+            return "agent_node"
         end
-        if current == "responder_node" then
+        if current == "finalize_node" then
             return "writeback_node"
         end
         if current == "writeback_node" then

@@ -10,6 +10,7 @@ local REQUIRED_KEYS = {
     "input",
     "uploads",
     "messages",
+    "agent_loop",
     "context",
     "router_decision",
     "recall",
@@ -155,6 +156,13 @@ function M.new_state(args)
         messages = {
             conversation_history = args.conversation_history or {},
             system_prompt = util.trim(args.system_prompt or ""),
+            runtime_messages = {},
+        },
+        agent_loop = {
+            remaining_steps = 25,
+            pending_tool_calls = {},
+            stop_reason = "",
+            iteration = 0,
         },
         context = {
             memory_context = "",

@@ -74,6 +74,90 @@ function M.supported_tools()
     }
 end
 
+function M.get_tool_schemas()
+    return {
+        {
+            type = "function",
+            ["function"] = {
+                name = "list_files",
+                description = "List files from the agent workspace with optional prefix filtering.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        prefix = { type = "string", description = "Relative path prefix, e.g. download/" },
+                        limit = { type = "integer", description = "Maximum number of files to return" },
+                    },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "read_file",
+                description = "Read file content from the agent workspace.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string", description = "Relative path to file" },
+                        max_chars = { type = "integer", description = "Maximum characters to read" },
+                    },
+                    required = { "path" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "read_lines",
+                description = "Read a range of lines from a file in the agent workspace.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string", description = "Relative path to file" },
+                        start_line = { type = "integer", description = "1-based start line" },
+                        max_lines = { type = "integer", description = "Maximum number of lines" },
+                    },
+                    required = { "path" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "search_file",
+                description = "Search a file for a text pattern.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string", description = "Relative path to file" },
+                        pattern = { type = "string", description = "Pattern to search for" },
+                        max_hits = { type = "integer", description = "Maximum number of matches" },
+                    },
+                    required = { "path", "pattern" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "search_files",
+                description = "Search files under a prefix for a text pattern.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        prefix = { type = "string", description = "Relative path prefix, e.g. download/" },
+                        pattern = { type = "string", description = "Pattern to search for" },
+                        max_hits = { type = "integer", description = "Maximum total hits" },
+                        max_files = { type = "integer", description = "Maximum files to scan" },
+                        per_file_hits = { type = "integer", description = "Maximum hits per file" },
+                    },
+                    required = { "pattern" },
+                },
+            },
+        },
+    }
+end
+
 function M.execute(call)
     local name = util.trim((call or {}).tool)
     local args = (call or {}).args or {}

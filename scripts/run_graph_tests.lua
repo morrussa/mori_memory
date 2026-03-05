@@ -36,6 +36,7 @@ local function encode_lua_value(v)
             end
             return "{" .. table.concat(parts, ",") .. "}"
         end
+
         local parts = {}
         for k, val in pairs(v) do
             local key
@@ -55,18 +56,6 @@ local function encode_lua_value(v)
     return encode_lua_value(tostring(v))
 end
 
-local function planner_literal(calls)
-    return "{tool_calls=" .. encode_lua_value(calls or {}) .. "}"
-end
-
-local function mk_tool_call(name, args, call_id)
-    return {
-        tool = name,
-        args = args or {},
-        call_id = call_id or ("call_" .. tostring(name)),
-    }
-end
-
 local function parse_lua_args(text)
     local src = tostring(text or "")
     local chunk = load("return " .. src, "tool_args", "t", {})
@@ -80,27 +69,38 @@ local function parse_lua_args(text)
     return value
 end
 
+local function mk_tool_call(name, args, id)
+    return {
+        name = name,
+        args = args or {},
+        id = id or ("call_" .. tostring(name)),
+        type = "tool_call",
+    }
+end
+
+local function mk_agent_step(content, tool_calls)
+    return {
+        content = tostring(content or ""),
+        tool_calls = tool_calls or {},
+    }
+end
+
 local CURRENT = nil
 
 local function setup_stubs(case)
     CURRENT = {
         id = case.id,
-        router = {},
-        planner = {},
-        repair = {},
-        planner_default = case.planner_default,
-        repair_default = case.repair_default,
         external_calls = 0,
         file_calls = {},
+        agent_steps = {},
+        agent_default_step = case.agent_default_step,
     }
-    for _, v in ipairs(case.router_steps or {}) do
-        CURRENT.router[#CURRENT.router + 1] = v
-    end
-    for _, v in ipairs(case.planner_steps or {}) do
-        CURRENT.planner[#CURRENT.planner + 1] = v
-    end
-    for _, v in ipairs(case.repair_steps or {}) do
-        CURRENT.repair[#CURRENT.repair + 1] = v
+
+    for _, step in ipairs(case.agent_steps or {}) do
+        CURRENT.agent_steps[#CURRENT.agent_steps + 1] = {
+            content = tostring(step.content or ""),
+            tool_calls = step.tool_calls or {},
+        }
     end
 
     for k, _ in pairs(package.loaded) do
@@ -114,13 +114,21 @@ local function setup_stubs(case)
             settings = {
                 graph = {
                     input_token_budget = 12000,
-                    tool_loop_max = 5,
+                    tool_loop_max = math.max(1, math.floor(tonumber(case.tool_loop_max) or 5)),
                     max_nodes_per_run = 128,
                     router = { max_tokens = 48, temperature = 0.0, seed = 7 },
+                    agent = {
+                        max_tokens = 512,
+                        temperature = 0.0,
+                        seed = 42,
+                        remaining_steps = math.max(1, math.floor(tonumber(case.remaining_steps) or 25)),
+                        tool_choice = "auto",
+                        parallel_tool_calls = true,
+                    },
                     planner = { max_tokens = 256, temperature = 0.1, seed = 11, max_calls_per_loop = 6 },
                     repair = { max_attempts = 2, max_tokens = 256, temperature = 0.0, seed = 29 },
                     responder = { max_tokens = 256, temperature = 0.0, seed = 42 },
-                    recall = { enable_on_respond = false },
+                    recall = { enable_on_respond = true },
                     streaming = { token_chunk_chars = 16 },
                     tools = { file_context_max_chars = 4000 },
                     file_tools = {
@@ -222,43 +230,27 @@ local function setup_stubs(case)
     end
 
     _G.py_pipeline = {
-        generate_chat_sync = function(_, messages, _params)
-            local prompt = ""
-            if type(messages) == "table" then
-                local last = messages[#messages]
-                if type(last) == "table" then
-                    prompt = tostring(last.content or "")
-                end
+        generate_chat_with_tools_sync = function(_, _messages, _params, _tools, _tool_choice, _parallel_tool_calls)
+            local step = nil
+            if #CURRENT.agent_steps > 0 then
+                step = table.remove(CURRENT.agent_steps, 1)
+            elseif type(CURRENT.agent_default_step) == "table" then
+                step = CURRENT.agent_default_step
             end
-
-            if prompt:find("strict routing classifier", 1, true) then
-                if #CURRENT.router > 0 then
-                    return table.remove(CURRENT.router, 1)
-                end
-                return '{route="respond"}'
+            if type(step) ~= "table" then
+                return {
+                    content = "FINAL_" .. tostring(case.id),
+                    tool_calls = {},
+                }
             end
+            return {
+                content = tostring(step.content or ""),
+                tool_calls = step.tool_calls or {},
+            }
+        end,
 
-            if prompt:find("strict tool planner", 1, true) then
-                if #CURRENT.planner > 0 then
-                    return table.remove(CURRENT.planner, 1)
-                end
-                if type(CURRENT.planner_default) == "string" then
-                    return CURRENT.planner_default
-                end
-                return "{tool_calls={}}"
-            end
-
-            if prompt:find("strict tool repair planner", 1, true) then
-                if #CURRENT.repair > 0 then
-                    return table.remove(CURRENT.repair, 1)
-                end
-                if type(CURRENT.repair_default) == "string" then
-                    return CURRENT.repair_default
-                end
-                return "{tool_calls={}}"
-            end
-
-            return "FINAL_" .. tostring(case.id)
+        generate_chat_sync = function(_, _messages, _params)
+            return "FALLBACK_" .. tostring(case.id)
         end,
 
         count_chat_tokens = function(_, messages)
@@ -375,6 +367,16 @@ local function assert_event_order(events, case_id)
     ensure(node_start > 0 and node_end > 0 and node_start == node_end, case_id .. ": node events mismatch")
 end
 
+local function count_events(events, name)
+    local n = 0
+    for _, evt in ipairs(events or {}) do
+        if evt.event == name then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 local function run_case(case)
     setup_stubs(case)
     local graph_runtime = require("module.graph.graph_runtime")
@@ -427,9 +429,6 @@ local function run_case(case)
     if case.expect_loops ~= nil then
         ensure((tonumber(trace.tool_loops) or 0) == case.expect_loops, case.id .. ": tool loop mismatch")
     end
-    if case.expect_repair_attempts ~= nil then
-        ensure((tonumber(trace.repair_attempts) or 0) == case.expect_repair_attempts, case.id .. ": repair attempts mismatch")
-    end
     if case.expect_uploads_count ~= nil then
         ensure((tonumber(snapshot.uploads_count) or 0) == case.expect_uploads_count, case.id .. ": uploads count mismatch")
     end
@@ -438,6 +437,16 @@ local function run_case(case)
     end
     if case.expect_writeback_saved ~= nil then
         ensure((tonumber(snapshot.writeback_saved) or 0) == case.expect_writeback_saved, case.id .. ": writeback_saved mismatch")
+    end
+    if case.expect_stop_reason ~= nil then
+        ensure(tostring(snapshot.stop_reason or "") == tostring(case.expect_stop_reason), case.id .. ": stop_reason mismatch")
+    end
+    if case.final_contains ~= nil then
+        ensure(tostring(output):find(tostring(case.final_contains), 1, true) ~= nil, case.id .. ": final text mismatch")
+    end
+    if case.min_tool_events ~= nil then
+        local n = math.min(count_events(events, "tool_call"), count_events(events, "tool_result"))
+        ensure(n >= case.min_tool_events, case.id .. ": tool events too small")
     end
 
     return {
@@ -449,23 +458,25 @@ end
 local function build_cases()
     local cases = {}
 
-    -- Memory 20
+    -- Memory 20: recall only, no tools.
     for i = 1, 20 do
         cases[#cases + 1] = {
             id = string.format("memory_%02d", i),
             category = "memory",
             input = string.format("MEMORY_HIT case %d", i),
-            router_steps = { '{route="tool_loop"}' },
-            planner_steps = { "{tool_calls={}}" },
-            expect_route = "tool_loop",
+            agent_steps = {
+                mk_agent_step("memory_answer_" .. tostring(i), {}),
+            },
+            expect_route = "respond",
             expect_recall = true,
             expect_tool_executed = 0,
+            expect_tool_failed = 0,
             expect_writeback_saved = 1,
             expect_uploads_count = 0,
         }
     end
 
-    local file_tools = {
+    local file_tool_calls = {
         mk_tool_call("list_files", { prefix = "download" }, "file_c1"),
         mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "file_c2"),
         mk_tool_call("read_lines", { path = "download/a.txt", start_line = 1, max_lines = 20 }, "file_c3"),
@@ -475,140 +486,144 @@ local function build_cases()
 
     -- File 20
     for i = 1, 20 do
-        local tool_call = file_tools[((i - 1) % #file_tools) + 1]
-        local planner_steps = {
-            planner_literal({ tool_call }),
-            "{tool_calls={}}",
-        }
-        local planner_default = nil
-        local expect_loops = nil
-        local input = string.format("file tool case %d", i)
-        local router_steps = { '{route="tool_loop"}' }
-        local conversation_history = nil
-        if i == 1 then
-            -- loop cap test: planner keeps emitting calls; runtime must stop at tool_loop_max=5
-            planner_steps = {}
-            planner_default = planner_literal({ tool_call })
-            expect_loops = 5
-        end
-        if i == 20 then
-            -- follow-up file reading test: router/planner must recover from history tool_path even without fresh uploads.
-            input = "继续读取这个文件前几行，看看模型设置"
-            router_steps = { '{route="respond"}' }
-            planner_steps = { "{tool_calls={}}" }
-            conversation_history = {
-                { role = "system", content = "SYSTEM_PROMPT" },
-                { role = "user", content = "我上传了文件" },
-                {
-                    role = "assistant",
-                    content = "[上传文件已保存到 ./workspace/download]\n- main.py: ./workspace/download/mori_x_main.py (tool_path=download/mori_x_main.py, bytes=38505)",
-                },
-            }
-        end
-        cases[#cases + 1] = {
+        local call = file_tool_calls[((i - 1) % #file_tool_calls) + 1]
+        local case = {
             id = string.format("file_%02d", i),
             category = "file",
-            input = input,
-            router_steps = router_steps,
-            planner_steps = planner_steps,
-            planner_default = planner_default,
-            conversation_history = conversation_history,
+            input = string.format("file tool case %d", i),
+            agent_steps = {
+                mk_agent_step("need_file_tool_" .. tostring(i), { call }),
+                mk_agent_step("file_done_" .. tostring(i), {}),
+            },
             expect_route = "tool_loop",
             min_tool_executed = 1,
             expect_tool_failed = 0,
-            expect_loops = expect_loops,
+            expect_loops = 1,
             expect_writeback_saved = 1,
             expect_uploads_count = 0,
+            min_tool_events = 1,
         }
+
+        if i == 1 then
+            case.agent_steps = {
+                mk_agent_step("loop_forever_file", { call }),
+            }
+            case.agent_default_step = mk_agent_step("loop_forever_file", { call })
+            case.expect_loops = 5
+            case.min_tool_executed = 5
+            case.expect_stop_reason = "tool_loop_max_exceeded"
+            case.final_contains = "Sorry, need more steps"
+        elseif i == 2 then
+            case.remaining_steps = 1
+            case.agent_steps = {
+                mk_agent_step("need_but_no_steps", { call }),
+            }
+            case.expect_route = "respond"
+            case.expect_loops = 0
+            case.expect_tool_executed = 0
+            case.min_tool_executed = nil
+            case.expect_stop_reason = "remaining_steps_exhausted"
+            case.final_contains = "Sorry, need more steps"
+            case.min_tool_events = 0
+        elseif i == 20 then
+            case.input = "读取我上传文件前几行"
+            case.uploads = {
+                { name = "a.txt", path = "./workspace/download/a.txt", tool_path = "download/a.txt", bytes = 5 },
+            }
+            case.expect_uploads_count = 1
+        end
+
+        cases[#cases + 1] = case
     end
 
     -- No-tool 10
     for i = 1, 10 do
-        local has_uploads = (i == 1)
-        local expect_route = "respond"
-        local expect_tool_executed = 0
-        local min_tool_executed = nil
-        local expect_tool_failed = 0
-        if has_uploads then
-            expect_route = "tool_loop"
-            expect_tool_executed = nil
-            min_tool_executed = 1
-            expect_tool_failed = nil
-        end
-
-        cases[#cases + 1] = {
+        local case = {
             id = string.format("no_tool_%02d", i),
             category = "no_tool",
             input = string.format("plain response %d", i),
-            router_steps = { '{route="respond"}' },
-            expect_route = expect_route,
+            agent_steps = {
+                mk_agent_step("plain_done_" .. tostring(i), {}),
+            },
+            expect_route = "respond",
             expect_recall = false,
-            expect_tool_executed = expect_tool_executed,
-            min_tool_executed = min_tool_executed,
-            expect_tool_failed = expect_tool_failed,
+            expect_tool_executed = 0,
+            expect_tool_failed = 0,
             expect_writeback_saved = 1,
-            expect_uploads_count = has_uploads and 1 or 0,
-            uploads = has_uploads and {
-                { name = "a.txt", path = "./workspace/download/a.txt", bytes = 5 },
-            } or {},
+            expect_uploads_count = 0,
         }
+
+        if i == 1 then
+            case.uploads = {
+                { name = "a.txt", path = "./workspace/download/a.txt", tool_path = "download/a.txt", bytes = 5 },
+            }
+            case.agent_steps = {
+                mk_agent_step("process_upload", { mk_tool_call("read_file", { path = "download/a.txt", max_chars = 40 }, "upload_read_1") }),
+                mk_agent_step("upload_done", {}),
+            }
+            case.expect_route = "tool_loop"
+            case.min_tool_executed = 1
+            case.expect_tool_executed = nil
+            case.expect_uploads_count = 1
+            case.min_tool_events = 1
+        end
+
+        cases[#cases + 1] = case
     end
 
     -- External 10
     for i = 1, 10 do
-        local external_enabled = true
-        local external_allowlist = { "web_search" }
-        local planner_steps = {
-            planner_literal({
-                mk_tool_call("web_search", { query = "q" .. tostring(i) }, "ext_c1"),
-                mk_tool_call("web_search", { query = "q" .. tostring(i) .. "_2" }, "ext_c2"),
-            }),
-            "{tool_calls={}}",
-        }
-        local expect_external_calls = 2
-        local expect_tool_failed = 0
-        local min_tool_failed = nil
-        local expect_repair_attempts = nil
-        local expect_loops = nil
-        local repair_steps = {}
-        local min_tool_executed = 2
-
-        if i == 2 then
-            -- repair cap test: disallowed tool -> fail -> repair repeats -> max 2 repairs
-            planner_steps = {
-                planner_literal({ mk_tool_call("not_allowlisted", { query = "x" }, "ext_bad1") }),
-            }
-            repair_steps = {
-                planner_literal({ mk_tool_call("not_allowlisted", { query = "x2" }, "ext_bad2") }),
-                planner_literal({ mk_tool_call("not_allowlisted", { query = "x3" }, "ext_bad3") }),
-            }
-            expect_external_calls = 0
-            expect_tool_failed = nil
-            min_tool_failed = 1
-            expect_repair_attempts = 2
-            expect_loops = 3
-            min_tool_executed = nil
-        end
-
-        cases[#cases + 1] = {
+        local case = {
             id = string.format("external_%02d", i),
             category = "external",
             input = string.format("external tool case %d", i),
-            router_steps = { '{route="tool_loop"}' },
-            planner_steps = planner_steps,
-            repair_steps = repair_steps,
-            external_enabled = external_enabled,
-            external_allowlist = external_allowlist,
+            external_enabled = true,
+            external_allowlist = { "web_search" },
+            agent_steps = {
+                mk_agent_step("need_external_" .. tostring(i), {
+                    mk_tool_call("web_search", { query = "q" .. tostring(i) }, "ext_c1"),
+                }),
+                mk_agent_step("external_done_" .. tostring(i), {}),
+            },
             expect_route = "tool_loop",
-            min_tool_executed = min_tool_executed,
-            expect_tool_failed = expect_tool_failed,
-            min_tool_failed = min_tool_failed,
-            expect_external_calls = expect_external_calls,
-            expect_repair_attempts = expect_repair_attempts,
-            expect_loops = expect_loops,
+            min_tool_executed = 1,
+            expect_tool_failed = 0,
+            expect_external_calls = 1,
+            expect_loops = 1,
             expect_writeback_saved = 1,
             expect_uploads_count = 0,
+            min_tool_events = 1,
         }
+
+        if i == 2 then
+            case.agent_steps = {
+                mk_agent_step("bad_external", {
+                    mk_tool_call("not_allowlisted", { query = "x" }, "ext_bad1"),
+                }),
+                mk_agent_step("retry_external", {
+                    mk_tool_call("web_search", { query = "x_fixed" }, "ext_good2"),
+                }),
+                mk_agent_step("done_after_retry", {}),
+            }
+            case.expect_external_calls = 1
+            case.min_tool_failed = 1
+            case.expect_tool_failed = nil
+            case.expect_loops = 2
+        elseif i == 3 then
+            case.agent_steps = {
+                mk_agent_step("parallel_two_external", {
+                    mk_tool_call("web_search", { query = "a" }, "ext_p1"),
+                    mk_tool_call("web_search", { query = "b" }, "ext_p2"),
+                }),
+                mk_agent_step("external_parallel_done", {}),
+            }
+            case.expect_external_calls = 2
+            case.min_tool_executed = 2
+            case.expect_loops = 1
+            case.min_tool_events = 2
+        end
+
+        cases[#cases + 1] = case
     end
 
     return cases
@@ -708,10 +723,9 @@ local function main()
     run_consistency_check({
         id = "consistency",
         input = "MEMORY_HIT consistency check",
-        router_steps = { '{route="tool_loop"}' },
-        planner_steps = { "{tool_calls={}}" },
-        external_enabled = false,
-        external_allowlist = {},
+        agent_steps = {
+            mk_agent_step("consistency_done", {}),
+        },
     })
 
     local hit_rate = passed / #cases

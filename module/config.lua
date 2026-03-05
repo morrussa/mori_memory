@@ -25,6 +25,14 @@ local DEFAULT_SETTINGS = {
             temperature = 0.0,
             seed = 7,
         },
+        agent = {
+            max_tokens = 1024,
+            temperature = 0.6,
+            seed = 42,
+            remaining_steps = 25,
+            tool_choice = "auto",
+            parallel_tool_calls = true,
+        },
         planner = {
             max_tokens = 256,
             temperature = 0.1,

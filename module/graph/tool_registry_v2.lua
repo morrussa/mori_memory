@@ -118,6 +118,37 @@ function M.get_supported_tools()
     return tools
 end
 
+function M.get_tool_schemas()
+    local out = {}
+    local seen = {}
+
+    for _, schema in ipairs(file_tools.get_tool_schemas() or {}) do
+        if type(schema) == "table" then
+            local fn = schema["function"] or {}
+            local name = util.trim(fn.name)
+            if name ~= "" and (not seen[name]) then
+                seen[name] = true
+                out[#out + 1] = schema
+            end
+        end
+    end
+
+    local provider_state = create_provider_state()
+    if provider_state.enabled and provider_state.provider then
+        for _, schema in ipairs(provider_state.provider:list_tools() or {}) do
+            if type(schema) == "table" then
+                local fn = schema["function"] or {}
+                local name = util.trim(fn.name)
+                if name ~= "" and (not seen[name]) then
+                    seen[name] = true
+                    out[#out + 1] = schema
+                end
+            end
+        end
+    end
+    return out
+end
+
 function M.execute_calls(calls)
     local out = {
         executed = 0,

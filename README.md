@@ -15,21 +15,20 @@
 主图固定节点顺序：
 
 1. `ingest_node`
-2. `context_node`
-3. `router_node`
-4. `recall_node`
-5. `planner_node`
-6. `tool_exec_node`
-7. `repair_node`
-8. `responder_node`
-9. `writeback_node`
-10. `persist_node`
-11. `end`
+2. `recall_node`
+3. `context_node`
+4. `agent_node`
+5. `tools_node`
+6. `agent_node`（循环）
+7. `finalize_node`
+8. `writeback_node`
+9. `persist_node`
+10. `end`
 
 循环约束：
 
 - `tool_loop` 最大 `5` 次（`graph.tool_loop_max`）
-- `repair` 最大 `2` 次（`graph.repair.max_attempts`）
+- `remaining_steps` 默认 `25`（`graph.agent.remaining_steps`）
 
 ## 3. 目录结构（核心）
 
@@ -42,6 +41,7 @@
 - `module/graph/trace_writer.lua`：JSONL trace
 - `module/graph/tool_registry_v2.lua`：工具执行层（file + external provider）
 - `module/graph/providers/*`：provider 抽象与 qwen 实现
+- `module/graph/nodes/router_node.lua|planner_node.lua|repair_node.lua|responder_node.lua`：retired（保留文件，不再接入主图）
 
 旧 `module/agent/*` 核心链路已删除。
 
@@ -103,7 +103,8 @@ external provider 默认关闭，必须显式白名单启用。
 ## 7. 环境变量（Graph）
 
 - `MORI_GRAPH_TOOL_LOOP_MAX`
-- `MORI_GRAPH_REPAIR_MAX_ATTEMPTS`
+- `MORI_GRAPH_AGENT_REMAINING_STEPS`
+- `MORI_GRAPH_AGENT_MAX_TOKENS`
 - `MORI_GRAPH_MAX_NODES_PER_RUN`
 - `MORI_GRAPH_STREAM_TOKEN_CHUNK_CHARS`
 - `MORI_GRAPH_DEBUG_TRACE`

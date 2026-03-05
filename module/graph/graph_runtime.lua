@@ -54,12 +54,13 @@ local function summarize_node(state, node_name)
     local summary = {
         node = node_name,
         route = (((state or {}).router_decision or {}).route) or nil,
-        planner_calls = #((((state or {}).planner or {}).tool_calls) or {}),
+        planner_calls = #((((state or {}).agent_loop or {}).pending_tool_calls) or {}),
         tool_executed = tonumber((((state or {}).tool_exec or {}).executed) or 0) or 0,
         tool_failed = tonumber((((state or {}).tool_exec or {}).failed) or 0) or 0,
         tool_executed_total = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0,
         tool_failed_total = tonumber((((state or {}).tool_exec or {}).failed_total) or 0) or 0,
-        repair_attempts = tonumber((((state or {}).repair or {}).attempts) or 0) or 0,
+        agent_iteration = tonumber((((state or {}).agent_loop or {}).iteration) or 0) or 0,
+        remaining_steps = tonumber((((state or {}).agent_loop or {}).remaining_steps) or 0) or 0,
     }
     return summary
 end
@@ -107,6 +108,9 @@ local function build_trace_summary(state)
         tool_executed = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0,
         tool_failed = tonumber((((state or {}).tool_exec or {}).failed_total) or 0) or 0,
         repair_attempts = tonumber((((state or {}).repair or {}).attempts) or 0) or 0,
+        agent_iteration = tonumber((((state or {}).agent_loop or {}).iteration) or 0) or 0,
+        remaining_steps = tonumber((((state or {}).agent_loop or {}).remaining_steps) or 0) or 0,
+        stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or ""),
     }
 end
 
@@ -134,6 +138,11 @@ function M.run_turn(args)
         system_prompt = base_system_prompt,
     })
     state.repair.max_attempts = math.max(0, math.floor(tonumber((cfg.repair or {}).max_attempts) or 2))
+    state.agent_loop = state.agent_loop or {}
+    state.agent_loop.remaining_steps = math.max(1, math.floor(tonumber(((cfg.agent or {}).remaining_steps) or 25)))
+    state.agent_loop.pending_tool_calls = {}
+    state.agent_loop.stop_reason = ""
+    state.agent_loop.iteration = 0
 
     state_schema.assert_valid(state)
     local graph = graph_builder.build()
@@ -190,7 +199,7 @@ function M.run_turn(args)
         emit_stream(stream_sink, "node_end", summary)
         trace(state.run_id, "node_end", summary)
 
-        if current == "tool_exec_node" then
+        if current == "tools_node" then
             for _, row in ipairs((((state or {}).tool_exec or {}).results) or {}) do
                 emit_stream(stream_sink, "tool_call", {
                     run_id = state.run_id,
@@ -230,10 +239,12 @@ function M.run_turn(args)
         uploads_count = #((state.uploads) or {}),
         route = (((state or {}).router_decision or {}).route) or "",
         recall_triggered = (((state or {}).recall or {}).triggered) == true,
-        planner_calls = #((((state or {}).planner or {}).tool_calls) or {}),
+        planner_calls = #((((state or {}).agent_loop or {}).pending_tool_calls) or {}),
         tool_results = (((state or {}).tool_exec or {}).results) or {},
         tool_executed = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0,
         tool_failed = tonumber((((state or {}).tool_exec or {}).failed_total) or 0) or 0,
+        stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or ""),
+        remaining_steps = tonumber((((state or {}).agent_loop or {}).remaining_steps) or 0) or 0,
         writeback_facts = (((state or {}).writeback or {}).facts) or {},
         writeback_saved = tonumber((((state or {}).writeback or {}).saved) or 0) or 0,
     }
