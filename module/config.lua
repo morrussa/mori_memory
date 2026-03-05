@@ -200,6 +200,26 @@ M.settings = {
             retry_validation_max = 0,        -- 参数/校验错误默认不重试
             retry_budget_max = 0,            -- 预算错误默认不重试
             retry_total_cap = 2,             -- 单调用总重试上限
+            agent_file_list_max_per_turn = 2, -- 每轮最多列目录次数
+            agent_file_list_default_limit = 12, -- list_agent_files 默认返回条数
+            agent_file_list_hard_limit = 64, -- list_agent_files 最大返回条数
+            agent_file_read_max_per_turn = 4, -- 每轮最多读取附件次数
+            agent_file_read_default_max_chars = 3000, -- read_agent_file 默认读取长度
+            agent_file_read_hard_max_chars = 12000, -- read_agent_file 单次读取硬上限
+            agent_file_read_lines_max_per_turn = 4, -- 每轮最多按行读取次数
+            agent_file_read_lines_default_max_lines = 220, -- read_agent_file_lines 默认最大行数
+            agent_file_read_lines_hard_max_lines = 1200, -- read_agent_file_lines 单次读取硬上限
+            agent_file_search_max_per_turn = 4, -- 每轮最多文件搜索次数
+            agent_file_search_default_max_hits = 20, -- search_agent_file 默认命中上限
+            agent_file_search_hard_max_hits = 200, -- search_agent_file 命中硬上限
+            agent_file_multi_search_max_per_turn = 3, -- 每轮最多跨文件搜索次数
+            agent_file_multi_search_default_max_hits = 30, -- search_agent_files 默认总命中上限
+            agent_file_multi_search_hard_max_hits = 400, -- search_agent_files 总命中硬上限
+            agent_file_multi_search_default_max_files = 24, -- search_agent_files 默认扫描文件数
+            agent_file_multi_search_hard_max_files = 200, -- search_agent_files 最大扫描文件数
+            agent_file_multi_search_default_per_file_hits = 5, -- search_agent_files 单文件默认命中上限
+            agent_file_multi_search_hard_per_file_hits = 20, -- search_agent_files 单文件命中硬上限
+            agent_file_context_max_chars = 1600, -- 文件工具结果注入上下文上限
         },
         memory_input = {
             -- 专业策略：对“记忆检索/原子事实提取”走独立输入通道，默认忽略附件正文。
@@ -268,7 +288,7 @@ M.settings = {
         function_protocol_result_max_chars = 600, -- 单条 tool result 回放长度上限
         direct_tool_call_enabled = true, -- 允许模型直出 {act="..."} 并直接执行（qwen-agent 风格）
         native_tool_call_enabled = true, -- 优先使用 OpenAI 原生 tools 协议（tool_calls），失败时回退文本解析
-        function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record
+        function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record|list_agent_files|read_agent_file|read_agent_file_lines|search_agent_file|search_agent_files
         parallel_function_calls = true, -- qwen-agent 对齐：false 时单轮最多执行 1 条工具调用
         include_tool_observation_trace = true, -- 把 Action/Observation 轨迹注入下一步上下文
         tool_trace_max_steps = 4, -- 轨迹最多保留多少个 step

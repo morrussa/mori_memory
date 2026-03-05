@@ -13,6 +13,11 @@ M._turn_budget_state = {
     turn = 0,
     upsert_count = 0,
     query_count = 0,
+    file_list_count = 0,
+    file_read_count = 0,
+    file_read_lines_count = 0,
+    file_search_count = 0,
+    file_multi_search_count = 0,
 }
 
 local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
@@ -20,6 +25,11 @@ local CORE_TOOL_ACTS = {
     query_record = true,
     upsert_record = true,
     delete_record = true,
+    list_agent_files = true,
+    read_agent_file = true,
+    read_agent_file_lines = true,
+    search_agent_file = true,
+    search_agent_files = true,
 }
 
 M._external_tools = {
@@ -258,11 +268,28 @@ local function build_call_arguments_json(call)
     local c = call or {}
     if trim(c.query) ~= "" then obj.query = c.query end
     if trim(c.string) ~= "" then obj.string = c.string end
+    if trim(c.path) ~= "" then obj.path = c.path end
+    if trim(c.file) ~= "" then obj.file = c.file end
+    if trim(c.prefix) ~= "" then obj.prefix = c.prefix end
+    if trim(c.pattern) ~= "" then obj.pattern = c.pattern end
     if trim(c.value) ~= "" then obj.value = c.value end
     if trim(c.type) ~= "" then obj.type = c.type end
     if trim(c.types) ~= "" then obj.types = c.types end
     if trim(c.entity) ~= "" then obj.entity = c.entity end
     if trim(c.evidence) ~= "" then obj.evidence = c.evidence end
+    if trim(c.start_char) ~= "" then obj.start_char = tonumber(c.start_char) or c.start_char end
+    if trim(c.offset_char) ~= "" then obj.offset_char = tonumber(c.offset_char) or c.offset_char end
+    if trim(c.max_chars) ~= "" then obj.max_chars = tonumber(c.max_chars) or c.max_chars end
+    if trim(c.start_line) ~= "" then obj.start_line = tonumber(c.start_line) or c.start_line end
+    if trim(c.end_line) ~= "" then obj.end_line = tonumber(c.end_line) or c.end_line end
+    if trim(c.max_lines) ~= "" then obj.max_lines = tonumber(c.max_lines) or c.max_lines end
+    if trim(c.max_hits) ~= "" then obj.max_hits = tonumber(c.max_hits) or c.max_hits end
+    if trim(c.max_files) ~= "" then obj.max_files = tonumber(c.max_files) or c.max_files end
+    if trim(c.per_file_hits) ~= "" then obj.per_file_hits = tonumber(c.per_file_hits) or c.per_file_hits end
+    if trim(c.context_lines) ~= "" then obj.context_lines = tonumber(c.context_lines) or c.context_lines end
+    if trim(c.regex) ~= "" then obj.regex = c.regex end
+    if trim(c.case_sensitive) ~= "" then obj.case_sensitive = c.case_sensitive end
+    if trim(c.limit) ~= "" then obj.limit = tonumber(c.limit) or c.limit end
     if trim(c.namespace) ~= "" then obj.namespace = c.namespace end
     if trim(c.key) ~= "" then obj.key = c.key end
     if c.confidence ~= nil and tostring(c.confidence) ~= "" then
@@ -413,11 +440,21 @@ local function get_turn_budget_state(current_turn)
             turn = turn_id,
             upsert_count = 0,
             query_count = 0,
+            file_list_count = 0,
+            file_read_count = 0,
+            file_read_lines_count = 0,
+            file_search_count = 0,
+            file_multi_search_count = 0,
         }
         M._turn_budget_state = state
     end
     state.upsert_count = tonumber(state.upsert_count) or 0
     state.query_count = tonumber(state.query_count) or 0
+    state.file_list_count = tonumber(state.file_list_count) or 0
+    state.file_read_count = tonumber(state.file_read_count) or 0
+    state.file_read_lines_count = tonumber(state.file_read_lines_count) or 0
+    state.file_search_count = tonumber(state.file_search_count) or 0
+    state.file_multi_search_count = tonumber(state.file_multi_search_count) or 0
     return state
 end
 
@@ -442,6 +479,26 @@ local function get_tool_policy()
         retry_validation_max = cfg_number(TOOL_CFG.retry_validation_max, 0, 0),
         retry_budget_max = cfg_number(TOOL_CFG.retry_budget_max, 0, 0),
         retry_total_cap = cfg_number(TOOL_CFG.retry_total_cap, 2, 0),
+        agent_file_list_max_per_turn = cfg_number(TOOL_CFG.agent_file_list_max_per_turn, 2, 0),
+        agent_file_list_default_limit = cfg_number(TOOL_CFG.agent_file_list_default_limit, 12, 1),
+        agent_file_list_hard_limit = cfg_number(TOOL_CFG.agent_file_list_hard_limit, 64, 1),
+        agent_file_read_max_per_turn = cfg_number(TOOL_CFG.agent_file_read_max_per_turn, 4, 0),
+        agent_file_read_default_max_chars = cfg_number(TOOL_CFG.agent_file_read_default_max_chars, 3000, 128),
+        agent_file_read_hard_max_chars = cfg_number(TOOL_CFG.agent_file_read_hard_max_chars, 12000, 256),
+        agent_file_read_lines_max_per_turn = cfg_number(TOOL_CFG.agent_file_read_lines_max_per_turn, 4, 0),
+        agent_file_read_lines_default_max_lines = cfg_number(TOOL_CFG.agent_file_read_lines_default_max_lines, 220, 16),
+        agent_file_read_lines_hard_max_lines = cfg_number(TOOL_CFG.agent_file_read_lines_hard_max_lines, 1200, 32),
+        agent_file_search_max_per_turn = cfg_number(TOOL_CFG.agent_file_search_max_per_turn, 4, 0),
+        agent_file_search_default_max_hits = cfg_number(TOOL_CFG.agent_file_search_default_max_hits, 20, 1),
+        agent_file_search_hard_max_hits = cfg_number(TOOL_CFG.agent_file_search_hard_max_hits, 200, 4),
+        agent_file_multi_search_max_per_turn = cfg_number(TOOL_CFG.agent_file_multi_search_max_per_turn, 3, 0),
+        agent_file_multi_search_default_max_hits = cfg_number(TOOL_CFG.agent_file_multi_search_default_max_hits, 30, 1),
+        agent_file_multi_search_hard_max_hits = cfg_number(TOOL_CFG.agent_file_multi_search_hard_max_hits, 400, 4),
+        agent_file_multi_search_default_max_files = cfg_number(TOOL_CFG.agent_file_multi_search_default_max_files, 24, 1),
+        agent_file_multi_search_hard_max_files = cfg_number(TOOL_CFG.agent_file_multi_search_hard_max_files, 200, 1),
+        agent_file_multi_search_default_per_file_hits = cfg_number(TOOL_CFG.agent_file_multi_search_default_per_file_hits, 5, 1),
+        agent_file_multi_search_hard_per_file_hits = cfg_number(TOOL_CFG.agent_file_multi_search_hard_per_file_hits, 20, 1),
+        agent_file_context_max_chars = cfg_number(TOOL_CFG.agent_file_context_max_chars, 1600, 120, 20000),
         external_enabled = to_bool(ext_cfg.enabled, false),
         external_include_memory_tools = to_bool(ext_cfg.include_memory_tools, true),
         external_context_inject = to_bool(ext_cfg.context_inject, true),
@@ -599,6 +656,256 @@ local function apply_query_record(call, current_turn, policy, state)
         context_signature = query_result_signature,
         context_added = (#results > 0),
         tool_result = (#results > 0) and ("query_record hits=" .. tostring(#results)) or "query_record hits=0",
+    }
+end
+
+local function apply_list_agent_files(call, current_turn, policy, state)
+    if state.file_list_count >= policy.agent_file_list_max_per_turn then
+        return false, string.format("list_agent_files 超出预算（max=%d）", policy.agent_file_list_max_per_turn), {
+            error_code = "budget",
+        }
+    end
+
+    if type(py_pipeline) ~= "table" or py_pipeline.list_agent_files == nil then
+        return false, "list_agent_files runtime 不可用", {
+            error_code = "transient",
+        }
+    end
+
+    local args_json = build_call_arguments_json(call)
+    local ok_call, result_or_err = pcall(function()
+        return py_pipeline:list_agent_files(
+            args_json,
+            policy.agent_file_list_default_limit,
+            policy.agent_file_list_hard_limit
+        )
+    end)
+    if not ok_call then
+        return false, "list_agent_files 调用失败: " .. tostring(result_or_err), {
+            error_code = "transient",
+        }
+    end
+
+    state.file_list_count = state.file_list_count + 1
+    local raw_result = trim(result_or_err or "")
+    if raw_result == "" then
+        raw_result = "[empty tool result]"
+    end
+    local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
+    if clipped ~= raw_result then
+        clipped = clipped .. "\n...(truncated)"
+    end
+
+    local payload = "【Tool:list_agent_files 返回】\n" .. clipped
+    push_pending_context(current_turn, payload)
+    local context_signature = "list_agent_files" .. "\x1F" .. clipped
+    return true, "list_agent_files ok", {
+        error_code = "ok",
+        context_added = true,
+        context_signature = context_signature,
+        tool_result = clipped,
+    }
+end
+
+local function apply_read_agent_file(call, current_turn, policy, state)
+    if state.file_read_count >= policy.agent_file_read_max_per_turn then
+        return false, string.format("read_agent_file 超出预算（max=%d）", policy.agent_file_read_max_per_turn), {
+            error_code = "budget",
+        }
+    end
+
+    if type(py_pipeline) ~= "table" or py_pipeline.read_agent_file == nil then
+        return false, "read_agent_file runtime 不可用", {
+            error_code = "transient",
+        }
+    end
+
+    local args_json = build_call_arguments_json(call)
+    local ok_call, result_or_err = pcall(function()
+        return py_pipeline:read_agent_file(
+            args_json,
+            policy.agent_file_read_default_max_chars,
+            policy.agent_file_read_hard_max_chars
+        )
+    end)
+    if not ok_call then
+        return false, "read_agent_file 调用失败: " .. tostring(result_or_err), {
+            error_code = "transient",
+        }
+    end
+
+    state.file_read_count = state.file_read_count + 1
+    local raw_result = trim(result_or_err or "")
+    if raw_result == "" then
+        raw_result = "[empty tool result]"
+    end
+    local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
+    if clipped ~= raw_result then
+        clipped = clipped .. "\n...(truncated)"
+    end
+
+    local payload = "【Tool:read_agent_file 返回】\n" .. clipped
+    push_pending_context(current_turn, payload)
+    local context_signature = "read_agent_file" .. "\x1F" .. clipped
+    return true, "read_agent_file ok", {
+        error_code = "ok",
+        context_added = true,
+        context_signature = context_signature,
+        tool_result = clipped,
+    }
+end
+
+local function apply_read_agent_file_lines(call, current_turn, policy, state)
+    if state.file_read_lines_count >= policy.agent_file_read_lines_max_per_turn then
+        return false, string.format(
+            "read_agent_file_lines 超出预算（max=%d）",
+            policy.agent_file_read_lines_max_per_turn
+        ), {
+            error_code = "budget",
+        }
+    end
+
+    if type(py_pipeline) ~= "table" or py_pipeline.read_agent_file_lines == nil then
+        return false, "read_agent_file_lines runtime 不可用", {
+            error_code = "transient",
+        }
+    end
+
+    local args_json = build_call_arguments_json(call)
+    local ok_call, result_or_err = pcall(function()
+        return py_pipeline:read_agent_file_lines(
+            args_json,
+            policy.agent_file_read_lines_default_max_lines,
+            policy.agent_file_read_lines_hard_max_lines
+        )
+    end)
+    if not ok_call then
+        return false, "read_agent_file_lines 调用失败: " .. tostring(result_or_err), {
+            error_code = "transient",
+        }
+    end
+
+    state.file_read_lines_count = state.file_read_lines_count + 1
+    local raw_result = trim(result_or_err or "")
+    if raw_result == "" then
+        raw_result = "[empty tool result]"
+    end
+    local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
+    if clipped ~= raw_result then
+        clipped = clipped .. "\n...(truncated)"
+    end
+
+    local payload = "【Tool:read_agent_file_lines 返回】\n" .. clipped
+    push_pending_context(current_turn, payload)
+    local context_signature = "read_agent_file_lines" .. "\x1F" .. clipped
+    return true, "read_agent_file_lines ok", {
+        error_code = "ok",
+        context_added = true,
+        context_signature = context_signature,
+        tool_result = clipped,
+    }
+end
+
+local function apply_search_agent_file(call, current_turn, policy, state)
+    if state.file_search_count >= policy.agent_file_search_max_per_turn then
+        return false, string.format("search_agent_file 超出预算（max=%d）", policy.agent_file_search_max_per_turn), {
+            error_code = "budget",
+        }
+    end
+
+    if type(py_pipeline) ~= "table" or py_pipeline.search_agent_file == nil then
+        return false, "search_agent_file runtime 不可用", {
+            error_code = "transient",
+        }
+    end
+
+    local args_json = build_call_arguments_json(call)
+    local ok_call, result_or_err = pcall(function()
+        return py_pipeline:search_agent_file(
+            args_json,
+            policy.agent_file_search_default_max_hits,
+            policy.agent_file_search_hard_max_hits
+        )
+    end)
+    if not ok_call then
+        return false, "search_agent_file 调用失败: " .. tostring(result_or_err), {
+            error_code = "transient",
+        }
+    end
+
+    state.file_search_count = state.file_search_count + 1
+    local raw_result = trim(result_or_err or "")
+    if raw_result == "" then
+        raw_result = "[empty tool result]"
+    end
+    local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
+    if clipped ~= raw_result then
+        clipped = clipped .. "\n...(truncated)"
+    end
+
+    local payload = "【Tool:search_agent_file 返回】\n" .. clipped
+    push_pending_context(current_turn, payload)
+    local context_signature = "search_agent_file" .. "\x1F" .. clipped
+    return true, "search_agent_file ok", {
+        error_code = "ok",
+        context_added = true,
+        context_signature = context_signature,
+        tool_result = clipped,
+    }
+end
+
+local function apply_search_agent_files(call, current_turn, policy, state)
+    if state.file_multi_search_count >= policy.agent_file_multi_search_max_per_turn then
+        return false, string.format(
+            "search_agent_files 超出预算（max=%d）",
+            policy.agent_file_multi_search_max_per_turn
+        ), {
+            error_code = "budget",
+        }
+    end
+
+    if type(py_pipeline) ~= "table" or py_pipeline.search_agent_files == nil then
+        return false, "search_agent_files runtime 不可用", {
+            error_code = "transient",
+        }
+    end
+
+    local args_json = build_call_arguments_json(call)
+    local ok_call, result_or_err = pcall(function()
+        return py_pipeline:search_agent_files(
+            args_json,
+            policy.agent_file_multi_search_default_max_hits,
+            policy.agent_file_multi_search_hard_max_hits,
+            policy.agent_file_multi_search_default_max_files,
+            policy.agent_file_multi_search_hard_max_files,
+            policy.agent_file_multi_search_default_per_file_hits,
+            policy.agent_file_multi_search_hard_per_file_hits
+        )
+    end)
+    if not ok_call then
+        return false, "search_agent_files 调用失败: " .. tostring(result_or_err), {
+            error_code = "transient",
+        }
+    end
+
+    state.file_multi_search_count = state.file_multi_search_count + 1
+    local raw_result = trim(result_or_err or "")
+    if raw_result == "" then
+        raw_result = "[empty tool result]"
+    end
+    local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
+    if clipped ~= raw_result then
+        clipped = clipped .. "\n...(truncated)"
+    end
+
+    local payload = "【Tool:search_agent_files 返回】\n" .. clipped
+    push_pending_context(current_turn, payload)
+    local context_signature = "search_agent_files" .. "\x1F" .. clipped
+    return true, "search_agent_files ok", {
+        error_code = "ok",
+        context_added = true,
+        context_signature = context_signature,
+        tool_result = clipped,
     }
 end
 
@@ -779,6 +1086,16 @@ local function execute_apply_once(call, current_turn, policy, state)
         return apply_delete_record(call, current_turn, policy)
     elseif call.act == "query_record" then
         return apply_query_record(call, current_turn, policy, state)
+    elseif call.act == "list_agent_files" then
+        return apply_list_agent_files(call, current_turn, policy, state)
+    elseif call.act == "read_agent_file" then
+        return apply_read_agent_file(call, current_turn, policy, state)
+    elseif call.act == "read_agent_file_lines" then
+        return apply_read_agent_file_lines(call, current_turn, policy, state)
+    elseif call.act == "search_agent_file" then
+        return apply_search_agent_file(call, current_turn, policy, state)
+    elseif call.act == "search_agent_files" then
+        return apply_search_agent_files(call, current_turn, policy, state)
     end
     local ext_state = refresh_external_tools()
     if ext_state.enabled and ext_state.name_set[tostring((call or {}).act or "")] then
@@ -901,6 +1218,102 @@ local function get_memory_openai_tools(policy)
                 },
             },
         },
+        {
+            type = "function",
+            ["function"] = {
+                name = "list_agent_files",
+                description = "列出 ./agent_files 下可读取的附件文件，支持 prefix 与 limit。",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        prefix = { type = "string", description = "可选，仅列出指定子目录前缀（如 session_x/）" },
+                        limit = { type = "number", description = "可选，返回条数上限" },
+                    },
+                    additionalProperties = false,
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "read_agent_file",
+                description = "读取 ./agent_files 下指定文件的文本片段，按需分段读取。",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string", description = "文件路径（例如 ./agent_files/<scope>/<name>）" },
+                        start_char = { type = "number", description = "可选，1-based 起始字符位置" },
+                        max_chars = { type = "number", description = "可选，本次读取最大字符数" },
+                    },
+                    required = { "path" },
+                    additionalProperties = false,
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "read_agent_file_lines",
+                description = "按行范围读取 ./agent_files 文本文件，返回带行号结果。",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string", description = "文件路径（例如 ./agent_files/<scope>/<name>）" },
+                        start_line = { type = "number", description = "可选，1-based 起始行号" },
+                        end_line = { type = "number", description = "可选，结束行号（包含）" },
+                        max_lines = { type = "number", description = "可选，本次最多返回行数" },
+                    },
+                    required = { "path" },
+                    additionalProperties = false,
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "search_agent_file",
+                description = "在 ./agent_files 文本文件中搜索关键词或正则，返回命中行号与上下文。",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string", description = "文件路径（例如 ./agent_files/<scope>/<name>）" },
+                        pattern = { type = "string", description = "搜索关键词或正则表达式" },
+                        regex = { type = "boolean", description = "可选，true=按正则匹配" },
+                        case_sensitive = { type = "boolean", description = "可选，true=区分大小写" },
+                        context_lines = { type = "number", description = "可选，命中行前后附加的上下文行数" },
+                        start_line = { type = "number", description = "可选，扫描起始行号" },
+                        end_line = { type = "number", description = "可选，扫描结束行号" },
+                        max_hits = { type = "number", description = "可选，最多展示多少个命中" },
+                    },
+                    required = { "path", "pattern" },
+                    additionalProperties = false,
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "search_agent_files",
+                description = "跨文件搜索 ./agent_files 下文本内容，返回文件路径+行号+上下文。",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        pattern = { type = "string", description = "搜索关键词或正则表达式" },
+                        prefix = { type = "string", description = "可选，仅扫描指定子目录前缀（如 session_x/）" },
+                        regex = { type = "boolean", description = "可选，true=按正则匹配" },
+                        case_sensitive = { type = "boolean", description = "可选，true=区分大小写" },
+                        context_lines = { type = "number", description = "可选，命中行前后附加的上下文行数" },
+                        start_line = { type = "number", description = "可选，每个文件的扫描起始行号" },
+                        end_line = { type = "number", description = "可选，每个文件的扫描结束行号" },
+                        max_files = { type = "number", description = "可选，最多扫描多少个文件" },
+                        per_file_hits = { type = "number", description = "可选，单文件最多展示多少个命中" },
+                        max_hits = { type = "number", description = "可选，总命中展示上限" },
+                    },
+                    required = { "pattern" },
+                    additionalProperties = false,
+                },
+            },
+        },
     }
 
     if policy.delete_enabled then
@@ -959,6 +1372,11 @@ function M.get_supported_acts(base_acts)
     if policy.external_include_memory_tools then
         acts.query_record = true
         acts.upsert_record = true
+        acts.list_agent_files = true
+        acts.read_agent_file = true
+        acts.read_agent_file_lines = true
+        acts.search_agent_file = true
+        acts.search_agent_files = true
         if policy.delete_enabled then
             acts.delete_record = true
         end
@@ -978,6 +1396,11 @@ function M.get_supported_acts(base_acts)
         acts.query_record = nil
         acts.upsert_record = nil
         acts.delete_record = nil
+        acts.list_agent_files = nil
+        acts.read_agent_file = nil
+        acts.read_agent_file_lines = nil
+        acts.search_agent_file = nil
+        acts.search_agent_files = nil
     end
 
     return acts
@@ -1019,11 +1442,21 @@ function M.execute_calls(calls, exec_ctx)
     local state = {
         upsert_count = 0,
         query_count = 0,
+        file_list_count = 0,
+        file_read_count = 0,
+        file_read_lines_count = 0,
+        file_search_count = 0,
+        file_multi_search_count = 0,
         query_seen = {},
     }
     local turn_budget = get_turn_budget_state(current_turn)
     state.upsert_count = turn_budget.upsert_count
     state.query_count = turn_budget.query_count
+    state.file_list_count = turn_budget.file_list_count
+    state.file_read_count = turn_budget.file_read_count
+    state.file_read_lines_count = turn_budget.file_read_lines_count
+    state.file_search_count = turn_budget.file_search_count
+    state.file_multi_search_count = turn_budget.file_multi_search_count
     local step_context_signatures = {}
     local step_context_sig_seen = {}
     local call_seq = 0
@@ -1108,6 +1541,11 @@ function M.execute_calls(calls, exec_ctx)
     end
     turn_budget.upsert_count = state.upsert_count
     turn_budget.query_count = state.query_count
+    turn_budget.file_list_count = state.file_list_count
+    turn_budget.file_read_count = state.file_read_count
+    turn_budget.file_read_lines_count = state.file_read_lines_count
+    turn_budget.file_search_count = state.file_search_count
+    turn_budget.file_multi_search_count = state.file_multi_search_count
 
     if #step_context_signatures > 0 then
         table.sort(step_context_signatures)

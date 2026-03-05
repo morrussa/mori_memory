@@ -6,6 +6,11 @@ local DEFAULT_SUPPORTED_ACTS = {
     upsert_record = true,
     query_record = true,
     delete_record = true,
+    list_agent_files = true,
+    read_agent_file = true,
+    read_agent_file_lines = true,
+    search_agent_file = true,
+    search_agent_files = true,
 }
 
 local ACT_ALIAS = {
@@ -23,6 +28,30 @@ local ACT_ALIAS = {
     remove = "delete_record",
     remove_record = "delete_record",
     delete_record = "delete_record",
+
+    list_files = "list_agent_files",
+    list_file = "list_agent_files",
+    list_uploaded_files = "list_agent_files",
+    list_agent_files = "list_agent_files",
+
+    read_file = "read_agent_file",
+    open_file = "read_agent_file",
+    read_uploaded_file = "read_agent_file",
+    read_agent_file = "read_agent_file",
+
+    read_file_lines = "read_agent_file_lines",
+    open_file_lines = "read_agent_file_lines",
+    read_agent_file_lines = "read_agent_file_lines",
+
+    find_in_file = "search_agent_file",
+    search_file = "search_agent_file",
+    grep_file = "search_agent_file",
+    search_agent_file = "search_agent_file",
+
+    find_in_files = "search_agent_files",
+    search_files = "search_agent_files",
+    grep_files = "search_agent_files",
+    search_agent_files = "search_agent_files",
 }
 
 local CALL_FIELDS = {
@@ -31,11 +60,28 @@ local CALL_FIELDS = {
     "arguments",
     "string",
     "query",
+    "path",
+    "file",
+    "prefix",
+    "pattern",
     "type",
     "types",
     "entity",
     "evidence",
     "confidence",
+    "start_char",
+    "offset_char",
+    "max_chars",
+    "start_line",
+    "end_line",
+    "max_lines",
+    "max_hits",
+    "max_files",
+    "per_file_hits",
+    "context_lines",
+    "regex",
+    "case_sensitive",
+    "limit",
     "namespace",
     "key",
     "value",

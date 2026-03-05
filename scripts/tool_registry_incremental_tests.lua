@@ -147,4 +147,38 @@ assert(rp.failed == 0, "rp failed should be 0")
 assert((tonumber(rp.parallel_batches) or 0) >= 1, "rp parallel_batches should be >= 1")
 assert((tonumber(rp.parallel_calls) or 0) >= 2, "rp parallel_calls should be >= 2")
 
+_G.py_pipeline = {
+    list_agent_files = function(_, _args_json, _default_limit, _hard_limit)
+        return "[agent_files] showing 1/1 files\n1) ./agent_files/t/a.txt | bytes=12"
+    end,
+    read_agent_file = function(_, _args_json, _default_max_chars, _hard_max_chars)
+        return "[read_agent_file] path=./agent_files/t/a.txt returned_chars=5\nhello"
+    end,
+    read_agent_file_lines = function(_, _args_json, _default_max_lines, _hard_max_lines)
+        return "[read_agent_file_lines] path=./agent_files/t/a.txt returned_lines=2\n  1 | hello\n  2 | world"
+    end,
+    search_agent_file = function(_, _args_json, _default_max_hits, _hard_max_hits)
+        return "[search_agent_file] path=./agent_files/t/a.txt hits=1 shown=1\n#1 line=2\n> 2 | world"
+    end,
+    search_agent_files = function(_, _args_json, _default_max_hits, _hard_max_hits, _default_max_files, _hard_max_files, _default_per_file_hits, _hard_per_file_hits)
+        return "[search_agent_files] files_total=2 files_scanned=2 hits=2 shown=2\n#1 file=./agent_files/t/a.txt line=2\n> 2 | world"
+    end,
+}
+local file_calls = {
+    { act = "list_agent_files", prefix = "t", limit = 5 },
+    { act = "read_agent_file", path = "./agent_files/t/a.txt", max_chars = 5 },
+    { act = "read_agent_file_lines", path = "./agent_files/t/a.txt", start_line = 1, max_lines = 2 },
+    { act = "search_agent_file", path = "./agent_files/t/a.txt", pattern = "world", max_hits = 3 },
+    { act = "search_agent_files", prefix = "t", pattern = "world", max_files = 5, per_file_hits = 2, max_hits = 8 },
+}
+local rf = registry.execute_calls(file_calls, { current_turn = 50, read_only = false })
+assert(rf.executed == 5, "rf executed should be 5")
+assert(rf.failed == 0, "rf failed should be 0")
+local c_file = registry.consume_pending_system_context_for_turn(50)
+assert(c_file:find("Tool:list_agent_files", 1, true), "file context should contain list_agent_files")
+assert(c_file:find("Tool:read_agent_file", 1, true), "file context should contain read_agent_file")
+assert(c_file:find("Tool:read_agent_file_lines", 1, true), "file context should contain read_agent_file_lines")
+assert(c_file:find("Tool:search_agent_file", 1, true), "file context should contain search_agent_file")
+assert(c_file:find("Tool:search_agent_files", 1, true), "file context should contain search_agent_files")
+
 print("TOOL_REGISTRY_INCREMENTAL_TESTS_PASS")

@@ -11,6 +11,7 @@ import atexit
 import json
 import gzip
 import hashlib
+import re
 import socket
 import subprocess
 import time
@@ -38,6 +39,7 @@ class LlamaCppServerClient:
         enable_jinja: bool = True,
         api_key: str = "",
         log_ready_url: bool = True,
+        log_to_file: bool = True,
         startup_timeout: int = 600,
     ):
         self.server_bin = server_bin
@@ -50,6 +52,7 @@ class LlamaCppServerClient:
         self.enable_jinja = bool(enable_jinja) and not self.embedding
         self.api_key = str(api_key or "").strip()
         self.log_ready_url = bool(log_ready_url)
+        self.log_to_file = bool(log_to_file)
         self.startup_timeout = int(startup_timeout)
         self.model_name = os.path.basename(model_path) or "local-model"
         self.port = int(port) if port else self._find_free_port(self.request_host)
@@ -74,10 +77,14 @@ class LlamaCppServerClient:
         return f"http://{host}:{self.port}"
 
     def _start_server(self):
-        os.makedirs("logs", exist_ok=True)
         role = "embedding" if self.embedding else "chat"
-        self.log_path = os.path.join("logs", f"llama_server_{role}_{self.port}.log")
-        self._log_file = open(self.log_path, "a", encoding="utf-8")
+        if self.log_to_file:
+            os.makedirs("logs", exist_ok=True)
+            self.log_path = os.path.join("logs", f"llama_server_{role}_{self.port}.log")
+            self._log_file = open(self.log_path, "a", encoding="utf-8")
+        else:
+            self.log_path = None
+            self._log_file = None
 
         cmd = [
             self.server_bin,
@@ -112,9 +119,10 @@ class LlamaCppServerClient:
         old_ld_path = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = f"{lib_dir}:{old_ld_path}" if old_ld_path else lib_dir
 
+        stdout_target = self._log_file if self._log_file is not None else subprocess.DEVNULL
         self.process = subprocess.Popen(
             cmd,
-            stdout=self._log_file,
+            stdout=stdout_target,
             stderr=subprocess.STDOUT,
             env=env,
         )
@@ -129,9 +137,14 @@ class LlamaCppServerClient:
         while time.time() < deadline:
             if self.process is not None and self.process.poll() is not None:
                 log_tail = self._tail_log()
+                log_hint = (
+                    f"log tail:\n{log_tail}"
+                    if self.log_to_file
+                    else "file logging disabled (set MORI_LLAMA_SERVER_LOG_TO_FILE=1 to enable)"
+                )
                 raise RuntimeError(
                     f"llama-server exited early (code={self.process.returncode}) for model: {self.model_path}\n"
-                    f"log tail:\n{log_tail}"
+                    f"{log_hint}"
                 )
 
             try:
@@ -143,9 +156,14 @@ class LlamaCppServerClient:
 
             time.sleep(0.5)
 
+        if self.log_to_file:
+            raise TimeoutError(
+                f"Timed out waiting llama-server ({self.model_path}) on {self.base_url}. "
+                f"Check logs: {self.log_path}"
+            )
         raise TimeoutError(
             f"Timed out waiting llama-server ({self.model_path}) on {self.base_url}. "
-            f"Check logs: {self.log_path}"
+            "file logging disabled (set MORI_LLAMA_SERVER_LOG_TO_FILE=1 to enable)"
         )
 
     def _tail_log(self, lines: int = 40) -> str:
@@ -378,6 +396,11 @@ class AIPipeline:
         self.large_server_webui = self._get_env_bool("MORI_LARGE_SERVER_WEBUI", True)
         self.large_server_jinja = self._get_env_bool("MORI_LARGE_SERVER_JINJA", True)
         self.large_server_api_key = str(os.environ.get("MORI_LARGE_SERVER_API_KEY", "") or "").strip()
+        self.llama_server_log_to_file = self._get_env_bool("MORI_LLAMA_SERVER_LOG_TO_FILE", True)
+        self.agent_files_root = os.path.abspath(
+            str(os.environ.get("MORI_AGENT_FILES_DIR", "agent_files") or "agent_files")
+        )
+        os.makedirs(self.agent_files_root, exist_ok=True)
         self.llama_server_bin = os.environ.get(
             "LLAMA_SERVER_BIN",
             os.path.join(self.llama_cpp_root, "build", "bin", "llama-server"),
@@ -403,6 +426,16 @@ class AIPipeline:
         if value <= 0:
             return default
         return value
+
+    @staticmethod
+    def _get_env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return int(default)
+        try:
+            return int(raw)
+        except ValueError:
+            return int(default)
 
     @staticmethod
     def _normalize_embedding_vec(embedding):
@@ -766,11 +799,28 @@ class AIPipeline:
             "arguments",
             "string",
             "query",
+            "path",
+            "file",
+            "prefix",
+            "pattern",
             "type",
             "types",
             "entity",
             "evidence",
             "confidence",
+            "start_char",
+            "offset_char",
+            "max_chars",
+            "start_line",
+            "end_line",
+            "max_lines",
+            "max_hits",
+            "max_files",
+            "per_file_hits",
+            "context_lines",
+            "regex",
+            "case_sensitive",
+            "limit",
             "namespace",
             "key",
             "value",
@@ -813,7 +863,35 @@ class AIPipeline:
             payload["tool_call_id"] = str(tc.get("id", "") or "")
             if isinstance(args_obj, dict):
                 payload["arguments_json"] = json.dumps(args_obj, ensure_ascii=False)
-                for key in ("string", "query", "type", "types", "entity", "evidence", "confidence", "namespace", "key", "value"):
+                for key in (
+                    "string",
+                    "query",
+                    "path",
+                    "file",
+                    "prefix",
+                    "pattern",
+                    "type",
+                    "types",
+                    "entity",
+                    "evidence",
+                    "confidence",
+                    "start_char",
+                    "offset_char",
+                    "max_chars",
+                    "start_line",
+                    "end_line",
+                    "max_lines",
+                    "max_hits",
+                    "max_files",
+                    "per_file_hits",
+                    "context_lines",
+                    "regex",
+                    "case_sensitive",
+                    "limit",
+                    "namespace",
+                    "key",
+                    "value",
+                ):
                     if key in args_obj:
                         payload[key] = args_obj.get(key)
                 if "input" in args_obj and (payload.get("query") is None) and (payload.get("string") is None):
@@ -1063,6 +1141,482 @@ class AIPipeline:
             raise RuntimeError(f"qwen tool `{name}` call failed: {e}") from e
         return self._normalize_qwen_tool_result(result)
 
+    @staticmethod
+    def _normalize_agent_rel_path(raw_path: str) -> str:
+        rel = str(raw_path or "").strip().replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        if rel.startswith("agent_files/"):
+            rel = rel[len("agent_files/") :]
+        return rel
+
+    def _resolve_agent_fs_path(self, raw_path: str):
+        rel = self._normalize_agent_rel_path(raw_path)
+        if not rel:
+            return "", ""
+
+        rel = os.path.normpath(rel).replace("\\", "/")
+        if rel in {".", ".."} or rel.startswith("../") or rel.startswith("/"):
+            return "", ""
+
+        root = os.path.abspath(self.agent_files_root)
+        abs_path = os.path.abspath(os.path.join(root, rel))
+        if abs_path == root:
+            return "", ""
+        if not (abs_path.startswith(root + os.sep) or abs_path == root):
+            return "", ""
+        return rel, abs_path
+
+    @staticmethod
+    def _coerce_int_arg(value, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _coerce_bool_arg(value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            s = value.strip().lower()
+            if s in {"1", "true", "yes", "on"}:
+                return True
+            if s in {"0", "false", "no", "off"}:
+                return False
+        return bool(default)
+
+    def list_agent_files(self, args_json="{}", default_limit=12, hard_limit=64):
+        args = self._parse_tool_arguments_relaxed(args_json)
+        if not isinstance(args, dict):
+            args = {}
+
+        limit = int(args.get("limit") or default_limit or 12)
+        hard = max(1, int(hard_limit or 64))
+        if limit < 1:
+            limit = int(default_limit or 12)
+        limit = min(limit, hard)
+
+        prefix = str(args.get("prefix") or args.get("path_prefix") or "").strip()
+        prefix_norm = self._normalize_agent_rel_path(prefix)
+        prefix_norm = os.path.normpath(prefix_norm).replace("\\", "/") if prefix_norm else ""
+        if prefix_norm in {".", ".."}:
+            prefix_norm = ""
+        if prefix_norm.startswith("../") or prefix_norm.startswith("/"):
+            return "list_agent_files error: invalid prefix"
+
+        root = os.path.abspath(self.agent_files_root)
+        if not os.path.isdir(root):
+            return "list_agent_files: ./agent_files is empty"
+
+        rows = []
+        for dirpath, _, filenames in os.walk(root):
+            for fname in filenames:
+                abs_path = os.path.join(dirpath, fname)
+                try:
+                    stat = os.stat(abs_path)
+                except OSError:
+                    continue
+                rel = os.path.relpath(abs_path, root).replace("\\", "/")
+                if prefix_norm:
+                    if rel == prefix_norm:
+                        pass
+                    elif not rel.startswith(prefix_norm.rstrip("/") + "/"):
+                        continue
+                rows.append((stat.st_mtime, rel, int(stat.st_size)))
+
+        if not rows:
+            if prefix_norm:
+                return f"list_agent_files: no files under ./agent_files/{prefix_norm}"
+            return "list_agent_files: no files in ./agent_files"
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+        shown = rows[:limit]
+        lines = [f"[agent_files] showing {len(shown)}/{len(rows)} files"]
+        for idx, (_mtime, rel, size) in enumerate(shown, 1):
+            lines.append(f"{idx}) ./agent_files/{rel} | bytes={size}")
+        if len(rows) > len(shown):
+            lines.append(f"... ({len(rows) - len(shown)} more)")
+        return "\n".join(lines)
+
+    def read_agent_file(self, args_json="{}", default_max_chars=3000, hard_max_chars=12000):
+        args = self._parse_tool_arguments_relaxed(args_json)
+        if not isinstance(args, dict):
+            args = {}
+
+        raw_path = str(args.get("path") or args.get("file") or args.get("target") or "").strip()
+        if not raw_path:
+            return "read_agent_file error: missing `path`"
+
+        rel, abs_path = self._resolve_agent_fs_path(raw_path)
+        if not abs_path:
+            return "read_agent_file error: path is outside ./agent_files"
+        if not os.path.isfile(abs_path):
+            return f"read_agent_file error: file not found: ./agent_files/{rel}"
+
+        max_chars = int(args.get("max_chars") or default_max_chars or 3000)
+        hard = max(128, int(hard_max_chars or 12000))
+        if max_chars < 1:
+            max_chars = int(default_max_chars or 3000)
+        max_chars = min(max_chars, hard)
+
+        start_char = int(args.get("start_char") or args.get("offset_char") or 1)
+        if start_char < 1:
+            start_char = 1
+
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception as e:
+            return f"read_agent_file error: failed to read file: {e}"
+
+        total = len(text)
+        start_idx = min(total, start_char - 1)
+        end_idx = min(total, start_idx + max_chars)
+        chunk = text[start_idx:end_idx]
+        truncated = end_idx < total
+
+        header = (
+            f"[read_agent_file] path=./agent_files/{rel} "
+            f"start_char={start_char} max_chars={max_chars} "
+            f"returned_chars={len(chunk)} total_chars={total} truncated={'yes' if truncated else 'no'}"
+        )
+        if chunk:
+            return header + "\n" + chunk
+        return header + "\n[empty slice]"
+
+    def read_agent_file_lines(self, args_json="{}", default_max_lines=220, hard_max_lines=1200):
+        args = self._parse_tool_arguments_relaxed(args_json)
+        if not isinstance(args, dict):
+            args = {}
+
+        raw_path = str(args.get("path") or args.get("file") or args.get("target") or "").strip()
+        if not raw_path:
+            return "read_agent_file_lines error: missing `path`"
+
+        rel, abs_path = self._resolve_agent_fs_path(raw_path)
+        if not abs_path:
+            return "read_agent_file_lines error: path is outside ./agent_files"
+        if not os.path.isfile(abs_path):
+            return f"read_agent_file_lines error: file not found: ./agent_files/{rel}"
+
+        max_lines = self._coerce_int_arg(args.get("max_lines"), int(default_max_lines or 220))
+        hard = max(16, int(hard_max_lines or 1200))
+        if max_lines < 1:
+            max_lines = int(default_max_lines or 220)
+        max_lines = min(max_lines, hard)
+
+        start_line = self._coerce_int_arg(
+            args.get("start_line") or args.get("line_start") or args.get("from_line"),
+            1,
+        )
+        if start_line < 1:
+            start_line = 1
+        raw_end = args.get("end_line") or args.get("line_end") or args.get("to_line")
+        has_end = raw_end is not None and str(raw_end).strip() != ""
+        end_line = self._coerce_int_arg(raw_end, 0)
+
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except Exception as e:
+            return f"read_agent_file_lines error: failed to read file: {e}"
+
+        total_lines = len(lines)
+        if has_end and end_line < start_line:
+            end_line = start_line
+        requested_end = end_line if has_end else (start_line + max_lines - 1)
+        effective_end = min(total_lines, requested_end, start_line + max_lines - 1)
+        start_idx = min(max(0, start_line - 1), total_lines)
+
+        out_rows = []
+        if total_lines > 0 and start_idx < total_lines and effective_end >= start_line:
+            width = max(3, len(str(total_lines)))
+            for line_no in range(start_line, effective_end + 1):
+                out_rows.append(f"{line_no:>{width}} | {lines[line_no - 1]}")
+
+        returned_lines = len(out_rows)
+        truncated = (requested_end > effective_end) or ((not has_end) and effective_end < total_lines)
+        header = (
+            f"[read_agent_file_lines] path=./agent_files/{rel} "
+            f"start_line={start_line} end_line={effective_end if effective_end > 0 else 0} "
+            f"max_lines={max_lines} returned_lines={returned_lines} total_lines={total_lines} "
+            f"truncated={'yes' if truncated else 'no'}"
+        )
+        if out_rows:
+            return header + "\n" + "\n".join(out_rows)
+        return header + "\n[empty slice]"
+
+    def search_agent_file(self, args_json="{}", default_max_hits=20, hard_max_hits=200):
+        args = self._parse_tool_arguments_relaxed(args_json)
+        if not isinstance(args, dict):
+            args = {}
+
+        raw_path = str(args.get("path") or args.get("file") or args.get("target") or "").strip()
+        if not raw_path:
+            return "search_agent_file error: missing `path`"
+        pattern = str(args.get("pattern") or args.get("query") or args.get("string") or "").strip()
+        if not pattern:
+            return "search_agent_file error: missing `pattern`"
+
+        rel, abs_path = self._resolve_agent_fs_path(raw_path)
+        if not abs_path:
+            return "search_agent_file error: path is outside ./agent_files"
+        if not os.path.isfile(abs_path):
+            return f"search_agent_file error: file not found: ./agent_files/{rel}"
+
+        max_hits = self._coerce_int_arg(args.get("max_hits"), int(default_max_hits or 20))
+        hard = max(8, int(hard_max_hits or 200))
+        if max_hits < 1:
+            max_hits = int(default_max_hits or 20)
+        max_hits = min(max_hits, hard)
+
+        context_lines = self._coerce_int_arg(args.get("context_lines"), 0)
+        if context_lines < 0:
+            context_lines = 0
+        if context_lines > 8:
+            context_lines = 8
+
+        case_sensitive = self._coerce_bool_arg(args.get("case_sensitive"), False)
+        regex_mode = self._coerce_bool_arg(args.get("regex"), False)
+        start_line = self._coerce_int_arg(
+            args.get("start_line") or args.get("line_start") or args.get("from_line"),
+            1,
+        )
+        if start_line < 1:
+            start_line = 1
+        raw_end = args.get("end_line") or args.get("line_end") or args.get("to_line")
+        has_end = raw_end is not None and str(raw_end).strip() != ""
+        end_line = self._coerce_int_arg(raw_end, 0)
+
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except Exception as e:
+            return f"search_agent_file error: failed to read file: {e}"
+
+        total_lines = len(lines)
+        if has_end and end_line < start_line:
+            end_line = start_line
+        scan_end = min(total_lines, end_line if has_end else total_lines)
+        scan_start = min(max(1, start_line), total_lines + 1)
+
+        matcher = None
+        if regex_mode:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            try:
+                matcher = re.compile(pattern, flags=flags)
+            except re.error as e:
+                return f"search_agent_file error: invalid regex: {e}"
+        elif not case_sensitive:
+            pattern_low = pattern.lower()
+        else:
+            pattern_low = pattern
+
+        total_hits = 0
+        shown = 0
+        blocks = []
+        width = max(3, len(str(max(1, total_lines))))
+
+        for line_no in range(scan_start, scan_end + 1):
+            line = lines[line_no - 1]
+            if regex_mode:
+                matched = matcher.search(line) is not None
+            elif case_sensitive:
+                matched = pattern_low in line
+            else:
+                matched = pattern_low in line.lower()
+            if not matched:
+                continue
+
+            total_hits += 1
+            if shown >= max_hits:
+                continue
+
+            shown += 1
+            from_no = max(scan_start, line_no - context_lines)
+            to_no = min(scan_end, line_no + context_lines)
+            block = [f"#{shown} line={line_no}"]
+            for n in range(from_no, to_no + 1):
+                mark = ">" if n == line_no else " "
+                block.append(f"{mark}{n:>{width}} | {lines[n - 1]}")
+            blocks.append("\n".join(block))
+
+        pattern_view = pattern if len(pattern) <= 120 else (pattern[:120] + "...")
+        header = (
+            f"[search_agent_file] path=./agent_files/{rel} pattern={json.dumps(pattern_view, ensure_ascii=False)} "
+            f"regex={'yes' if regex_mode else 'no'} case_sensitive={'yes' if case_sensitive else 'no'} "
+            f"start_line={scan_start if total_lines > 0 else 0} end_line={scan_end if total_lines > 0 else 0} "
+            f"hits={total_hits} shown={shown} context_lines={context_lines} truncated={'yes' if total_hits > shown else 'no'}"
+        )
+        if not blocks:
+            return header + "\n[no matches]"
+        return header + "\n" + "\n\n".join(blocks)
+
+    def search_agent_files(
+        self,
+        args_json="{}",
+        default_max_hits=30,
+        hard_max_hits=400,
+        default_max_files=24,
+        hard_max_files=200,
+        default_per_file_hits=5,
+        hard_per_file_hits=20,
+    ):
+        args = self._parse_tool_arguments_relaxed(args_json)
+        if not isinstance(args, dict):
+            args = {}
+
+        pattern = str(args.get("pattern") or args.get("query") or args.get("string") or "").strip()
+        if not pattern:
+            return "search_agent_files error: missing `pattern`"
+
+        prefix = str(args.get("prefix") or args.get("path_prefix") or "").strip()
+        prefix_norm = self._normalize_agent_rel_path(prefix)
+        prefix_norm = os.path.normpath(prefix_norm).replace("\\", "/") if prefix_norm else ""
+        if prefix_norm in {".", ".."}:
+            prefix_norm = ""
+        if prefix_norm.startswith("../") or prefix_norm.startswith("/"):
+            return "search_agent_files error: invalid prefix"
+
+        max_hits = self._coerce_int_arg(args.get("max_hits"), int(default_max_hits or 30))
+        hard_hits = max(8, int(hard_max_hits or 400))
+        if max_hits < 1:
+            max_hits = int(default_max_hits or 30)
+        max_hits = min(max_hits, hard_hits)
+
+        max_files = self._coerce_int_arg(args.get("max_files"), int(default_max_files or 24))
+        hard_files = max(1, int(hard_max_files or 200))
+        if max_files < 1:
+            max_files = int(default_max_files or 24)
+        max_files = min(max_files, hard_files)
+
+        per_file_hits = self._coerce_int_arg(args.get("per_file_hits"), int(default_per_file_hits or 5))
+        hard_per_file = max(1, int(hard_per_file_hits or 20))
+        if per_file_hits < 1:
+            per_file_hits = int(default_per_file_hits or 5)
+        per_file_hits = min(per_file_hits, hard_per_file)
+
+        context_lines = self._coerce_int_arg(args.get("context_lines"), 0)
+        if context_lines < 0:
+            context_lines = 0
+        if context_lines > 8:
+            context_lines = 8
+
+        case_sensitive = self._coerce_bool_arg(args.get("case_sensitive"), False)
+        regex_mode = self._coerce_bool_arg(args.get("regex"), False)
+        start_line = self._coerce_int_arg(
+            args.get("start_line") or args.get("line_start") or args.get("from_line"),
+            1,
+        )
+        if start_line < 1:
+            start_line = 1
+        raw_end = args.get("end_line") or args.get("line_end") or args.get("to_line")
+        has_end = raw_end is not None and str(raw_end).strip() != ""
+        end_line = self._coerce_int_arg(raw_end, 0)
+
+        root = os.path.abspath(self.agent_files_root)
+        if not os.path.isdir(root):
+            return "search_agent_files: ./agent_files is empty"
+
+        rows = []
+        for dirpath, _, filenames in os.walk(root):
+            for fname in filenames:
+                abs_path = os.path.join(dirpath, fname)
+                try:
+                    stat = os.stat(abs_path)
+                except OSError:
+                    continue
+                rel = os.path.relpath(abs_path, root).replace("\\", "/")
+                if prefix_norm:
+                    if rel == prefix_norm:
+                        pass
+                    elif not rel.startswith(prefix_norm.rstrip("/") + "/"):
+                        continue
+                rows.append((stat.st_mtime, rel, abs_path))
+
+        if not rows:
+            if prefix_norm:
+                return f"search_agent_files: no files under ./agent_files/{prefix_norm}"
+            return "search_agent_files: no files in ./agent_files"
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+        scan_rows = rows[:max_files]
+
+        matcher = None
+        if regex_mode:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            try:
+                matcher = re.compile(pattern, flags=flags)
+            except re.error as e:
+                return f"search_agent_files error: invalid regex: {e}"
+        elif not case_sensitive:
+            pattern_low = pattern.lower()
+        else:
+            pattern_low = pattern
+
+        total_hits = 0
+        shown = 0
+        scanned_files = 0
+        blocks = []
+
+        for _, rel, abs_path in scan_rows:
+            scanned_files += 1
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except Exception:
+                continue
+
+            total_lines = len(lines)
+            if has_end and end_line < start_line:
+                end_line = start_line
+            scan_end = min(total_lines, end_line if has_end else total_lines)
+            scan_start = min(max(1, start_line), total_lines + 1)
+            width = max(3, len(str(max(1, total_lines))))
+            shown_in_file = 0
+
+            for line_no in range(scan_start, scan_end + 1):
+                line = lines[line_no - 1]
+                if regex_mode:
+                    matched = matcher.search(line) is not None
+                elif case_sensitive:
+                    matched = pattern_low in line
+                else:
+                    matched = pattern_low in line.lower()
+                if not matched:
+                    continue
+
+                total_hits += 1
+                if shown >= max_hits or shown_in_file >= per_file_hits:
+                    continue
+
+                shown += 1
+                shown_in_file += 1
+
+                from_no = max(scan_start, line_no - context_lines)
+                to_no = min(scan_end, line_no + context_lines)
+                block = [f"#{shown} file=./agent_files/{rel} line={line_no}"]
+                for n in range(from_no, to_no + 1):
+                    mark = ">" if n == line_no else " "
+                    block.append(f"{mark}{n:>{width}} | {lines[n - 1]}")
+                blocks.append("\n".join(block))
+
+        pattern_view = pattern if len(pattern) <= 120 else (pattern[:120] + "...")
+        header = (
+            f"[search_agent_files] files_total={len(rows)} files_scanned={scanned_files} "
+            f"pattern={json.dumps(pattern_view, ensure_ascii=False)} "
+            f"regex={'yes' if regex_mode else 'no'} case_sensitive={'yes' if case_sensitive else 'no'} "
+            f"max_files={max_files} max_hits={max_hits} per_file_hits={per_file_hits} "
+            f"context_lines={context_lines} hits={total_hits} shown={shown} "
+            f"truncated={'yes' if total_hits > shown or len(rows) > scanned_files else 'no'}"
+        )
+        if not blocks:
+            return header + "\n[no matches]"
+        return header + "\n" + "\n\n".join(blocks)
+
     def get_embedding(self, text: str, mode: str = "query"):
         """将文本转换为向量"""
         if not self.llm_embed:
@@ -1254,6 +1808,7 @@ class AIPipeline:
                 enable_jinja=self.large_server_jinja,
                 api_key=self.large_server_api_key,
                 log_ready_url=not self.quiet_server_urls,
+                log_to_file=self.llama_server_log_to_file,
             )
             if self.large_server_webui and not self.suppress_large_webui_log:
                 webui_url = self.llm_large.get_webui_url()
@@ -1271,6 +1826,7 @@ class AIPipeline:
                 ctx_size=2048,
                 embedding=True,
                 log_ready_url=not self.quiet_server_urls,
+                log_to_file=self.llama_server_log_to_file,
             )
 
         print("[Python] All models loaded (llama.cpp + GGUF).")
@@ -1552,6 +2108,7 @@ class MoriWebUIChainBridge:
         primary_idle_ttl_sec: int = 1800,
         session_debug: bool = False,
         history_file_path: str = "memory/history.txt",
+        agent_files_root: str = "agent_files",
     ):
         self.host = str(host or "127.0.0.1")
         self.port = int(port)
@@ -1570,6 +2127,12 @@ class MoriWebUIChainBridge:
         self.session_debug = bool(session_debug)
         self.primary_conversation_name = "Mori"
         self.history_file_path = str(history_file_path or "memory/history.txt")
+        self.agent_files_root = os.path.abspath(str(agent_files_root or "agent_files"))
+        os.makedirs(self.agent_files_root, exist_ok=True)
+        self.agent_file_manifest_max_items = max(
+            1,
+            _read_env_int("MORI_AGENT_FILE_MANIFEST_MAX_ITEMS", 8),
+        )
         self.webui_input_chunk_chars = max(256, _read_env_int("MORI_WEBUI_INPUT_CHUNK_CHARS", 4096))
         self.webui_user_text_max_chars = max(2048, _read_env_int("MORI_WEBUI_USER_TEXT_MAX_CHARS", 120000))
         self.webui_fingerprint_text_max_chars = max(
@@ -1609,8 +2172,42 @@ class MoriWebUIChainBridge:
             for item in content:
                 if not isinstance(item, dict):
                     continue
+                item_type = str(item.get("type", "") or "").strip().lower()
+                is_file_item = (
+                    item_type in {"file", "input_file", "uploaded_file"}
+                    or item.get("file") is not None
+                    or item.get("filename") is not None
+                    or item.get("file_name") is not None
+                )
                 text = ""
-                if item.get("type") == "text":
+                if is_file_item:
+                    file_name = (
+                        item.get("name")
+                        or item.get("filename")
+                        or item.get("file_name")
+                    )
+                    file_obj = item.get("file")
+                    if isinstance(file_obj, dict):
+                        if not file_name:
+                            file_name = (
+                                file_obj.get("name")
+                                or file_obj.get("filename")
+                                or file_obj.get("file_name")
+                            )
+                        payload = file_obj.get("text")
+                        if payload is None:
+                            payload = file_obj.get("content")
+                    else:
+                        payload = item.get("text")
+                        if payload is None:
+                            payload = item.get("content")
+
+                    file_name = str(file_name or "upload.txt").strip() or "upload.txt"
+                    body = str(payload or "")
+                    if body == "":
+                        body = "[binary or unavailable inline payload]"
+                    text = f"--- File: {file_name} ---\n{body}\n"
+                elif item_type in {"text", "input_text"}:
                     text = str(item.get("text", ""))
                 elif "text" in item and item.get("text") is not None:
                     text = str(item.get("text"))
@@ -1657,8 +2254,137 @@ class MoriWebUIChainBridge:
         text, _truncated = cls._content_to_text_limited(content, chunk_chars=chunk_chars, max_chars=max_chars)
         return text
 
-    @classmethod
-    def _extract_last_user_text(cls, messages, chunk_chars: int = 4096, max_chars=None) -> str:
+    @staticmethod
+    def _is_file_attachment_label(label: str) -> bool:
+        raw = str(label or "").strip()
+        if not raw:
+            return False
+        low = raw.lower()
+        if "file" in low or "pdf" in low:
+            return True
+        if ("文件" in raw) or ("附件" in raw):
+            return True
+        return False
+
+    @staticmethod
+    def _sanitize_agent_scope(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return "default"
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", raw).strip("._-")
+        if not safe:
+            return "default"
+        if len(safe) > 48:
+            safe = safe[:48]
+        return safe
+
+    @staticmethod
+    def _sanitize_agent_filename(name: str) -> str:
+        raw = str(name or "").strip().replace("\\", "/")
+        base = os.path.basename(raw)
+        if not base:
+            base = "upload.txt"
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", base).strip("._")
+        if not safe:
+            safe = "upload.txt"
+        if len(safe) > 96:
+            root, ext = os.path.splitext(safe)
+            if ext:
+                keep_root = max(1, 96 - len(ext))
+                safe = root[:keep_root] + ext
+            else:
+                safe = safe[:96]
+        return safe
+
+    def _store_agent_file_block(self, file_name: str, payload: str, thread_key: str):
+        scope = self._sanitize_agent_scope(thread_key)
+        target_dir = os.path.join(self.agent_files_root, scope)
+        os.makedirs(target_dir, exist_ok=True)
+
+        safe_name = self._sanitize_agent_filename(file_name)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        final_name = f"{stamp}_{uuid.uuid4().hex[:8]}_{safe_name}"
+        abs_path = os.path.join(target_dir, final_name)
+
+        text = str(payload or "")
+        with open(abs_path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+
+        rel = os.path.relpath(abs_path, start=os.getcwd()).replace("\\", "/")
+        display_path = abs_path if rel.startswith("..") else f"./{rel}"
+        return {
+            "name": safe_name,
+            "path": display_path,
+            "chars": len(text),
+        }
+
+    def _extract_and_store_file_blocks(self, text: str, thread_key: str):
+        raw = str(text or "")
+        if raw == "" or "---" not in raw:
+            return raw, []
+
+        header_re = re.compile(r"^\s*---\s*([^:]+)\s*:\s*(.*?)\s*---\s*$")
+        kept = []
+        saved = []
+        in_file = False
+        current_name = ""
+        current_lines = []
+
+        def flush_file_block():
+            nonlocal in_file, current_name, current_lines
+            if not in_file:
+                return
+            payload = "\n".join(current_lines)
+            saved.append(self._store_agent_file_block(current_name or "upload.txt", payload, thread_key))
+            in_file = False
+            current_name = ""
+            current_lines = []
+
+        for line in raw.splitlines():
+            m = header_re.match(line.strip())
+            if m:
+                label = str(m.group(1) or "").strip()
+                name = str(m.group(2) or "").strip()
+                if self._is_file_attachment_label(label):
+                    flush_file_block()
+                    in_file = True
+                    current_name = name or "upload.txt"
+                    current_lines = []
+                    continue
+
+                if in_file:
+                    flush_file_block()
+                kept.append(line)
+                continue
+
+            if in_file:
+                current_lines.append(line)
+            else:
+                kept.append(line)
+
+        if in_file:
+            flush_file_block()
+
+        return "\n".join(kept).strip(), saved
+
+    def _build_file_manifest_note(self, saved_files):
+        if not saved_files:
+            return ""
+        listed = saved_files[: self.agent_file_manifest_max_items]
+        lines = [
+            "[附件已保存到 ./agent_files，正文未直接注入上下文]",
+        ]
+        for item in listed:
+            lines.append(
+                f"- {item.get('name')}: {item.get('path')} (chars={int(item.get('chars') or 0)})"
+            )
+        rest = len(saved_files) - len(listed)
+        if rest > 0:
+            lines.append(f"- ... ({rest} more files)")
+        lines.append("如果需要读取内容，请先规划，再调用 list_agent_files / read_agent_file 按需分段读取。")
+        return "\n".join(lines)
+
+    def _extract_last_user_text(self, messages, chunk_chars: int = 4096, max_chars=None, thread_key: str = "") -> str:
         if not isinstance(messages, list):
             return ""
         for msg in reversed(messages):
@@ -1666,14 +2392,30 @@ class MoriWebUIChainBridge:
                 continue
             if str(msg.get("role", "")).lower() != "user":
                 continue
-            text, truncated = cls._content_to_text_limited(
+            text = self._content_to_text(
                 msg.get("content"),
                 chunk_chars=chunk_chars,
-                max_chars=max_chars,
             )
-            stripped = text.strip()
-            if not stripped:
+            stripped, saved_files = self._extract_and_store_file_blocks(text, thread_key)
+            stripped = stripped.strip()
+            truncated = False
+
+            if not stripped and not saved_files:
                 continue
+
+            manifest_note = self._build_file_manifest_note(saved_files)
+            if manifest_note:
+                if stripped:
+                    stripped = stripped + "\n\n" + manifest_note
+                else:
+                    stripped = manifest_note
+
+            if max_chars is not None:
+                limit = max(0, int(max_chars))
+                if len(stripped) > limit:
+                    stripped = stripped[:limit].rstrip()
+                    truncated = True
+
             if truncated:
                 stripped = (
                     stripped
@@ -2587,6 +3329,7 @@ class MoriWebUIChainBridge:
             payload.get("messages"),
             chunk_chars=self.webui_input_chunk_chars,
             max_chars=self.webui_user_text_max_chars,
+            thread_key=thread_key,
         )
         if not user_text:
             self._send_oai_error(
@@ -2814,6 +3557,7 @@ def main():
                 thread_header_name=bridge_thread_header,
                 primary_idle_ttl_sec=bridge_primary_idle_ttl,
                 session_debug=bridge_session_debug,
+                agent_files_root=pipeline.agent_files_root,
             )
             print(f"[Python] WebUI chain bridge ready at http://{bridge_host}:{bridge_port}")
             print("[Python] Upstream llama-server is internal-only in webui mode.")

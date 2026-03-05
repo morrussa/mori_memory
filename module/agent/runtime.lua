@@ -270,11 +270,28 @@ local function build_call_arguments_json(call)
     local obj = {}
     if trim(call.query) ~= "" then obj.query = call.query end
     if trim(call.string) ~= "" then obj.string = call.string end
+    if trim(call.path) ~= "" then obj.path = call.path end
+    if trim(call.file) ~= "" then obj.file = call.file end
+    if trim(call.prefix) ~= "" then obj.prefix = call.prefix end
+    if trim(call.pattern) ~= "" then obj.pattern = call.pattern end
     if trim(call.value) ~= "" then obj.value = call.value end
     if trim(call.type) ~= "" then obj.type = call.type end
     if trim(call.types) ~= "" then obj.types = call.types end
     if trim(call.entity) ~= "" then obj.entity = call.entity end
     if trim(call.evidence) ~= "" then obj.evidence = call.evidence end
+    if trim(call.start_char) ~= "" then obj.start_char = tonumber(call.start_char) or call.start_char end
+    if trim(call.offset_char) ~= "" then obj.offset_char = tonumber(call.offset_char) or call.offset_char end
+    if trim(call.max_chars) ~= "" then obj.max_chars = tonumber(call.max_chars) or call.max_chars end
+    if trim(call.start_line) ~= "" then obj.start_line = tonumber(call.start_line) or call.start_line end
+    if trim(call.end_line) ~= "" then obj.end_line = tonumber(call.end_line) or call.end_line end
+    if trim(call.max_lines) ~= "" then obj.max_lines = tonumber(call.max_lines) or call.max_lines end
+    if trim(call.max_hits) ~= "" then obj.max_hits = tonumber(call.max_hits) or call.max_hits end
+    if trim(call.max_files) ~= "" then obj.max_files = tonumber(call.max_files) or call.max_files end
+    if trim(call.per_file_hits) ~= "" then obj.per_file_hits = tonumber(call.per_file_hits) or call.per_file_hits end
+    if trim(call.context_lines) ~= "" then obj.context_lines = tonumber(call.context_lines) or call.context_lines end
+    if trim(call.regex) ~= "" then obj.regex = call.regex end
+    if trim(call.case_sensitive) ~= "" then obj.case_sensitive = call.case_sensitive end
+    if trim(call.limit) ~= "" then obj.limit = tonumber(call.limit) or call.limit end
     if trim(call.namespace) ~= "" then obj.namespace = call.namespace end
     if trim(call.key) ~= "" then obj.key = call.key end
     if call.confidence ~= nil and tostring(call.confidence) ~= "" then
