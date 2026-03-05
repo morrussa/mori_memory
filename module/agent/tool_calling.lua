@@ -1,31 +1,18 @@
 local M = {}
 
 local tool = require("module.tool")
-local tool_parser = require("module.agent.tool_parser")
 local history = require("module.memory.history")
-local topic = require("module.memory.topic")
 local memory = require("module.memory.store")
 local heat = require("module.memory.heat")
 local config_mem = require("module.config")
-local notebook = require("module.agent.notebook")
 
-M._pending_system_context = ""
-M._pending_topic_anchor = nil
-M._pending_created_turn = 0
-
-local function clear_pending_system_context()
-    M._pending_system_context = ""
-    M._pending_topic_anchor = nil
-    M._pending_created_turn = 0
-end
-
-local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
 local FACT_CFG = ((config_mem.settings or {}).keyring or {}).fact_extractor or {}
 local MEMORY_INPUT_CFG = ((config_mem.settings or {}).keyring or {}).memory_input or {}
-local SUPPORTED_TOOL_ACTS = tool_parser.clone_supported_acts()
-local trim
-local resolve_file_payload_mode
-local get_memory_input_policy
+
+local function trim(s)
+    if not s then return "" end
+    return (tostring(s):gsub("^%s*(.-)%s*$", "%1"))
+end
 
 local function to_bool(v, fallback)
     if type(v) == "boolean" then return v end
@@ -48,7 +35,7 @@ end
 
 local function cfg_string(v, fallback)
     if type(v) == "string" then
-        local s = tostring(v):gsub("^%s*(.-)%s*$", "%1")
+        local s = trim(v)
         if s ~= "" then
             return s
         end
@@ -56,20 +43,65 @@ local function cfg_string(v, fallback)
     return tostring(fallback or "")
 end
 
-local function get_tool_policy()
+local function utf8_take(s, max_chars)
+    s = tostring(s or "")
+    max_chars = tonumber(max_chars) or 0
+    if max_chars <= 0 then return s end
+
+    local out = {}
+    local count = 0
+    for ch in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        count = count + 1
+        if count > max_chars then break end
+        out[count] = ch
+    end
+    return table.concat(out)
+end
+
+local function strip_cot_safe(text)
+    text = tostring(text or "")
+    local cleaned = tool.remove_cot(text)
+    if cleaned == "" and text ~= "" and not text:find("</think>", 1, true) then
+        cleaned = text
+    end
+    return cleaned
+end
+
+local function resolve_file_payload_mode(mode, fallback_mode)
+    local raw = trim(mode)
+    if raw == "" then
+        raw = trim(fallback_mode)
+    end
+    if raw == "" then
+        raw = "ignore"
+    end
+
+    local low = raw:lower()
+    if low == "filename" then
+        low = "filename_only"
+    end
+    if low ~= "ignore" and low ~= "filename_only" and low ~= "keep" then
+        low = "ignore"
+    end
+    return low
+end
+
+local function get_memory_input_policy()
+    local default_mode = resolve_file_payload_mode(
+        MEMORY_INPUT_CFG.file_payload_mode,
+        FACT_CFG.file_payload_mode
+    )
     return {
-        upsert_min_confidence = cfg_number(TOOL_CFG.upsert_min_confidence, 0.82, 0, 1),
-        upsert_max_per_turn = cfg_number(TOOL_CFG.upsert_max_per_turn, 1, 0),
-        query_max_per_turn = cfg_number(TOOL_CFG.query_max_per_turn, 2, 0),
-        delete_enabled = to_bool(TOOL_CFG.delete_enabled, false),
-        query_max_types = cfg_number(TOOL_CFG.query_max_types, 3, 1),
-        query_fetch_limit = cfg_number(TOOL_CFG.query_fetch_limit, 18, 1),
-        query_inject_top = cfg_number(TOOL_CFG.query_inject_top, 3, 1),
-        query_inject_max_chars = cfg_number(TOOL_CFG.query_inject_max_chars, 800, 200),
-        tool_pass_temperature = cfg_number(TOOL_CFG.tool_pass_temperature, 0.15, 0, 1),
-        tool_pass_max_tokens = cfg_number(TOOL_CFG.tool_pass_max_tokens, 128, 32),
-        tool_pass_seed = cfg_number(TOOL_CFG.tool_pass_seed, 42),
+        recall_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.recall_file_payload_mode, default_mode),
+        fact_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.fact_file_payload_mode, default_mode),
+        max_chars = cfg_number(MEMORY_INPUT_CFG.max_chars, 2048, 256, 32768),
+        manifest_max_items = cfg_number(MEMORY_INPUT_CFG.manifest_max_items, 8, 1, 64),
+        manifest_name_max_chars = cfg_number(MEMORY_INPUT_CFG.manifest_name_max_chars, 96, 8, 256),
     }
+end
+
+function M.get_memory_input_policy()
+    return get_memory_input_policy()
 end
 
 local function get_fact_policy()
@@ -96,54 +128,6 @@ local function get_fact_policy()
         verify_temperature = cfg_number(FACT_CFG.verify_temperature, 0.0, 0, 1),
         verify_seed = cfg_number(FACT_CFG.verify_seed, 46),
     }
-end
-
-trim = function(s)
-    if not s then return "" end
-    return (tostring(s):gsub("^%s*(.-)%s*$", "%1"))
-end
-
-local function strip_cot_safe(text)
-    text = tostring(text or "")
-    local cleaned = tool.remove_cot(text)
-    if cleaned == "" and text ~= "" and not text:find("</think>", 1, true) then
-        cleaned = text
-    end
-    return cleaned
-end
-
-resolve_file_payload_mode = function(mode, fallback_mode)
-    local raw = trim(mode)
-    if raw == "" then
-        raw = trim(fallback_mode)
-    end
-    if raw == "" then
-        raw = "ignore"
-    end
-    local low = trim(raw):lower()
-    if low == "filename" then low = "filename_only" end
-    if low ~= "ignore" and low ~= "filename_only" and low ~= "keep" then
-        low = "ignore"
-    end
-    return low
-end
-
-get_memory_input_policy = function()
-    local default_mode = resolve_file_payload_mode(
-        MEMORY_INPUT_CFG.file_payload_mode,
-        FACT_CFG.file_payload_mode
-    )
-    return {
-        recall_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.recall_file_payload_mode, default_mode),
-        fact_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.fact_file_payload_mode, default_mode),
-        max_chars = cfg_number(MEMORY_INPUT_CFG.max_chars, 2048, 256, 32768),
-        manifest_max_items = cfg_number(MEMORY_INPUT_CFG.manifest_max_items, 8, 1, 64),
-        manifest_name_max_chars = cfg_number(MEMORY_INPUT_CFG.manifest_name_max_chars, 96, 8, 256),
-    }
-end
-
-function M.get_memory_input_policy()
-    return get_memory_input_policy()
 end
 
 local function is_file_attachment_label(label)
@@ -230,314 +214,49 @@ local function strip_file_payload_for_memory(text, opts)
     return out, true, redacted_blocks
 end
 
-local function split_csv(s)
-    local out = {}
-    s = trim(s)
-    if s == "" then return out end
-    for part in s:gmatch("[^,]+") do
-        local p = trim(part)
-        if p ~= "" then table.insert(out, p) end
+function M.sanitize_memory_input(user_input, opts)
+    local safe = tostring(user_input or "")
+    if tool.utf8_sanitize_lossy then
+        safe = tool.utf8_sanitize_lossy(safe)
     end
-    return out
-end
+    local input_policy = get_memory_input_policy()
+    local mode = ""
+    local max_chars = input_policy.max_chars
+    local manifest_max_items = input_policy.manifest_max_items
+    local manifest_name_max_chars = input_policy.manifest_name_max_chars
 
-local function clamp01(v, fallback)
-    local n = tonumber(v)
-    if not n then return fallback or 0.7 end
-    if n < 0 then return 0 end
-    if n > 1 then return 1 end
-    return n
-end
+    if type(opts) == "string" then
+        mode = trim(opts)
+    elseif type(opts) == "table" then
+        mode = trim(opts.mode or opts.file_payload_mode or "")
+        if opts.max_chars ~= nil then
+            max_chars = cfg_number(opts.max_chars, max_chars, 256, 32768)
+        end
+        if opts.manifest_max_items ~= nil then
+            manifest_max_items = cfg_number(opts.manifest_max_items, manifest_max_items, 1, 64)
+        end
+        if opts.manifest_name_max_chars ~= nil then
+            manifest_name_max_chars = cfg_number(opts.manifest_name_max_chars, manifest_name_max_chars, 8, 256)
+        end
+    end
 
-local function split_tool_calls_and_text(text)
-    return tool_parser.split_tool_calls_and_text(text, {
-        supported_acts = SUPPORTED_TOOL_ACTS,
+    local resolved_mode = resolve_file_payload_mode(mode, input_policy.recall_mode)
+    local normalized, changed, blocks = strip_file_payload_for_memory(safe, {
+        mode = resolved_mode,
+        manifest_max_items = manifest_max_items,
+        manifest_name_max_chars = manifest_name_max_chars,
     })
-end
 
-local function collect_tool_calls_only(text)
-    return tool_parser.collect_tool_calls_only(text, {
-        supported_acts = SUPPORTED_TOOL_ACTS,
-    })
-end
-
-local function utf8_take(s, max_chars)
-    s = tostring(s or "")
-    max_chars = tonumber(max_chars) or 0
-    if max_chars <= 0 then return s end
-
-    local out = {}
-    local count = 0
-    for ch in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        count = count + 1
-        if count > max_chars then break end
-        out[count] = ch
-    end
-    return table.concat(out)
-end
-
-local function dedupe_and_clip_types(types, max_types)
-    local out = {}
-    local seen = {}
-    max_types = tonumber(max_types) or 3
-    for _, raw in ipairs(types or {}) do
-        local t = trim(raw)
-        if t ~= "" then
-            t = t:gsub("%-", "_")
-            t = t:lower()
-            if not seen[t] then
-                seen[t] = true
-                table.insert(out, t)
-                if #out >= max_types then break end
-            end
-        end
-    end
-    return out
-end
-
-local function deterministic_rerank(results, query)
-    local ranked = {}
-    local now = os.time()
-    local q = trim(query):lower()
-
-    for _, r in ipairs(results or {}) do
-        local base = tonumber(r.score) or 0
-        local conf = clamp01(r.confidence, 0.7)
-        local updated_at = tonumber(r.updated_at) or 0
-        local recency = 0
-        if updated_at > 0 then
-            local age_hours = math.max(0, (now - updated_at) / 3600)
-            recency = 1 / (1 + age_hours / 96)
-        end
-
-        local lexical = 0
-        if q ~= "" then
-            local entity_l = tostring(r.entity or ""):lower()
-            local value_l = tostring(r.value or ""):lower()
-            if entity_l:find(q, 1, true) then lexical = lexical + 0.45 end
-            if value_l:find(q, 1, true) then lexical = lexical + 0.70 end
-        end
-
-        local final = base + conf * 0.40 + recency * 0.25 + lexical
-        table.insert(ranked, {
-            rec = r,
-            final = final,
-            updated_at = updated_at,
-            id = tonumber(r.id) or 0,
-        })
-    end
-
-    table.sort(ranked, function(a, b)
-        if a.final == b.final then
-            if a.updated_at == b.updated_at then
-                return a.id < b.id
-            end
-            return a.updated_at > b.updated_at
-        end
-        return a.final > b.final
-    end)
-
-    local out = {}
-    for _, item in ipairs(ranked) do
-        table.insert(out, item.rec)
-    end
-    return out
-end
-
-local function build_tool_pass_prompt(user_input, assistant_text, policy)
-    local delete_flag = policy.delete_enabled and "允许" or "禁用"
-    return string.format([[
-你是 keyring 工具调用规划器，只负责输出工具调用，不负责回复用户。
-
-可用调用（每条必须单独一行，严格 Lua table）：
-{act="upsert_record", type="preference|constraint|identity|credential_hint|long_term_plan", entity="对象", value="内容", evidence="原话片段", confidence=0.0}
-{act="query_record", query="检索内容", types="可选逗号分隔type列表"}
-{act="delete_record", type="...", entity="对象", evidence="删除依据"}
-
-硬约束：
-1. 只输出工具调用行，不要解释、不要 markdown、不要代码块。
-2. 如果不需要调用，输出空字符串。
-3. upsert_record 只在“明确且长期稳定事实”时调用，confidence 必须 >= %.2f。
-4. 本轮最多 upsert_record %d 条，最多 query_record %d 条。
-5. delete_record 当前%s。
-6. query_record 可适当发散（同义词、上位词）提高命中，但必须与当前问题相关。
-
-输入上下文：
-用户原话：
-%s
-
-助手回复：
-%s
-]], policy.upsert_min_confidence, policy.upsert_max_per_turn, policy.query_max_per_turn, delete_flag, user_input, assistant_text)
-end
-
-local function generate_two_step_tool_calls(user_input, assistant_text, policy)
-    local prompt = build_tool_pass_prompt(user_input, assistant_text, policy)
-    local tool_messages = {
-        -- jinja chat template 需要 user 消息作为查询入口
-        { role = "user", content = prompt }
-    }
-    local tool_params = {
-        max_tokens = policy.tool_pass_max_tokens,
-        temperature = policy.tool_pass_temperature,
-        seed = policy.tool_pass_seed,
-    }
-    local raw = py_pipeline:generate_chat_sync(tool_messages, tool_params)
-    raw = strip_cot_safe(raw or "")
-    local calls = collect_tool_calls_only(raw)
-    if #calls > 0 then
-        print(string.format("[ToolCalling] two_step 产出 %d 条调用", #calls))
-    end
-    return calls
-end
-
-local function apply_upsert_record(call, current_turn, policy, state)
-    if state.upsert_count >= policy.upsert_max_per_turn then
-        return false, string.format("upsert_record 超出预算（max=%d）", policy.upsert_max_per_turn)
-    end
-
-    local rec_type = trim(call.type)
-    local entity = trim(call.entity)
-    local value = trim(call.value)
-    if value == "" then value = trim(call.string) end
-    if rec_type == "" then return false, "upsert_record 缺少 type" end
-    if entity == "" then return false, "upsert_record 缺少 entity" end
-    if value == "" then return false, "upsert_record 缺少 value" end
-
-    local confidence = clamp01(call.confidence, 0.75)
-    if confidence < policy.upsert_min_confidence then
-        return false, string.format(
-            "upsert_record 置信度 %.2f 低于阈值 %.2f",
-            confidence,
-            policy.upsert_min_confidence
-        )
-    end
-
-    local id, op = notebook.upsert_record(rec_type, entity, value, {
-        turn = current_turn,
-        confidence = confidence,
-        evidence = trim(call.evidence),
-        source = "tool_call_upsert_record",
-    })
-    if not id then
-        return false, "upsert_record 写入失败: " .. tostring(op)
-    end
-    state.upsert_count = state.upsert_count + 1
-    return true, string.format("upsert_record %s (id=%d)", tostring(op), id)
-end
-
-local function apply_delete_record(call, current_turn, policy)
-    if not policy.delete_enabled then
-        return false, "delete_record 已禁用"
-    end
-
-    local rec_type = trim(call.type)
-    local entity = trim(call.entity)
-    if rec_type == "" then return false, "delete_record 缺少 type" end
-    if entity == "" then return false, "delete_record 缺少 entity" end
-
-    local id, op = notebook.delete_record(rec_type, entity, {
-        turn = current_turn,
-        evidence = trim(call.evidence),
-        source = "tool_call_delete_record",
-    })
-    if not id then
-        return false, "delete_record 失败: " .. tostring(op)
-    end
-    return true, string.format("delete_record %s (id=%d)", tostring(op), id)
-end
-
-local function apply_query_record(call, policy, state)
-    if state.query_count >= policy.query_max_per_turn then
-        return false, string.format("query_record 超出预算（max=%d）", policy.query_max_per_turn)
-    end
-
-    local query = trim(call.query)
-    if query == "" then query = trim(call.string) end
-    if query == "" then query = trim(call.value) end
-    if query == "" then return false, "query_record 缺少 query/string/value" end
-
-    local types = split_csv(call.types or "")
-    if #types == 0 and trim(call.type) ~= "" then
-        table.insert(types, trim(call.type))
-    end
-    types = dedupe_and_clip_types(types, policy.query_max_types)
-
-    local results = notebook.query_records(query, {
-        types = types,
-        limit = policy.query_fetch_limit,
-        mark_hit = true,
-    })
-    results = deterministic_rerank(results, query)
-    if #results > policy.query_inject_top then
-        for i = #results, policy.query_inject_top + 1, -1 do
-            table.remove(results, i)
+    local truncated = false
+    if max_chars > 0 then
+        local clipped = utf8_take(normalized, max_chars)
+        if clipped ~= normalized then
+            truncated = true
+            normalized = trim(clipped) .. "\n\n[memory input truncated]"
         end
     end
 
-    state.query_count = state.query_count + 1
-    print(string.format("[ToolCalling] query_record 命中 %d 条", #results))
-    if #results > 0 then
-        print(notebook.render_results(results))
-        local block = {}
-        table.insert(block, "【Tool:query_record 上一轮检索结果】")
-        table.insert(block, "query: " .. query)
-        table.insert(block, "请把以下记录当作可引用事实，若不相关可忽略：")
-        for i, r in ipairs(results) do
-            table.insert(block, string.format(
-                "%d) [%s] entity=%s | value=%s | conf=%.2f",
-                i,
-                r.type or "identity",
-                r.entity or "",
-                r.value or "",
-                r.confidence or 0
-            ))
-        end
-        local payload_raw = table.concat(block, "\n")
-        local payload = utf8_take(payload_raw, policy.query_inject_max_chars)
-        if payload ~= payload_raw then
-            payload = payload .. "\n...(truncated)"
-        end
-        local anchor = topic.get_topic_anchor and topic.get_topic_anchor(call._turn_for_anchor) or nil
-        if M._pending_system_context ~= "" and M._pending_topic_anchor == anchor then
-            M._pending_system_context = M._pending_system_context .. "\n\n" .. payload
-        else
-            M._pending_system_context = payload
-            M._pending_topic_anchor = anchor
-            M._pending_created_turn = tonumber(call._turn_for_anchor) or 0
-        end
-    end
-    return true, string.format("query_record ok (%d hits)", #results)
-end
-
-local function execute_tool_calls(calls, current_turn, policy)
-    if #calls == 0 then return end
-    local state = {
-        upsert_count = 0,
-        query_count = 0,
-    }
-
-    for _, call in ipairs(calls) do
-        local ok, msg
-        if call.act == "save_key" then
-            ok, msg = false, "two_step 模式禁用 save_key"
-        elseif call.act == "upsert_record" then
-            ok, msg = apply_upsert_record(call, current_turn, policy, state)
-        elseif call.act == "delete_record" then
-            ok, msg = apply_delete_record(call, current_turn, policy)
-        elseif call.act == "query_record" then
-            call._turn_for_anchor = current_turn
-            ok, msg = apply_query_record(call, policy, state)
-        else
-            ok, msg = false, "跳过未知 act: " .. tostring(call.act)
-        end
-
-        print(string.format("[ToolCalling] %s | %s", ok and "OK" or "FAIL", msg))
-    end
-end
-
-local function resolve_calls_for_turn(user_input, clean_result, policy)
-    return generate_two_step_tool_calls(user_input, clean_result, policy)
+    return normalized, (changed or truncated), blocks, resolved_mode, truncated
 end
 
 local function build_fact_prompt(user_input, assistant_clean, style)
@@ -801,7 +520,6 @@ end
 
 local function run_fact_chat_once(prompt, max_tokens, temperature, seed)
     local messages = {
-        -- jinja chat template 需要 user 消息作为查询入口
         { role = "user", content = prompt }
     }
     local params = {
@@ -827,10 +545,19 @@ local function parse_facts_from_llm(raw_facts_str, fact_policy, stage_name)
         local quoted = parse_quoted_candidates(facts_str, fact_policy.max_parse_items)
         local recovered = sanitize_facts(quoted, fact_policy.max_facts)
         if #recovered > 0 then
-            print(string.format("[Lua Fact Extract][%s] strict 解析失败(%s)，已从引号内容恢复 %d 条", stage_name, tostring(err), #recovered))
+            print(string.format(
+                "[Lua Fact Extract][%s] strict 解析失败(%s)，已从引号内容恢复 %d 条",
+                stage_name,
+                tostring(err),
+                #recovered
+            ))
             return recovered
         end
-        print(string.format("[Lua Fact Extract][%s] LLM 输出格式非法，已丢弃: %s", stage_name, tostring(err)))
+        print(string.format(
+            "[Lua Fact Extract][%s] LLM 输出格式非法，已丢弃: %s",
+            stage_name,
+            tostring(err)
+        ))
         return {}
     end
 
@@ -858,51 +585,6 @@ local function verify_facts(user_input, assistant_clean, candidates, fact_policy
     return parse_facts_from_llm(raw, fact_policy, "verify")
 end
 
-function M.sanitize_memory_input(user_input, opts)
-    local safe = tostring(user_input or "")
-    if tool.utf8_sanitize_lossy then
-        safe = tool.utf8_sanitize_lossy(safe)
-    end
-    local input_policy = get_memory_input_policy()
-    local mode = ""
-    local max_chars = input_policy.max_chars
-    local manifest_max_items = input_policy.manifest_max_items
-    local manifest_name_max_chars = input_policy.manifest_name_max_chars
-
-    if type(opts) == "string" then
-        mode = trim(opts)
-    elseif type(opts) == "table" then
-        mode = trim(opts.mode or opts.file_payload_mode or "")
-        if opts.max_chars ~= nil then
-            max_chars = cfg_number(opts.max_chars, max_chars, 256, 32768)
-        end
-        if opts.manifest_max_items ~= nil then
-            manifest_max_items = cfg_number(opts.manifest_max_items, manifest_max_items, 1, 64)
-        end
-        if opts.manifest_name_max_chars ~= nil then
-            manifest_name_max_chars = cfg_number(opts.manifest_name_max_chars, manifest_name_max_chars, 8, 256)
-        end
-    end
-
-    local resolved_mode = resolve_file_payload_mode(mode, input_policy.recall_mode)
-    local normalized, changed, blocks = strip_file_payload_for_memory(safe, {
-        mode = resolved_mode,
-        manifest_max_items = manifest_max_items,
-        manifest_name_max_chars = manifest_name_max_chars,
-    })
-
-    local truncated = false
-    if max_chars > 0 then
-        local clipped = utf8_take(normalized, max_chars)
-        if clipped ~= normalized then
-            truncated = true
-            normalized = trim(clipped) .. "\n\n[memory input truncated]"
-        end
-    end
-
-    return normalized, (changed or truncated), blocks, resolved_mode, truncated
-end
-
 function M.extract_atomic_facts(user_input, assistant_text)
     local fact_policy = get_fact_policy()
     local safe_user = tostring(user_input or "")
@@ -911,6 +593,7 @@ function M.extract_atomic_facts(user_input, assistant_text)
         safe_user = tool.utf8_sanitize_lossy(safe_user)
         safe_assistant = tool.utf8_sanitize_lossy(safe_assistant)
     end
+
     local memory_user, changed, blocks, mode, truncated = M.sanitize_memory_input(safe_user, {
         mode = fact_policy.file_payload_mode,
         max_chars = fact_policy.memory_input_max_chars,
@@ -925,6 +608,7 @@ function M.extract_atomic_facts(user_input, assistant_text)
             truncated and "yes" or "no"
         ))
     end
+
     local assistant_clean = tool.replace(safe_assistant, "\n", " ")
     local fact_prompt = build_fact_prompt(memory_user, assistant_clean, fact_policy.prompt_style)
     local facts_str = run_fact_chat_once(
@@ -974,11 +658,15 @@ end
 
 function M.save_turn_memory(facts, mem_turn)
     if history.get_turn() ~= mem_turn then
-        print(string.format("[WARN] history turn mismatch: history=%d, current=%d", history.get_turn(), mem_turn))
+        print(string.format(
+            "[WARN] history turn mismatch: history=%d, current=%d",
+            history.get_turn(),
+            mem_turn
+        ))
     end
 
     local saved = 0
-    for _, fact in ipairs(facts) do
+    for _, fact in ipairs(facts or {}) do
         local fact_vec = tool.get_embedding_passage(fact)
         local affected_line, add_err = memory.add_memory(fact_vec, mem_turn)
         if affected_line then
@@ -986,7 +674,11 @@ function M.save_turn_memory(facts, mem_turn)
             print(string.format("   → 原子事实存入记忆行 %d: %s", affected_line, fact:sub(1, 60)))
             saved = saved + 1
         else
-            print(string.format("[Memory][WARN] 原子事实写入失败(%s): %s", tostring(add_err), fact:sub(1, 60)))
+            print(string.format(
+                "[Memory][WARN] 原子事实写入失败(%s): %s",
+                tostring(add_err),
+                fact:sub(1, 60)
+            ))
         end
     end
     if saved == 0 then
@@ -996,87 +688,6 @@ function M.save_turn_memory(facts, mem_turn)
     if mem_turn % config_mem.settings.time.maintenance_task == 0 then
         heat.perform_cold_exchange()
     end
-end
-
-function M.handle_chat_result(ctx, result)
-    local user_input = ctx.user_input
-    local current_turn = ctx.current_turn
-    local read_only = ctx.read_only == true
-    local add_to_history = ctx.add_to_history
-
-    local policy = get_tool_policy()
-    local cot_clean = strip_cot_safe(result or "")
-    local parsed_calls, visible_text = split_tool_calls_and_text(cot_clean)
-    local clean_result = visible_text
-    if clean_result == "" and #parsed_calls == 0 then
-        clean_result = trim(cot_clean)
-    end
-    if clean_result == "" then
-        clean_result = "好的，已记录。"
-    end
-
-    if not read_only then
-        local calls_to_run = resolve_calls_for_turn(user_input, clean_result, policy)
-        execute_tool_calls(calls_to_run, current_turn, policy)
-    else
-        print("[ToolCalling] read_only 模式：跳过工具写入")
-    end
-    print("\n[Assistant]: " .. clean_result)
-
-    if not read_only then
-        history.add_history(user_input, clean_result)
-        topic.update_assistant(current_turn, clean_result)
-        if add_to_history then
-            add_to_history(user_input, clean_result)
-        end
-    else
-        print("[ToolCalling] read_only 模式：跳过 history/topic 写入")
-    end
-
-    local facts = {}
-
-    if not read_only then
-        facts = M.extract_atomic_facts(user_input, clean_result)
-
-        local cur_summary = topic.get_summary(current_turn)
-        if cur_summary and cur_summary ~= "" then
-            print("[当前话题摘要] " .. cur_summary)
-        end
-
-        M.save_turn_memory(facts, current_turn)
-    else
-        print("[ToolCalling] read_only 模式：跳过 memory 写入")
-    end
-
-    return clean_result, facts
-end
-
-function M.consume_pending_system_context(current_turn)
-    local ctx = M.get_pending_system_context and M.get_pending_system_context(current_turn) or M._pending_system_context
-    if ctx == "" then return "" end
-    clear_pending_system_context()
-    return ctx
-end
-
-function M.get_pending_system_context(current_turn)
-    if M._pending_system_context == "" then return "" end
-    local cur_anchor = topic.get_topic_anchor and topic.get_topic_anchor(current_turn) or nil
-    if M._pending_topic_anchor and cur_anchor and M._pending_topic_anchor ~= cur_anchor then
-        clear_pending_system_context()
-        return ""
-    end
-    return M._pending_system_context
-end
-
-function M.consume_pending_system_context_for_turn(current_turn)
-    local ctx = M.get_pending_system_context(current_turn)
-    if ctx == "" then return "" end
-    clear_pending_system_context()
-    return ctx
-end
-
-function M.get_long_term_plan_bom()
-    return notebook.build_long_term_plan_bom and notebook.build_long_term_plan_bom() or ""
 end
 
 return M

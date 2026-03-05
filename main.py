@@ -383,6 +383,8 @@ class LlamaCppServerClient:
 
 
 class AIPipeline:
+    """Lua-facing bridge for model IO, tool adapters, and state archive lifecycle."""
+
     def __init__(self):
         self.llm_large = None   # GPU 大模型（生成用）
         self.llm_embed = None   # GGUF Embedding 模型
@@ -720,194 +722,6 @@ class AIPipeline:
                 row["tool_calls"] = _normalize_tool_calls(row.get("tool_calls"))
             normalized.append(row)
         return normalized
-
-    @staticmethod
-    def _coerce_tools(tools):
-        raw = AIPipeline._coerce_lua_value(tools)
-        if raw is None:
-            return []
-        if not isinstance(raw, list):
-            return []
-
-        out = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "function" and isinstance(item.get("function"), dict):
-                fn = item["function"]
-                name = str(fn.get("name", "") or "").strip()
-                if not name:
-                    continue
-                out.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "description": str(fn.get("description", "") or ""),
-                            "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-                        },
-                    }
-                )
-                continue
-
-            name = str(item.get("name", "") or "").strip()
-            if not name:
-                continue
-            out.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": str(item.get("description", "") or ""),
-                        "parameters": item.get("parameters", {"type": "object", "properties": {}}),
-                    },
-                }
-            )
-        return out
-
-    @staticmethod
-    def _coerce_tool_choice(tool_choice):
-        if tool_choice is None:
-            return None
-        raw = AIPipeline._coerce_lua_value(tool_choice)
-        if isinstance(raw, str):
-            s = raw.strip().lower()
-            if s in {"auto", "none", "required"}:
-                return s
-            if s:
-                return {"type": "function", "function": {"name": s}}
-            return "auto"
-        if isinstance(raw, dict):
-            return raw
-        return "auto"
-
-    @staticmethod
-    def _lua_escape_str(value: str) -> str:
-        s = str(value or "")
-        s = s.replace("\\", "\\\\")
-        s = s.replace("\"", "\\\"")
-        s = s.replace("\r", "\\r")
-        s = s.replace("\n", "\\n")
-        return s
-
-    @staticmethod
-    def _dict_to_lua_table_row(payload: dict) -> str:
-        ordered_keys = [
-            "act",
-            "tool_call_id",
-            "arguments_json",
-            "arguments",
-            "string",
-            "query",
-            "path",
-            "file",
-            "prefix",
-            "pattern",
-            "type",
-            "types",
-            "entity",
-            "evidence",
-            "confidence",
-            "start_char",
-            "offset_char",
-            "max_chars",
-            "start_line",
-            "end_line",
-            "max_lines",
-            "max_hits",
-            "max_files",
-            "per_file_hits",
-            "context_lines",
-            "regex",
-            "case_sensitive",
-            "limit",
-            "namespace",
-            "key",
-            "value",
-        ]
-        parts = []
-        for key in ordered_keys:
-            if key not in payload:
-                continue
-            val = payload[key]
-            if val is None:
-                continue
-            if isinstance(val, bool):
-                lit = "true" if val else "false"
-            elif isinstance(val, (int, float)):
-                lit = str(val)
-            else:
-                lit = '"' + AIPipeline._lua_escape_str(str(val)) + '"'
-            parts.append(f"{key}={lit}")
-        return "{" + ", ".join(parts) + "}"
-
-    @staticmethod
-    def _tool_calls_to_lua_rows(tool_calls):
-        if not isinstance(tool_calls, list):
-            return ""
-        rows = []
-        for tc in tool_calls:
-            if not isinstance(tc, dict):
-                continue
-            fn = tc.get("function")
-            if not isinstance(fn, dict):
-                continue
-            name = str(fn.get("name", "") or "").strip()
-            if not name:
-                continue
-            args_raw = fn.get("arguments", "")
-            args_obj = AIPipeline._parse_tool_arguments_relaxed(args_raw)
-            args_text = str(args_raw or "").strip()
-
-            payload = {"act": name}
-            payload["tool_call_id"] = str(tc.get("id", "") or "")
-            if isinstance(args_obj, dict):
-                payload["arguments_json"] = json.dumps(args_obj, ensure_ascii=False)
-                for key in (
-                    "string",
-                    "query",
-                    "path",
-                    "file",
-                    "prefix",
-                    "pattern",
-                    "type",
-                    "types",
-                    "entity",
-                    "evidence",
-                    "confidence",
-                    "start_char",
-                    "offset_char",
-                    "max_chars",
-                    "start_line",
-                    "end_line",
-                    "max_lines",
-                    "max_hits",
-                    "max_files",
-                    "per_file_hits",
-                    "context_lines",
-                    "regex",
-                    "case_sensitive",
-                    "limit",
-                    "namespace",
-                    "key",
-                    "value",
-                ):
-                    if key in args_obj:
-                        payload[key] = args_obj.get(key)
-                if "input" in args_obj and (payload.get("query") is None) and (payload.get("string") is None):
-                    payload["string"] = args_obj.get("input")
-            elif args_text:
-                payload["arguments_json"] = args_text
-            if (
-                isinstance(args_text, str)
-                and args_text
-                and payload.get("query") is None
-                and payload.get("string") is None
-                and payload.get("value") is None
-            ):
-                payload["string"] = args_text
-            rows.append(AIPipeline._dict_to_lua_table_row(payload))
-        return "\n".join(rows)
 
     @staticmethod
     def _extract_first_json_object(text: str) -> str:
@@ -1799,54 +1613,6 @@ class AIPipeline:
         )
         return self._extract_chat_text(output)
 
-    def generate_chat_with_tools_sync(
-        self,
-        messages,
-        params,
-        tools,
-        tool_choice="auto",
-        parallel_tool_calls=True,
-    ):
-        """同步工具调用版本：返回 (text, lua_tool_rows)"""
-        if not self.llm_large:
-            raise RuntimeError("Large model not loaded")
-
-        messages_list = self._coerce_messages(messages)
-        if not messages_list:
-            raise ValueError("Invalid messages format")
-
-        params_dict = dict(params) if hasattr(params, 'keys') else params
-        max_tokens = int(params_dict.get("max_tokens", 128))
-        temperature = float(params_dict.get("temperature", 0.7))
-        stop = [str(s) for s in params_dict.get("stop", []) if s is not None]
-
-        seed = params_dict.get("seed")
-        if seed is not None:
-            try:
-                seed = int(seed)
-                if seed < 0:
-                    seed = None
-            except (TypeError, ValueError):
-                seed = None
-
-        tools_payload = self._coerce_tools(tools)
-        tool_choice_payload = self._coerce_tool_choice(tool_choice)
-        parallel_payload = bool(parallel_tool_calls)
-
-        output = self.llm_large.create_chat_completion(
-            messages=messages_list,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=stop,
-            seed=seed,
-            tools=tools_payload,
-            tool_choice=tool_choice_payload,
-            parallel_tool_calls=parallel_payload,
-        )
-        text_result, tool_calls = self._extract_chat_text_and_tool_calls(output)
-        lua_rows = self._tool_calls_to_lua_rows(tool_calls)
-        return text_result, lua_rows
-
     def load_models(self, large_model_path: str, embedding_model_path: str):
         print("[Python] Loading models...")
 
@@ -2139,6 +1905,8 @@ class AIPipeline:
 
 
 class MoriWebUIChainBridge:
+    """HTTP bridge that keeps llama.cpp WebUI assets but routes chat through Mori chain."""
+
     HISTORY_HEADER = "HIST_V2"
     HISTORY_FIELD_SEP = "\x1F"
     SESSION_ID_FIELDS = ("conversation_id", "chat_id", "session_id")
@@ -3555,6 +3323,7 @@ def _read_env_bool(name: str, default: bool) -> bool:
 
 
 def main():
+    # 1) Resolve run mode and initialize shared Python<->Lua bridge objects.
     run_mode = str(os.environ.get("MORI_RUN_MODE", "cli")).strip().lower()
     if run_mode not in {"cli", "webui"}:
         print(f"[Python][WARN] Unknown MORI_RUN_MODE={run_mode}, fallback to cli")
@@ -3577,6 +3346,7 @@ def main():
     bridge_primary_idle_ttl = _read_env_int("MORI_WEBUI_PRIMARY_IDLE_TTL_SEC", 1800)
     bridge_session_debug = _read_env_bool("MORI_WEBUI_SESSION_DEBUG", False)
 
+    # 2) In webui mode, force internal upstream protection and avoid port collisions.
     if run_mode == "webui":
         pipeline.suppress_large_webui_log = True
         pipeline.quiet_server_urls = True
@@ -3594,6 +3364,7 @@ def main():
             )
             pipeline.large_server_port = None
 
+    # 3) Restore persisted state, execute Lua pipeline, then optionally start WebUI bridge.
     pipeline.unpack_state()
 
     lua_shutdown = None
@@ -3640,6 +3411,7 @@ def main():
             except KeyboardInterrupt:
                 print("\n[Python] KeyboardInterrupt received, stopping WebUI bridge...")
     finally:
+        # 4) Graceful teardown order: bridge -> Lua state flush -> model servers.
         if bridge is not None:
             try:
                 bridge.shutdown()

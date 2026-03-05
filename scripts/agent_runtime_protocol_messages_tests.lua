@@ -18,11 +18,16 @@ local function clear_mods()
     end
 end
 
+local function contains(s, part)
+    return tostring(s or ""):find(tostring(part or ""), 1, true) ~= nil
+end
+
 clear_mods()
 
 local state = {
     build_ctx_calls = 0,
     tail_messages_by_step = {},
+    system_prompts_by_step = {},
     generate_calls = 0,
     planner_calls = 0,
     exec_calls = 0,
@@ -39,6 +44,8 @@ package.preload["module.config"] = function()
                 continue_on_tool_failure = true,
                 max_context_refine_steps = 1,
                 max_failure_refine_steps = 1,
+                planner_gate_mode = "assistant_signal",
+                planner_default_when_missing = false,
                 function_choice = "auto",
                 parallel_function_calls = true,
                 function_protocol_enabled = true,
@@ -192,6 +199,7 @@ package.preload["module.agent.context_window"] = function()
             tails[#tails + 1] = m
         end
         state.tail_messages_by_step[state.build_ctx_calls] = tails
+        state.system_prompts_by_step[state.build_ctx_calls] = tostring(opts.system_prompt or "")
 
         return {
             { role = "system", content = "sys" },
@@ -212,9 +220,9 @@ _G.py_pipeline = {
     generate_chat = function(_, _, _, cb, _)
         state.generate_calls = state.generate_calls + 1
         if state.generate_calls == 1 then
-            cb("第一步草稿")
+            cb("第一步草稿 <<PLAN:YES>>")
         else
-            cb("第二步终稿")
+            cb("第二步终稿 <<PLAN:NO>>")
         end
     end,
 }
@@ -233,11 +241,15 @@ assert(state.build_ctx_calls == 2, "should build context twice")
 
 local step1_tail = state.tail_messages_by_step[1] or {}
 local step2_tail = state.tail_messages_by_step[2] or {}
+local step1_system = tostring(state.system_prompts_by_step[1] or "")
+local step2_system = tostring(state.system_prompts_by_step[2] or "")
 assert(#step1_tail == 0, "step1 should not contain protocol tail messages")
 assert(#step2_tail >= 2, "step2 should contain assistant/tool protocol tail")
 assert(tostring((step2_tail[1] or {}).role) == "assistant", "tail[1] should be assistant tool_call message")
 assert(type((step2_tail[1] or {}).tool_calls) == "table", "assistant tail should contain tool_calls")
 assert(tostring((step2_tail[2] or {}).role) == "tool", "tail[2] should be tool result message")
 assert(tostring((step2_tail[2] or {}).tool_call_id) == "tc_protocol_1", "tool_call_id should be preserved")
+assert(contains(step1_system, "<<PLAN:YES>>"), "step1 system prompt should contain plan marker instruction")
+assert(not contains(step2_system, "<<PLAN:YES>>"), "step2(system in plan mode) should not repeat plan marker instruction")
 
 print("AGENT_RUNTIME_PROTOCOL_MESSAGES_TESTS_PASS")

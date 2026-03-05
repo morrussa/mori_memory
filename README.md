@@ -182,8 +182,8 @@ agent = {
     max_context_refine_steps = 2,
     continue_on_tool_failure = true,
     max_failure_refine_steps = 2,
-    direct_tool_call_enabled = true,
-    native_tool_call_enabled = true,
+    planner_gate_mode = "assistant_signal",
+    planner_default_when_missing = false,
     function_choice = "auto",
     parallel_function_calls = true,
     include_tool_observation_trace = true,
@@ -194,7 +194,10 @@ agent = {
 
 补充语义：
 - `upsert_max_per_turn` / `query_max_per_turn` 为同一 `turn` 内跨 `step` 累计预算，不会在多步循环中按 step 重置。
-- `settings.agent.native_tool_call_enabled = true`：优先走 OpenAI 原生 tools 协议（`tools/tool_choice/parallel_tool_calls` + `tool_calls`），失败自动回退文本解析。
+- 工具调用统一走二阶段 planner；主回复只负责给出 `<<PLAN:YES|NO>>` 计划信号。
+- 计划信号提示采用运行时动态注入：仅首轮注入，进入 plan/refine 轮后不再重复注入。
+- `settings.agent.planner_gate_mode = "assistant_signal"`：按主回复信号决定是否进入 planner（可选 `always`）。
+- `settings.agent.planner_default_when_missing = false`：缺失计划信号时默认不进入 planner（建议保持 `false`）。
 - `settings.agent.function_choice`：`auto|none|query_record|upsert_record|delete_record`，用于约束本轮可执行工具。
 - `settings.agent.parallel_function_calls=false`：单轮只保留第一条工具调用（qwen-agent 对齐）。
 - `settings.keyring.tool_calling.parallel_execute_enabled = true`：连续 `query_record` 会按批次并行调度（默认批大小 `parallel_query_batch_size=4`）。
@@ -215,7 +218,7 @@ agent = {
 - `kept_pairs`
 - `dropped_blocks`
 - `tool_calls_count`
-- `tool_calls_count source=model_native|model_direct|planner_pass`
+- `tool_calls_count source=planner_pass|planner_skipped|planner_error|none`
 - `tool_exec ... parallel_batches=... retries=...`
 - `continue reason`
 - `工具上下文无增量，提前收敛`

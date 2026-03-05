@@ -39,7 +39,6 @@ print("[Lua] Pipeline started.")
 topic.init()
 
 -- ====================== 对话历史 + Token 窗口管理 ======================
-print("[Lua] keyring tool mode: two_step")
 
 local base_prompt = [[
 你叫 Mori，是一名天才AI极客少女，常用颜文字 (´･ω･')ﾉ
@@ -54,7 +53,8 @@ local base_prompt = [[
 1. 正常回复用户，不要输出任何 {act="..."} 工具调用行。
 2. 若你判断需要长期保存事实、更新计划、或检索旧记录，直接在正文自然表达意图即可，后台会自动处理。
 3. 回答时优先保持与 LongTermPlan BOM 一致；若信息冲突，先向用户确认。
-4. 若用户上传文件且上下文给出了附件目录路径（MORI_AGENT_FILES_DIR，默认 ./workspace），不要假设你已读完整正文；先规划，再按需调用 list_agent_files/read_agent_file/read_agent_file_lines/search_agent_file/search_agent_files 分段读取或定位。
+4. 若用户上传文件且上下文给出了附件目录路径（MORI_AGENT_FILES_DIR，默认 ./workspace），不要假设你已读完整正文；先在正文说明你将分段检索/读取，再由后台 planner 按需调用 list_agent_files/read_agent_file/read_agent_file_lines/search_agent_file/search_agent_files。
+5. 若系统在当前轮要求你输出计划信号标记，请严格按要求仅输出一个标记，并放在回复最后一行。
 ]]
 
 local conversation_history = {
@@ -79,7 +79,7 @@ if run_mode ~= "webui" then
     local score = tool.cosine_similarity(emb_a, emb_b)
     print(string.format("[Lua] Similarity between '%s' and '%s' is: %.4f", text_a, text_b, score))
 
-    -- 4. 聊天生成接口演示（保留原样）
+    -- 4. 聊天生成接口演示
     local function demo_callback(result_text)
         local cot_rm = tool.remove_cot(result_text)
         print("\n[Lua Callback] Generation Finished! Result: " .. cot_rm)
@@ -106,7 +106,7 @@ local function shutdown_pipeline()
     saver.on_exit()
 end
 
-local function process_user_input(line, stream_sink, session_id, read_only)
+local function process_user_input(line, stream_sink, _thread_id, read_only)
     local user_input = tostring(line or ""):match("^%s*(.-)%s*$")
     if user_input == "" then
         return ""
@@ -115,7 +115,6 @@ local function process_user_input(line, stream_sink, session_id, read_only)
     return agent_runtime.run_turn({
         user_input = user_input,
         stream_sink = stream_sink,
-        session_id = session_id,
         read_only = (read_only == true),
         conversation_history = conversation_history,
         add_to_history = add_to_history,

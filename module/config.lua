@@ -281,13 +281,12 @@ M.settings = {
         max_failure_refine_steps = 2, -- 单轮最多因工具失败触发多少次重修
         llm_retry_max = 2, -- qwen-agent 对齐：主生成失败后的最大重试次数（不含首轮）
         llm_retry_backoff_sec = 0.35, -- 重试指数退避基线秒数
-        native_llm_retry_max = 2, -- 原生 tools 生成链路重试次数（默认跟随 llm_retry_max）
         planner_retry_max = 1, -- 二阶段 planner 失败时最大重试次数
         planner_retry_backoff_sec = 0.2, -- planner 重试退避秒数
         function_protocol_enabled = true, -- 以 assistant/tool 协议消息回放工具调用链（qwen-agent 对齐）
         function_protocol_result_max_chars = 600, -- 单条 tool result 回放长度上限
-        direct_tool_call_enabled = true, -- 允许模型直出 {act="..."} 并直接执行（qwen-agent 风格）
-        native_tool_call_enabled = true, -- 优先使用 OpenAI 原生 tools 协议（tool_calls），失败时回退文本解析
+        planner_gate_mode = "assistant_signal", -- assistant_signal|always：是否由主回复信号决定要不要做 planner
+        planner_default_when_missing = false, -- assistant_signal 模式下，缺少信号时是否默认进入 planner
         function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record|list_agent_files|read_agent_file|read_agent_file_lines|search_agent_file|search_agent_files
         parallel_function_calls = true, -- qwen-agent 对齐：false 时单轮最多执行 1 条工具调用
         include_tool_observation_trace = true, -- 把 Action/Observation 轨迹注入下一步上下文

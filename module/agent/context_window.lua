@@ -74,6 +74,62 @@ local function append_unique(arr, value)
     arr[#arr + 1] = value
 end
 
+local function normalize_token_count_mode(raw_mode)
+    local mode = trim(raw_mode):lower()
+    if mode == "" then
+        mode = "templated_exact"
+    end
+    if mode ~= "templated_exact" then
+        error(string.format(
+            "[ContextWindow] unsupported token_count_mode=%s (only templated_exact is supported)",
+            tostring(raw_mode)
+        ))
+    end
+    return mode
+end
+
+local function parse_context_drop_order(raw_order, plan_pinned)
+    local text = trim(raw_order):lower()
+    if text == "" then
+        text = "memory_tool_plan"
+    end
+    text = text:gsub("memory_context", "memory")
+    text = text:gsub("tool_context", "tool")
+    text = text:gsub("plan_bom", "plan")
+
+    local order = {}
+    local seen = {}
+    local map = {
+        memory = "memory_context",
+        tool = "tool_context",
+        plan = "plan_bom",
+    }
+
+    for token in text:gmatch("[a-z]+") do
+        local name = map[token]
+        if name and (not seen[name]) then
+            seen[name] = true
+            order[#order + 1] = name
+        end
+    end
+
+    if #order == 0 then
+        order = { "memory_context", "tool_context", "plan_bom" }
+    end
+
+    if plan_pinned then
+        local filtered = {}
+        for _, name in ipairs(order) do
+            if name ~= "plan_bom" then
+                filtered[#filtered + 1] = name
+            end
+        end
+        order = filtered
+    end
+
+    return order
+end
+
 local function extract_history_pairs(conversation_history)
     local out = {}
     if type(conversation_history) ~= "table" then
@@ -271,6 +327,7 @@ end
 function M.build_messages(opts)
     opts = opts or {}
     local agent_cfg = (config.settings or {}).agent or {}
+    normalize_token_count_mode(opts.token_count_mode or agent_cfg.token_count_mode)
 
     local budget = to_int(
         opts.input_token_budget,
@@ -360,11 +417,10 @@ function M.build_messages(opts)
     local total_tokens = count_messages_tokens(base_messages)
 
     if total_tokens > budget then
-        -- 固定顺序：memory -> tool -> (plan 可选)
-        local order = { "memory_context", "tool_context" }
-        if not plan_pinned then
-            order[#order + 1] = "plan_bom"
-        end
+        local order = parse_context_drop_order(
+            opts.context_drop_order or agent_cfg.context_drop_order,
+            plan_pinned
+        )
         for _, name in ipairs(order) do
             if total_tokens <= budget then
                 break
