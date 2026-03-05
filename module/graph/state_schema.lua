@@ -194,6 +194,9 @@ function M.new_state(args)
             read_evidence_total = 0,
             results = {},
             context_fragments = {},
+            truncated_count = 0,
+            total_result_chars = 0,
+            large_results = {},
         },
         repair = {
             attempts = 0,

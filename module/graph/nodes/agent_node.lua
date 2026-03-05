@@ -1,8 +1,14 @@
 local util = require("module.graph.util")
 local config = require("module.config")
 local tool_registry = require("module.graph.tool_registry_v2")
+local context_manager = require("module.graph.context_manager")
 
 local M = {}
+
+-- 最大tool消息累积限制
+local MAX_TOOL_MESSAGES = 50
+-- 最大runtime_messages总长度
+local MAX_RUNTIME_MESSAGES_CHARS = 100000
 
 local function graph_cfg()
     return ((config.settings or {}).graph or {})
@@ -598,6 +604,51 @@ function M.run(state, _ctx)
     state.planner = state.planner or { tool_calls = {}, errors = {}, raw = "", force_reason = "" }
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
 
+    -- 检查上下文预算
+    local stats = context_manager.get_context_stats(state)
+    local budget = math.max(256, math.floor(tonumber((graph_cfg().input_token_budget) or 12000)))
+    local budget_status, budget_warning = context_manager.check_budget(stats.estimated_tokens, budget)
+
+    -- 如果预算超限，尝试优化runtime_messages
+    if budget_status == "exceeded" then
+        local optimized, opt_stats = context_manager.optimize_runtime_messages(
+            state.messages.runtime_messages,
+            2000 -- 更激进的截断
+        )
+        state.messages.runtime_messages = optimized
+        -- 重新计算
+        stats = context_manager.get_context_stats(state)
+        budget_status, budget_warning = context_manager.check_budget(stats.estimated_tokens, budget)
+    end
+
+    -- 限制tool消息数量，防止上下文无限增长
+    local runtime_msgs = state.messages.runtime_messages
+    local tool_msg_count = 0
+    for i = #runtime_msgs, 1, -1 do
+        if runtime_msgs[i] and runtime_msgs[i].role == "tool" then
+            tool_msg_count = tool_msg_count + 1
+            if tool_msg_count > MAX_TOOL_MESSAGES then
+                -- 标记需要清理旧消息
+                state.context._tool_messages_overflow = true
+            end
+        end
+    end
+
+    -- 如果tool消息过多，清理最旧的
+    if tool_msg_count > MAX_TOOL_MESSAGES then
+        local cleaned_msgs = {}
+        local kept_tools = 0
+        for _, msg in ipairs(runtime_msgs) do
+            if msg.role ~= "tool" then
+                cleaned_msgs[#cleaned_msgs + 1] = msg
+            elseif kept_tools < MAX_TOOL_MESSAGES then
+                cleaned_msgs[#cleaned_msgs + 1] = msg
+                kept_tools = kept_tools + 1
+            end
+        end
+        state.messages.runtime_messages = cleaned_msgs
+    end
+
     local out, err = call_agent_with_tools(state)
     if not out then
         out, err = fallback_without_tools(state)
@@ -619,6 +670,12 @@ function M.run(state, _ctx)
     if model_done and #tool_calls <= 0 and util.trim(finish_message) ~= "" then
         assistant_content = finish_message
     end
+
+    -- 如果预算紧张，在assistant消息中添加提示
+    if budget_status == "warning" then
+        assistant_content = assistant_content .. "\n\n[System: Context budget is high. Consider summarizing previous results.]"
+    end
+
     state.messages.runtime_messages[#state.messages.runtime_messages + 1] = {
         role = "assistant",
         content = assistant_content,
@@ -647,6 +704,10 @@ function M.run(state, _ctx)
     elseif util.trim(state.agent_loop.stop_reason) == "" then
         state.agent_loop.stop_reason = ""
     end
+
+    -- 记录上下文统计
+    state.metrics = state.metrics or {}
+    state.metrics.context_stats = context_manager.get_context_stats(state)
 
     return state
 end

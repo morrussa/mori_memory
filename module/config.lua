@@ -63,7 +63,32 @@ local DEFAULT_SETTINGS = {
             token_chunk_chars = 24,
         },
         tools = {
-            file_context_max_chars = 1600,
+            file_context_max_chars = 6000,
+        },
+        -- 上下文管理配置（新增）
+        context_manager = {
+            -- 工具结果最大字符数（单条）
+            tool_result_max_chars = 4000,
+            -- 工具结果硬上限（超过则强制截断）
+            tool_result_hard_max_chars = 8000,
+            -- tool_context总上限
+            tool_context_total_max_chars = 8000,
+            -- 是否启用智能截断
+            enable_smart_truncation = true,
+            -- 是否启用重复内容检测
+            enable_dedup = true,
+            -- 重复检测的最小匹配长度
+            dedup_min_match_chars = 100,
+            -- 是否启用结果缓存
+            enable_cache = true,
+            -- 缓存最大条目数
+            cache_max_entries = 32,
+            -- 历史压缩阈值（对话对数）
+            history_compress_threshold = 6,
+            -- 是否启用上下文预算监控
+            enable_budget_monitor = true,
+            -- 预算警告阈值（相对于input_token_budget的比例）
+            budget_warning_ratio = 0.85,
         },
         file_tools = {
             list_default_limit = 12,

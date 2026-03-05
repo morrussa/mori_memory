@@ -2,6 +2,7 @@ local util = require("module.graph.util")
 local config = require("module.config")
 local file_tools = require("module.graph.file_tools")
 local provider_registry = require("module.graph.providers.registry")
+local context_manager = require("module.graph.context_manager")
 
 local M = {}
 
@@ -12,6 +13,9 @@ local NO_SIDE_EFFECT_TOOLS = {
     search_file = true,
     search_files = true,
 }
+
+-- 大文件提示阈值
+local LARGE_FILE_HINT_THRESHOLD = 10000
 
 local function graph_cfg()
     return ((config.settings or {}).graph or {})
@@ -157,6 +161,8 @@ function M.execute_calls(calls)
         call_results = {},
         context_fragments = {},
         parallel_groups = 0,
+        total_result_chars = 0,
+        large_results = {}, -- 记录大结果
     }
 
     if type(calls) ~= "table" or #calls == 0 then
@@ -168,7 +174,7 @@ function M.execute_calls(calls)
     local ext_cfg = external_cfg()
     local inject_external_context = util.to_bool(ext_cfg.context_inject, true)
     local external_context_max_chars = math.max(120, math.floor(tonumber(ext_cfg.context_max_chars) or 1200))
-    local file_context_max_chars = math.max(120, math.floor(tonumber((tool_cfg().file_context_max_chars) or 1600)))
+    local file_context_max_chars = math.max(120, math.floor(tonumber((tool_cfg().file_context_max_chars) or 4000)))
 
     local serial_calls = {}
     local no_side_effect_count = 0
@@ -225,6 +231,18 @@ function M.execute_calls(calls)
         end
 
         local result_text = util.trim(result_or_err)
+        local original_len = #result_text
+        out.total_result_chars = (out.total_result_chars or 0) + original_len
+
+        -- 记录大结果
+        if original_len > LARGE_FILE_HINT_THRESHOLD then
+            out.large_results[#out.large_results + 1] = {
+                tool = call.tool,
+                chars = original_len,
+                call_id = call.call_id,
+            }
+        end
+
         if not ok then
             out.failed = out.failed + 1
             out.call_results[#out.call_results + 1] = {
@@ -234,18 +252,41 @@ function M.execute_calls(calls)
                 ok = false,
                 error = result_text ~= "" and result_text or "tool_exec_failed",
                 result = "",
+                original_chars = original_len,
             }
         else
             out.executed = out.executed + 1
+
+            -- 对大结果添加智能提示
+            local final_result = result_text
+            if original_len > LARGE_FILE_HINT_THRESHOLD then
+                -- 添加大文件建议
+                local strategy_hint = ""
+                if call.tool == "read_file" then
+                    strategy_hint = string.format(
+                        "\n\n[System: Large file detected (%d chars). Consider using read_lines for specific sections.]",
+                        original_len
+                    )
+                elseif call.tool == "search_files" or call.tool == "search_file" then
+                    strategy_hint = string.format(
+                        "\n\n[System: Many results found (%d chars). Consider using more specific patterns.]",
+                        original_len
+                    )
+                end
+                final_result = result_text .. strategy_hint
+            end
+
             out.call_results[#out.call_results + 1] = {
                 call_id = call.call_id,
                 tool = call.tool,
                 args = call.args,
                 ok = true,
                 error = "",
-                result = result_text,
+                result = final_result,
+                original_chars = original_len,
             }
 
+            -- 生成context fragment时使用更大的限制
             if NO_SIDE_EFFECT_TOOLS[call.tool] then
                 if result_text ~= "" then
                     local clipped = util.utf8_take(result_text, file_context_max_chars)
