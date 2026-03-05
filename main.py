@@ -11,7 +11,6 @@ import atexit
 import json
 import gzip
 import hashlib
-import cgi
 import mimetypes
 import re
 import socket
@@ -21,6 +20,8 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from email import policy as email_policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 try:
@@ -2243,36 +2244,44 @@ class MoriLocalWebUIBridge:
         if not content_type.lower().startswith("multipart/form-data"):
             return None, "Only multipart/form-data is supported."
 
-        env = {
-            "REQUEST_METHOD": "POST",
-            "CONTENT_TYPE": content_type,
-            "CONTENT_LENGTH": str(len(body)),
-        }
-        fs = cgi.FieldStorage(
-            fp=io.BytesIO(body),
-            environ=env,
-            headers=handler.headers,
-            keep_blank_values=True,
-        )
+        try:
+            mime_bytes = (
+                f"Content-Type: {content_type}\r\n"
+                "MIME-Version: 1.0\r\n"
+                "\r\n"
+            ).encode("utf-8") + body
+            parsed = BytesParser(policy=email_policy.default).parsebytes(mime_bytes)
+        except Exception as e:
+            return None, f"Invalid multipart payload: {e}"
+        if not parsed.is_multipart():
+            return None, "Invalid multipart form data."
 
-        message = str(fs.getfirst("message", "") or "").strip()
+        message = ""
         raw_files = []
-        file_fields = []
-        if "files[]" in fs:
-            file_fields.append(fs["files[]"])
-        if "files" in fs:
-            file_fields.append(fs["files"])
+        for part in parsed.iter_parts():
+            name = part.get_param("name", header="Content-Disposition")
+            if not name:
+                continue
+            field_name = str(name).strip()
+            filename = part.get_filename()
+            payload_bytes = part.get_payload(decode=True)
+            if payload_bytes is None:
+                payload_bytes = b""
 
-        for field in file_fields:
-            entries = field if isinstance(field, list) else [field]
-            for item in entries:
-                if not getattr(item, "filename", None):
-                    continue
-                file_bytes = item.file.read() if item.file is not None else b""
+            if field_name == "message" and not filename:
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    message_piece = payload_bytes.decode(charset, errors="replace")
+                except LookupError:
+                    message_piece = payload_bytes.decode("utf-8", errors="replace")
+                message = (message + message_piece).strip()
+                continue
+
+            if field_name in {"files[]", "files"} and filename:
                 raw_files.append(
                     {
-                        "name": str(item.filename or "upload.bin"),
-                        "content": bytes(file_bytes or b""),
+                        "name": str(filename or "upload.bin"),
+                        "content": bytes(payload_bytes),
                     }
                 )
         return {"message": message, "files": raw_files}, None
