@@ -115,12 +115,16 @@ external provider 默认关闭，必须显式白名单启用。
 
 ```bash
 MORI_RUN_MODE=cli python3 main.py
+# 或直接强制终端模式（忽略环境变量）：
+python3 main.py --cli
 ```
 
 ### WebUI
 
 ```bash
 MORI_RUN_MODE=webui python3 main.py
+# 或：
+python3 main.py --webui
 ```
 
 默认本地地址：`http://127.0.0.1:8080`

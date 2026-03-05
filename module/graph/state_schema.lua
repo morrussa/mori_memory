@@ -191,6 +191,7 @@ function M.new_state(args)
             failed = 0,
             executed_total = 0,
             failed_total = 0,
+            read_evidence_total = 0,
             results = {},
             context_fragments = {},
         },

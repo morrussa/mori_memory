@@ -8,6 +8,13 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
+local READ_EVIDENCE_TOOLS = {
+    read_file = true,
+    read_lines = true,
+    search_file = true,
+    search_files = true,
+}
+
 local function build_tool_message(row)
     local ok = row.ok == true
     local content = ""
@@ -56,6 +63,7 @@ function M.run(state, _ctx)
         failed = 0,
         executed_total = 0,
         failed_total = 0,
+        read_evidence_total = 0,
         results = {},
         context_fragments = {},
     }
@@ -68,9 +76,15 @@ function M.run(state, _ctx)
     state.tool_exec.failed = tonumber(result.failed) or 0
     state.tool_exec.executed_total = (tonumber(state.tool_exec.executed_total) or 0) + (tonumber(result.executed) or 0)
     state.tool_exec.failed_total = (tonumber(state.tool_exec.failed_total) or 0) + (tonumber(result.failed) or 0)
+    state.tool_exec.read_evidence_total = tonumber(state.tool_exec.read_evidence_total) or 0
     state.tool_exec.results = result.call_results or {}
     state.tool_exec.context_fragments = result.context_fragments or {}
     state.tool_exec.parallel_groups = tonumber(result.parallel_groups) or 0
+    for _, row in ipairs(state.tool_exec.results or {}) do
+        if row.ok == true and READ_EVIDENCE_TOOLS[tostring(row.tool or "")] then
+            state.tool_exec.read_evidence_total = state.tool_exec.read_evidence_total + 1
+        end
+    end
 
     merge_tool_context(state, state.tool_exec.context_fragments)
 

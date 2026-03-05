@@ -2,6 +2,7 @@ import lupa.luajit21 as lupa
 from lupa.luajit21 import LuaRuntime
 import numpy as np
 import zstandard as zstd
+import argparse
 import errno
 import os
 import io
@@ -2790,12 +2791,45 @@ def _py_to_lua_value(lua_runtime: LuaRuntime, value):
     return value
 
 
+def _resolve_run_mode() -> str:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--mode", choices=["cli", "webui"], help="Run mode override.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--cli", action="store_true", help="Force CLI mode.")
+    mode_group.add_argument("--webui", action="store_true", help="Force WebUI mode.")
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"[Python][WARN] Ignored unknown args: {' '.join(unknown)}")
+
+    cli_mode = None
+    if args.mode:
+        cli_mode = str(args.mode).strip().lower()
+        print(f"[Python] Run mode forced by --mode: {cli_mode}")
+    elif args.cli:
+        cli_mode = "cli"
+        print("[Python] Run mode forced by --cli: cli")
+    elif args.webui:
+        cli_mode = "webui"
+        print("[Python] Run mode forced by --webui: webui")
+
+    if cli_mode is None:
+        env_mode = os.environ.get("MORI_RUN_MODE")
+        if env_mode is None:
+            cli_mode = "cli"
+            print("[Python] Run mode default: cli")
+        else:
+            cli_mode = str(env_mode).strip().lower()
+            print(f"[Python] Run mode from MORI_RUN_MODE: {cli_mode}")
+
+    if cli_mode not in {"cli", "webui"}:
+        print(f"[Python][WARN] Unknown MORI_RUN_MODE={cli_mode}, fallback to cli")
+        cli_mode = "cli"
+    return cli_mode
+
+
 def main():
     # 1) Resolve run mode and initialize shared Python<->Lua bridge objects.
-    run_mode = str(os.environ.get("MORI_RUN_MODE", "cli")).strip().lower()
-    if run_mode not in {"cli", "webui"}:
-        print(f"[Python][WARN] Unknown MORI_RUN_MODE={run_mode}, fallback to cli")
-        run_mode = "cli"
+    run_mode = _resolve_run_mode()
 
     lua = LuaRuntime(unpack_returned_tuples=True)
     pipeline = AIPipeline()

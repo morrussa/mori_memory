@@ -64,6 +64,86 @@ local function default_numbers(...)
     return out
 end
 
+local function normalize_rel_path(raw)
+    local path = util.trim(raw)
+    if path == "" then
+        return ""
+    end
+    path = tostring(path):gsub("\\", "/")
+    while path:sub(1, 2) == "./" do
+        path = path:sub(3)
+    end
+    if path:sub(1, 10) == "workspace/" then
+        path = path:sub(11)
+    end
+    local idx = path:find("/workspace/", 1, true)
+    if idx then
+        path = path:sub(idx + 11)
+    end
+    path = path:gsub("^/+", "")
+    return util.trim(path)
+end
+
+local function pick_first_nonempty(tbl, keys)
+    if type(tbl) ~= "table" then
+        return ""
+    end
+    for _, key in ipairs(keys or {}) do
+        local v = util.trim(tbl[key])
+        if v ~= "" then
+            return v
+        end
+    end
+    return ""
+end
+
+local function normalize_file_tool_args(name, args)
+    if type(args) ~= "table" then
+        args = {}
+    end
+
+    if name == "list_files" then
+        local prefix = pick_first_nonempty(args, { "prefix", "path_prefix", "dir", "directory", "path" })
+        if prefix ~= "" then
+            args.prefix = normalize_rel_path(prefix)
+        end
+        return args
+    end
+
+    if name == "read_file" or name == "read_lines" or name == "search_file" then
+        local path = pick_first_nonempty(args, {
+            "path",
+            "file",
+            "target",
+            "filename",
+            "file_name",
+            "filepath",
+            "file_path",
+            "name",
+        })
+        if path ~= "" then
+            args.path = normalize_rel_path(path)
+        end
+        return args
+    end
+
+    if name == "search_files" then
+        local prefix = pick_first_nonempty(args, {
+            "prefix",
+            "path_prefix",
+            "dir",
+            "directory",
+            "path",
+        })
+        if prefix ~= "" then
+            args.prefix = normalize_rel_path(prefix)
+        end
+        return args
+    end
+
+    return args
+end
+
 function M.supported_tools()
     return {
         list_files = true,
@@ -160,7 +240,7 @@ end
 
 function M.execute(call)
     local name = util.trim((call or {}).tool)
-    local args = (call or {}).args or {}
+    local args = normalize_file_tool_args(name, (call or {}).args or {})
     local args_lua = util.encode_lua_value(args, 0)
     local cfg = file_cfg()
 

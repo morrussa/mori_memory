@@ -158,6 +158,269 @@ local function normalize_tool_calls(raw_calls)
     return out
 end
 
+local READ_EVIDENCE_TOOLS = {
+    read_file = true,
+    read_lines = true,
+    search_file = true,
+    search_files = true,
+}
+
+local function lower_text(v)
+    return tostring(v or ""):lower()
+end
+
+local function has_uploads(state)
+    local rows = ((state or {}).uploads) or {}
+    return type(rows) == "table" and #rows > 0
+end
+
+local function collect_history_rows(state)
+    local rows = ((((state or {}).messages or {}).conversation_history) or {})
+    if type(rows) ~= "table" then
+        return {}
+    end
+    return rows
+end
+
+local function has_history_tool_path(state)
+    local rows = collect_history_rows(state)
+    for i = #rows, 1, -1 do
+        local row = rows[i]
+        if type(row) == "table" then
+            local content = tostring(row.content or "")
+            if content:find("tool_path=download/", 1, true) or content:find("download/", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function has_file_intent(user_input)
+    local q = lower_text(user_input)
+    if q == "" then
+        return false
+    end
+    local keywords = {
+        "读取", "读一下", "读一读", "查看", "前几行", "几行", "第几行",
+        "文件", "代码", "模型设置", "配置", "search", "grep", "read", "line", "lines",
+        "list_files", "read_file", "read_lines", "search_file", "search_files",
+        "download/", ".py", ".lua", ".txt",
+    }
+    for _, key in ipairs(keywords) do
+        if q:find(key, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function has_followup_read_intent(user_input)
+    local q = lower_text(user_input)
+    if q == "" then
+        return false
+    end
+    return q == "再试一次"
+        or q == "继续"
+        or q == "继续吧"
+        or q == "..."
+        or q:find("再来一次", 1, true) ~= nil
+        or q:find("倒是读", 1, true) ~= nil
+end
+
+local function should_require_file_read(state)
+    if has_uploads(state) then
+        return true
+    end
+    if not has_history_tool_path(state) then
+        return false
+    end
+    local user_input = tostring((((state or {}).input or {}).message) or "")
+    if has_file_intent(user_input) then
+        return true
+    end
+    return has_followup_read_intent(user_input)
+end
+
+local function normalize_tool_path(raw)
+    local path = util.trim(raw)
+    if path == "" then
+        return ""
+    end
+    path = tostring(path):gsub("\\", "/")
+
+    while path:sub(1, 2) == "./" do
+        path = path:sub(3)
+    end
+    if path:sub(1, 10) == "workspace/" then
+        path = path:sub(11)
+    end
+    local idx = path:find("/workspace/", 1, true)
+    if idx then
+        path = path:sub(idx + 11)
+    end
+
+    path = path:gsub("^/+", "")
+    return util.trim(path)
+end
+
+local function extract_tool_paths_from_text(text, out, seen)
+    local s = tostring(text or "")
+    if s == "" then
+        return
+    end
+
+    for path in s:gmatch("tool_path=([^,%s%)]+)") do
+        local p = normalize_tool_path(path)
+        if p ~= "" and not seen[p] then
+            seen[p] = true
+            out[#out + 1] = p
+        end
+    end
+
+    for path in s:gmatch("download/[0-9A-Za-z%._%-%/]+") do
+        local p = normalize_tool_path(path)
+        if p ~= "" and not seen[p] then
+            seen[p] = true
+            out[#out + 1] = p
+        end
+    end
+end
+
+local function collect_known_tool_paths(state)
+    local out = {}
+    local seen = {}
+
+    local uploads = ((state or {}).uploads) or {}
+    for _, item in ipairs(uploads) do
+        local p = normalize_tool_path((item or {}).tool_path or (item or {}).path)
+        if p ~= "" and not seen[p] then
+            seen[p] = true
+            out[#out + 1] = p
+        end
+    end
+
+    local rows = collect_history_rows(state)
+    for i = #rows, 1, -1 do
+        local row = rows[i]
+        if type(row) == "table" then
+            extract_tool_paths_from_text(row.content or "", out, seen)
+        end
+    end
+
+    extract_tool_paths_from_text((((state or {}).input or {}).message) or "", out, seen)
+    return out
+end
+
+local function has_read_evidence(state)
+    if (tonumber((((state or {}).tool_exec or {}).read_evidence_total) or 0) or 0) > 0 then
+        return true
+    end
+    local tool_ctx = tostring((((state or {}).context or {}).tool_context) or "")
+    if tool_ctx:find("[Tool:read_file]", 1, true)
+        or tool_ctx:find("[Tool:read_lines]", 1, true)
+        or tool_ctx:find("[Tool:search_file]", 1, true)
+        or tool_ctx:find("[Tool:search_files]", 1, true) then
+        return true
+    end
+    return false
+end
+
+local function has_read_call(calls)
+    for _, row in ipairs(calls or {}) do
+        if READ_EVIDENCE_TOOLS[tostring((row or {}).tool or "")] then
+            return true
+        end
+    end
+    return false
+end
+
+local function build_forced_read_calls(state, max_calls)
+    local calls = {}
+    local limit = math.max(1, math.floor(tonumber(max_calls) or 1))
+    local known_paths = collect_known_tool_paths(state)
+    local path = tostring(known_paths[1] or "")
+    local q = lower_text((((state or {}).input or {}).message) or "")
+    local wants_lines = (
+        q:find("前几行", 1, true) ~= nil
+        or q:find("几行", 1, true) ~= nil
+        or q:find("line", 1, true) ~= nil
+        or q:find("lines", 1, true) ~= nil
+        or q:find("配置", 1, true) ~= nil
+        or q:find("config", 1, true) ~= nil
+        or q:find("模型设置", 1, true) ~= nil
+    )
+
+    if path == "" then
+        calls[#calls + 1] = {
+            tool = "list_files",
+            args = { prefix = "download" },
+            call_id = "guard_list_files_1",
+        }
+        return calls
+    end
+
+    if wants_lines then
+        calls[#calls + 1] = {
+            tool = "read_lines",
+            args = {
+                path = path,
+                start_line = 1,
+                max_lines = 220,
+            },
+            call_id = "guard_read_lines_1",
+        }
+    else
+        calls[#calls + 1] = {
+            tool = "read_file",
+            args = {
+                path = path,
+                max_chars = 2400,
+            },
+            call_id = "guard_read_file_1",
+        }
+    end
+
+    if #calls > limit then
+        for i = #calls, limit + 1, -1 do
+            table.remove(calls, i)
+        end
+    end
+    return calls
+end
+
+local function enforce_file_read_guard(state, tool_calls)
+    local calls = tool_calls or {}
+    if not should_require_file_read(state) then
+        return calls
+    end
+    if has_read_evidence(state) then
+        return calls
+    end
+
+    local max_calls = math.max(1, math.floor(tonumber((((graph_cfg() or {}).planner or {}).max_calls_per_loop) or 6)))
+    if #calls <= 0 then
+        local forced = build_forced_read_calls(state, max_calls)
+        if #forced > 0 then
+            return forced
+        end
+        return calls
+    end
+
+    if has_read_call(calls) then
+        return calls
+    end
+    if #calls >= max_calls then
+        return calls
+    end
+
+    local forced = build_forced_read_calls(state, 1)
+    if #forced > 0 then
+        calls[#calls + 1] = forced[1]
+    end
+    return calls
+end
+
 local function parse_model_output(raw)
     if type(raw) == "string" then
         local parsed = util.parse_lua_table_literal(raw)
@@ -172,20 +435,27 @@ local function parse_model_output(raw)
         end
     end
 
-    if type(raw) ~= "table" and raw ~= nil then
+    local content_v = get_field(raw, "content")
+    local text_v = get_field(raw, "text")
+    local tool_calls_v = get_field(raw, "tool_calls")
+    local raw_v = get_field(raw, "raw")
+
+    local content = util.trim(content_v or text_v)
+    local calls = normalize_tool_calls(tool_calls_v)
+    local raw_text = util.trim(raw_v)
+
+    -- Python dict/list objects may arrive as userdata proxy via Lupa.
+    -- In that case, try field extraction first; only fallback to tostring
+    -- when no structured fields are available.
+    if content == "" and #calls <= 0 and raw_text == "" and raw ~= nil then
+        local fallback = util.trim(tostring(raw))
         return {
-            content = util.trim(tostring(raw)),
+            content = fallback,
             tool_calls = {},
-            raw = util.trim(tostring(raw)),
+            raw = fallback,
         }
     end
 
-    local content = util.trim(
-        get_field(raw, "content")
-        or get_field(raw, "text")
-    )
-    local calls = normalize_tool_calls(get_field(raw, "tool_calls"))
-    local raw_text = util.trim(get_field(raw, "raw"))
     return {
         content = content,
         tool_calls = calls,
@@ -282,7 +552,7 @@ function M.run(state, _ctx)
         return state
     end
 
-    local tool_calls = out.tool_calls or {}
+    local tool_calls = enforce_file_read_guard(state, out.tool_calls or {})
     state.messages.runtime_messages[#state.messages.runtime_messages + 1] = {
         role = "assistant",
         content = tostring(out.content or ""),

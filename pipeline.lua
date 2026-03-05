@@ -12,6 +12,7 @@ local app_config = require("module.config")
 local graph_runtime = require("module.graph.graph_runtime")
 local run_mode = tostring(MORI_RUN_MODE or "cli")
 local graph_cfg = ((app_config.settings or {}).graph or {})
+local cli_boot_demo = false
 
 local function read_env_int(name, fallback, min_value)
     local raw = os.getenv(name)
@@ -71,6 +72,7 @@ do
     )
     graph_cfg.cli = graph_cfg.cli or {}
     graph_cfg.cli.debug_trace = read_env_bool("MORI_GRAPH_DEBUG_TRACE", (graph_cfg.cli or {}).debug_trace == true)
+    cli_boot_demo = read_env_bool("MORI_CLI_BOOT_DEMO", false)
 end
 
 local runtime_cfg = (app_config.settings or {}).runtime or {}
@@ -126,7 +128,7 @@ topic.init()
 
 
 
-if run_mode ~= "webui" then
+if run_mode ~= "webui" and cli_boot_demo then
     -- 3. 测试相似度接口
     print("\n[Lua] Testing Similarity...")
     local text_a = "Python is terrible."
@@ -224,7 +226,11 @@ else
             break
         end
 
-        process_user_input(line, nil, nil, false)
+        local assistant_text = process_user_input(line, nil, nil, false)
+        assistant_text = tostring(assistant_text or "")
+        if assistant_text ~= "" then
+            print(assistant_text)
+        end
 
         ::continue::
     end
