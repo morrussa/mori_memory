@@ -30,6 +30,9 @@ local DEFAULT_SETTINGS = {
             temperature = 0.1,
             seed = 11,
             max_calls_per_loop = 6,
+            force_upload_toolchain = true,
+            force_upload_read_limit = 2,
+            force_upload_read_max_chars = 2400,
         },
         repair = {
             max_attempts = 2,
@@ -41,6 +44,7 @@ local DEFAULT_SETTINGS = {
             max_tokens = 1024,
             temperature = 0.75,
             seed = 42,
+            strict_tool_honesty = true,
         },
         recall = {
             enable_on_respond = false,

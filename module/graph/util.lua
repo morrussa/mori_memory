@@ -158,9 +158,18 @@ end
 
 local function parse_lua_table_literal(raw)
     local text = trim(raw)
-    if text == "" or (not text:match("^%b{}$")) then
+    if text == "" then
         return nil, "not_lua_table"
     end
+
+    if not text:match("^%b{}$") then
+        local candidate = text:match("(%b{})")
+        if not candidate then
+            return nil, "not_lua_table"
+        end
+        text = candidate
+    end
+
     local chunk, load_err = load("return " .. text, "graph_literal", "t", {})
     if not chunk then
         return nil, tostring(load_err or "load_failed")

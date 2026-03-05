@@ -501,18 +501,31 @@ local function build_cases()
 
     -- No-tool 10
     for i = 1, 10 do
+        local has_uploads = (i == 1)
+        local expect_route = "respond"
+        local expect_tool_executed = 0
+        local min_tool_executed = nil
+        local expect_tool_failed = 0
+        if has_uploads then
+            expect_route = "tool_loop"
+            expect_tool_executed = nil
+            min_tool_executed = 1
+            expect_tool_failed = nil
+        end
+
         cases[#cases + 1] = {
             id = string.format("no_tool_%02d", i),
             category = "no_tool",
             input = string.format("plain response %d", i),
             router_steps = { '{route="respond"}' },
-            expect_route = "respond",
+            expect_route = expect_route,
             expect_recall = false,
-            expect_tool_executed = 0,
-            expect_tool_failed = 0,
+            expect_tool_executed = expect_tool_executed,
+            min_tool_executed = min_tool_executed,
+            expect_tool_failed = expect_tool_failed,
             expect_writeback_saved = 1,
-            expect_uploads_count = (i == 1) and 1 or 0,
-            uploads = (i == 1) and {
+            expect_uploads_count = has_uploads and 1 or 0,
+            uploads = has_uploads and {
                 { name = "a.txt", path = "./workspace/download/a.txt", bytes = 5 },
             } or {},
         }

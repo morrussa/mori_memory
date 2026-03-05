@@ -2305,10 +2305,15 @@ class MoriLocalWebUIBridge:
         return message, saved_files, None
 
     def _send_sse_event(self, handler: BaseHTTPRequestHandler, event_name: str, payload) -> bool:
+        event = str(event_name or "message").strip() or "message"
         try:
+            try:
+                data_json = json.dumps(payload or {}, ensure_ascii=False)
+            except Exception:
+                data_json = json.dumps({"message": str(payload)}, ensure_ascii=False)
             line = (
-                f"event: {event_name}\n"
-                f"data: {json.dumps(payload or {}, ensure_ascii=False)}\n\n"
+                f"event: {event}\n"
+                f"data: {data_json}\n\n"
             ).encode("utf-8")
             handler.wfile.write(line)
             handler.wfile.flush()
@@ -2377,9 +2382,12 @@ class MoriLocalWebUIBridge:
         try:
             handler.send_response(200)
             handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            handler.send_header("Cache-Control", "no-cache")
+            handler.send_header("Cache-Control", "no-cache, no-transform")
+            handler.send_header("X-Accel-Buffering", "no")
             handler.send_header("Connection", "close")
             handler.end_headers()
+            handler.wfile.write(b": stream-open\n\n")
+            handler.wfile.flush()
         except Exception as e:
             if self._is_client_disconnect_error(e):
                 return

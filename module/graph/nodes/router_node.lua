@@ -19,6 +19,19 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
+local function has_uploads(state)
+    local rows = ((state or {}).uploads) or {}
+    return type(rows) == "table" and #rows > 0
+end
+
+local function should_force_tool_loop(state)
+    if not has_uploads(state) then
+        return false
+    end
+    local executed_total = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0
+    return executed_total <= 0
+end
+
 local function parse_router_output(raw)
     local parsed, err = util.parse_lua_table_literal(raw)
     if not parsed then
@@ -40,6 +53,7 @@ function M.run(state, _ctx)
     local user_input = tostring((((state or {}).input or {}).message) or "")
     local tool_context = tostring((((state or {}).context or {}).tool_context) or "")
     local memory_context = tostring((((state or {}).context or {}).memory_context) or "")
+    local force_upload_route = should_force_tool_loop(state)
 
     local prompt = table.concat({
         ROUTER_PROMPT,
@@ -64,11 +78,17 @@ function M.run(state, _ctx)
     )
 
     local decision, err = parse_router_output(raw)
+    if decision and force_upload_route and decision.route ~= "tool_loop" then
+        decision.route = "tool_loop"
+        decision.reason = "forced_upload_tool_loop"
+    end
+
     if not decision then
+        local fallback_route = force_upload_route and "tool_loop" or "respond"
         decision = {
-            route = "respond",
+            route = fallback_route,
             raw = util.trim(raw),
-            reason = "fallback:" .. tostring(err),
+            reason = "fallback:" .. tostring(err or "router_parse_failed"),
         }
     end
 

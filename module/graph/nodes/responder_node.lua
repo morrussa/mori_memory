@@ -8,15 +8,48 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
-local function append_tool_summary(user_input, tool_results)
+local FILE_TOOLS = {
+    list_files = true,
+    read_file = true,
+    read_lines = true,
+    search_file = true,
+    search_files = true,
+}
+
+local function has_uploads(state)
+    local rows = ((state or {}).uploads) or {}
+    return type(rows) == "table" and #rows > 0
+end
+
+local function has_file_tool_evidence(state)
+    local rows = (((state or {}).tool_exec or {}).results) or {}
+    for _, row in ipairs(rows) do
+        if row.ok == true and FILE_TOOLS[tostring(row.tool or "")] then
+            return true
+        end
+    end
+
+    local tool_context = tostring((((state or {}).context or {}).tool_context) or "")
+    if tool_context ~= "" then
+        for tool_name, _ in pairs(FILE_TOOLS) do
+            if tool_context:find("[Tool:" .. tool_name .. "]", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function build_responder_user_payload(user_input, tool_results, uploads_present)
     local lines = {
+        "[UserRequest]",
         tostring(user_input or ""),
+        "",
+        "[ToolExecutionSummary]",
     }
 
     local rows = tool_results or {}
     if type(rows) == "table" and #rows > 0 then
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = "[ToolExecutionSummary]"
         for _, row in ipairs(rows) do
             local tool_name = util.trim((row or {}).tool)
             if tool_name == "" then
@@ -30,16 +63,50 @@ local function append_tool_summary(user_input, tool_results)
                 lines[#lines + 1] = string.format("- %s: failed | %s", tool_name, err)
             end
         end
+    else
+        lines[#lines + 1] = "- none"
+    end
+
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "[ResponsePolicy]"
+    lines[#lines + 1] = "1) 只能依据 ToolExecutionSummary 中真实结果描述工具行为。"
+    lines[#lines + 1] = "2) 当 ToolExecutionSummary 为 none 时，禁止声称已经执行任何工具。"
+    lines[#lines + 1] = "3) 工具失败时需明确失败并给出可执行的下一步。"
+    if uploads_present then
+        lines[#lines + 1] = "4) 用户已上传附件；若没有文件工具结果，不要编造附件内容。"
     end
 
     return table.concat(lines, "\n")
+end
+
+local function contains_tool_claim(text)
+    local s = tostring(text or ""):lower()
+    return s:find("list_files", 1, true) ~= nil
+        or s:find("read_file", 1, true) ~= nil
+        or s:find("read_lines", 1, true) ~= nil
+        or s:find("search_file", 1, true) ~= nil
+        or s:find("search_files", 1, true) ~= nil
 end
 
 function M.run(state, _ctx)
     local cfg = graph_cfg().responder or {}
     local tool_results = (((state or {}).tool_exec or {}).results) or {}
     local original_user = tostring((((state or {}).input or {}).message) or "")
-    local merged_user = append_tool_summary(original_user, tool_results)
+    local uploads_present = has_uploads(state)
+    local strict_tool_honesty = util.to_bool(cfg.strict_tool_honesty, true)
+    local file_tool_evidence = has_file_tool_evidence(state)
+
+    if strict_tool_honesty and uploads_present and not file_tool_evidence then
+        state.final_response = {
+            message = "我还没有成功读取你上传的附件内容。请重试这次请求，我会先执行文件工具再给出基于附件的结论。",
+            context_meta = {
+                policy = "missing_upload_tool_evidence",
+            },
+        }
+        return state
+    end
+
+    local merged_user = build_responder_user_payload(original_user, tool_results, uploads_present)
 
     local original = (((state or {}).input or {}).message) or ""
     state.input.message = merged_user
@@ -55,6 +122,10 @@ function M.run(state, _ctx)
     final_text = util.trim(final_text)
     if final_text == "" then
         final_text = "好的，已处理。"
+    end
+
+    if strict_tool_honesty and (type(tool_results) ~= "table" or #tool_results == 0) and contains_tool_claim(final_text) then
+        final_text = "当前回合没有任何工具执行结果可用。我可以先执行工具，再基于真实结果回答。"
     end
 
     state.final_response = {

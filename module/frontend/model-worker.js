@@ -27,6 +27,7 @@ function dispatchEvent(eventName, payload, doneState) {
   if (event === "token") {
     const token = typeof data.token === "string" ? data.token : "";
     if (token) {
+      doneState.tokenCount = (doneState.tokenCount || 0) + 1;
       postMessage({ type: "newToken", payload: { token } });
     }
     return;
@@ -79,7 +80,8 @@ function dispatchEvent(eventName, payload, doneState) {
   }
 
   if (event === "status") {
-    postMessage({ type: "status", payload: { message: String(data.message || "") } });
+    const statusMsg = String(data.message || data.phase || "");
+    postMessage({ type: "status", payload: { message: statusMsg } });
     return;
   }
 
@@ -91,6 +93,10 @@ function dispatchEvent(eventName, payload, doneState) {
   if (event === "done") {
     if (!doneState.done) {
       doneState.done = true;
+      const finalMessage = typeof data.message === "string" ? data.message : "";
+      if ((doneState.tokenCount || 0) === 0 && finalMessage) {
+        postMessage({ type: "newToken", payload: { token: finalMessage } });
+      }
       postMessage({ type: "runDone", payload: data });
       postMessage({ type: "tokensDone" });
     }
@@ -130,7 +136,7 @@ async function streamChat(message, files, onSent) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
-  const doneState = { done: false };
+  const doneState = { done: false, tokenCount: 0 };
 
   let curEvent = "message";
   let dataLines = [];
@@ -142,6 +148,12 @@ async function streamChat(message, files, onSent) {
       return;
     }
     const rawData = dataLines.join("\n");
+    if (rawData === "[DONE]") {
+      dispatchEvent("done", {}, doneState);
+      curEvent = "message";
+      dataLines = [];
+      return;
+    }
     let payload = {};
     try {
       payload = rawData ? JSON.parse(rawData) : {};
@@ -160,6 +172,36 @@ async function streamChat(message, files, onSent) {
     buffer += decoder.decode(value, { stream: true });
     buffer = buffer.replace(/\r/g, "");
 
+    while (true) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+
+      if (line === "") {
+        flushEvent();
+        continue;
+      }
+      if (line.startsWith(":")) {
+        continue;
+      }
+      if (line.startsWith("event:")) {
+        curEvent = line.slice(6).trim() || "message";
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trim());
+        continue;
+      }
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer.length > 0) {
+    buffer = buffer.replace(/\r/g, "");
+    if (!buffer.endsWith("\n")) {
+      buffer += "\n";
+    }
     while (true) {
       const newline = buffer.indexOf("\n");
       if (newline < 0) break;

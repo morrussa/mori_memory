@@ -58,13 +58,15 @@ local function normalize_upload_item(item)
     end
     local name = tostring(get_field(item, "name") or "")
     local path = tostring(get_field(item, "path") or "")
+    local tool_path = tostring(get_field(item, "tool_path") or get_field(item, "toolPath") or "")
     local bytes = tonumber(get_field(item, "bytes")) or 0
-    if name == "" and path == "" and bytes <= 0 then
+    if name == "" and path == "" and tool_path == "" and bytes <= 0 then
         return nil
     end
     return {
         name = name,
         path = path,
+        tool_path = tool_path,
         bytes = bytes,
     }
 end
@@ -173,6 +175,7 @@ function M.new_state(args)
             raw = "",
             tool_calls = {},
             errors = {},
+            force_reason = "",
         },
         tool_exec = {
             loop_count = 0,
