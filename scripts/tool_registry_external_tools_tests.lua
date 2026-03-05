@@ -105,8 +105,8 @@ _G.py_pipeline = {
             },
         }
     end,
-    call_qwen_tool = function(_, name, args_json)
-        return string.format("tool=%s args=%s", tostring(name), tostring(args_json))
+    call_qwen_tool = function(_, name, args_lua)
+        return string.format("tool=%s args=%s", tostring(name), tostring(args_lua))
     end,
 }
 
@@ -132,7 +132,7 @@ local calls = {
     {
         act = "web_search",
         tool_call_id = "tc_web_1",
-        arguments_json = '{"query":"llama.cpp"}',
+        arguments = '{query="llama.cpp"}',
     }
 }
 local r1 = registry.execute_calls(calls, { current_turn = 88, read_only = false })
@@ -141,6 +141,7 @@ assert(r1.failed == 0, "external call should not fail")
 assert(r1.context_updated == true, "external call should update pending context")
 assert(type(r1.call_results) == "table" and #r1.call_results >= 1, "call_results should be populated")
 assert(r1.call_results[1].tool_call_id == "tc_web_1", "tool_call_id should be preserved")
+assert(tostring(r1.call_results[1].arguments or ""):find("{query=", 1, true), "call_results should store lua table arguments")
 
 local ctx = registry.consume_pending_system_context_for_turn(88)
 assert(type(ctx) == "string" and ctx:find("Tool:web_search", 1, true), "pending context should contain web_search result")

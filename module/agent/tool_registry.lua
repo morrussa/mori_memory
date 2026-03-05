@@ -98,7 +98,7 @@ local function utf8_take(s, max_chars)
     return table.concat(out)
 end
 
-local function json_escape_str(s)
+local function lua_escape_str(s)
     s = tostring(s or "")
     s = s:gsub("\\", "\\\\")
     s = s:gsub('"', '\\"')
@@ -107,17 +107,128 @@ local function json_escape_str(s)
     return s
 end
 
-local function to_json_literal(v)
+local function to_lua_literal(v)
     if type(v) == "boolean" then
         return v and "true" or "false"
     end
     if type(v) == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then
+            return "nil"
+        end
         return tostring(v)
     end
     if v == nil then
-        return "null"
+        return "nil"
     end
-    return '"' .. json_escape_str(v) .. '"'
+    return '"' .. lua_escape_str(v) .. '"'
+end
+
+local function parse_lua_table_literal(raw)
+    raw = trim(raw)
+    if raw == "" or not raw:match("^%b{}$") then
+        return nil
+    end
+
+    local chunk, load_err = load("return " .. raw, "tool_args", "t", {})
+    if not chunk then
+        return nil, load_err
+    end
+
+    local ok, parsed = pcall(chunk)
+    if not ok or type(parsed) ~= "table" then
+        return nil, parsed
+    end
+    return parsed
+end
+
+local function is_array_like_table(tbl)
+    if type(tbl) ~= "table" then
+        return false, 0
+    end
+    local count = 0
+    local max_idx = 0
+    for k, _ in pairs(tbl) do
+        if type(k) ~= "number" or k < 1 or k % 1 ~= 0 then
+            return false, 0
+        end
+        count = count + 1
+        if k > max_idx then
+            max_idx = k
+        end
+    end
+    if max_idx ~= count then
+        return false, 0
+    end
+    return true, max_idx
+end
+
+local function is_lua_identifier(s)
+    return type(s) == "string" and s:match("^[A-Za-z_][A-Za-z0-9_]*$") ~= nil
+end
+
+local function encode_lua_value(v, depth)
+    depth = tonumber(depth) or 0
+    if depth > 24 then
+        return "nil"
+    end
+
+    local vt = type(v)
+    if vt == "table" then
+        local is_arr, arr_len = is_array_like_table(v)
+        if is_arr then
+            local parts = {}
+            for i = 1, arr_len do
+                parts[#parts + 1] = encode_lua_value(v[i], depth + 1)
+            end
+            return "{" .. table.concat(parts, ",") .. "}"
+        end
+
+        local entries = {}
+        for k, val in pairs(v) do
+            entries[#entries + 1] = {
+                key = k,
+                key_type = type(k),
+                key_text = tostring(k),
+                value = val,
+            }
+        end
+        table.sort(entries, function(a, b)
+            if a.key_type == b.key_type then
+                return a.key_text < b.key_text
+            end
+            if a.key_type == "number" then
+                return true
+            end
+            if b.key_type == "number" then
+                return false
+            end
+            return a.key_type < b.key_type
+        end)
+
+        local parts = {}
+        for _, item in ipairs(entries) do
+            local key = item.key
+            local key_expr = ""
+            if type(key) == "string" and is_lua_identifier(key) then
+                key_expr = key
+            elseif type(key) == "string" then
+                key_expr = '["' .. lua_escape_str(key) .. '"]'
+            elseif type(key) == "number" then
+                key_expr = "[" .. tostring(key) .. "]"
+            elseif type(key) == "boolean" then
+                key_expr = key and "[true]" or "[false]"
+            else
+                key_expr = '["' .. lua_escape_str(tostring(key)) .. '"]'
+            end
+            parts[#parts + 1] = key_expr .. "=" .. encode_lua_value(item.value, depth + 1)
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+
+    if vt == "string" or vt == "number" or vt == "boolean" or v == nil then
+        return to_lua_literal(v)
+    end
+    return '"' .. lua_escape_str(tostring(v)) .. '"'
 end
 
 local function normalize_tool_entry_names(raw, out)
@@ -258,14 +369,17 @@ local function push_pending_context(current_turn, payload)
     end
 end
 
-local function build_call_arguments_json(call)
-    local raw = trim((call or {}).arguments_json or (call or {}).arguments or "")
+local function build_call_arguments_lua(call)
+    local c = call or {}
+    local raw = trim(c.arguments or "")
     if raw ~= "" then
-        return raw
+        local parsed_lua = parse_lua_table_literal(raw)
+        if type(parsed_lua) == "table" then
+            return encode_lua_value(parsed_lua, 0)
+        end
     end
 
     local obj = {}
-    local c = call or {}
     if trim(c.query) ~= "" then obj.query = c.query end
     if trim(c.string) ~= "" then obj.string = c.string end
     if trim(c.path) ~= "" then obj.path = c.path end
@@ -296,20 +410,7 @@ local function build_call_arguments_json(call)
         obj.confidence = tonumber(c.confidence) or c.confidence
     end
 
-    local keys = {}
-    for k, _ in pairs(obj) do
-        keys[#keys + 1] = k
-    end
-    table.sort(keys)
-    if #keys == 0 then
-        return "{}"
-    end
-
-    local parts = {}
-    for _, k in ipairs(keys) do
-        parts[#parts + 1] = '"' .. json_escape_str(k) .. '":' .. to_json_literal(obj[k])
-    end
-    return "{" .. table.concat(parts, ",") .. "}"
+    return encode_lua_value(obj, 0)
 end
 
 local function dedupe_and_clip_types(types, max_types)
@@ -672,10 +773,10 @@ local function apply_list_agent_files(call, current_turn, policy, state)
         }
     end
 
-    local args_json = build_call_arguments_json(call)
+    local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
         return py_pipeline:list_agent_files(
-            args_json,
+            args_lua,
             policy.agent_file_list_default_limit,
             policy.agent_file_list_hard_limit
         )
@@ -720,10 +821,10 @@ local function apply_read_agent_file(call, current_turn, policy, state)
         }
     end
 
-    local args_json = build_call_arguments_json(call)
+    local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
         return py_pipeline:read_agent_file(
-            args_json,
+            args_lua,
             policy.agent_file_read_default_max_chars,
             policy.agent_file_read_hard_max_chars
         )
@@ -771,10 +872,10 @@ local function apply_read_agent_file_lines(call, current_turn, policy, state)
         }
     end
 
-    local args_json = build_call_arguments_json(call)
+    local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
         return py_pipeline:read_agent_file_lines(
-            args_json,
+            args_lua,
             policy.agent_file_read_lines_default_max_lines,
             policy.agent_file_read_lines_hard_max_lines
         )
@@ -819,10 +920,10 @@ local function apply_search_agent_file(call, current_turn, policy, state)
         }
     end
 
-    local args_json = build_call_arguments_json(call)
+    local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
         return py_pipeline:search_agent_file(
-            args_json,
+            args_lua,
             policy.agent_file_search_default_max_hits,
             policy.agent_file_search_hard_max_hits
         )
@@ -870,10 +971,10 @@ local function apply_search_agent_files(call, current_turn, policy, state)
         }
     end
 
-    local args_json = build_call_arguments_json(call)
+    local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
         return py_pipeline:search_agent_files(
-            args_json,
+            args_lua,
             policy.agent_file_multi_search_default_max_hits,
             policy.agent_file_multi_search_hard_max_hits,
             policy.agent_file_multi_search_default_max_files,
@@ -928,9 +1029,9 @@ local function apply_external_tool(call, current_turn, policy)
         }
     end
 
-    local args_json = build_call_arguments_json(call)
+    local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
-        return py_pipeline:call_qwen_tool(act, args_json)
+        return py_pipeline:call_qwen_tool(act, args_lua)
     end)
     if not ok_call then
         return false, "external tool 调用失败: " .. tostring(result_or_err), {
@@ -1514,7 +1615,7 @@ function M.execute_calls(calls, exec_ctx)
             result.call_results[#result.call_results + 1] = {
                 act = tostring((call or {}).act or ""),
                 tool_call_id = tool_call_id,
-                arguments_json = build_call_arguments_json(call),
+                arguments = build_call_arguments_lua(call),
                 ok = (ok == true),
                 skipped = (count_result == false),
                 message = tostring(msg or ""),

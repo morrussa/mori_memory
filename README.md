@@ -140,12 +140,13 @@ http://127.0.0.1:8080
 当前主链路已切到（按职责分层）：
 - `module/agent/runtime.lua`：多步闭环状态机（循环 `BUILD_CONTEXT -> GENERATE -> PLAN_TOOLS -> EXECUTE_TOOLS`，最后 `PERSIST`）
   - 支持 qwen-agent 风格 “Action -> Observation” 轨迹回注
-  - 支持模型直出工具调用（`{act="..."}` / `<tool_call>...</tool_call>` / `✿FUNCTION✿ + ✿ARGS✿`）
+  - 主模型仅负责聊天/总结；工具调用统一由二阶段 `tool_planner` 产出并执行
 - `module/agent/tool_planner.lua`：二阶段工具规划（只产出工具调用，显式消费上一轮 observation/trace）
 - `module/agent/tool_registry.lua`：工具执行与 pending context（仅 notebook 工具）
 - `module/agent/context_window.lua`：按 token 预算裁剪上下文（模板后精确计数）
-- `module/agent/tool_parser.lua`：统一工具调用解析层（兼容 Lua table / Qwen / Nous 风格）
+- `module/agent/tool_parser.lua`：统一工具调用解析层（兼容 Lua table / Qwen 符号 / ReAct 风格；不再解析 XML/JSON 调用协议）
 - `module/memory/*.lua`：记忆与检索子系统（history/topic/recall/store/heat/cluster/adaptive/saver）
+- 工具参数协议：Lua table 是第一公民（`arguments={...}`）；JSON 仅保留 Python 边界兼容解析，不作为模型/规划器协议。
 
 路径约束：
 - 仅保留新路径：`module/agent/*.lua` 与 `module/memory/*.lua`。

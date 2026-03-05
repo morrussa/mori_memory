@@ -56,7 +56,6 @@ local ACT_ALIAS = {
 
 local CALL_FIELDS = {
     "tool_call_id",
-    "arguments_json",
     "arguments",
     "string",
     "query",
@@ -92,19 +91,6 @@ local function trim(s)
     return (tostring(s):gsub("^%s*(.-)%s*$", "%1"))
 end
 
-local function is_space(ch)
-    return ch == " " or ch == "\t" or ch == "\r" or ch == "\n"
-end
-
-local function skip_spaces(text, pos)
-    local i = pos or 1
-    local n = #text
-    while i <= n and is_space(text:sub(i, i)) do
-        i = i + 1
-    end
-    return i
-end
-
 local function normalize_act(name, supported_acts)
     local raw = trim(name):lower()
     if raw == "" then return nil end
@@ -117,6 +103,8 @@ local function normalize_act(name, supported_acts)
     end
     return nil
 end
+
+local extract_balanced = nil
 
 local function parse_lua_field(tbl_line, field)
     tbl_line = tostring(tbl_line or "")
@@ -168,12 +156,21 @@ local function parse_lua_field(tbl_line, field)
         return table.concat(out)
     end
 
+    if first == "{" then
+        if extract_balanced then
+            local seg = extract_balanced(tbl_line, i, "{", "}")
+            if seg then
+                return trim(seg)
+            end
+        end
+    end
+
     local raw = tbl_line:match("%f[%w_]" .. safe_field .. "%f[^%w_]%s*=%s*([^,%}]+)")
     if raw then return trim(raw) end
     return nil
 end
 
-local function extract_balanced(text, start_pos, open_char, close_char)
+extract_balanced = function(text, start_pos, open_char, close_char)
     local n = #text
     local i = tonumber(start_pos) or 1
     if i < 1 or i > n then
@@ -221,139 +218,9 @@ local function extract_balanced(text, start_pos, open_char, close_char)
     return nil, nil, nil
 end
 
-local function parse_json_string(text, start_pos)
-    local pos = tonumber(start_pos) or 1
-    if text:sub(pos, pos) ~= '"' then
-        return nil, pos
-    end
-    pos = pos + 1
-    local out = {}
-    local n = #text
-    while pos <= n do
-        local ch = text:sub(pos, pos)
-        if ch == '"' then
-            return table.concat(out), pos + 1
-        end
-        if ch == "\\" then
-            local nxt = text:sub(pos + 1, pos + 1)
-            if nxt == "" then
-                return table.concat(out), n + 1
-            end
-            if nxt == "n" then
-                out[#out + 1] = "\n"
-            elseif nxt == "r" then
-                out[#out + 1] = "\r"
-            elseif nxt == "t" then
-                out[#out + 1] = "\t"
-            elseif nxt == "b" then
-                out[#out + 1] = "\b"
-            elseif nxt == "f" then
-                out[#out + 1] = "\f"
-            elseif nxt == '"' then
-                out[#out + 1] = '"'
-            elseif nxt == "\\" then
-                out[#out + 1] = "\\"
-            elseif nxt == "/" then
-                out[#out + 1] = "/"
-            elseif nxt == "u" then
-                local hx = text:sub(pos + 2, pos + 5)
-                if #hx == 4 and hx:match("^[0-9a-fA-F]+$") then
-                    out[#out + 1] = "\\u" .. hx
-                    pos = pos + 6
-                    goto continue
-                else
-                    out[#out + 1] = "u"
-                end
-            else
-                out[#out + 1] = nxt
-            end
-            pos = pos + 2
-        else
-            out[#out + 1] = ch
-            pos = pos + 1
-        end
-        ::continue::
-    end
-    return table.concat(out), pos
-end
-
-local function parse_json_value(text, start_pos)
-    local pos = skip_spaces(text, start_pos)
-    local n = #text
-    if pos > n then
-        return nil, "nil", pos
-    end
-
-    local ch = text:sub(pos, pos)
-    if ch == '"' then
-        local val, next_pos = parse_json_string(text, pos)
-        return val, "string", next_pos
-    end
-    if ch == "{" then
-        local seg, _, e = extract_balanced(text, pos, "{", "}")
-        if seg then
-            return seg, "object", e + 1
-        end
-        return nil, "object", pos + 1
-    end
-    if ch == "[" then
-        local seg, _, e = extract_balanced(text, pos, "[", "]")
-        if seg then
-            return seg, "array", e + 1
-        end
-        return nil, "array", pos + 1
-    end
-
-    local i = pos
-    while i <= n do
-        local c = text:sub(i, i)
-        if c == "," or c == "}" or c == "]" then
-            break
-        end
-        i = i + 1
-    end
-    local token = trim(text:sub(pos, i - 1))
-    return token, "literal", i
-end
-
-local function find_json_key_value(text, key, from_pos)
-    local pos = tonumber(from_pos) or 1
-    local needle = '"' .. tostring(key) .. '"'
-    while true do
-        local i = text:find(needle, pos, true)
-        if not i then
-            return nil, nil, nil, nil
-        end
-        local j = i + #needle
-        j = skip_spaces(text, j)
-        if text:sub(j, j) ~= ":" then
-            pos = j + 1
-        else
-            local value_start = skip_spaces(text, j + 1)
-            local value, kind, next_pos = parse_json_value(text, value_start)
-            return value, kind, value_start, next_pos
-        end
-    end
-end
-
 local function parse_mixed_field(blob, field)
     blob = tostring(blob or "")
     if blob == "" then return nil end
-
-    local value, kind = find_json_key_value(blob, field, 1)
-    if value ~= nil then
-        if kind == "string" then
-            return trim(value)
-        end
-        return trim(tostring(value))
-    end
-
-    local dq = blob:match('"' .. field .. '"%s*:%s*"([^"]*)"')
-    if dq then return trim(dq) end
-    local sq = blob:match("'" .. field .. "'%s*:%s*'([^']*)'")
-    if sq then return trim(sq) end
-    local raw_json = blob:match('"' .. field .. '"%s*:%s*([^,%}%]]+)')
-    if raw_json then return trim(raw_json) end
 
     local lua_v = parse_lua_field(blob, field)
     if lua_v ~= nil and lua_v ~= "" then
@@ -405,68 +272,6 @@ local function parse_lua_call_block(raw, supported_acts)
     return build_call(act, s, s, s)
 end
 
-local function first_non_empty_field(blob, names)
-    for _, name in ipairs(names or {}) do
-        local v = parse_mixed_field(blob, name)
-        if v ~= nil and v ~= "" then
-            return v
-        end
-    end
-    return nil
-end
-
-local function json_value_to_blob(value, kind)
-    if value == nil then
-        return nil
-    end
-    if kind == "string" then
-        return tostring(value)
-    end
-    return trim(tostring(value))
-end
-
-local function extract_json_args_blob(obj_text)
-    local args_val, args_kind = find_json_key_value(obj_text, "arguments", 1)
-    local args_blob = json_value_to_blob(args_val, args_kind)
-    if args_blob == nil then
-        local input_val, input_kind = find_json_key_value(obj_text, "input", 1)
-        args_blob = json_value_to_blob(input_val, input_kind)
-    end
-    if trim(args_blob or "") == "" then
-        return obj_text
-    end
-    return args_blob
-end
-
-local function parse_json_function_object(raw, supported_acts)
-    local s = trim(raw)
-    if s == "" then return nil end
-    if s:sub(1, 1) ~= "{" then return nil end
-
-    local name = first_non_empty_field(s, { "name", "act" })
-    if not name then return nil end
-
-    local act = normalize_act(name, supported_acts)
-    if not act then return nil end
-
-    local args_blob = extract_json_args_blob(s)
-    local call = build_call(act, s, args_blob, s)
-    if trim(call.tool_call_id or "") == "" then
-        local tcid = parse_mixed_field(s, "tool_call_id")
-        if tcid == nil or trim(tcid) == "" then
-            tcid = parse_mixed_field(s, "id")
-        end
-        call.tool_call_id = trim(tcid or "")
-    end
-    if trim(call.arguments_json or "") == "" then
-        local arg_raw = trim(args_blob or "")
-        if arg_raw ~= "" then
-            call.arguments_json = arg_raw
-        end
-    end
-    return call
-end
-
 local function append_unique_call(calls, seen, call)
     if not call or type(call) ~= "table" then return end
     local sig = table.concat({
@@ -503,6 +308,20 @@ local function parse_lua_lines(text, calls, spans, seen, supported_acts)
             add_span(spans, line_start, math.max(line_start, line_end))
         end
     end
+end
+
+local function is_lua_table_literal(text)
+    local s = trim(text)
+    if s == "" then return false end
+    if not s:match("^%b{}$") then
+        return false
+    end
+    local chunk = load("return " .. s, "tool_args", "t", {})
+    if not chunk then
+        return false
+    end
+    local ok, value = pcall(chunk)
+    return ok and type(value) == "table"
 end
 
 local function parse_qwen_symbol_calls(text, calls, spans, seen, supported_acts)
@@ -545,8 +364,15 @@ local function parse_qwen_symbol_calls(text, calls, spans, seen, supported_acts)
         local args_blob = trim(text:sub(colon_args + 1, end_pos))
 
         if act then
-            append_unique_call(calls, seen, build_call(act, text:sub(s_fn, end_pos), args_blob, args_blob))
-            add_span(spans, s_fn, end_pos)
+            local args_clean = trim(args_blob)
+            if args_clean == "" or is_lua_table_literal(args_clean) then
+                local call = build_call(act, text:sub(s_fn, end_pos), args_clean, args_clean)
+                if args_clean ~= "" then
+                    call.arguments = args_clean
+                end
+                append_unique_call(calls, seen, call)
+                add_span(spans, s_fn, end_pos)
+            end
         end
         pos = (next_fn or (n + 1))
         ::continue::
@@ -612,13 +438,15 @@ local function parse_react_action_calls(text, calls, spans, seen, supported_acts
 
             if act then
                 local args_clean = trim(args_blob)
-                local raw_block = trim(text:sub(raw_start, raw_end))
-                local call = build_call(act, raw_block, args_clean, args_clean)
-                if trim(call.arguments_json or "") == "" and args_clean ~= "" then
-                    call.arguments_json = args_clean
+                if args_clean == "" or is_lua_table_literal(args_clean) then
+                    local raw_block = trim(text:sub(raw_start, raw_end))
+                    local call = build_call(act, raw_block, args_clean, args_clean)
+                    if args_clean ~= "" then
+                        call.arguments = args_clean
+                    end
+                    append_unique_call(calls, seen, call)
+                    add_span(spans, raw_start, raw_end)
                 end
-                append_unique_call(calls, seen, call)
-                add_span(spans, raw_start, raw_end)
             end
 
             if next_idx > idx then
@@ -628,65 +456,6 @@ local function parse_react_action_calls(text, calls, spans, seen, supported_acts
             end
         else
             idx = idx + 1
-        end
-    end
-end
-
-local function parse_tool_call_xml(text, calls, spans, seen, supported_acts)
-    local lower = text:lower()
-    local open_tag = "<tool_call>"
-    local close_tag = "</tool_call>"
-    local pos = 1
-
-    while true do
-        local s_tag, e_tag = lower:find(open_tag, pos, true)
-        if not s_tag then break end
-        local s_close, e_close = lower:find(close_tag, e_tag + 1, true)
-        if not s_close then break end
-
-        local inner = text:sub(e_tag + 1, s_close - 1)
-        local found = false
-        local scan = 1
-        while scan <= #inner do
-            local obj_start = inner:find("{", scan, true)
-            if not obj_start then break end
-            local obj, _, obj_end = extract_balanced(inner, obj_start, "{", "}")
-            if not obj then
-                scan = obj_start + 1
-            else
-                local call = parse_json_function_object(obj, supported_acts)
-                if call then
-                    append_unique_call(calls, seen, call)
-                    found = true
-                end
-                scan = obj_end + 1
-            end
-        end
-
-        if found then
-            add_span(spans, s_tag, e_close)
-        end
-
-        pos = e_close + 1
-    end
-end
-
-local function parse_json_objects(text, calls, spans, seen, supported_acts)
-    local pos = 1
-    local n = #text
-    while pos <= n do
-        local obj_start = text:find("{", pos, true)
-        if not obj_start then break end
-        local obj, _, obj_end = extract_balanced(text, obj_start, "{", "}")
-        if not obj then
-            pos = obj_start + 1
-        else
-            local call = parse_json_function_object(obj, supported_acts)
-            if call then
-                append_unique_call(calls, seen, call)
-                add_span(spans, obj_start, obj_end)
-            end
-            pos = obj_end + 1
         end
     end
 end
@@ -749,11 +518,10 @@ local function parse_calls_with_spans(text, opts)
     local calls, spans = {}, {}
     local seen = {}
 
-    parse_tool_call_xml(text, calls, spans, seen, supported_acts)
+    -- 协议收敛：移除 XML/JSON 作为工具调用入口，仅保留 Lua table + Qwen/ReAct。
     parse_qwen_symbol_calls(text, calls, spans, seen, supported_acts)
     parse_react_action_calls(text, calls, spans, seen, supported_acts)
     parse_lua_lines(text, calls, spans, seen, supported_acts)
-    parse_json_objects(text, calls, spans, seen, supported_acts)
 
     return calls, spans
 end
@@ -798,16 +566,10 @@ function M.parse_tool_call_line(line, opts)
     local call = parse_lua_call_block(text, supported_acts)
     if call then return call end
 
-    call = parse_json_function_object(text, supported_acts)
-    if call then return call end
-
     call = collect_first_call_with_parser(text, supported_acts, parse_qwen_symbol_calls)
     if call then return call end
 
     call = collect_first_call_with_parser(text, supported_acts, parse_react_action_calls)
-    if call then return call end
-
-    call = collect_first_call_with_parser(text, supported_acts, parse_tool_call_xml)
     if call then return call end
 
     return nil

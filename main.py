@@ -384,6 +384,8 @@ class LlamaCppServerClient:
 
 class AIPipeline:
     """Lua-facing bridge for model IO, tool adapters, and state archive lifecycle."""
+    _tool_args_lua_runtime = None
+    _tool_args_lua_parser = None
 
     def __init__(self):
         self.llm_large = None   # GPU 大模型（生成用）
@@ -757,6 +759,65 @@ class AIPipeline:
         return ""
 
     @staticmethod
+    def _extract_first_lua_table(text: str) -> str:
+        return AIPipeline._extract_first_json_object(text)
+
+    @staticmethod
+    def _get_tool_args_lua_parser():
+        parser = AIPipeline._tool_args_lua_parser
+        if parser is False:
+            return None
+        if parser is not None:
+            return parser
+        try:
+            runtime = LuaRuntime(unpack_returned_tuples=True)
+            parser = runtime.eval(
+                "function(src)\n"
+                "  local text = tostring(src or '')\n"
+                "  text = text:gsub('^%s*(.-)%s*$', '%1')\n"
+                "  if text == '' then return nil end\n"
+                "  local chunk = load('return ' .. text, 'tool_args', 't', {})\n"
+                "  if not chunk then return nil end\n"
+                "  local ok, value = pcall(chunk)\n"
+                "  if not ok or type(value) ~= 'table' then return nil end\n"
+                "  return value\n"
+                "end"
+            )
+            AIPipeline._tool_args_lua_runtime = runtime
+            AIPipeline._tool_args_lua_parser = parser
+            return parser
+        except Exception:
+            AIPipeline._tool_args_lua_parser = False
+            return None
+
+    @staticmethod
+    def _parse_lua_table_arguments(text: str):
+        if not isinstance(text, str):
+            return None
+        parser = AIPipeline._get_tool_args_lua_parser()
+        if parser is None:
+            return None
+
+        raw = text.strip()
+        if not raw:
+            return {}
+
+        candidates = [raw]
+        first_tbl = AIPipeline._extract_first_lua_table(raw)
+        if first_tbl and first_tbl != raw:
+            candidates.append(first_tbl)
+
+        for candidate in candidates:
+            try:
+                parsed = parser(candidate)
+            except Exception:
+                parsed = None
+            parsed = AIPipeline._coerce_lua_value(parsed)
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    @staticmethod
     def _parse_tool_arguments_relaxed(args_raw):
         if isinstance(args_raw, dict):
             return args_raw
@@ -766,6 +827,10 @@ class AIPipeline:
         text = args_raw.strip()
         if not text:
             return {}
+
+        parsed_lua = AIPipeline._parse_lua_table_arguments(text)
+        if isinstance(parsed_lua, dict):
+            return parsed_lua
 
         parsers = [json.loads]
         if json5 is not None:
@@ -940,17 +1005,20 @@ class AIPipeline:
             raise RuntimeError(f"qwen tool `{name}` is not available")
 
         args = self._coerce_lua_value(tool_args)
-        if isinstance(args, str):
-            args = args.strip()
-            if args == "":
-                args = "{}"
-        elif isinstance(args, dict):
-            pass
+        tool_args_raw = "{}"
+        if isinstance(args, dict):
+            tool_args_raw = json.dumps(args, ensure_ascii=False)
         else:
-            args = str(args)
+            raw = str(args or "").strip()
+            if raw:
+                parsed = self._parse_tool_arguments_relaxed(raw)
+                if isinstance(parsed, dict) and parsed:
+                    tool_args_raw = json.dumps(parsed, ensure_ascii=False)
+                else:
+                    tool_args_raw = raw
 
         try:
-            result = tool.call(args)
+            result = tool.call(tool_args_raw)
         except Exception as e:
             raise RuntimeError(f"qwen tool `{name}` call failed: {e}") from e
         return self._normalize_qwen_tool_result(result)
@@ -1059,8 +1127,8 @@ class AIPipeline:
                 return False
         return bool(default)
 
-    def list_agent_files(self, args_json="{}", default_limit=12, hard_limit=64):
-        args = self._parse_tool_arguments_relaxed(args_json)
+    def list_agent_files(self, args_raw="{}", default_limit=12, hard_limit=64):
+        args = self._parse_tool_arguments_relaxed(args_raw)
         if not isinstance(args, dict):
             args = {}
 
@@ -1113,8 +1181,8 @@ class AIPipeline:
             lines.append(f"... ({len(rows) - len(shown)} more)")
         return "\n".join(lines)
 
-    def read_agent_file(self, args_json="{}", default_max_chars=3000, hard_max_chars=12000):
-        args = self._parse_tool_arguments_relaxed(args_json)
+    def read_agent_file(self, args_raw="{}", default_max_chars=3000, hard_max_chars=12000):
+        args = self._parse_tool_arguments_relaxed(args_raw)
         if not isinstance(args, dict):
             args = {}
 
@@ -1160,8 +1228,8 @@ class AIPipeline:
             return header + "\n" + chunk
         return header + "\n[empty slice]"
 
-    def read_agent_file_lines(self, args_json="{}", default_max_lines=220, hard_max_lines=1200):
-        args = self._parse_tool_arguments_relaxed(args_json)
+    def read_agent_file_lines(self, args_raw="{}", default_max_lines=220, hard_max_lines=1200):
+        args = self._parse_tool_arguments_relaxed(args_raw)
         if not isinstance(args, dict):
             args = {}
 
@@ -1223,8 +1291,8 @@ class AIPipeline:
             return header + "\n" + "\n".join(out_rows)
         return header + "\n[empty slice]"
 
-    def search_agent_file(self, args_json="{}", default_max_hits=20, hard_max_hits=200):
-        args = self._parse_tool_arguments_relaxed(args_json)
+    def search_agent_file(self, args_raw="{}", default_max_hits=20, hard_max_hits=200):
+        args = self._parse_tool_arguments_relaxed(args_raw)
         if not isinstance(args, dict):
             args = {}
 
@@ -1332,7 +1400,7 @@ class AIPipeline:
 
     def search_agent_files(
         self,
-        args_json="{}",
+        args_raw="{}",
         default_max_hits=30,
         hard_max_hits=400,
         default_max_files=24,
@@ -1340,7 +1408,7 @@ class AIPipeline:
         default_per_file_hits=5,
         hard_per_file_hits=20,
     ):
-        args = self._parse_tool_arguments_relaxed(args_json)
+        args = self._parse_tool_arguments_relaxed(args_raw)
         if not isinstance(args, dict):
             args = {}
 

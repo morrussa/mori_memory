@@ -148,19 +148,19 @@ assert((tonumber(rp.parallel_batches) or 0) >= 1, "rp parallel_batches should be
 assert((tonumber(rp.parallel_calls) or 0) >= 2, "rp parallel_calls should be >= 2")
 
 _G.py_pipeline = {
-    list_agent_files = function(_, _args_json, _default_limit, _hard_limit)
+    list_agent_files = function(_, _args_lua, _default_limit, _hard_limit)
         return "[agent_files] showing 1/1 files\n1) ./agent_files/t/a.txt | bytes=12"
     end,
-    read_agent_file = function(_, _args_json, _default_max_chars, _hard_max_chars)
+    read_agent_file = function(_, _args_lua, _default_max_chars, _hard_max_chars)
         return "[read_agent_file] path=./agent_files/t/a.txt returned_chars=5\nhello"
     end,
-    read_agent_file_lines = function(_, _args_json, _default_max_lines, _hard_max_lines)
+    read_agent_file_lines = function(_, _args_lua, _default_max_lines, _hard_max_lines)
         return "[read_agent_file_lines] path=./agent_files/t/a.txt returned_lines=2\n  1 | hello\n  2 | world"
     end,
-    search_agent_file = function(_, _args_json, _default_max_hits, _hard_max_hits)
+    search_agent_file = function(_, _args_lua, _default_max_hits, _hard_max_hits)
         return "[search_agent_file] path=./agent_files/t/a.txt hits=1 shown=1\n#1 line=2\n> 2 | world"
     end,
-    search_agent_files = function(_, _args_json, _default_max_hits, _hard_max_hits, _default_max_files, _hard_max_files, _default_per_file_hits, _hard_per_file_hits)
+    search_agent_files = function(_, _args_lua, _default_max_hits, _hard_max_hits, _default_max_files, _hard_max_files, _default_per_file_hits, _hard_per_file_hits)
         return "[search_agent_files] files_total=2 files_scanned=2 hits=2 shown=2\n#1 file=./agent_files/t/a.txt line=2\n> 2 | world"
     end,
 }

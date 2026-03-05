@@ -50,7 +50,7 @@ local base_prompt = [[
 系统会在每轮自动注入 LongTermPlan BOM（来自已存 long_term_plan 记录）。
 
 规则：
-1. 正常回复用户，不要输出任何 {act="..."} 工具调用行。
+1. 正常回复用户，不要输出任何工具调用格式（包括 `{act="..."}`、`<tool_call>...</tool_call>`、`✿FUNCTION✿/✿ARGS✿`）。
 2. 若你判断需要长期保存事实、更新计划、或检索旧记录，直接在正文自然表达意图即可，后台会自动处理。
 3. 回答时优先保持与 LongTermPlan BOM 一致；若信息冲突，先向用户确认。
 4. 若用户上传文件且上下文给出了附件目录路径（MORI_AGENT_FILES_DIR，默认 ./workspace），不要假设你已读完整正文；先在正文说明你将分段检索/读取，再由后台 planner 按需调用 list_agent_files/read_agent_file/read_agent_file_lines/search_agent_file/search_agent_files。

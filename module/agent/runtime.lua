@@ -16,6 +16,7 @@ local PLAN_SIGNAL_PROMPT = [[
 仅在回复最后一行输出一个隐藏标记：<<PLAN:YES>> 或 <<PLAN:NO>>。
 - 需要后台二阶段 planner 调用工具：YES
 - 不需要工具：NO
+禁止输出任何工具调用格式（包括 {act=...} / <tool_call> / ✿FUNCTION✿）。
 不要输出其它 PLAN 标记。
 ]]
 
@@ -44,21 +45,15 @@ local function strip_cot_safe(text)
     return cleaned
 end
 
-local function normalize_result_text(result, supported_acts)
-    local cot_clean = strip_cot_safe(result or "")
-    local _calls, visible = tool_parser.split_tool_calls_and_text(cot_clean, {
-        supported_acts = supported_acts or tool_parser.clone_supported_acts(),
-    })
-    if visible == "" then
-        visible = trim(cot_clean)
-    end
+local function normalize_result_text(result)
+    local visible = trim(strip_cot_safe(result or ""))
     if visible == "" then
         visible = "好的，已记录。"
     end
     if tool.utf8_sanitize_lossy then
         visible = tool.utf8_sanitize_lossy(visible)
     end
-    return visible, _calls
+    return visible
 end
 
 local function normalize_plan_signal_token(token)
@@ -312,70 +307,6 @@ local function format_call_brief(call)
     return string.format('{act="%s"}', act)
 end
 
-local function build_function_protocol_tail(exec_result, max_result_chars)
-    local events = (exec_result or {}).call_results
-    if type(events) ~= "table" or #events == 0 then
-        return {}
-    end
-    max_result_chars = math.max(64, math.floor(tonumber(max_result_chars) or 600))
-
-    local tool_calls = {}
-    local tool_msgs = {}
-    local fallback_id = 0
-
-    for _, ev in ipairs(events) do
-        if type(ev) == "table" and ev.skipped ~= true then
-            local act = trim(ev.act or "")
-            if act ~= "" then
-                fallback_id = fallback_id + 1
-                local tcid = trim(ev.tool_call_id or "")
-                if tcid == "" then
-                    tcid = string.format("call_auto_%d", fallback_id)
-                end
-                tool_calls[#tool_calls + 1] = {
-                    id = tcid,
-                    type = "function",
-                    ["function"] = {
-                        name = act,
-                        arguments = tostring(ev.arguments_json or "{}"),
-                    },
-                }
-
-                local result_text = trim(ev.result or "")
-                if result_text == "" then
-                    result_text = trim(ev.message or "")
-                end
-                if result_text == "" then
-                    result_text = (ev.ok == true) and "ok" or "failed"
-                end
-                result_text = utf8_take(result_text, max_result_chars)
-                tool_msgs[#tool_msgs + 1] = {
-                    role = "tool",
-                    tool_call_id = tcid,
-                    name = act,
-                    content = result_text,
-                }
-            end
-        end
-    end
-
-    if #tool_calls == 0 then
-        return {}
-    end
-
-    local tail = {
-        {
-            role = "assistant",
-            content = "",
-            tool_calls = tool_calls,
-        }
-    }
-    for _, msg in ipairs(tool_msgs) do
-        tail[#tail + 1] = msg
-    end
-    return tail
-end
-
 local function build_observation_entry(step_idx, call_source, calls, exec_result)
     local executed = tonumber((exec_result or {}).executed) or 0
     local failed = tonumber((exec_result or {}).failed) or 0
@@ -514,11 +445,6 @@ function M.run_turn(args)
     local include_tool_observation_trace = to_bool(agent_cfg.include_tool_observation_trace, true)
     local function_choice = normalize_function_choice(agent_cfg.function_choice, supported_tool_acts)
     local parallel_function_calls = to_bool(agent_cfg.parallel_function_calls, true)
-    local function_protocol_enabled = to_bool(agent_cfg.function_protocol_enabled, true)
-    local function_protocol_result_max_chars = math.max(
-        64,
-        math.floor(tonumber(agent_cfg.function_protocol_result_max_chars) or 600)
-    )
     local tool_trace_max_steps = math.max(
         1,
         math.floor(tonumber(agent_cfg.tool_trace_max_steps) or 4)
@@ -579,7 +505,6 @@ function M.run_turn(args)
     local last_call_signature = ""
     local tool_observation_entries = {}
     local latest_observation = ""
-    local pending_protocol_tail = {}
 
     while (not done) and attempts < max_steps do
         attempts = attempts + 1
@@ -626,9 +551,7 @@ function M.run_turn(args)
             input_token_budget = token_budget,
             token_count_mode = agent_cfg.token_count_mode,
             context_drop_order = agent_cfg.context_drop_order,
-            tail_messages = pending_protocol_tail,
         })
-        pending_protocol_tail = {}
         print(string.format(
             "[AgentRuntime][step=%d] context_tokens=%d kept_pairs=%d dropped_pairs=%d compressed_pairs=%d history_summary=%s dropped_blocks=%s",
             attempts,
@@ -670,7 +593,7 @@ function M.run_turn(args)
             ))
         end
 
-        local clean_result = normalize_result_text(generated_text, supported_tool_acts)
+        local clean_result = normalize_result_text(generated_text)
         local planner_signal = nil
         clean_result, planner_signal = extract_plan_signal(clean_result)
         if clean_result == "" then
@@ -876,18 +799,9 @@ function M.run_turn(args)
                 context_updated,
                 call_source
             )
-            if function_protocol_enabled then
-                pending_protocol_tail = build_function_protocol_tail(
-                    exec_result,
-                    function_protocol_result_max_chars
-                )
-            else
-                pending_protocol_tail = {}
-            end
             print(string.format("[AgentRuntime][step=%d] continue reason=%s", attempts, continue_reason))
         else
             done = true
-            pending_protocol_tail = {}
         end
     end
 

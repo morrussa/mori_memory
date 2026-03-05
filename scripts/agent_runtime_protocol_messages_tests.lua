@@ -48,8 +48,6 @@ package.preload["module.config"] = function()
                 planner_default_when_missing = false,
                 function_choice = "auto",
                 parallel_function_calls = true,
-                function_protocol_enabled = true,
-                function_protocol_result_max_chars = 600,
             },
         },
     }
@@ -168,7 +166,7 @@ package.preload["module.agent.tool_registry"] = function()
                     {
                         act = "query_record",
                         tool_call_id = "tc_protocol_1",
-                        arguments_json = '{"query":"协议测试"}',
+                        arguments = '{query="协议测试"}',
                         ok = true,
                         skipped = false,
                         message = "query_record ok (1 hits)",
@@ -244,11 +242,7 @@ local step2_tail = state.tail_messages_by_step[2] or {}
 local step1_system = tostring(state.system_prompts_by_step[1] or "")
 local step2_system = tostring(state.system_prompts_by_step[2] or "")
 assert(#step1_tail == 0, "step1 should not contain protocol tail messages")
-assert(#step2_tail >= 2, "step2 should contain assistant/tool protocol tail")
-assert(tostring((step2_tail[1] or {}).role) == "assistant", "tail[1] should be assistant tool_call message")
-assert(type((step2_tail[1] or {}).tool_calls) == "table", "assistant tail should contain tool_calls")
-assert(tostring((step2_tail[2] or {}).role) == "tool", "tail[2] should be tool result message")
-assert(tostring((step2_tail[2] or {}).tool_call_id) == "tc_protocol_1", "tool_call_id should be preserved")
+assert(#step2_tail == 0, "step2 should not append legacy assistant/tool protocol tail")
 assert(contains(step1_system, "<<PLAN:YES>>"), "step1 system prompt should contain plan marker instruction")
 assert(not contains(step2_system, "<<PLAN:YES>>"), "step2(system in plan mode) should not repeat plan marker instruction")
 

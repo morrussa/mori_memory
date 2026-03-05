@@ -96,7 +96,7 @@ local function build_dynamic_tool_call_examples(policy)
         if name ~= "" and (not known[name]) then
             known[name] = true
             lines[#lines + 1] = string.format(
-                '{act="%s", arguments_json="{\\"...\\": ...}"}',
+                '{act="%s", arguments={key="value"}}',
                 name
             )
         end
