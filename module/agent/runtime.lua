@@ -447,6 +447,125 @@ local function build_step_feedback(step_idx, clean_result, calls, exec_result, r
     return table.concat(lines, "\n")
 end
 
+local function can_emit_stream_sink(stream_sink)
+    return stream_sink ~= nil
+end
+
+local function emit_stream_payload(stream_sink, payload)
+    if (not can_emit_stream_sink(stream_sink)) or type(payload) ~= "table" then
+        return
+    end
+    local ok, err = pcall(stream_sink, payload)
+    if not ok then
+        print(string.format("[AgentRuntime][WARN] stream sink emit failed: %s", tostring(err)))
+    end
+end
+
+local function emit_stream_status(stream_sink, message)
+    local msg = trim(message)
+    if msg == "" then
+        return
+    end
+    emit_stream_payload(stream_sink, {
+        type = "status",
+        message = msg,
+    })
+end
+
+local function build_stream_tool_arguments(call, fallback_raw)
+    if type(call) ~= "table" then
+        local raw = trim(fallback_raw)
+        if raw ~= "" then
+            return raw
+        end
+        return {}
+    end
+
+    local args = {}
+    for k, v in pairs(call) do
+        local key = tostring(k or "")
+        if key ~= "" and key ~= "act" and key ~= "raw" and key ~= "tool_call_id" then
+            args[key] = v
+        end
+    end
+    local key_name = trim(args.key or "")
+    if key_name ~= "" and args.value ~= nil and args[key_name] == nil then
+        args[key_name] = args.value
+        args.key = nil
+        args.value = nil
+        args.arguments = nil
+    end
+    if next(args) ~= nil then
+        return args
+    end
+
+    local raw = trim(fallback_raw or call.raw or "")
+    if raw ~= "" then
+        return raw
+    end
+    return {}
+end
+
+local function emit_stream_tool_events(stream_sink, calls, exec_result)
+    if not can_emit_stream_sink(stream_sink) then
+        return
+    end
+    local call_results = (exec_result or {}).call_results
+    if type(call_results) ~= "table" or #call_results == 0 then
+        return
+    end
+
+    for idx, row in ipairs(call_results) do
+        local call = nil
+        if type(calls) == "table" then
+            call = calls[idx]
+        end
+
+        local act = trim((row or {}).act or (call or {}).act or "tool")
+        if act == "" then
+            act = "tool"
+        end
+        local tool_call_id = trim((row or {}).tool_call_id or (call or {}).tool_call_id)
+
+        emit_stream_payload(stream_sink, {
+            type = "tool_call",
+            name = act,
+            tool_call_id = tool_call_id,
+            arguments = build_stream_tool_arguments(call, (row or {}).arguments),
+        })
+
+        local ok_call = (row or {}).ok == true
+        local skipped_call = (row or {}).skipped == true
+        local msg = trim((row or {}).message)
+        local result_text = trim((row or {}).result)
+        local result_payload = {
+            type = "tool_result",
+            name = act,
+            tool_call_id = tool_call_id,
+        }
+
+        if ok_call or skipped_call then
+            if result_text ~= "" then
+                result_payload.result = result_text
+            elseif msg ~= "" then
+                result_payload.result = msg
+            else
+                result_payload.result = ok_call and "ok" or "skipped"
+            end
+            if skipped_call then
+                result_payload.skipped = true
+            end
+        else
+            result_payload.error = (msg ~= "" and msg) or (result_text ~= "" and result_text) or "tool execution failed"
+            if result_text ~= "" then
+                result_payload.result = result_text
+            end
+        end
+
+        emit_stream_payload(stream_sink, result_payload)
+    end
+end
+
 function M.run_turn(args)
     args = args or {}
     local user_input = trim(args.user_input or "")
@@ -483,6 +602,7 @@ function M.run_turn(args)
             configured_max_steps
         ))
     end
+    emit_stream_status(stream_sink, string.format("开始处理（max_steps=%d）。", max_steps))
     local completion_reserve_tokens = math.max(
         64,
         math.floor(
@@ -711,6 +831,7 @@ function M.run_turn(args)
 
     while (not done) and attempts < max_steps do
         attempts = attempts + 1
+        emit_stream_status(stream_sink, string.format("第 %d 步执行中…", attempts))
 
         state_name = "BUILD_CONTEXT"
         local consumed_tool_context = ""
@@ -904,6 +1025,9 @@ function M.run_turn(args)
             call_count,
             call_source
         ))
+        if call_count > 0 then
+            emit_stream_status(stream_sink, string.format("第 %d 步规划到 %d 个工具调用。", attempts, call_count))
+        end
 
         local call_signature = ""
         if call_count > 0 then
@@ -938,6 +1062,18 @@ function M.run_turn(args)
             tonumber(exec_result.parallel_batches) or 0,
             tonumber(exec_result.retry_total) or 0
         ))
+        emit_stream_tool_events(stream_sink, calls, exec_result)
+        if call_count > 0 then
+            emit_stream_status(
+                stream_sink,
+                string.format(
+                    "工具执行结果：成功 %d，失败 %d，跳过 %d。",
+                    tonumber(exec_result.executed) or 0,
+                    tonumber(exec_result.failed) or 0,
+                    tonumber(exec_result.skipped) or 0
+                )
+            )
+        end
         if not read_only then
             local observation_entry = build_observation_entry(
                 attempts,
@@ -997,6 +1133,11 @@ function M.run_turn(args)
         end
 
         if continue_reason then
+            emit_stream_payload(stream_sink, {
+                type = "thinking",
+                content = clean_result,
+                step = attempts,
+            })
             step_feedback = build_step_feedback(
                 attempts,
                 clean_result,
@@ -1006,6 +1147,7 @@ function M.run_turn(args)
                 context_updated,
                 call_source
             )
+            emit_stream_status(stream_sink, string.format("继续下一步：%s。", continue_reason))
             print(string.format("[AgentRuntime][step=%d] continue reason=%s", attempts, continue_reason))
         else
             done = true
@@ -1023,6 +1165,7 @@ function M.run_turn(args)
     end
 
     state_name = "PERSIST"
+    emit_stream_status(stream_sink, "回答生成完成。")
     print("\n[Assistant]: " .. final_result)
     if not read_only then
         history.add_history(user_input, final_result)

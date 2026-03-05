@@ -2373,7 +2373,47 @@ class MoriLocalWebUIBridge:
             )
 
         def emit_piece(piece):
-            text = str(piece or "")
+            try:
+                coerced = AIPipeline._coerce_lua_value(piece)
+            except Exception:
+                coerced = piece
+
+            if isinstance(coerced, (bytes, bytearray)):
+                coerced = bytes(coerced).decode("utf-8", errors="replace")
+
+            if isinstance(coerced, dict):
+                event_type = str(coerced.get("type", "") or "").strip()
+                if event_type:
+                    payload_obj = dict(coerced)
+                    payload_obj["type"] = event_type
+                    if not self._send_sse_data(handler, payload_obj):
+                        raise BrokenPipeError("client disconnected during stream")
+                    if event_type == "token":
+                        token_piece = payload_obj.get("token")
+                        if isinstance(token_piece, str) and token_piece:
+                            streamed.append(token_piece)
+                    return
+
+                text_like = coerced.get("token")
+                if not isinstance(text_like, str) or not text_like:
+                    text_like = coerced.get("text")
+                if not isinstance(text_like, str) or not text_like:
+                    text_like = coerced.get("content")
+                if isinstance(text_like, str) and text_like:
+                    if not self._send_sse_data(handler, {"type": "token", "token": text_like}):
+                        raise BrokenPipeError("client disconnected during stream")
+                    streamed.append(text_like)
+                    return
+
+                try:
+                    fallback_msg = json.dumps(coerced, ensure_ascii=False)
+                except Exception:
+                    fallback_msg = str(coerced)
+                if not self._send_sse_data(handler, {"type": "status", "message": fallback_msg}):
+                    raise BrokenPipeError("client disconnected during stream")
+                return
+
+            text = str(coerced or "")
             if not text:
                 return
             if not self._send_sse_data(handler, {"type": "token", "token": text}):
@@ -2457,6 +2497,7 @@ class MoriLocalWebUIBridge:
                 "session": self.session_key,
                 "thread": self.session_key,
                 "policy": "single_write",
+                "model_name": self.model_name,
                 "upload_dir": self._display_path(self.upload_download_root),
                 "upload_limits": {
                     "max_files": int(self.upload_max_files),
@@ -2586,7 +2627,7 @@ def main():
     if run_mode not in {"cli", "webui"}:
         print(f"[Python][WARN] Unknown MORI_RUN_MODE={run_mode}, fallback to cli")
         run_mode = "cli"
-    webui_stream_max_steps = _read_env_int_allow_zero("MORI_WEBUI_STREAM_MAX_STEPS", 1)
+    webui_stream_max_steps = _read_env_int_allow_zero("MORI_WEBUI_STREAM_MAX_STEPS", 2)
 
     lua = LuaRuntime(unpack_returned_tuples=True)
     pipeline = AIPipeline()

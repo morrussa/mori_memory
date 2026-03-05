@@ -81,6 +81,27 @@ local function trim(s)
     return (tostring(s):gsub("^%s*(.-)%s*$", "%1"))
 end
 
+local function get_py_runtime()
+    return _G.py_pipeline
+end
+
+local function has_py_runtime_method(method_name)
+    local runtime = get_py_runtime()
+    if runtime == nil then
+        return false, nil
+    end
+    if type(method_name) ~= "string" or method_name == "" then
+        return false, runtime
+    end
+    local ok_attr, attr = pcall(function()
+        return runtime[method_name]
+    end)
+    if not ok_attr or attr == nil then
+        return false, runtime
+    end
+    return true, runtime
+end
+
 local function to_bool(v, fallback)
     if type(v) == "boolean" then return v end
     if type(v) == "number" then return v ~= 0 end
@@ -354,16 +375,17 @@ local function refresh_external_tools()
         name_set = {},
     }
 
-    if (not enabled) or type(py_pipeline) ~= "table" or py_pipeline.get_qwen_tool_schemas == nil then
+    local has_qwen_schemas, runtime = has_py_runtime_method("get_qwen_tool_schemas")
+    if (not enabled) or (not has_qwen_schemas) then
         M._external_tools = state
         return state
     end
 
     local ok_schemas, schemas_or_err = pcall(function()
         if #entries > 0 then
-            return py_pipeline:get_qwen_tool_schemas(entries)
+            return runtime:get_qwen_tool_schemas(entries)
         end
-        return py_pipeline:get_qwen_tool_schemas(nil)
+        return runtime:get_qwen_tool_schemas(nil)
     end)
     if not ok_schemas or type(schemas_or_err) ~= "table" then
         print(string.format(
@@ -419,12 +441,52 @@ local function push_pending_context(current_turn, payload)
 end
 
 local function build_call_arguments_lua(call)
+    local function normalize_key_value_args(tbl)
+        if type(tbl) ~= "table" then
+            return tbl
+        end
+        local out = {}
+        for k, v in pairs(tbl) do
+            out[k] = v
+        end
+
+        local key_name = trim(out.key or "")
+        if key_name ~= "" and out.value ~= nil and out[key_name] == nil then
+            out[key_name] = out.value
+        end
+
+        local nested = out.arguments
+        if type(nested) == "string" then
+            local nested_tbl = parse_lua_table_literal(nested)
+            if type(nested_tbl) == "table" then
+                for k, v in pairs(normalize_key_value_args(nested_tbl) or {}) do
+                    if out[k] == nil then
+                        out[k] = v
+                    end
+                end
+            end
+        elseif type(nested) == "table" then
+            for k, v in pairs(normalize_key_value_args(nested) or {}) do
+                if out[k] == nil then
+                    out[k] = v
+                end
+            end
+        end
+
+        if key_name ~= "" and out[key_name] ~= nil then
+            out.key = nil
+            out.value = nil
+            out.arguments = nil
+        end
+        return out
+    end
+
     local c = call or {}
     local raw = trim(c.arguments or "")
     if raw ~= "" then
         local parsed_lua = parse_lua_table_literal(raw)
         if type(parsed_lua) == "table" then
-            return encode_lua_value(parsed_lua, 0)
+            return encode_lua_value(normalize_key_value_args(parsed_lua), 0)
         end
     end
 
@@ -455,11 +517,25 @@ local function build_call_arguments_lua(call)
     if trim(c.limit) ~= "" then obj.limit = tonumber(c.limit) or c.limit end
     if trim(c.namespace) ~= "" then obj.namespace = c.namespace end
     if trim(c.key) ~= "" then obj.key = c.key end
+    if trim(c.key) ~= "" and c.value ~= nil and obj[trim(c.key)] == nil then
+        obj[trim(c.key)] = c.value
+        obj.key = nil
+        obj.value = nil
+    end
     if c.confidence ~= nil and tostring(c.confidence) ~= "" then
         obj.confidence = tonumber(c.confidence) or c.confidence
     end
 
     return encode_lua_value(obj, 0)
+end
+
+local function is_tool_result_error_text(tool_name, result_text)
+    local raw = trim(result_text or "")
+    if raw == "" then
+        return false
+    end
+    local prefix = tostring(tool_name or ""):lower() .. " error:"
+    return raw:lower():sub(1, #prefix) == prefix
 end
 
 local function dedupe_and_clip_types(types, max_types)
@@ -819,7 +895,8 @@ local function apply_list_agent_files(call, current_turn, policy, state)
         }
     end
 
-    if type(py_pipeline) ~= "table" or py_pipeline.list_agent_files == nil then
+    local has_method, runtime = has_py_runtime_method("list_agent_files")
+    if not has_method then
         return false, "list_agent_files runtime 不可用", {
             error_code = "transient",
         }
@@ -827,7 +904,7 @@ local function apply_list_agent_files(call, current_turn, policy, state)
 
     local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
-        return py_pipeline:list_agent_files(
+        return runtime:list_agent_files(
             args_lua,
             policy.agent_file_list_default_limit,
             policy.agent_file_list_hard_limit
@@ -843,6 +920,12 @@ local function apply_list_agent_files(call, current_turn, policy, state)
     local raw_result = trim(result_or_err or "")
     if raw_result == "" then
         raw_result = "[empty tool result]"
+    end
+    if is_tool_result_error_text("list_agent_files", raw_result) then
+        return false, raw_result, {
+            error_code = "validation",
+            tool_result = raw_result,
+        }
     end
     local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
     if clipped ~= raw_result then
@@ -867,7 +950,8 @@ local function apply_read_agent_file(call, current_turn, policy, state)
         }
     end
 
-    if type(py_pipeline) ~= "table" or py_pipeline.read_agent_file == nil then
+    local has_method, runtime = has_py_runtime_method("read_agent_file")
+    if not has_method then
         return false, "read_agent_file runtime 不可用", {
             error_code = "transient",
         }
@@ -875,7 +959,7 @@ local function apply_read_agent_file(call, current_turn, policy, state)
 
     local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
-        return py_pipeline:read_agent_file(
+        return runtime:read_agent_file(
             args_lua,
             policy.agent_file_read_default_max_chars,
             policy.agent_file_read_hard_max_chars
@@ -891,6 +975,12 @@ local function apply_read_agent_file(call, current_turn, policy, state)
     local raw_result = trim(result_or_err or "")
     if raw_result == "" then
         raw_result = "[empty tool result]"
+    end
+    if is_tool_result_error_text("read_agent_file", raw_result) then
+        return false, raw_result, {
+            error_code = "validation",
+            tool_result = raw_result,
+        }
     end
     local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
     if clipped ~= raw_result then
@@ -918,7 +1008,8 @@ local function apply_read_agent_file_lines(call, current_turn, policy, state)
         }
     end
 
-    if type(py_pipeline) ~= "table" or py_pipeline.read_agent_file_lines == nil then
+    local has_method, runtime = has_py_runtime_method("read_agent_file_lines")
+    if not has_method then
         return false, "read_agent_file_lines runtime 不可用", {
             error_code = "transient",
         }
@@ -926,7 +1017,7 @@ local function apply_read_agent_file_lines(call, current_turn, policy, state)
 
     local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
-        return py_pipeline:read_agent_file_lines(
+        return runtime:read_agent_file_lines(
             args_lua,
             policy.agent_file_read_lines_default_max_lines,
             policy.agent_file_read_lines_hard_max_lines
@@ -942,6 +1033,12 @@ local function apply_read_agent_file_lines(call, current_turn, policy, state)
     local raw_result = trim(result_or_err or "")
     if raw_result == "" then
         raw_result = "[empty tool result]"
+    end
+    if is_tool_result_error_text("read_agent_file_lines", raw_result) then
+        return false, raw_result, {
+            error_code = "validation",
+            tool_result = raw_result,
+        }
     end
     local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
     if clipped ~= raw_result then
@@ -966,7 +1063,8 @@ local function apply_search_agent_file(call, current_turn, policy, state)
         }
     end
 
-    if type(py_pipeline) ~= "table" or py_pipeline.search_agent_file == nil then
+    local has_method, runtime = has_py_runtime_method("search_agent_file")
+    if not has_method then
         return false, "search_agent_file runtime 不可用", {
             error_code = "transient",
         }
@@ -974,7 +1072,7 @@ local function apply_search_agent_file(call, current_turn, policy, state)
 
     local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
-        return py_pipeline:search_agent_file(
+        return runtime:search_agent_file(
             args_lua,
             policy.agent_file_search_default_max_hits,
             policy.agent_file_search_hard_max_hits
@@ -990,6 +1088,12 @@ local function apply_search_agent_file(call, current_turn, policy, state)
     local raw_result = trim(result_or_err or "")
     if raw_result == "" then
         raw_result = "[empty tool result]"
+    end
+    if is_tool_result_error_text("search_agent_file", raw_result) then
+        return false, raw_result, {
+            error_code = "validation",
+            tool_result = raw_result,
+        }
     end
     local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
     if clipped ~= raw_result then
@@ -1017,7 +1121,8 @@ local function apply_search_agent_files(call, current_turn, policy, state)
         }
     end
 
-    if type(py_pipeline) ~= "table" or py_pipeline.search_agent_files == nil then
+    local has_method, runtime = has_py_runtime_method("search_agent_files")
+    if not has_method then
         return false, "search_agent_files runtime 不可用", {
             error_code = "transient",
         }
@@ -1025,7 +1130,7 @@ local function apply_search_agent_files(call, current_turn, policy, state)
 
     local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
-        return py_pipeline:search_agent_files(
+        return runtime:search_agent_files(
             args_lua,
             policy.agent_file_multi_search_default_max_hits,
             policy.agent_file_multi_search_hard_max_hits,
@@ -1045,6 +1150,12 @@ local function apply_search_agent_files(call, current_turn, policy, state)
     local raw_result = trim(result_or_err or "")
     if raw_result == "" then
         raw_result = "[empty tool result]"
+    end
+    if is_tool_result_error_text("search_agent_files", raw_result) then
+        return false, raw_result, {
+            error_code = "validation",
+            tool_result = raw_result,
+        }
     end
     local clipped = utf8_take(raw_result, policy.agent_file_context_max_chars)
     if clipped ~= raw_result then
@@ -1075,7 +1186,8 @@ local function apply_external_tool(call, current_turn, policy)
             error_code = "validation",
         }
     end
-    if type(py_pipeline) ~= "table" or py_pipeline.call_qwen_tool == nil then
+    local has_method, runtime = has_py_runtime_method("call_qwen_tool")
+    if not has_method then
         return false, "external tool runtime 不可用", {
             error_code = "transient",
         }
@@ -1083,7 +1195,7 @@ local function apply_external_tool(call, current_turn, policy)
 
     local args_lua = build_call_arguments_lua(call)
     local ok_call, result_or_err = pcall(function()
-        return py_pipeline:call_qwen_tool(act, args_lua)
+        return runtime:call_qwen_tool(act, args_lua)
     end)
     if not ok_call then
         return false, "external tool 调用失败: " .. tostring(result_or_err), {

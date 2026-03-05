@@ -171,8 +171,19 @@ _G.py_pipeline = {
     list_agent_files = function(_, _args_lua, _default_limit, _hard_limit)
         return "[agent_files] showing 1/1 files\n1) ./agent_files/t/a.txt | bytes=12"
     end,
-    read_agent_file = function(_, _args_lua, _default_max_chars, _hard_max_chars)
-        return "[read_agent_file] path=./agent_files/t/a.txt returned_chars=5\nhello"
+    read_agent_file = function(_, args_lua, _default_max_chars, _hard_max_chars)
+        local path = ""
+        local chunk = load("return " .. tostring(args_lua or ""), "tool_args", "t", {})
+        if chunk then
+            local ok, parsed = pcall(chunk)
+            if ok and type(parsed) == "table" then
+                path = tostring(parsed.path or "")
+            end
+        end
+        if path == "" then
+            return "read_agent_file error: missing `path`"
+        end
+        return "[read_agent_file] path=" .. path .. " returned_chars=5\nhello"
     end,
     read_agent_file_lines = function(_, _args_lua, _default_max_lines, _hard_max_lines)
         return "[read_agent_file_lines] path=./agent_files/t/a.txt returned_lines=2\n  1 | hello\n  2 | world"
@@ -200,5 +211,17 @@ assert(c_file:find("Tool:read_agent_file", 1, true), "file context should contai
 assert(c_file:find("Tool:read_agent_file_lines", 1, true), "file context should contain read_agent_file_lines")
 assert(c_file:find("Tool:search_agent_file", 1, true), "file context should contain search_agent_file")
 assert(c_file:find("Tool:search_agent_files", 1, true), "file context should contain search_agent_files")
+
+local kv_calls = {
+    { act = "list_agent_files", key = "prefix", value = "t" },
+    { act = "read_agent_file", key = "path", value = "./agent_files/t/a.txt" },
+    { act = "read_agent_file", value = "./agent_files/t/a.txt" },
+}
+local rk = registry.execute_calls(kv_calls, { current_turn = 51, read_only = false })
+assert(rk.executed == 2, "rk executed should be 2 (key/value normalized for first two)")
+assert(rk.failed == 1, "rk failed should be 1 (missing path should fail)")
+assert((rk.call_results[2] or {}).arguments:find("path", 1, true), "kv args should map to path")
+assert((rk.call_results[3] or {}).ok == false, "third kv call should fail")
+assert((rk.call_results[3] or {}).message:find("missing `path`", 1, true), "failed kv call should expose missing path")
 
 print("TOOL_REGISTRY_INCREMENTAL_TESTS_PASS")

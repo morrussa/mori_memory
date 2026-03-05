@@ -73,17 +73,17 @@ http://127.0.0.1:8080
 - `MORI_EMBED_SERVER_GPU_LAYERS`：embedding 模型 `--gpu-layers`（默认 `0`）
 - `MORI_LARGE_SERVER_GPU_FALLBACK_CPU=0|1`：主模型 `gpu_layers=all` OOM 时是否自动回退 `0`（默认 `1`）
 - `MORI_LLAMA_SERVER_LOG_TO_FILE=0|1`：是否将 `llama-server` 输出写入 `logs/llama_server_*.log`（默认 `1`）
-- `MORI_WEBUI_STREAM_MAX_STEPS`：仅对流式请求生效的 `agent_runtime.max_steps` 覆盖（默认 `1`，设 `0` 关闭覆盖）
+- `MORI_WEBUI_STREAM_MAX_STEPS`：仅对流式请求生效的 `agent_runtime.max_steps` 覆盖（默认 `2`，设 `0` 关闭覆盖）
 
 本地 WebUI API：
 
 - `GET /health` -> `{"status":"ok"}`
-- `GET /mori/session/status` -> 单会话状态（`mode=single`, `session=mori`），并包含 `upload_dir` 与 `upload_limits`
+- `GET /mori/session/status` -> 单会话状态（`mode=single`, `session=mori`），并包含 `model_name`、`upload_dir` 与 `upload_limits`
 - `POST /mori/chat`：非流式  
   请求：`{"message":"...", "thread_id":"mori", "files":[...]}`  
   `files[]` 支持 `{"name":"a.txt","content_base64":"..."}`（可仅上传文件不填 message）
 - `POST /mori/chat/stream`：SSE 流式  
-  请求同上；事件：`{"type":"token","token":"..."}`，结束 `{"type":"done"}` + `[DONE]`
+  请求同上；事件：`token / uploads / status / thinking / tool_call / tool_result / done`，结束 `{"type":"done"}` + `[DONE]`
 - `POST /v1/chat/completions`：已废弃，返回 `410` 并提示迁移到 `/mori/chat` 或 `/mori/chat/stream`
 
 说明：
