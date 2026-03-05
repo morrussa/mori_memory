@@ -1,6 +1,7 @@
 local util = require("module.graph.util")
 local config = require("module.config")
 local context_manager = require("module.graph.context_manager")
+local project_knowledge = require("module.graph.project_knowledge")
 
 local M = {}
 
@@ -48,6 +49,14 @@ end
 
 local function compose_system_prompt(base_system_prompt, context)
     local lines = { tostring(base_system_prompt or "") }
+    
+    -- 注入项目知识（如果启用）
+    local pk_overview = project_knowledge.get_project_knowledge()
+    if util.trim(pk_overview or "") ~= "" then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = pk_overview
+    end
+    
     if util.trim((context or {}).memory_context or "") ~= "" then
         lines[#lines + 1] = "[MemoryContext]"
         lines[#lines + 1] = tostring(context.memory_context)

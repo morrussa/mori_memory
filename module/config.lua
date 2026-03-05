@@ -90,6 +90,34 @@ local DEFAULT_SETTINGS = {
             -- 预算警告阈值（相对于input_token_budget的比例）
             budget_warning_ratio = 0.85,
         },
+        -- 项目知识注入配置（新增：帮助模型理解自身代码）
+        project_knowledge = {
+            enabled = true,
+            -- 项目概览最大字符数
+            max_overview_chars = 2000,
+            -- 是否自动生成模块列表
+            auto_module_list = true,
+            -- 是否包含文件类型统计
+            include_ext_stats = true,
+            -- 缓存时间（秒）
+            cache_ttl = 300,
+            -- 核心模块列表（可选，为空则自动检测）
+            core_modules = {
+                "module.graph.graph_runtime",
+                "module.graph.state_schema",
+                "module.graph.context_builder",
+                "module.graph.context_manager",
+                "module.graph.tool_registry_v2",
+                "module.graph.file_tools",
+                "module.graph.code_tools",
+                "module.graph.project_knowledge",
+                "module.graph.nodes.agent_node",
+                "module.graph.nodes.planner_node",
+                "module.graph.nodes.tools_node",
+                "module.graph.nodes.router_node",
+                "module.config",
+            },
+        },
         file_tools = {
             list_default_limit = 12,
             list_hard_limit = 64,

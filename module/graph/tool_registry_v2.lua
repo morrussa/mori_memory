@@ -1,6 +1,7 @@
 local util = require("module.graph.util")
 local config = require("module.config")
 local file_tools = require("module.graph.file_tools")
+local code_tools = require("module.graph.code_tools")
 local provider_registry = require("module.graph.providers.registry")
 local context_manager = require("module.graph.context_manager")
 
@@ -12,6 +13,10 @@ local NO_SIDE_EFFECT_TOOLS = {
     read_lines = true,
     search_file = true,
     search_files = true,
+    -- 代码分析工具（只读）
+    code_outline = true,
+    project_structure = true,
+    code_symbols = true,
 }
 
 -- 大文件提示阈值
@@ -109,6 +114,12 @@ end
 
 function M.get_supported_tools()
     local tools = file_tools.supported_tools()
+    -- 添加代码分析工具
+    for name, enabled in pairs(code_tools.supported_tools() or {}) do
+        if enabled then
+            tools[name] = true
+        end
+    end
     local provider_state = create_provider_state()
     if provider_state.enabled and provider_state.provider then
         for _, schema in ipairs(provider_state.provider:list_tools() or {}) do
@@ -127,6 +138,18 @@ function M.get_tool_schemas()
     local seen = {}
 
     for _, schema in ipairs(file_tools.get_tool_schemas() or {}) do
+        if type(schema) == "table" then
+            local fn = schema["function"] or {}
+            local name = util.trim(fn.name)
+            if name ~= "" and (not seen[name]) then
+                seen[name] = true
+                out[#out + 1] = schema
+            end
+        end
+    end
+
+    -- 添加代码分析工具 schema
+    for _, schema in ipairs(code_tools.get_tool_schemas() or {}) do
         if type(schema) == "table" then
             local fn = schema["function"] or {}
             local name = util.trim(fn.name)
@@ -219,7 +242,12 @@ function M.execute_calls(calls)
         local ok = false
         local result_or_err = ""
 
-        if NO_SIDE_EFFECT_TOOLS[call.tool] then
+        -- 判断是代码分析工具还是普通文件工具
+        local is_code_tool = code_tools.supported_tools()[call.tool] == true
+        
+        if is_code_tool then
+            ok, result_or_err = code_tools.execute(call)
+        elseif NO_SIDE_EFFECT_TOOLS[call.tool] then
             ok, result_or_err = file_tools.execute(call)
         else
             if provider_state.enabled and provider_state.provider then
