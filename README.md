@@ -4,7 +4,7 @@
 
 这是heat_mem的重置版，因为我不喜欢python，就这么简单。
 
-要求lupa支持luaJIT，因为向量计算余弦近似度我是用FFI强算的
+要求lupa支持luaJIT，因为向量计算余弦近似度我是用c库+FFI强算的
 
 # 可能有用的命令
 
