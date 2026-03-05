@@ -24,6 +24,7 @@ The page is served by `main.py` and talks to Mori native endpoints.
 ### Notes
 
 - This frontend assumes same-origin deployment with `main.py` and does not require API keys.
+- Markdown rendering now has a built-in fallback (no CDN dependency required).
 - Uploaded files are stored server-side under `./workspace/download/`.
 - The UI supports selecting multiple files, removing individual files before send, and client-side size/count pre-checks.
 - If you serve files separately, make sure your static host and Mori backend CORS/network rules allow the worker fetch to `/mori/chat/stream`.

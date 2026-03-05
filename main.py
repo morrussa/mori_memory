@@ -21,7 +21,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 try:
     import json5
@@ -44,6 +44,7 @@ class LlamaCppServerClient:
         log_ready_url: bool = True,
         log_to_file: bool = True,
         startup_timeout: int = 600,
+        gpu_layers="all",
     ):
         self.server_bin = server_bin
         self.model_path = model_path
@@ -57,6 +58,15 @@ class LlamaCppServerClient:
         self.log_ready_url = bool(log_ready_url)
         self.log_to_file = bool(log_to_file)
         self.startup_timeout = int(startup_timeout)
+        raw_gpu_layers = str(gpu_layers if gpu_layers is not None else "all").strip().lower()
+        if raw_gpu_layers in {"all", "-1"}:
+            self.gpu_layers = "all"
+        else:
+            try:
+                parsed_layers = int(raw_gpu_layers)
+            except ValueError:
+                parsed_layers = -1
+            self.gpu_layers = max(0, parsed_layers) if parsed_layers >= 0 else "all"
         self.model_name = os.path.basename(model_path) or "local-model"
         self.port = int(port) if port else self._find_free_port(self.request_host)
         self.base_url = f"http://{self.request_host}:{self.port}"
@@ -99,9 +109,8 @@ class LlamaCppServerClient:
             str(self.port),
             "--ctx-size",
             str(self.ctx_size),
-            "--gpu-layers",
-            "all",
         ]
+        cmd.extend(["--gpu-layers", str(self.gpu_layers)])
 
         if not self.embedding:
             cmd.extend(["--reasoning-format", "none"])
@@ -403,6 +412,9 @@ class AIPipeline:
         self.large_server_webui = self._get_env_bool("MORI_LARGE_SERVER_WEBUI", True)
         self.large_server_jinja = self._get_env_bool("MORI_LARGE_SERVER_JINJA", True)
         self.large_server_api_key = str(os.environ.get("MORI_LARGE_SERVER_API_KEY", "") or "").strip()
+        self.large_server_gpu_layers = str(os.environ.get("MORI_LARGE_SERVER_GPU_LAYERS", "all") or "all").strip()
+        self.embed_server_gpu_layers = str(os.environ.get("MORI_EMBED_SERVER_GPU_LAYERS", "0") or "0").strip()
+        self.large_server_gpu_fallback_cpu = self._get_env_bool("MORI_LARGE_SERVER_GPU_FALLBACK_CPU", True)
         self.llama_server_log_to_file = self._get_env_bool("MORI_LLAMA_SERVER_LOG_TO_FILE", True)
         self.agent_files_root = os.path.abspath(
             str(os.environ.get("MORI_AGENT_FILES_DIR", "workspace") or "workspace")
@@ -1695,20 +1707,47 @@ class AIPipeline:
         if large_model_path:
             if not os.path.exists(large_model_path):
                 raise FileNotFoundError(f"Large model not found: {large_model_path}")
-            print(f"[Python] Loading Large LLM on GPU: {large_model_path}")
-            self.llm_large = LlamaCppServerClient(
-                server_bin=self.llama_server_bin,
-                model_path=large_model_path,
-                ctx_size=30720,
-                embedding=False,
-                host=self.large_server_host,
-                port=self.large_server_port,
-                enable_webui=self.large_server_webui,
-                enable_jinja=self.large_server_jinja,
-                api_key=self.large_server_api_key,
-                log_ready_url=not self.quiet_server_urls,
-                log_to_file=self.llama_server_log_to_file,
+            print(
+                f"[Python] Loading Large LLM: {large_model_path} "
+                f"(gpu_layers={self.large_server_gpu_layers})"
             )
+            large_common_kwargs = {
+                "server_bin": self.llama_server_bin,
+                "model_path": large_model_path,
+                "ctx_size": 30720,
+                "embedding": False,
+                "host": self.large_server_host,
+                "port": self.large_server_port,
+                "enable_webui": self.large_server_webui,
+                "enable_jinja": self.large_server_jinja,
+                "api_key": self.large_server_api_key,
+                "log_ready_url": not self.quiet_server_urls,
+                "log_to_file": self.llama_server_log_to_file,
+            }
+            configured_layers = self.large_server_gpu_layers
+            try:
+                self.llm_large = LlamaCppServerClient(
+                    gpu_layers=configured_layers,
+                    **large_common_kwargs,
+                )
+            except RuntimeError as e:
+                err_text = str(e).lower()
+                can_fallback = (
+                    self.large_server_gpu_fallback_cpu
+                    and str(configured_layers or "").strip().lower() in {"all", "-1"}
+                    and "cuda" in err_text
+                    and ("out of memory" in err_text or "failed to allocate" in err_text)
+                )
+                if not can_fallback:
+                    raise
+                print(
+                    "[Python][WARN] Large LLM GPU OOM detected with gpu_layers=all; "
+                    "retrying with gpu_layers=0 (CPU fallback)."
+                )
+                self.llm_large = LlamaCppServerClient(
+                    gpu_layers=0,
+                    **large_common_kwargs,
+                )
             if self.large_server_webui and not self.suppress_large_webui_log:
                 webui_url = self.llm_large.get_webui_url()
                 if webui_url:
@@ -1724,6 +1763,7 @@ class AIPipeline:
                 model_path=embedding_model_path,
                 ctx_size=2048,
                 embedding=True,
+                gpu_layers=self.embed_server_gpu_layers,
                 log_ready_url=not self.quiet_server_urls,
                 log_to_file=self.llama_server_log_to_file,
             )
@@ -2501,7 +2541,8 @@ class MoriLocalWebUIBridge:
 
     def serve_forever(self):
         handler = self._make_handler()
-        self._httpd = HTTPServer((self.host, self.port), handler)
+        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd.daemon_threads = True
         self._httpd.serve_forever()
 
     def shutdown(self):

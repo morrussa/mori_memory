@@ -17,7 +17,10 @@ if (typeof messagesArea.appendSystemMessage === 'function') {
     messagesArea.appendUserMessage("Connected to local Mori backend.", "System");
 }
 
-fetch('/mori/session/status')
+const statusAbort = new AbortController();
+setTimeout(() => statusAbort.abort(), 4000);
+
+fetch('/mori/session/status', { signal: statusAbort.signal })
     .then((resp) => resp.ok ? resp.json() : null)
     .then((status) => {
         if (!status || typeof status !== 'object') {
@@ -30,8 +33,13 @@ fetch('/mori/session/status')
             messagesArea.appendSystemMessage(`Upload dir: ${status.upload_dir}`);
         }
     })
-    .catch((_e) => {
-        // ignore bootstrap status fetch failures
+    .catch((e) => {
+        const msg = (e && e.name === 'AbortError')
+            ? 'Status check timed out (backend busy).'
+            : 'Status check failed.';
+        if (typeof messagesArea.appendSystemMessage === 'function') {
+            messagesArea.appendSystemMessage(msg);
+        }
     });
 
 

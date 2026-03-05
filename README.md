@@ -51,7 +51,7 @@ qwen3.5支持pr：
 MORI_RUN_MODE=webui \
 MORI_WEBUI_BRIDGE_HOST=127.0.0.1 \
 MORI_WEBUI_BRIDGE_PORT=8080 \
-python main.py
+.venv/bin/python main.py
 ```
 
 访问：
@@ -69,6 +69,9 @@ http://127.0.0.1:8080
 - `MORI_LARGE_SERVER_WEBUI=0|1`：主模型服务是否启用自带 WebUI（`MORI_RUN_MODE=webui` 时强制 `0`）
 - `MORI_LARGE_SERVER_JINJA=0|1`：主模型 `--jinja`（默认 `1`）
 - `MORI_LARGE_SERVER_API_KEY`：上游 `llama-server` API key（未设置时自动生成）
+- `MORI_LARGE_SERVER_GPU_LAYERS`：主模型 `--gpu-layers`（默认 `all`）
+- `MORI_EMBED_SERVER_GPU_LAYERS`：embedding 模型 `--gpu-layers`（默认 `0`）
+- `MORI_LARGE_SERVER_GPU_FALLBACK_CPU=0|1`：主模型 `gpu_layers=all` OOM 时是否自动回退 `0`（默认 `1`）
 - `MORI_LLAMA_SERVER_LOG_TO_FILE=0|1`：是否将 `llama-server` 输出写入 `logs/llama_server_*.log`（默认 `1`）
 
 本地 WebUI API：
@@ -292,4 +295,4 @@ source .venv/bin/activate
 MORI_RUN_MODE=webui \
 MORI_WEBUI_BRIDGE_HOST=127.0.0.1 \
 MORI_WEBUI_BRIDGE_PORT=8080 \
-python main.py
+.venv/bin/python main.py

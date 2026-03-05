@@ -55,6 +55,22 @@ class MessagesArea extends HTMLElement {
         this.messages = shadowRoot.querySelector('#messages');
     }
 
+    renderMarkdownSafely(fullText) {
+        const source = String(fullText || '');
+        if (typeof globalThis.marked === 'object' && globalThis.marked && typeof globalThis.marked.parse === 'function') {
+            try {
+                return globalThis.marked.parse(source);
+            } catch (_e) {
+                // fallback below
+            }
+        }
+        const escaped = source
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+        return escaped.replace(/\n/g, '<br>');
+    }
+
     createNewAccumulatingMessage() {
         const lastMessage = this.messages.lastElementChild;
         const isLastMessageFromUser = lastMessage && lastMessage.classList.contains('user');
@@ -131,8 +147,8 @@ class MessagesArea extends HTMLElement {
                 fullText += tokenEl.textContent;
             });
 
-            // Convert Markdown to HTML
-            let htmlText = marked.parse(fullText);
+            // Convert Markdown to HTML (with local fallback when CDN is unavailable)
+            let htmlText = this.renderMarkdownSafely(fullText);
             console.log("htmlText: "+htmlText);
             this.accumulatingMessageEl.innerHTML = htmlText;
 
