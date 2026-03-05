@@ -5,13 +5,22 @@ local SEP = "\x1F"
 local config = require("module.config")
 local persistence = require("module.persistence")
 
-local DEFAULT_K1 = 1.2
-local DEFAULT_B = 0.75
-local PLAN_CFG = (config.settings.keyring and config.settings.keyring.long_term_plan) or {}
-local PLAN_MAX_VALUE = tonumber(PLAN_CFG.max_value_chars) or 200
-local PLAN_MAX_EVIDENCE = tonumber(PLAN_CFG.max_evidence_chars) or 160
-local PLAN_BOM_ITEMS = tonumber(PLAN_CFG.bom_max_items) or 3
-local PLAN_BOM_CHARS = tonumber(PLAN_CFG.bom_max_chars) or 800
+local KEYRING_CFG = (config.settings or {}).keyring or {}
+local KEYRING_DEFAULTS = (config.defaults or {}).keyring
+if type(KEYRING_DEFAULTS) ~= "table" then
+    KEYRING_DEFAULTS = KEYRING_CFG
+end
+local NOTEBOOK_CFG = KEYRING_CFG.notebook or {}
+local NOTEBOOK_DEFAULTS = KEYRING_DEFAULTS.notebook or {}
+local PLAN_CFG = KEYRING_CFG.long_term_plan or {}
+local PLAN_DEFAULTS = KEYRING_DEFAULTS.long_term_plan or {}
+
+local DEFAULT_K1 = tonumber(NOTEBOOK_CFG.bm25_k1) or tonumber(NOTEBOOK_DEFAULTS.bm25_k1) or 1.2
+local DEFAULT_B = tonumber(NOTEBOOK_CFG.bm25_b) or tonumber(NOTEBOOK_DEFAULTS.bm25_b) or 0.75
+local PLAN_MAX_VALUE = tonumber(PLAN_CFG.max_value_chars) or tonumber(PLAN_DEFAULTS.max_value_chars) or 200
+local PLAN_MAX_EVIDENCE = tonumber(PLAN_CFG.max_evidence_chars) or tonumber(PLAN_DEFAULTS.max_evidence_chars) or 160
+local PLAN_BOM_ITEMS = tonumber(PLAN_CFG.bom_max_items) or tonumber(PLAN_DEFAULTS.bom_max_items) or 3
+local PLAN_BOM_CHARS = tonumber(PLAN_CFG.bom_max_chars) or tonumber(PLAN_DEFAULTS.bom_max_chars) or 800
 
 local ALLOWED_TYPES = {
     preference = true,

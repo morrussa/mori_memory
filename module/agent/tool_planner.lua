@@ -5,7 +5,29 @@ local tool_parser = require("module.agent.tool_parser")
 local tool_registry = require("module.agent.tool_registry")
 local config_mem = require("module.config")
 
-local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
+local function get_tool_cfg()
+    return ((config_mem.settings or {}).keyring or {}).tool_calling or {}
+end
+
+local function get_tool_defaults()
+    local defaults = ((config_mem.defaults or {}).keyring or {}).tool_calling
+    if type(defaults) ~= "table" then
+        defaults = get_tool_cfg()
+    end
+    return defaults or {}
+end
+
+local function get_agent_cfg()
+    return (config_mem.settings or {}).agent or {}
+end
+
+local function get_agent_defaults()
+    local defaults = (config_mem.defaults or {}).agent
+    if type(defaults) ~= "table" then
+        defaults = get_agent_cfg()
+    end
+    return defaults or {}
+end
 
 local function get_supported_tool_acts()
     local acts = tool_parser.clone_supported_acts()
@@ -46,6 +68,15 @@ local function normalize_function_choice(raw_choice, supported_acts)
     return tool_parser.normalize_function_choice(raw_choice, {
         supported_acts = supported_acts or tool_parser.clone_supported_acts(),
     })
+end
+
+local function get_default_parallel_function_calls()
+    local agent_cfg = get_agent_cfg()
+    local agent_defaults = get_agent_defaults()
+    return to_bool(
+        agent_cfg.parallel_function_calls,
+        to_bool(agent_defaults.parallel_function_calls, true)
+    )
 end
 
 local function utf8_take(s, max_chars)
@@ -110,7 +141,10 @@ local function build_tool_pass_prompt(user_input, assistant_text, policy, planne
     local delete_flag = policy.delete_enabled and "允许" or "禁用"
     local step_idx = math.max(1, math.floor(tonumber(planner_ctx.step_idx) or 1))
     local function_choice = normalize_function_choice(planner_ctx.function_choice, supported_acts)
-    local parallel_function_calls = to_bool(planner_ctx.parallel_function_calls, true)
+    local parallel_function_calls = to_bool(
+        planner_ctx.parallel_function_calls,
+        get_default_parallel_function_calls()
+    )
     local last_observation = trim(planner_ctx.last_observation or "")
     local tool_trace = trim(planner_ctx.tool_trace or "")
     local tool_examples = build_dynamic_tool_call_examples(policy)
@@ -184,7 +218,10 @@ local function filter_planner_calls(calls, planner_ctx, supported_acts)
     planner_ctx = planner_ctx or {}
     supported_acts = supported_acts or tool_parser.clone_supported_acts()
     local function_choice = normalize_function_choice(planner_ctx.function_choice, supported_acts)
-    local parallel_function_calls = to_bool(planner_ctx.parallel_function_calls, true)
+    local parallel_function_calls = to_bool(
+        planner_ctx.parallel_function_calls,
+        get_default_parallel_function_calls()
+    )
 
     local out = {}
     if function_choice == "none" then
@@ -204,18 +241,20 @@ local function filter_planner_calls(calls, planner_ctx, supported_acts)
 end
 
 local function get_default_policy()
+    local cfg = get_tool_cfg()
+    local defaults = get_tool_defaults()
     return {
-        upsert_min_confidence = cfg_number(TOOL_CFG.upsert_min_confidence, 0.82, 0, 1),
-        upsert_max_per_turn = cfg_number(TOOL_CFG.upsert_max_per_turn, 1, 0),
-        query_max_per_turn = cfg_number(TOOL_CFG.query_max_per_turn, 2, 0),
-        delete_enabled = to_bool(TOOL_CFG.delete_enabled, false),
-        query_max_types = cfg_number(TOOL_CFG.query_max_types, 3, 1),
-        query_fetch_limit = cfg_number(TOOL_CFG.query_fetch_limit, 18, 1),
-        query_inject_top = cfg_number(TOOL_CFG.query_inject_top, 3, 1),
-        query_inject_max_chars = cfg_number(TOOL_CFG.query_inject_max_chars, 800, 200),
-        tool_pass_temperature = cfg_number(TOOL_CFG.tool_pass_temperature, 0.15, 0, 1),
-        tool_pass_max_tokens = cfg_number(TOOL_CFG.tool_pass_max_tokens, 128, 32),
-        tool_pass_seed = cfg_number(TOOL_CFG.tool_pass_seed, 42),
+        upsert_min_confidence = cfg_number(cfg.upsert_min_confidence, defaults.upsert_min_confidence, 0, 1),
+        upsert_max_per_turn = cfg_number(cfg.upsert_max_per_turn, defaults.upsert_max_per_turn, 0),
+        query_max_per_turn = cfg_number(cfg.query_max_per_turn, defaults.query_max_per_turn, 0),
+        delete_enabled = to_bool(cfg.delete_enabled, defaults.delete_enabled),
+        query_max_types = cfg_number(cfg.query_max_types, defaults.query_max_types, 1),
+        query_fetch_limit = cfg_number(cfg.query_fetch_limit, defaults.query_fetch_limit, 1),
+        query_inject_top = cfg_number(cfg.query_inject_top, defaults.query_inject_top, 1),
+        query_inject_max_chars = cfg_number(cfg.query_inject_max_chars, defaults.query_inject_max_chars, 200),
+        tool_pass_temperature = cfg_number(cfg.tool_pass_temperature, defaults.tool_pass_temperature, 0, 1),
+        tool_pass_max_tokens = cfg_number(cfg.tool_pass_max_tokens, defaults.tool_pass_max_tokens, 32),
+        tool_pass_seed = cfg_number(cfg.tool_pass_seed, defaults.tool_pass_seed),
     }
 end
 

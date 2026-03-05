@@ -327,11 +327,15 @@ end
 function M.build_messages(opts)
     opts = opts or {}
     local agent_cfg = (config.settings or {}).agent or {}
-    normalize_token_count_mode(opts.token_count_mode or agent_cfg.token_count_mode)
+    local agent_defaults = (config.defaults or {}).agent
+    if type(agent_defaults) ~= "table" then
+        agent_defaults = agent_cfg
+    end
+    normalize_token_count_mode(opts.token_count_mode or agent_cfg.token_count_mode or agent_defaults.token_count_mode)
 
     local budget = to_int(
         opts.input_token_budget,
-        agent_cfg.input_token_budget or 12000,
+        agent_cfg.input_token_budget or agent_defaults.input_token_budget,
         128
     )
 
@@ -361,45 +365,45 @@ function M.build_messages(opts)
 
     local plan_pinned = to_bool(
         opts.plan_bom_pinned,
-        to_bool(agent_cfg.plan_bom_pinned, true)
+        to_bool(agent_cfg.plan_bom_pinned, agent_defaults.plan_bom_pinned)
     )
     local history_auto_compress = to_bool(
         opts.history_auto_compress,
-        to_bool(agent_cfg.history_auto_compress, true)
+        to_bool(agent_cfg.history_auto_compress, agent_defaults.history_auto_compress)
     )
     local history_compress_min_dropped = to_int(
         opts.history_auto_compress_min_dropped_pairs,
-        agent_cfg.history_auto_compress_min_dropped_pairs or 1,
+        agent_cfg.history_auto_compress_min_dropped_pairs or agent_defaults.history_auto_compress_min_dropped_pairs,
         1
     )
     local history_compress_max_pairs = to_int(
         opts.history_auto_compress_max_pairs,
-        agent_cfg.history_auto_compress_max_pairs or 24,
+        agent_cfg.history_auto_compress_max_pairs or agent_defaults.history_auto_compress_max_pairs,
         1
     )
     local history_compress_user_chars = to_int(
         opts.history_auto_compress_user_chars,
-        agent_cfg.history_auto_compress_user_chars or 64,
+        agent_cfg.history_auto_compress_user_chars or agent_defaults.history_auto_compress_user_chars,
         8
     )
     local history_compress_assistant_chars = to_int(
         opts.history_auto_compress_assistant_chars,
-        agent_cfg.history_auto_compress_assistant_chars or 96,
+        agent_cfg.history_auto_compress_assistant_chars or agent_defaults.history_auto_compress_assistant_chars,
         8
     )
     local history_compress_max_chars = to_int(
         opts.history_auto_compress_max_chars,
-        agent_cfg.history_auto_compress_max_chars or 1400,
+        agent_cfg.history_auto_compress_max_chars or agent_defaults.history_auto_compress_max_chars,
         100
     )
     local history_compress_min_chars = to_int(
         opts.history_auto_compress_min_chars,
-        agent_cfg.history_auto_compress_min_chars or 220,
+        agent_cfg.history_auto_compress_min_chars or agent_defaults.history_auto_compress_min_chars,
         80
     )
     local plan_compact_min_chars = to_int(
         opts.plan_bom_compact_min_chars,
-        agent_cfg.plan_bom_compact_min_chars or 120,
+        agent_cfg.plan_bom_compact_min_chars or agent_defaults.plan_bom_compact_min_chars,
         64
     )
 

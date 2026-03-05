@@ -6,8 +6,33 @@ local memory = require("module.memory.store")
 local heat = require("module.memory.heat")
 local config_mem = require("module.config")
 
-local FACT_CFG = ((config_mem.settings or {}).keyring or {}).fact_extractor or {}
-local MEMORY_INPUT_CFG = ((config_mem.settings or {}).keyring or {}).memory_input or {}
+local function get_keyring_cfg()
+    return (config_mem.settings or {}).keyring or {}
+end
+
+local function get_keyring_defaults()
+    local defaults = (config_mem.defaults or {}).keyring
+    if type(defaults) ~= "table" then
+        defaults = get_keyring_cfg()
+    end
+    return defaults or {}
+end
+
+local function get_fact_cfg()
+    return (get_keyring_cfg().fact_extractor or {})
+end
+
+local function get_fact_defaults()
+    return (get_keyring_defaults().fact_extractor or {})
+end
+
+local function get_memory_input_cfg()
+    return (get_keyring_cfg().memory_input or {})
+end
+
+local function get_memory_input_defaults()
+    return (get_keyring_defaults().memory_input or {})
+end
 
 local function trim(s)
     if not s then return "" end
@@ -87,16 +112,20 @@ local function resolve_file_payload_mode(mode, fallback_mode)
 end
 
 local function get_memory_input_policy()
+    local memory_cfg = get_memory_input_cfg()
+    local memory_defaults = get_memory_input_defaults()
+    local fact_cfg = get_fact_cfg()
+    local fact_defaults = get_fact_defaults()
     local default_mode = resolve_file_payload_mode(
-        MEMORY_INPUT_CFG.file_payload_mode,
-        FACT_CFG.file_payload_mode
+        memory_cfg.file_payload_mode or memory_defaults.file_payload_mode,
+        fact_cfg.file_payload_mode or fact_defaults.file_payload_mode
     )
     return {
-        recall_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.recall_file_payload_mode, default_mode),
-        fact_mode = resolve_file_payload_mode(MEMORY_INPUT_CFG.fact_file_payload_mode, default_mode),
-        max_chars = cfg_number(MEMORY_INPUT_CFG.max_chars, 2048, 256, 32768),
-        manifest_max_items = cfg_number(MEMORY_INPUT_CFG.manifest_max_items, 8, 1, 64),
-        manifest_name_max_chars = cfg_number(MEMORY_INPUT_CFG.manifest_name_max_chars, 96, 8, 256),
+        recall_mode = resolve_file_payload_mode(memory_cfg.recall_file_payload_mode, memory_defaults.recall_file_payload_mode or default_mode),
+        fact_mode = resolve_file_payload_mode(memory_cfg.fact_file_payload_mode, memory_defaults.fact_file_payload_mode or default_mode),
+        max_chars = cfg_number(memory_cfg.max_chars, memory_defaults.max_chars, 256, 32768),
+        manifest_max_items = cfg_number(memory_cfg.manifest_max_items, memory_defaults.manifest_max_items, 1, 64),
+        manifest_name_max_chars = cfg_number(memory_cfg.manifest_name_max_chars, memory_defaults.manifest_name_max_chars, 8, 256),
     }
 end
 
@@ -105,8 +134,11 @@ function M.get_memory_input_policy()
 end
 
 local function get_fact_policy()
-    local style = cfg_string(FACT_CFG.prompt_style, "high_recall_v1")
-    local default_extract_tokens = (style == "high_recall_v1") and 320 or 256
+    local fact_cfg = get_fact_cfg()
+    local fact_defaults = get_fact_defaults()
+    local style = cfg_string(fact_cfg.prompt_style, fact_defaults.prompt_style)
+    local default_extract_tokens = tonumber(fact_defaults.extract_max_tokens)
+        or ((style == "high_recall_v1") and 320 or 256)
     local input_policy = get_memory_input_policy()
     return {
         prompt_style = style,
@@ -114,19 +146,19 @@ local function get_fact_policy()
         memory_input_max_chars = input_policy.max_chars,
         memory_manifest_max_items = input_policy.manifest_max_items,
         memory_manifest_name_max_chars = input_policy.manifest_name_max_chars,
-        verify_pass = to_bool(FACT_CFG.verify_pass, true),
-        max_facts = cfg_number(FACT_CFG.max_facts, 8, 1, 16),
-        max_parse_items = cfg_number(FACT_CFG.max_parse_items, 12, 1, 24),
-        max_item_chars = cfg_number(FACT_CFG.max_item_chars, 64, 8, 256),
-        extract_max_tokens = cfg_number(FACT_CFG.extract_max_tokens, default_extract_tokens, 64, 1024),
-        extract_temperature = cfg_number(FACT_CFG.extract_temperature, 0.15, 0, 1),
-        extract_seed = cfg_number(FACT_CFG.extract_seed, 42),
-        repair_max_tokens = cfg_number(FACT_CFG.repair_max_tokens, 192, 64, 512),
-        repair_temperature = cfg_number(FACT_CFG.repair_temperature, 0.0, 0, 1),
-        repair_seed = cfg_number(FACT_CFG.repair_seed, 43),
-        verify_max_tokens = cfg_number(FACT_CFG.verify_max_tokens, 192, 64, 512),
-        verify_temperature = cfg_number(FACT_CFG.verify_temperature, 0.0, 0, 1),
-        verify_seed = cfg_number(FACT_CFG.verify_seed, 46),
+        verify_pass = to_bool(fact_cfg.verify_pass, fact_defaults.verify_pass),
+        max_facts = cfg_number(fact_cfg.max_facts, fact_defaults.max_facts, 1, 16),
+        max_parse_items = cfg_number(fact_cfg.max_parse_items, fact_defaults.max_parse_items, 1, 24),
+        max_item_chars = cfg_number(fact_cfg.max_item_chars, fact_defaults.max_item_chars, 8, 256),
+        extract_max_tokens = cfg_number(fact_cfg.extract_max_tokens, default_extract_tokens, 64, 1024),
+        extract_temperature = cfg_number(fact_cfg.extract_temperature, fact_defaults.extract_temperature, 0, 1),
+        extract_seed = cfg_number(fact_cfg.extract_seed, fact_defaults.extract_seed),
+        repair_max_tokens = cfg_number(fact_cfg.repair_max_tokens, fact_defaults.repair_max_tokens, 64, 512),
+        repair_temperature = cfg_number(fact_cfg.repair_temperature, fact_defaults.repair_temperature, 0, 1),
+        repair_seed = cfg_number(fact_cfg.repair_seed, fact_defaults.repair_seed),
+        verify_max_tokens = cfg_number(fact_cfg.verify_max_tokens, fact_defaults.verify_max_tokens, 64, 512),
+        verify_temperature = cfg_number(fact_cfg.verify_temperature, fact_defaults.verify_temperature, 0, 1),
+        verify_seed = cfg_number(fact_cfg.verify_seed, fact_defaults.verify_seed),
     }
 end
 
@@ -145,8 +177,9 @@ local function strip_file_payload_for_memory(text, opts)
     text = tostring(text or "")
     opts = opts or {}
     local mode = resolve_file_payload_mode(opts.mode, "ignore")
-    local manifest_max_items = cfg_number(opts.manifest_max_items, 8, 1, 64)
-    local manifest_name_max_chars = cfg_number(opts.manifest_name_max_chars, 96, 8, 256)
+    local input_policy = get_memory_input_policy()
+    local manifest_max_items = cfg_number(opts.manifest_max_items, input_policy.manifest_max_items, 1, 64)
+    local manifest_name_max_chars = cfg_number(opts.manifest_name_max_chars, input_policy.manifest_name_max_chars, 8, 256)
     if text == "" or mode == "keep" then
         return text, false, 0
     end
@@ -490,7 +523,8 @@ end
 local function sanitize_facts(candidates, max_items)
     local out = {}
     local seen = {}
-    max_items = tonumber(max_items) or 8
+    local fact_policy = get_fact_policy()
+    max_items = tonumber(max_items) or tonumber(fact_policy.max_facts) or 8
     for _, item in ipairs(candidates or {}) do
         local fact = normalize_fact(item)
         local key = fact:lower()
@@ -505,7 +539,8 @@ end
 
 local function parse_quoted_candidates(text, max_items)
     local out = {}
-    max_items = tonumber(max_items) or 12
+    local fact_policy = get_fact_policy()
+    max_items = tonumber(max_items) or tonumber(fact_policy.max_parse_items) or 12
     text = tostring(text or "")
     for q in text:gmatch('"(.-)"') do
         out[#out + 1] = q

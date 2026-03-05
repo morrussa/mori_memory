@@ -164,6 +164,20 @@ http://127.0.0.1:8080
 ### 新配置（`module/config.lua`）
 
 ```lua
+runtime = {
+    models = {
+        base_dir = "/home/morusa/AI/mori/model/",
+        large_model = "Qwen3.5-9B-Q6_K.gguf",
+        embedding_model = "Qwen3-Embedding-0.6B-Q8_0.gguf",
+    },
+    demo_chat = {
+        max_tokens = 1024,
+        temperature = 0.5,
+        seed_min = 114,
+        seed_max = 514,
+    },
+},
+
 agent = {
     max_steps = 4,
     input_token_budget = 12000,
@@ -183,9 +197,22 @@ agent = {
     max_context_refine_steps = 2,
     continue_on_tool_failure = true,
     max_failure_refine_steps = 2,
+    llm_temperature = 0.75,
+    llm_seed_min = 1,
+    llm_seed_max = 2147483647,
     planner_gate_mode = "assistant_signal",
     planner_default_when_missing = false,
     function_choice = "auto",
+    supported_tool_acts = {
+        upsert_record = true,
+        query_record = true,
+        delete_record = true,
+        list_agent_files = true,
+        read_agent_file = true,
+        read_agent_file_lines = true,
+        search_agent_file = true,
+        search_agent_files = true,
+    },
     parallel_function_calls = true,
     include_tool_observation_trace = true,
     tool_trace_max_steps = 4,

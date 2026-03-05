@@ -1,17 +1,23 @@
 local M = {}
 
 local tool = require("module.tool")
+local config = require("module.config")
 
-local DEFAULT_SUPPORTED_ACTS = {
-    upsert_record = true,
-    query_record = true,
-    delete_record = true,
-    list_agent_files = true,
-    read_agent_file = true,
-    read_agent_file_lines = true,
-    search_agent_file = true,
-    search_agent_files = true,
-}
+local function get_default_supported_acts()
+    local cfg = ((config.settings or {}).agent or {}).supported_tool_acts
+    if type(cfg) ~= "table" then
+        cfg = ((config.defaults or {}).agent or {}).supported_tool_acts
+    end
+    local out = {}
+    if type(cfg) == "table" then
+        for act, enabled in pairs(cfg) do
+            if enabled then
+                out[act] = true
+            end
+        end
+    end
+    return out
+end
 
 local ACT_ALIAS = {
     upsert = "upsert_record",
@@ -97,7 +103,7 @@ local function normalize_act(name, supported_acts)
     raw = raw:gsub("%-", "_")
     raw = raw:gsub("%s+", "_")
     local mapped = ACT_ALIAS[raw] or raw
-    local allow = supported_acts or DEFAULT_SUPPORTED_ACTS
+    local allow = supported_acts or get_default_supported_acts()
     if allow[mapped] then
         return mapped
     end
@@ -513,7 +519,7 @@ local function strip_ranges(text, ranges)
 end
 
 local function parse_calls_with_spans(text, opts)
-    local supported_acts = (opts or {}).supported_acts or DEFAULT_SUPPORTED_ACTS
+    local supported_acts = (opts or {}).supported_acts or get_default_supported_acts()
     text = tostring(text or "")
     local calls, spans = {}, {}
     local seen = {}
@@ -560,7 +566,7 @@ function M.split_tool_calls_and_text(text, opts)
 end
 
 function M.parse_tool_call_line(line, opts)
-    local supported_acts = (opts or {}).supported_acts or DEFAULT_SUPPORTED_ACTS
+    local supported_acts = (opts or {}).supported_acts or get_default_supported_acts()
     local text = tostring(line or "")
 
     local call = parse_lua_call_block(text, supported_acts)
@@ -576,7 +582,7 @@ function M.parse_tool_call_line(line, opts)
 end
 
 function M.clone_supported_acts(overrides)
-    local acts = copy_supported_acts(DEFAULT_SUPPORTED_ACTS)
+    local acts = copy_supported_acts(get_default_supported_acts())
     if type(overrides) == "table" then
         for act, enabled in pairs(overrides) do
             if enabled then
@@ -590,7 +596,7 @@ function M.clone_supported_acts(overrides)
 end
 
 function M.normalize_function_choice(raw_choice, opts)
-    local supported_acts = ((opts or {}).supported_acts) or DEFAULT_SUPPORTED_ACTS
+    local supported_acts = ((opts or {}).supported_acts) or get_default_supported_acts()
     local raw = trim(raw_choice):lower()
     if raw == "" or raw == "auto" then
         return "auto"

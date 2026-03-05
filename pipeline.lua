@@ -13,16 +13,43 @@ local app_config = require("module.config")
 local agent_runtime = require("module.agent.runtime")
 local run_mode = tostring(MORI_RUN_MODE or "cli")
 
--- 1. 配置模型路径
-local base = "/home/morusa/AI/mori/model/"
-local config = {
-    large_model = base .. "Qwen3.5-9B-Q6_K.gguf",
-    embedding_model = base .. "Qwen3-Embedding-0.6B-Q8_0.gguf"
-}
+local runtime_cfg = (app_config.settings or {}).runtime or {}
+local runtime_defaults = (app_config.defaults or {}).runtime
+if type(runtime_defaults) ~= "table" then
+    runtime_defaults = runtime_cfg
+end
+local model_cfg = runtime_cfg.models or {}
+local model_defaults = runtime_defaults.models or {}
+local demo_cfg = runtime_cfg.demo_chat or {}
+local demo_defaults = runtime_defaults.demo_chat or {}
 
-print("[Lua] large_model path: " .. tostring(config.large_model))
-print("[Lua] embedding_model path: " .. tostring(config.embedding_model))
-py_pipeline:load_models(config.large_model, config.embedding_model)
+local function join_model_path(base_dir, path_or_name)
+    local path = tostring(path_or_name or "")
+    if path == "" then
+        return path
+    end
+    if path:sub(1, 1) == "/" then
+        return path
+    end
+
+    local base = tostring(base_dir or "")
+    if base == "" then
+        return path
+    end
+    if base:sub(-1) ~= "/" then
+        base = base .. "/"
+    end
+    return base .. path
+end
+
+-- 1. 配置模型路径（统一从 config.lua 读取）
+local model_base = tostring(model_cfg.base_dir or model_defaults.base_dir or "")
+local large_model_path = join_model_path(model_base, model_cfg.large_model or model_defaults.large_model)
+local embedding_model_path = join_model_path(model_base, model_cfg.embedding_model or model_defaults.embedding_model)
+
+print("[Lua] large_model path: " .. tostring(large_model_path))
+print("[Lua] embedding_model path: " .. tostring(embedding_model_path))
+py_pipeline:load_models(large_model_path, embedding_model_path)
 
 memory.load()
 cluster.load()
@@ -90,10 +117,15 @@ if run_mode ~= "webui" then
         { role = "user",   content = "写一首关于讨厌Python的短诗。" }
     }
 
+    local demo_seed_min = math.floor(tonumber(demo_cfg.seed_min) or tonumber(demo_defaults.seed_min) or 114)
+    local demo_seed_max = math.floor(tonumber(demo_cfg.seed_max) or tonumber(demo_defaults.seed_max) or 514)
+    if demo_seed_max < demo_seed_min then
+        demo_seed_min, demo_seed_max = demo_seed_max, demo_seed_min
+    end
     local gen_params = {
-        max_tokens = 1024,
-        temperature = 0.5,
-        seed = math.random(114, 514)
+        max_tokens = math.floor(tonumber(demo_cfg.max_tokens) or tonumber(demo_defaults.max_tokens) or 1024),
+        temperature = tonumber(demo_cfg.temperature) or tonumber(demo_defaults.temperature) or 0.5,
+        seed = math.random(demo_seed_min, demo_seed_max)
     }
 
     print("\n[Lua] Calling Large Model (GPU) with chat template...")

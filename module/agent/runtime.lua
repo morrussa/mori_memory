@@ -150,6 +150,14 @@ local function get_agent_cfg()
     return (config.settings or {}).agent or {}
 end
 
+local function get_agent_defaults()
+    local defaults = (config.defaults or {}).agent
+    if type(defaults) ~= "table" then
+        defaults = get_agent_cfg()
+    end
+    return defaults or {}
+end
+
 local function to_bool(v, fallback)
     if type(v) == "boolean" then return v end
     if type(v) == "number" then return v ~= 0 end
@@ -351,8 +359,13 @@ local function build_tool_observation_trace(entries, max_steps, max_chars)
     if type(entries) ~= "table" or #entries <= 0 then
         return ""
     end
-    max_steps = math.max(1, math.floor(tonumber(max_steps) or 4))
-    max_chars = math.max(120, math.floor(tonumber(max_chars) or 1200))
+    local agent_defaults = get_agent_defaults()
+    max_steps = math.max(1, math.floor(
+        tonumber(max_steps) or tonumber(agent_defaults.tool_trace_max_steps) or 4
+    ))
+    max_chars = math.max(120, math.floor(
+        tonumber(max_chars) or tonumber(agent_defaults.tool_trace_max_chars) or 1200
+    ))
     local start_idx = math.max(1, #entries - max_steps + 1)
     local lines = {
         "【Tool Observation Trace】",
@@ -420,49 +433,131 @@ function M.run_turn(args)
     local base_system_prompt = resolve_base_system_prompt(conversation_history)
 
     local agent_cfg = get_agent_cfg()
+    local agent_defaults = get_agent_defaults()
     local supported_tool_acts = get_supported_tool_acts()
-    local max_steps = math.max(1, math.floor(tonumber(agent_cfg.max_steps) or 4))
+    local max_steps = math.max(
+        1,
+        math.floor(tonumber(agent_cfg.max_steps) or tonumber(agent_defaults.max_steps) or 4)
+    )
     local completion_reserve_tokens = math.max(
         64,
-        math.floor(tonumber(agent_cfg.completion_reserve_tokens) or 1024)
+        math.floor(
+            tonumber(agent_cfg.completion_reserve_tokens)
+            or tonumber(agent_defaults.completion_reserve_tokens)
+            or 1024
+        )
     )
     local token_budget = math.max(
         128,
-        math.floor(tonumber(agent_cfg.input_token_budget) or 12000)
+        math.floor(
+            tonumber(agent_cfg.input_token_budget)
+            or tonumber(agent_defaults.input_token_budget)
+            or 12000
+        )
     )
-    local continue_on_tool_context = to_bool(agent_cfg.continue_on_tool_context, true)
-    local continue_on_tool_failure = to_bool(agent_cfg.continue_on_tool_failure, true)
+    local continue_on_tool_context = to_bool(
+        agent_cfg.continue_on_tool_context,
+        agent_defaults.continue_on_tool_context
+    )
+    local continue_on_tool_failure = to_bool(
+        agent_cfg.continue_on_tool_failure,
+        agent_defaults.continue_on_tool_failure
+    )
     local max_context_refine_steps = math.max(
         0,
-        math.floor(tonumber(agent_cfg.max_context_refine_steps) or 2)
+        math.floor(
+            tonumber(agent_cfg.max_context_refine_steps)
+            or tonumber(agent_defaults.max_context_refine_steps)
+            or 2
+        )
     )
     local max_failure_refine_steps = math.max(
         0,
-        math.floor(tonumber(agent_cfg.max_failure_refine_steps) or 2)
+        math.floor(
+            tonumber(agent_cfg.max_failure_refine_steps)
+            or tonumber(agent_defaults.max_failure_refine_steps)
+            or 2
+        )
     )
-    local planner_gate_mode = normalize_planner_gate_mode(agent_cfg.planner_gate_mode)
-    local planner_default_when_missing = to_bool(agent_cfg.planner_default_when_missing, false)
-    local include_tool_observation_trace = to_bool(agent_cfg.include_tool_observation_trace, true)
+    local planner_gate_mode = normalize_planner_gate_mode(
+        agent_cfg.planner_gate_mode or agent_defaults.planner_gate_mode
+    )
+    local planner_default_when_missing = to_bool(
+        agent_cfg.planner_default_when_missing,
+        agent_defaults.planner_default_when_missing
+    )
+    local include_tool_observation_trace = to_bool(
+        agent_cfg.include_tool_observation_trace,
+        agent_defaults.include_tool_observation_trace
+    )
     local function_choice = normalize_function_choice(agent_cfg.function_choice, supported_tool_acts)
-    local parallel_function_calls = to_bool(agent_cfg.parallel_function_calls, true)
+    local parallel_function_calls = to_bool(
+        agent_cfg.parallel_function_calls,
+        agent_defaults.parallel_function_calls
+    )
     local tool_trace_max_steps = math.max(
         1,
-        math.floor(tonumber(agent_cfg.tool_trace_max_steps) or 4)
+        math.floor(
+            tonumber(agent_cfg.tool_trace_max_steps)
+            or tonumber(agent_defaults.tool_trace_max_steps)
+            or 4
+        )
     )
     local tool_trace_max_chars = math.max(
         240,
-        math.floor(tonumber(agent_cfg.tool_trace_max_chars) or 1200)
+        math.floor(
+            tonumber(agent_cfg.tool_trace_max_chars)
+            or tonumber(agent_defaults.tool_trace_max_chars)
+            or 1200
+        )
     )
     local llm_retry_max = math.max(
         0,
-        math.floor(tonumber(agent_cfg.llm_retry_max) or 2)
+        math.floor(
+            tonumber(agent_cfg.llm_retry_max)
+            or tonumber(agent_defaults.llm_retry_max)
+            or 2
+        )
     )
-    local llm_retry_backoff_sec = cfg_number(agent_cfg.llm_retry_backoff_sec, 0.35, 0, 10)
+    local llm_retry_backoff_sec = cfg_number(
+        agent_cfg.llm_retry_backoff_sec,
+        agent_defaults.llm_retry_backoff_sec,
+        0,
+        10
+    )
+    local llm_temperature = cfg_number(
+        agent_cfg.llm_temperature,
+        agent_defaults.llm_temperature,
+        0,
+        2
+    )
+    local llm_seed_min = math.floor(cfg_number(
+        agent_cfg.llm_seed_min,
+        agent_defaults.llm_seed_min,
+        1
+    ))
+    local llm_seed_max = math.floor(cfg_number(
+        agent_cfg.llm_seed_max,
+        agent_defaults.llm_seed_max,
+        llm_seed_min
+    ))
+    if llm_seed_max < llm_seed_min then
+        llm_seed_min, llm_seed_max = llm_seed_max, llm_seed_min
+    end
     local planner_retry_max = math.max(
         0,
-        math.floor(tonumber(agent_cfg.planner_retry_max) or 1)
+        math.floor(
+            tonumber(agent_cfg.planner_retry_max)
+            or tonumber(agent_defaults.planner_retry_max)
+            or 1
+        )
     )
-    local planner_retry_backoff_sec = cfg_number(agent_cfg.planner_retry_backoff_sec, 0.2, 0, 10)
+    local planner_retry_backoff_sec = cfg_number(
+        agent_cfg.planner_retry_backoff_sec,
+        agent_defaults.planner_retry_backoff_sec,
+        0,
+        10
+    )
     local memory_input_policy = tool_calling.get_memory_input_policy()
     local memory_user_input, memory_input_sanitized, redacted_blocks, file_mode, memory_input_truncated =
         tool_calling.sanitize_memory_input(user_input, {
@@ -566,8 +661,8 @@ function M.run_turn(args)
         state_name = "GENERATE"
         local params = {
             max_tokens = completion_reserve_tokens,
-            temperature = 0.75,
-            seed = math.random(1, 2147483647),
+            temperature = llm_temperature,
+            seed = math.random(llm_seed_min, llm_seed_max),
         }
         -- 多步模式下避免流式泄露中间草稿；最终文本由上层统一输出。
         if stream_sink and max_steps <= 1 then

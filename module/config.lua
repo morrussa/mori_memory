@@ -1,8 +1,21 @@
 local M = {}
 
-M.settings = {
+local DEFAULT_SETTINGS = {
     merge_limit = 0.95,--两个记忆如果相似度>0.95，则直接合并为一个，并且对应多条记忆。
     dim = 1024,
+    runtime = {
+        models = {
+            base_dir = "/home/morusa/AI/mori/model/",
+            large_model = "Qwen3.5-9B-Q6_K.gguf",
+            embedding_model = "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        },
+        demo_chat = {
+            max_tokens = 1024,
+            temperature = 0.5,
+            seed_min = 114,
+            seed_max = 514,
+        },
+    },
     heat = {
         total_heat = 10000000,--总热力池大小
         new_memory_heat = 43000,--新记忆的热力
@@ -181,6 +194,10 @@ M.settings = {
             bom_max_items = 3,         -- 每轮注入 BOM 的最多条数
             bom_max_chars = 800,       -- BOM 注入文本最大长度
         },
+        notebook = {
+            bm25_k1 = 1.2,
+            bm25_b = 0.75,
+        },
         tool_calling = {
             upsert_min_confidence = 0.82,   -- upsert 最低置信度
             upsert_max_per_turn = 1,        -- 每轮最多 upsert 次数
@@ -281,11 +298,24 @@ M.settings = {
         max_failure_refine_steps = 2, -- 单轮最多因工具失败触发多少次重修
         llm_retry_max = 2, -- qwen-agent 对齐：主生成失败后的最大重试次数（不含首轮）
         llm_retry_backoff_sec = 0.35, -- 重试指数退避基线秒数
+        llm_temperature = 0.75, -- 主回复生成温度
+        llm_seed_min = 1, -- 主回复随机种子下界（含）
+        llm_seed_max = 2147483647, -- 主回复随机种子上界（含）
         planner_retry_max = 1, -- 二阶段 planner 失败时最大重试次数
         planner_retry_backoff_sec = 0.2, -- planner 重试退避秒数
         planner_gate_mode = "assistant_signal", -- assistant_signal|always：是否由主回复信号决定要不要做 planner
         planner_default_when_missing = false, -- assistant_signal 模式下，缺少信号时是否默认进入 planner
         function_choice = "auto", -- qwen-agent 对齐：auto|none|query_record|upsert_record|delete_record|list_agent_files|read_agent_file|read_agent_file_lines|search_agent_file|search_agent_files
+        supported_tool_acts = {
+            upsert_record = true,
+            query_record = true,
+            delete_record = true,
+            list_agent_files = true,
+            read_agent_file = true,
+            read_agent_file_lines = true,
+            search_agent_file = true,
+            search_agent_files = true,
+        },
         parallel_function_calls = true, -- qwen-agent 对齐：false 时单轮最多执行 1 条工具调用
         include_tool_observation_trace = true, -- 把 Action/Observation 轨迹注入下一步上下文
         tool_trace_max_steps = 4, -- 轨迹最多保留多少个 step
@@ -307,5 +337,65 @@ M.settings = {
         enable_lru = true,
     },
 }
+
+local function deep_copy(value, seen)
+    if type(value) ~= "table" then
+        return value
+    end
+    seen = seen or {}
+    if seen[value] then
+        return seen[value]
+    end
+    local out = {}
+    seen[value] = out
+    for k, v in pairs(value) do
+        out[deep_copy(k, seen)] = deep_copy(v, seen)
+    end
+    return out
+end
+
+local function get_by_path(root, path)
+    if type(root) ~= "table" then
+        return nil
+    end
+    if type(path) ~= "string" or path == "" then
+        return root
+    end
+    local cur = root
+    for seg in path:gmatch("[^%.]+") do
+        if type(cur) ~= "table" then
+            return nil
+        end
+        cur = cur[seg]
+        if cur == nil then
+            return nil
+        end
+    end
+    return cur
+end
+
+M.defaults = deep_copy(DEFAULT_SETTINGS)
+M.settings = deep_copy(DEFAULT_SETTINGS)
+
+function M.reset()
+    M.settings = deep_copy(M.defaults)
+    return M.settings
+end
+
+function M.get(path, fallback)
+    local v = get_by_path(M.settings, path)
+    if v == nil then
+        return fallback
+    end
+    return v
+end
+
+function M.get_default(path, fallback)
+    local v = get_by_path(M.defaults, path)
+    if v == nil then
+        return fallback
+    end
+    return v
+end
 
 return M

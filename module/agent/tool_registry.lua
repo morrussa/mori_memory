@@ -20,17 +20,53 @@ M._turn_budget_state = {
     file_multi_search_count = 0,
 }
 
-local TOOL_CFG = ((config_mem.settings or {}).keyring or {}).tool_calling or {}
-local CORE_TOOL_ACTS = {
-    query_record = true,
-    upsert_record = true,
-    delete_record = true,
-    list_agent_files = true,
-    read_agent_file = true,
-    read_agent_file_lines = true,
-    search_agent_file = true,
-    search_agent_files = true,
-}
+local function get_keyring_cfg()
+    return (config_mem.settings or {}).keyring or {}
+end
+
+local function get_keyring_defaults()
+    local defaults = (config_mem.defaults or {}).keyring
+    if type(defaults) ~= "table" then
+        defaults = get_keyring_cfg()
+    end
+    return defaults or {}
+end
+
+local function get_agent_cfg()
+    return (config_mem.settings or {}).agent or {}
+end
+
+local function get_agent_defaults()
+    local defaults = (config_mem.defaults or {}).agent
+    if type(defaults) ~= "table" then
+        defaults = get_agent_cfg()
+    end
+    return defaults or {}
+end
+
+local function get_tool_cfg()
+    return get_keyring_cfg().tool_calling or {}
+end
+
+local function get_tool_defaults()
+    return get_keyring_defaults().tool_calling or {}
+end
+
+local function get_core_tool_acts()
+    local acts = get_agent_cfg().supported_tool_acts
+    if type(acts) ~= "table" then
+        acts = get_agent_defaults().supported_tool_acts
+    end
+    local out = {}
+    if type(acts) == "table" then
+        for act, enabled in pairs(acts) do
+            if enabled then
+                out[act] = true
+            end
+        end
+    end
+    return out
+end
 
 M._external_tools = {
     cfg_signature = "",
@@ -259,25 +295,36 @@ local function normalize_tool_entry_names(raw, out)
 end
 
 local function get_external_cfg()
-    local keyring = ((config_mem.settings or {}).keyring or {})
-    return keyring.external_tools or {}
+    return get_keyring_cfg().external_tools or {}
 end
 
-local function get_external_tool_entries()
-    local ext_cfg = get_external_cfg()
+local function get_external_defaults()
+    return get_keyring_defaults().external_tools or {}
+end
+
+local function get_external_tool_entries(ext_cfg, ext_defaults)
+    ext_cfg = ext_cfg or {}
+    ext_defaults = ext_defaults or {}
     local merged = {}
     normalize_tool_entry_names(ext_cfg.tools, merged)
     normalize_tool_entry_names(ext_cfg.names, merged)
     if #merged == 0 then
+        normalize_tool_entry_names(ext_defaults.tools, merged)
+        normalize_tool_entry_names(ext_defaults.names, merged)
+    end
+    if #merged == 0 then
         normalize_tool_entry_names(ext_cfg.allowlist, merged)
+    end
+    if #merged == 0 then
+        normalize_tool_entry_names(ext_defaults.allowlist, merged)
     end
     return merged
 end
 
-local function external_cfg_signature(ext_cfg, entries)
+local function external_cfg_signature(ext_cfg, ext_defaults, entries)
     local parts = {
-        tostring(to_bool(ext_cfg.enabled, false) and "1" or "0"),
-        tostring(to_bool(ext_cfg.include_memory_tools, true) and "1" or "0"),
+        tostring(to_bool(ext_cfg.enabled, ext_defaults.enabled) and "1" or "0"),
+        tostring(to_bool(ext_cfg.include_memory_tools, ext_defaults.include_memory_tools) and "1" or "0"),
     }
     local copy = {}
     for _, x in ipairs(entries or {}) do
@@ -290,9 +337,10 @@ end
 
 local function refresh_external_tools()
     local ext_cfg = get_external_cfg()
-    local enabled = to_bool(ext_cfg.enabled, false)
-    local entries = get_external_tool_entries()
-    local sig = external_cfg_signature(ext_cfg, entries)
+    local ext_defaults = get_external_defaults()
+    local enabled = to_bool(ext_cfg.enabled, ext_defaults.enabled)
+    local entries = get_external_tool_entries(ext_cfg, ext_defaults)
+    local sig = external_cfg_signature(ext_cfg, ext_defaults, entries)
 
     if M._external_tools.cfg_signature == sig then
         return M._external_tools
@@ -326,11 +374,12 @@ local function refresh_external_tools()
         return state
     end
 
+    local core_tool_acts = get_core_tool_acts()
     for _, item in ipairs(schemas_or_err) do
         if type(item) == "table" and type(item["function"]) == "table" then
             local fn = item["function"]
             local name = trim(fn.name or "")
-            if name ~= "" and (not CORE_TOOL_ACTS[name]) then
+            if name ~= "" and (not core_tool_acts[name]) then
                 state.schemas[#state.schemas + 1] = item
                 if not state.name_set[name] then
                     state.name_set[name] = true
@@ -560,50 +609,53 @@ local function get_turn_budget_state(current_turn)
 end
 
 local function get_tool_policy()
+    local cfg = get_tool_cfg()
+    local defaults = get_tool_defaults()
     local ext_cfg = get_external_cfg()
+    local ext_defaults = get_external_defaults()
     return {
-        upsert_min_confidence = cfg_number(TOOL_CFG.upsert_min_confidence, 0.82, 0, 1),
-        upsert_max_per_turn = cfg_number(TOOL_CFG.upsert_max_per_turn, 1, 0),
-        query_max_per_turn = cfg_number(TOOL_CFG.query_max_per_turn, 2, 0),
-        delete_enabled = to_bool(TOOL_CFG.delete_enabled, false),
-        query_max_types = cfg_number(TOOL_CFG.query_max_types, 3, 1),
-        query_fetch_limit = cfg_number(TOOL_CFG.query_fetch_limit, 18, 1),
-        query_inject_top = cfg_number(TOOL_CFG.query_inject_top, 3, 1),
-        query_inject_max_chars = cfg_number(TOOL_CFG.query_inject_max_chars, 800, 200),
-        tool_pass_temperature = cfg_number(TOOL_CFG.tool_pass_temperature, 0.15, 0, 1),
-        tool_pass_max_tokens = cfg_number(TOOL_CFG.tool_pass_max_tokens, 128, 32),
-        tool_pass_seed = cfg_number(TOOL_CFG.tool_pass_seed, 42),
-        parallel_execute_enabled = to_bool(TOOL_CFG.parallel_execute_enabled, true),
-        parallel_query_batch_size = cfg_number(TOOL_CFG.parallel_query_batch_size, 4, 1),
-        retry_transient_max = cfg_number(TOOL_CFG.retry_transient_max, 1, 0),
-        retry_unknown_max = cfg_number(TOOL_CFG.retry_unknown_max, 0, 0),
-        retry_validation_max = cfg_number(TOOL_CFG.retry_validation_max, 0, 0),
-        retry_budget_max = cfg_number(TOOL_CFG.retry_budget_max, 0, 0),
-        retry_total_cap = cfg_number(TOOL_CFG.retry_total_cap, 2, 0),
-        agent_file_list_max_per_turn = cfg_number(TOOL_CFG.agent_file_list_max_per_turn, 2, 0),
-        agent_file_list_default_limit = cfg_number(TOOL_CFG.agent_file_list_default_limit, 12, 1),
-        agent_file_list_hard_limit = cfg_number(TOOL_CFG.agent_file_list_hard_limit, 64, 1),
-        agent_file_read_max_per_turn = cfg_number(TOOL_CFG.agent_file_read_max_per_turn, 4, 0),
-        agent_file_read_default_max_chars = cfg_number(TOOL_CFG.agent_file_read_default_max_chars, 3000, 128),
-        agent_file_read_hard_max_chars = cfg_number(TOOL_CFG.agent_file_read_hard_max_chars, 12000, 256),
-        agent_file_read_lines_max_per_turn = cfg_number(TOOL_CFG.agent_file_read_lines_max_per_turn, 4, 0),
-        agent_file_read_lines_default_max_lines = cfg_number(TOOL_CFG.agent_file_read_lines_default_max_lines, 220, 16),
-        agent_file_read_lines_hard_max_lines = cfg_number(TOOL_CFG.agent_file_read_lines_hard_max_lines, 1200, 32),
-        agent_file_search_max_per_turn = cfg_number(TOOL_CFG.agent_file_search_max_per_turn, 4, 0),
-        agent_file_search_default_max_hits = cfg_number(TOOL_CFG.agent_file_search_default_max_hits, 20, 1),
-        agent_file_search_hard_max_hits = cfg_number(TOOL_CFG.agent_file_search_hard_max_hits, 200, 4),
-        agent_file_multi_search_max_per_turn = cfg_number(TOOL_CFG.agent_file_multi_search_max_per_turn, 3, 0),
-        agent_file_multi_search_default_max_hits = cfg_number(TOOL_CFG.agent_file_multi_search_default_max_hits, 30, 1),
-        agent_file_multi_search_hard_max_hits = cfg_number(TOOL_CFG.agent_file_multi_search_hard_max_hits, 400, 4),
-        agent_file_multi_search_default_max_files = cfg_number(TOOL_CFG.agent_file_multi_search_default_max_files, 24, 1),
-        agent_file_multi_search_hard_max_files = cfg_number(TOOL_CFG.agent_file_multi_search_hard_max_files, 200, 1),
-        agent_file_multi_search_default_per_file_hits = cfg_number(TOOL_CFG.agent_file_multi_search_default_per_file_hits, 5, 1),
-        agent_file_multi_search_hard_per_file_hits = cfg_number(TOOL_CFG.agent_file_multi_search_hard_per_file_hits, 20, 1),
-        agent_file_context_max_chars = cfg_number(TOOL_CFG.agent_file_context_max_chars, 1600, 120, 20000),
-        external_enabled = to_bool(ext_cfg.enabled, false),
-        external_include_memory_tools = to_bool(ext_cfg.include_memory_tools, true),
-        external_context_inject = to_bool(ext_cfg.context_inject, true),
-        external_context_max_chars = cfg_number(ext_cfg.context_max_chars, 1200, 120, 10000),
+        upsert_min_confidence = cfg_number(cfg.upsert_min_confidence, defaults.upsert_min_confidence, 0, 1),
+        upsert_max_per_turn = cfg_number(cfg.upsert_max_per_turn, defaults.upsert_max_per_turn, 0),
+        query_max_per_turn = cfg_number(cfg.query_max_per_turn, defaults.query_max_per_turn, 0),
+        delete_enabled = to_bool(cfg.delete_enabled, defaults.delete_enabled),
+        query_max_types = cfg_number(cfg.query_max_types, defaults.query_max_types, 1),
+        query_fetch_limit = cfg_number(cfg.query_fetch_limit, defaults.query_fetch_limit, 1),
+        query_inject_top = cfg_number(cfg.query_inject_top, defaults.query_inject_top, 1),
+        query_inject_max_chars = cfg_number(cfg.query_inject_max_chars, defaults.query_inject_max_chars, 200),
+        tool_pass_temperature = cfg_number(cfg.tool_pass_temperature, defaults.tool_pass_temperature, 0, 1),
+        tool_pass_max_tokens = cfg_number(cfg.tool_pass_max_tokens, defaults.tool_pass_max_tokens, 32),
+        tool_pass_seed = cfg_number(cfg.tool_pass_seed, defaults.tool_pass_seed),
+        parallel_execute_enabled = to_bool(cfg.parallel_execute_enabled, defaults.parallel_execute_enabled),
+        parallel_query_batch_size = cfg_number(cfg.parallel_query_batch_size, defaults.parallel_query_batch_size, 1),
+        retry_transient_max = cfg_number(cfg.retry_transient_max, defaults.retry_transient_max, 0),
+        retry_unknown_max = cfg_number(cfg.retry_unknown_max, defaults.retry_unknown_max, 0),
+        retry_validation_max = cfg_number(cfg.retry_validation_max, defaults.retry_validation_max, 0),
+        retry_budget_max = cfg_number(cfg.retry_budget_max, defaults.retry_budget_max, 0),
+        retry_total_cap = cfg_number(cfg.retry_total_cap, defaults.retry_total_cap, 0),
+        agent_file_list_max_per_turn = cfg_number(cfg.agent_file_list_max_per_turn, defaults.agent_file_list_max_per_turn, 0),
+        agent_file_list_default_limit = cfg_number(cfg.agent_file_list_default_limit, defaults.agent_file_list_default_limit, 1),
+        agent_file_list_hard_limit = cfg_number(cfg.agent_file_list_hard_limit, defaults.agent_file_list_hard_limit, 1),
+        agent_file_read_max_per_turn = cfg_number(cfg.agent_file_read_max_per_turn, defaults.agent_file_read_max_per_turn, 0),
+        agent_file_read_default_max_chars = cfg_number(cfg.agent_file_read_default_max_chars, defaults.agent_file_read_default_max_chars, 128),
+        agent_file_read_hard_max_chars = cfg_number(cfg.agent_file_read_hard_max_chars, defaults.agent_file_read_hard_max_chars, 256),
+        agent_file_read_lines_max_per_turn = cfg_number(cfg.agent_file_read_lines_max_per_turn, defaults.agent_file_read_lines_max_per_turn, 0),
+        agent_file_read_lines_default_max_lines = cfg_number(cfg.agent_file_read_lines_default_max_lines, defaults.agent_file_read_lines_default_max_lines, 16),
+        agent_file_read_lines_hard_max_lines = cfg_number(cfg.agent_file_read_lines_hard_max_lines, defaults.agent_file_read_lines_hard_max_lines, 32),
+        agent_file_search_max_per_turn = cfg_number(cfg.agent_file_search_max_per_turn, defaults.agent_file_search_max_per_turn, 0),
+        agent_file_search_default_max_hits = cfg_number(cfg.agent_file_search_default_max_hits, defaults.agent_file_search_default_max_hits, 1),
+        agent_file_search_hard_max_hits = cfg_number(cfg.agent_file_search_hard_max_hits, defaults.agent_file_search_hard_max_hits, 4),
+        agent_file_multi_search_max_per_turn = cfg_number(cfg.agent_file_multi_search_max_per_turn, defaults.agent_file_multi_search_max_per_turn, 0),
+        agent_file_multi_search_default_max_hits = cfg_number(cfg.agent_file_multi_search_default_max_hits, defaults.agent_file_multi_search_default_max_hits, 1),
+        agent_file_multi_search_hard_max_hits = cfg_number(cfg.agent_file_multi_search_hard_max_hits, defaults.agent_file_multi_search_hard_max_hits, 4),
+        agent_file_multi_search_default_max_files = cfg_number(cfg.agent_file_multi_search_default_max_files, defaults.agent_file_multi_search_default_max_files, 1),
+        agent_file_multi_search_hard_max_files = cfg_number(cfg.agent_file_multi_search_hard_max_files, defaults.agent_file_multi_search_hard_max_files, 1),
+        agent_file_multi_search_default_per_file_hits = cfg_number(cfg.agent_file_multi_search_default_per_file_hits, defaults.agent_file_multi_search_default_per_file_hits, 1),
+        agent_file_multi_search_hard_per_file_hits = cfg_number(cfg.agent_file_multi_search_hard_per_file_hits, defaults.agent_file_multi_search_hard_per_file_hits, 1),
+        agent_file_context_max_chars = cfg_number(cfg.agent_file_context_max_chars, defaults.agent_file_context_max_chars, 120, 20000),
+        external_enabled = to_bool(ext_cfg.enabled, ext_defaults.enabled),
+        external_include_memory_tools = to_bool(ext_cfg.include_memory_tools, ext_defaults.include_memory_tools),
+        external_context_inject = to_bool(ext_cfg.context_inject, ext_defaults.context_inject),
+        external_context_max_chars = cfg_number(ext_cfg.context_max_chars, ext_defaults.context_max_chars, 120, 10000),
     }
 end
 
@@ -1470,16 +1522,14 @@ function M.get_supported_acts(base_acts)
     end
 
     local policy = get_tool_policy()
+    local core_tool_acts = get_core_tool_acts()
     if policy.external_include_memory_tools then
-        acts.query_record = true
-        acts.upsert_record = true
-        acts.list_agent_files = true
-        acts.read_agent_file = true
-        acts.read_agent_file_lines = true
-        acts.search_agent_file = true
-        acts.search_agent_files = true
-        if policy.delete_enabled then
-            acts.delete_record = true
+        for act, enabled in pairs(core_tool_acts) do
+            if enabled then
+                if act ~= "delete_record" or policy.delete_enabled then
+                    acts[act] = true
+                end
+            end
         end
     end
 
@@ -1494,14 +1544,9 @@ function M.get_supported_acts(base_acts)
 
     -- 当 memory 工具显式关闭时，移除内置 act，避免解析误命中。
     if not policy.external_include_memory_tools then
-        acts.query_record = nil
-        acts.upsert_record = nil
-        acts.delete_record = nil
-        acts.list_agent_files = nil
-        acts.read_agent_file = nil
-        acts.read_agent_file_lines = nil
-        acts.search_agent_file = nil
-        acts.search_agent_files = nil
+        for act, _ in pairs(core_tool_acts) do
+            acts[act] = nil
+        end
     end
 
     return acts
