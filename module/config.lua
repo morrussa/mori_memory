@@ -33,6 +33,8 @@ local DEFAULT_SETTINGS = {
             force_upload_toolchain = true,
             force_upload_read_limit = 2,
             force_upload_read_max_chars = 2400,
+            force_history_toolchain = true,
+            force_history_read_max_chars = 2400,
         },
         repair = {
             max_attempts = 2,

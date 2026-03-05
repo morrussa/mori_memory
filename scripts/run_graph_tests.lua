@@ -380,15 +380,20 @@ local function run_case(case)
     local graph_runtime = require("module.graph.graph_runtime")
 
     local events = {}
-    local output = graph_runtime.run_turn({
-        user_input = case.input,
-        read_only = false,
-        uploads = case.uploads or {},
+    local conversation_history = case.conversation_history
+    if type(conversation_history) ~= "table" or #conversation_history == 0 then
         conversation_history = {
             { role = "system", content = "SYSTEM_PROMPT" },
             { role = "user", content = "history_u1" },
             { role = "assistant", content = "history_a1" },
-        },
+        }
+    end
+
+    local output = graph_runtime.run_turn({
+        user_input = case.input,
+        read_only = false,
+        uploads = case.uploads or {},
+        conversation_history = conversation_history,
         stream_sink = function(evt)
             events[#events + 1] = evt
         end,
@@ -477,19 +482,37 @@ local function build_cases()
         }
         local planner_default = nil
         local expect_loops = nil
+        local input = string.format("file tool case %d", i)
+        local router_steps = { '{route="tool_loop"}' }
+        local conversation_history = nil
         if i == 1 then
             -- loop cap test: planner keeps emitting calls; runtime must stop at tool_loop_max=5
             planner_steps = {}
             planner_default = planner_literal({ tool_call })
             expect_loops = 5
         end
+        if i == 20 then
+            -- follow-up file reading test: router/planner must recover from history tool_path even without fresh uploads.
+            input = "继续读取这个文件前几行，看看模型设置"
+            router_steps = { '{route="respond"}' }
+            planner_steps = { "{tool_calls={}}" }
+            conversation_history = {
+                { role = "system", content = "SYSTEM_PROMPT" },
+                { role = "user", content = "我上传了文件" },
+                {
+                    role = "assistant",
+                    content = "[上传文件已保存到 ./workspace/download]\n- main.py: ./workspace/download/mori_x_main.py (tool_path=download/mori_x_main.py, bytes=38505)",
+                },
+            }
+        end
         cases[#cases + 1] = {
             id = string.format("file_%02d", i),
             category = "file",
-            input = string.format("file tool case %d", i),
-            router_steps = { '{route="tool_loop"}' },
+            input = input,
+            router_steps = router_steps,
             planner_steps = planner_steps,
             planner_default = planner_default,
+            conversation_history = conversation_history,
             expect_route = "tool_loop",
             min_tool_executed = 1,
             expect_tool_failed = 0,
