@@ -13,7 +13,6 @@ function M.run(state, _ctx)
     state.context = state.context or {}
     state.working_memory = state.working_memory or {}
     state.planner = state.planner or {}
-    state.experience = state.experience or {}
 
     local pending = state.repair.pending == true or util.trim(state.repair.last_error or "") ~= ""
     if not pending then
@@ -21,10 +20,7 @@ function M.run(state, _ctx)
         return state
     end
 
-    local runtime_policy = state.experience.runtime_policy or {}
-    local repair_policy = ((runtime_policy or {}).repair) or {}
-    local planner_policy = ((runtime_policy or {}).planner) or {}
-    local repair_mode = util.trim((repair_policy or {}).mode or "normal")
+    local repair_mode = "normal"
 
     local max_attempts = tonumber(state.repair.max_attempts)
     if not max_attempts then
@@ -63,16 +59,6 @@ function M.run(state, _ctx)
         lines[#lines + 1] = "Repair policy: aggressively change the failed plan instead of retrying a similar batch."
     elseif repair_mode == "fail_fast" then
         lines[#lines + 1] = "Repair policy: this is the final repair attempt; if repair is not possible, stop."
-    end
-    local avoid = {}
-    for tool_name, enabled in pairs((planner_policy or {}).avoid_tools or {}) do
-        if enabled then
-            avoid[#avoid + 1] = tostring(tool_name)
-        end
-    end
-    table.sort(avoid)
-    if #avoid > 0 then
-        lines[#lines + 1] = "Do not use avoided tools: " .. table.concat(avoid, ", ")
     end
     state.context.planner_context = table.concat(lines, "\n")
     state.repair.pending = false

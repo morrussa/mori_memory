@@ -341,34 +341,6 @@ local DEFAULT_SETTINGS = {
         cold_rescue_on_empty_only = false, -- true=仅空召回时入队；false=命中不足(hits<=0)也会入队。
         cold_rescue_max_queue = 50000, -- 冷救援队列硬上限，超过后停止入队以保护内存与I/O。
     },
-    experience = {
-        storage = {
-            root = "memory/experience_graph_policy",
-        },
-        v2 = {
-            enabled = true,
-            candidate_limit = 5,
-            min_support_for_recommend = 3,
-            min_confidence_for_recommend = 0.72,
-            hard_fallback_on_error = true,
-            recency_half_life_days = 30,
-        },
-        retriever = {
-            fetch_multiplier = 8, -- 初始候选放大量，供 relevance gate + joint rerank 使用。
-            relevance_gate = 0.32, -- relevance 硬门基础阈值；不足时仅逐级放宽该门限。
-            context_threshold = 0.30, -- context candidate generation 的最低相似度。
-            semantic_threshold = 0.12, -- embedding candidate generation 的最低相似度。
-            semantic_scan_limit = 48, -- 单次检索最多保留多少语义候选进入排序。
-            min_needed_ratio = 0.60, -- 每阶段至少命中的结果比例；不足则继续放宽 relevance gate。
-            exploration_slots = 1, -- 为低样本高潜力经验保留的探索位。
-            utility_confidence_count = 6, -- 经验效用学习达到该观测数后，learned utility 基本接管 prior。
-        },
-        adaptive = {
-            enabled = true, -- 经验检索闭环默认开启：route learning、utility learning、output learning 全部生效。
-            route_learning_rate = 0.10,
-            utility_learning_rate = 0.10,
-        },
-    },
     episode = {
         storage = {
             root = "memory/episodes",

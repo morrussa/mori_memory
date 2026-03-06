@@ -1,8 +1,33 @@
 local context_builder = require("module.graph.context_builder")
 local util = require("module.graph.util")
-local experience_policy = require("module.experience.policy")
 
 local M = {}
+
+local CODE_HINT_PATTERNS = {
+    "code", "bug", "debug", "patch", "repo", "function", "class", "test", "compile", "build",
+    "代码", "函数", "类", "修复", "测试", "编译", "模块",
+}
+
+local WORKSPACE_HINT_PATTERNS = {
+    "file", "files", "read", "write", "search", "folder", "directory", "command", "upload", "workspace",
+    "文件", "目录", "搜索", "命令", "上传",
+}
+
+local function has_code_extension(text)
+    local s = tostring(text or ""):lower()
+    return s:find("%.lua", 1, false) ~= nil
+        or s:find("%.py", 1, false) ~= nil
+        or s:find("%.js", 1, false) ~= nil
+        or s:find("%.ts", 1, false) ~= nil
+        or s:find("%.tsx", 1, false) ~= nil
+        or s:find("%.jsx", 1, false) ~= nil
+        or s:find("%.rs", 1, false) ~= nil
+        or s:find("%.go", 1, false) ~= nil
+        or s:find("%.java", 1, false) ~= nil
+        or s:find("%.c", 1, false) ~= nil
+        or s:find("%.cpp", 1, false) ~= nil
+        or s:find("%.h", 1, false) ~= nil
+end
 
 local function detect_task_profile(state)
     local session = ((state or {}).session) or {}
@@ -14,7 +39,52 @@ local function detect_task_profile(state)
         and existing ~= "" then
         return existing
     end
-    return experience_policy.detect_task_profile(state)
+
+    local user_input = tostring((((state or {}).input or {}).message) or "")
+    local lower = user_input:lower()
+    local uploads = (((state or {}).uploads) or {})
+    local working_memory = ((state or {}).working_memory) or {}
+
+    if type(uploads) == "table" and #uploads > 0 then
+        if has_code_extension(user_input) or has_code_extension(active_task.goal or "") then
+            return "code"
+        end
+        return "workspace"
+    end
+
+    for _, pattern in ipairs(CODE_HINT_PATTERNS) do
+        if lower:find(pattern, 1, true) ~= nil then
+            return "code"
+        end
+    end
+    if has_code_extension(user_input) then
+        return "code"
+    end
+
+    for path, enabled in pairs((working_memory.files_read_set or {})) do
+        if enabled and has_code_extension(path) then
+            return "code"
+        end
+    end
+    for path, enabled in pairs((working_memory.files_written_set or {})) do
+        if enabled and has_code_extension(path) then
+            return "code"
+        end
+    end
+
+    for _, pattern in ipairs(WORKSPACE_HINT_PATTERNS) do
+        if lower:find(pattern, 1, true) ~= nil then
+            return "workspace"
+        end
+    end
+    if lower:find("/mori/workspace", 1, true) ~= nil then
+        return "workspace"
+    end
+
+    if existing ~= "" then
+        return existing
+    end
+    return "general"
 end
 
 function M.run(state, _ctx)

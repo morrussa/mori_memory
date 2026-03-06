@@ -22,10 +22,6 @@ local SIDE_EFFECT_TOOLS = {
     apply_patch = true,
     exec_command = true,
 }
-local DIRECTORY_SCAN_TOOLS = {
-    list_files = true,
-    search_files = true,
-}
 
 local function graph_cfg()
     return ((config.settings or {}).graph or {})
@@ -131,21 +127,26 @@ local function parse_model_output(raw)
     }
 end
 
+local function copy_runtime_message(row)
+    local out = {
+        role = tostring(get_field(row, "role") or ""),
+        content = tostring(get_field(row, "content") or ""),
+    }
+    for _, key in ipairs({ "name", "tool_call_id", "tool_calls", "reasoning_content", "function_call", "function_id" }) do
+        local value = get_field(row, key)
+        if value ~= nil then
+            out[key] = value
+        end
+    end
+    return out
+end
+
 local function ensure_contract_system_message(messages, state)
     local out = {}
     for i, row in ipairs(messages or {}) do
-        out[i] = {
-            role = tostring((row or {}).role or ""),
-            content = tostring((row or {}).content or ""),
-        }
+        out[i] = copy_runtime_message(row)
     end
     local profile = util.trim((((state or {}).context or {}).task_profile) or "general")
-    local runtime_policy = (((state or {}).experience) or {}).runtime_policy or {}
-    local planner_policy = ((runtime_policy or {}).planner) or {}
-    local repair_policy = ((runtime_policy or {}).repair) or {}
-    local recall_policy = ((runtime_policy or {}).recall) or {}
-    local context_policy = ((runtime_policy or {}).context) or {}
-    local experience_prior = util.trim((((state or {}).context or {}).experience_prior) or "")
     local contract = table.concat({
         "You are the planner for a single-session tool agent.",
         "Return tool calls when more work is needed.",
@@ -155,53 +156,6 @@ local function ensure_contract_system_message(messages, state)
         "Available workspace root: " .. util.workspace_virtual_root(),
         "Current task profile: " .. profile,
     }, "\n")
-
-    local policy_lines = {}
-    local planner_mode = util.trim((planner_policy or {}).mode or "auto")
-    if planner_mode == "tool_first" then
-        policy_lines[#policy_lines + 1] = "Planner policy: prefer tool calls before finalizing the turn."
-    elseif planner_mode == "direct_first" then
-        policy_lines[#policy_lines + 1] = "Planner policy: if a direct answer is sufficient, call finish_turn immediately."
-    elseif planner_mode == "evidence_first" then
-        policy_lines[#policy_lines + 1] = "Planner policy: collect concrete evidence with tools before the final reply."
-    end
-
-    local preferred_chain = (planner_policy or {}).preferred_tool_chain or {}
-    if #preferred_chain > 0 then
-        policy_lines[#policy_lines + 1] = "Preferred tool chain: " .. table.concat(preferred_chain, " -> ")
-    end
-
-    local avoid = {}
-    for tool_name, enabled in pairs((planner_policy or {}).avoid_tools or {}) do
-        if enabled then
-            avoid[#avoid + 1] = tostring(tool_name)
-        end
-    end
-    table.sort(avoid)
-    if #avoid > 0 then
-        policy_lines[#policy_lines + 1] = "Avoid these tools unless no alternative exists: " .. table.concat(avoid, ", ")
-    end
-    if (planner_policy or {}).force_read_before_write == true then
-        policy_lines[#policy_lines + 1] = "Before using write-capable tools, read relevant files or workspace context first."
-    end
-    if util.trim((repair_policy or {}).mode or "normal") ~= "normal" then
-        policy_lines[#policy_lines + 1] = "Repair mode: " .. tostring((repair_policy or {}).mode)
-    end
-    if util.trim((recall_policy or {}).mode or "auto") ~= "auto" then
-        policy_lines[#policy_lines + 1] = "Recall mode: " .. tostring((recall_policy or {}).mode)
-    end
-    if (context_policy or {}).include_memory == false then
-        policy_lines[#policy_lines + 1] = "Memory context may be absent by policy."
-    end
-    if (context_policy or {}).include_episode == false then
-        policy_lines[#policy_lines + 1] = "Episode continuity context may be absent by policy."
-    end
-    if #policy_lines > 0 then
-        contract = table.concat({ contract, "", "[GraphPolicy]", table.concat(policy_lines, "\n") }, "\n")
-    end
-    if experience_prior ~= "" then
-        contract = table.concat({ contract, "", experience_prior }, "\n")
-    end
 
     if #out > 0 and tostring((out[1] or {}).role or "") == "system" then
         out[1].content = table.concat({ tostring(out[1].content or ""), "", "[PlannerContract]", contract }, "\n")
@@ -262,120 +216,44 @@ local function find_avoided_tool(calls, avoid_tools)
     return ""
 end
 
-local function collect_upload_paths(state)
-    local out = {}
-    local seen = {}
-    for _, item in ipairs(((state or {}).uploads) or {}) do
-        local path = util.normalize_tool_path(((item or {}).tool_path) or ((item or {}).path) or "")
-        if path ~= "" and not seen[path] then
-            seen[path] = true
-            out[#out + 1] = path
+local function select_planner_messages(state)
+    local runtime_messages = ((((state or {}).messages) or {}).runtime_messages) or {}
+    if type(runtime_messages) == "table" and #runtime_messages > 0 then
+        local out = {}
+        for i, row in ipairs(runtime_messages) do
+            out[i] = copy_runtime_message(row)
         end
+        return out
+    end
+    return context_builder.build_chat_messages(state)
+end
+
+local function build_runtime_tool_calls(tool_calls)
+    local out = {}
+    for _, call in ipairs(tool_calls or {}) do
+        out[#out + 1] = {
+            id = tostring(call.call_id or ""),
+            type = "function",
+            ["function"] = {
+                name = tostring(call.tool or ""),
+                arguments = util.encode_lua_value((call or {}).args or {}, 0),
+            },
+        }
     end
     return out
 end
 
-local function has_content_read_call(calls)
-    for _, call in ipairs(calls or {}) do
-        local tool_name = util.trim((call or {}).tool)
-        if tool_name == "read_file" or tool_name == "read_lines" or tool_name == "search_file" or tool_name == "search_files" then
-            return true
-        end
+local function append_assistant_tool_batch(state, content, tool_calls)
+    if type(tool_calls) ~= "table" or #tool_calls == 0 then
+        return
     end
-    return false
-end
-
-local function is_directory_scan_only(calls)
-    if type(calls) ~= "table" or #calls == 0 then
-        return false
-    end
-    for _, call in ipairs(calls or {}) do
-        if not DIRECTORY_SCAN_TOOLS[util.trim((call or {}).tool)] then
-            return false
-        end
-    end
-    return true
-end
-
-local function has_prior_directory_scan(state)
-    for _, row in ipairs(((((state or {}).tool_exec) or {}).all_results) or {}) do
-        if type(row) == "table" and row.ok == true and DIRECTORY_SCAN_TOOLS[util.trim(row.tool or "")] then
-            return true
-        end
-    end
-    return false
-end
-
-local function wants_read_lines(state)
-    local q = tostring((((state or {}).input or {}).message) or "")
-    return q:find("前几行", 1, true) ~= nil
-        or q:find("几行", 1, true) ~= nil
-        or q:lower():find("line", 1, true) ~= nil
-        or q:lower():find("lines", 1, true) ~= nil
-        or q:find("配置", 1, true) ~= nil
-        or q:lower():find("config", 1, true) ~= nil
-end
-
-local function build_forced_upload_read_calls(state, max_calls)
-    local read_files = ((((state or {}).tool_exec) or {}).read_files) or {}
-    local unread_paths = {}
-    for _, path in ipairs(collect_upload_paths(state)) do
-        if read_files[path] ~= true then
-            unread_paths[#unread_paths + 1] = path
-        end
-    end
-
-    local calls = {}
-    local limit = math.max(1, math.floor(tonumber(max_calls) or 1))
-    local use_lines = wants_read_lines(state)
-    for _, path in ipairs(unread_paths) do
-        if #calls >= limit then
-            break
-        end
-        if use_lines then
-            calls[#calls + 1] = {
-                tool = "read_lines",
-                args = {
-                    path = path,
-                    start_line = 1,
-                    max_lines = 220,
-                },
-                call_id = string.format("planner_guard_read_lines_%d", #calls + 1),
-            }
-        else
-            calls[#calls + 1] = {
-                tool = "read_file",
-                args = {
-                    path = path,
-                    max_chars = 2400,
-                },
-                call_id = string.format("planner_guard_read_file_%d", #calls + 1),
-            }
-        end
-    end
-    return calls
-end
-
-local function enforce_upload_read_guard(state, tool_calls)
-    if #(((state or {}).uploads) or {}) == 0 then
-        return tool_calls, ""
-    end
-    if has_content_read_call(tool_calls) then
-        return tool_calls, ""
-    end
-    if not is_directory_scan_only(tool_calls) then
-        return tool_calls, ""
-    end
-    if not has_prior_directory_scan(state) then
-        return tool_calls, ""
-    end
-
-    local max_calls = math.max(1, math.floor(tonumber((((graph_cfg() or {}).planner or {}).max_calls_per_loop) or 6)))
-    local forced = build_forced_upload_read_calls(state, max_calls)
-    if #forced == 0 then
-        return tool_calls, ""
-    end
-    return forced, "upload_read_guard"
+    state.messages = state.messages or {}
+    state.messages.runtime_messages = state.messages.runtime_messages or {}
+    state.messages.runtime_messages[#state.messages.runtime_messages + 1] = {
+        role = "assistant",
+        content = tostring(content or ""),
+        tool_calls = build_runtime_tool_calls(tool_calls),
+    }
 end
 
 function M.run(state, _ctx)
@@ -435,7 +313,7 @@ function M.run(state, _ctx)
         seed = tonumber(cfg.seed) or 11,
     }
 
-    local messages = ensure_contract_system_message(context_builder.build_chat_messages(state), state)
+    local messages = ensure_contract_system_message(select_planner_messages(state), state)
     local tools = tool_registry.get_tool_schemas(state)
 
     local ok, result_or_err = pcall(function()
@@ -456,9 +334,6 @@ function M.run(state, _ctx)
 
     local parsed = parse_model_output(result_or_err)
     state.planner.raw = parsed.raw ~= "" and parsed.raw or parsed.content
-    local runtime_policy = (((state or {}).experience) or {}).runtime_policy or {}
-    local planner_policy = ((runtime_policy or {}).planner) or {}
-
     local finish_call = nil
     local tool_calls = {}
     for _, call in ipairs(parsed.tool_calls or {}) do
@@ -497,16 +372,6 @@ function M.run(state, _ctx)
     end
 
     if #tool_calls == 0 then
-        if util.trim((planner_policy or {}).mode or "auto") == "direct_first" and util.trim(parsed.content or "") ~= "" then
-            state.termination.finish_requested = true
-            state.termination.final_message = util.trim(parsed.content or "")
-            state.termination.final_status = "completed"
-            state.termination.stop_reason = "finish_turn_called"
-            state.agent_loop.stop_reason = "finish_turn_called"
-            state.agent_loop.pending_tool_calls = {}
-            state.working_memory.current_plan = "finish_turn"
-            return state
-        end
         state.planner.missing_terminal_signal = true
         state.planner.errors[#state.planner.errors + 1] = "missing_terminal_signal"
         state.repair.pending = true
@@ -515,40 +380,15 @@ function M.run(state, _ctx)
         return state
     end
 
-    local avoided_tool = find_avoided_tool(tool_calls, (planner_policy or {}).avoid_tools or {})
-    if avoided_tool ~= "" then
-        state.planner.errors[#state.planner.errors + 1] = "policy_avoid_tool:" .. avoided_tool
-        state.repair.pending = true
-        state.repair.last_error = "policy_avoid_tool:" .. avoided_tool
-        state.working_memory.last_repair_error = state.repair.last_error
-        state.context.planner_context = "Do not use avoided tool: " .. avoided_tool
-        return state
-    end
-
-    if (planner_policy or {}).force_read_before_write == true
-        and has_side_effect_tool(tool_calls)
-        and not has_read_tool(tool_calls)
-        and not has_previous_reads(state) then
-        state.planner.errors[#state.planner.errors + 1] = "missing_read_before_write"
-        state.repair.pending = true
-        state.repair.last_error = "missing_read_before_write"
-        state.working_memory.last_repair_error = "missing_read_before_write"
-        state.context.planner_context = "Read relevant workspace context before using write-capable tools."
-        return state
-    end
-
-    local guarded_calls, force_reason = enforce_upload_read_guard(state, tool_calls)
-    state.planner.tool_calls = guarded_calls
-    state.agent_loop.pending_tool_calls = guarded_calls
+    state.planner.tool_calls = tool_calls
+    state.agent_loop.pending_tool_calls = tool_calls
 
     local plan_names = {}
-    for _, call in ipairs(guarded_calls) do
+    for _, call in ipairs(tool_calls) do
         plan_names[#plan_names + 1] = call.tool
     end
-    state.planner.force_reason = util.trim(force_reason or "")
-    if state.planner.force_reason ~= "" then
-        state.context.planner_context = "Uploads already listed. Read unread uploaded files instead of repeating directory scans."
-    end
+    state.planner.force_reason = ""
+    append_assistant_tool_batch(state, parsed.content or "", tool_calls)
     state.working_memory.current_plan = table.concat(plan_names, " -> ")
     state.working_memory.plan_step_index = (tonumber(state.working_memory.plan_step_index) or 0) + 1
     return state

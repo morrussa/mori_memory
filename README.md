@@ -16,21 +16,19 @@
 
 1. `ingest_node`
 2. `recall_node`
-3. `experience_node`（policy retrieval）
-4. `context_node`
-5. `planner_node`
-6. `tool_exec_node` / `repair_node`（循环）
-7. `responder_node`
-8. `finalize_node`
-9. `writeback_node`
-10. `persist_node`
-11. `end`
+3. `context_node`
+4. `planner_node`
+5. `tool_exec_node` / `repair_node`（循环）
+6. `responder_node`
+7. `finalize_node`
+8. `writeback_node`
+9. `persist_node`
+10. `end`
 
 执行层分为三层：
 
 - `memory/*`：长期事实记忆
 - `episode/*`：run 级执行历史
-- `experience/*`：策略/惯性记忆（policy memory）
 
 循环约束：
 

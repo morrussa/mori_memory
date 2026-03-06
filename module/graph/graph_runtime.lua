@@ -9,7 +9,6 @@ local util = require("module.graph.util")
 local command = require("module.graph.command")
 local config = require("module.config")
 local episode = require("module.episode")
-local experience_policy = require("module.experience.policy")
 
 local M = {}
 
@@ -353,54 +352,16 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.context = state.context or {
         task_context = "",
         memory_context = "",
-        experience_context = "",
         policy_context = "",
         applied_policy = "",
-        experience_prior = "",
         tool_context = "",
         planner_context = "",
     }
     state.context.task_context = state.context.task_context or ""
     state.context.policy_context = state.context.policy_context or ""
     state.context.applied_policy = state.context.applied_policy or ""
-    state.context.experience_prior = state.context.experience_prior or ""
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
     state.recall = state.recall or { triggered = false, context = "", score = nil }
-    state.experience = state.experience or {
-        version = "v2",
-        query = {},
-        retrieved = { items = {}, ids = {}, strategy = "" },
-        candidates = {},
-        recommendation = { id = "", confidence = 0, reason = "", support = 0, accepted = false },
-        runtime_policy = experience_policy.default_runtime_policy(),
-        audit = "",
-        kind = "graph_policy",
-        feedback = { effective_ids = {} },
-        behavior_match = { selected_id = "", match_score = 0 },
-        writeback = { written = false, policy_id = "" },
-    }
-    state.experience.version = tostring(state.experience.version or "v2")
-    state.experience.kind = state.experience.kind or "graph_policy"
-    state.experience.retrieved = state.experience.retrieved or {}
-    state.experience.retrieved.items = state.experience.retrieved.items or {}
-    state.experience.retrieved.ids = state.experience.retrieved.ids or {}
-    state.experience.retrieved.strategy = state.experience.retrieved.strategy or ""
-    state.experience.candidates = state.experience.candidates or {}
-    state.experience.recommendation = state.experience.recommendation or { id = "", confidence = 0, reason = "", support = 0, accepted = false }
-    state.experience.recommendation.id = tostring(state.experience.recommendation.id or "")
-    state.experience.recommendation.confidence = tonumber(state.experience.recommendation.confidence) or 0
-    state.experience.recommendation.reason = tostring(state.experience.recommendation.reason or "")
-    state.experience.recommendation.support = tonumber(state.experience.recommendation.support) or 0
-    state.experience.recommendation.accepted = state.experience.recommendation.accepted == true
-    state.experience.runtime_policy = experience_policy.normalize_runtime_policy(
-        state.experience.runtime_policy or (((state.experience or {}).policy) or {})
-    )
-    state.experience.audit = tostring(state.experience.audit or "")
-    state.experience.behavior_match = state.experience.behavior_match or { selected_id = "", match_score = 0 }
-    state.experience.behavior_match.selected_id = tostring(state.experience.behavior_match.selected_id or "")
-    state.experience.behavior_match.match_score = tonumber(state.experience.behavior_match.match_score) or 0
-    state.experience.writeback = state.experience.writeback or { written = false, policy_id = "" }
-    state.experience.writeback.policy_id = tostring(state.experience.writeback.policy_id or "")
     state.episode = state.episode or {
         current = { turn_index = 0, topic_anchor = "" },
         recent = { items = {}, summary = "", count = 0, latest_episode_id = "" },
@@ -742,24 +703,6 @@ function M.run_turn(args)
         task_contract_goal = tostring((((state or {}).task or {}).contract or {}).goal or ""),
         task_contract_acceptance_count = #(((((state or {}).task or {}).contract or {}).acceptance_criteria) or {}),
         recall_triggered = (((state or {}).recall or {}).triggered) == true,
-        experience_retrieved_ids = (((((state or {}).experience or {}).retrieved) or {}).ids) or {},
-        experience_version = tostring((((state or {}).experience or {}).version) or ""),
-        experience_candidate_ids = (function()
-            local ids = {}
-            for _, row in ipairs((((state or {}).experience or {}).candidates) or {}) do
-                if type(row) == "table" and tostring(row.id or "") ~= "" then
-                    ids[#ids + 1] = tostring(row.id)
-                end
-            end
-            return ids
-        end)(),
-        experience_recommendation_id = tostring((((state or {}).experience or {}).recommendation or {}).id or ""),
-        experience_recommendation_confidence = tonumber(((((state or {}).experience or {}).recommendation or {}).confidence) or 0) or 0,
-        experience_behavior_match_selected = tostring((((state or {}).experience or {}).behavior_match or {}).selected_id or ""),
-        experience_behavior_match_score = tonumber(((((state or {}).experience or {}).behavior_match or {}).match_score) or 0) or 0,
-        experience_audit = tostring((((state or {}).experience or {}).audit) or ""),
-        experience_runtime_policy = (((state or {}).experience or {}).runtime_policy) or {},
-        experience_written = (((((state or {}).experience or {}).writeback) or {}).written) == true,
         episode_id = tostring((((((state or {}).episode or {}).writeback) or {}).episode_id) or ""),
         episode_written = (((((state or {}).episode or {}).writeback) or {}).written) == true,
         planner_calls = #((((state or {}).planner or {}).tool_calls) or {}),

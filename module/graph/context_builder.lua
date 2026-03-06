@@ -104,8 +104,6 @@ end
 
 local function compose_system_prompt(base_system_prompt, state)
     local context = ((state or {}).context) or {}
-    local runtime_policy = ((((state or {}).experience) or {}).runtime_policy) or {}
-    local context_policy = ((runtime_policy or {}).context) or {}
     local lines = { tostring(base_system_prompt or "") }
 
     local pk_overview = project_knowledge.get_project_knowledge(state)
@@ -116,7 +114,7 @@ local function compose_system_prompt(base_system_prompt, state)
 
     lines[#lines + 1] = summarize_working_memory(state)
 
-    if (context_policy.include_memory ~= false) and util.trim((context or {}).memory_context or "") ~= "" then
+    if util.trim((context or {}).memory_context or "") ~= "" then
         lines[#lines + 1] = "[MemoryContext]"
         lines[#lines + 1] = tostring(context.memory_context)
     end
@@ -124,14 +122,9 @@ local function compose_system_prompt(base_system_prompt, state)
         lines[#lines + 1] = tostring(context.task_context)
     end
     local recent_episode_summary = util.trim((((state or {}).episode or {}).recent or {}).summary or "")
-    if (context_policy.include_episode ~= false) and recent_episode_summary ~= "" then
+    if recent_episode_summary ~= "" then
         lines[#lines + 1] = "[RecentEpisodes]"
         lines[#lines + 1] = tostring(recent_episode_summary)
-    end
-    local applied_policy = util.trim((context or {}).applied_policy or "")
-    if applied_policy ~= "" then
-        lines[#lines + 1] = "[AppliedGraphPolicy]"
-        lines[#lines + 1] = tostring(applied_policy)
     end
     if util.trim((context or {}).tool_context or "") ~= "" then
         lines[#lines + 1] = "[ToolContext]"

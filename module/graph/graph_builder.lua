@@ -6,7 +6,6 @@ local ingest_node = require("module.graph.nodes.ingest_node")
 local task_node = require("module.graph.nodes.task_node")
 local context_node = require("module.graph.nodes.context_node")
 local recall_node = require("module.graph.nodes.recall_node")
-local experience_node = require("module.graph.nodes.experience_node")
 local planner_node = require("module.graph.nodes.planner_node")
 local tool_exec_node = require("module.graph.nodes.tool_exec_node")
 local repair_node = require("module.graph.nodes.repair_node")
@@ -99,7 +98,6 @@ function M.build()
         ingest_node = ingest_node,
         task_node = task_node,
         recall_node = recall_node,
-        experience_node = experience_node,
         context_node = context_node,
         planner_node = planner_node,
         tool_exec_node = tool_exec_node,

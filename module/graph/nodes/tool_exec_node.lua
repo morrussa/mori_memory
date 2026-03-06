@@ -88,6 +88,27 @@ local function update_read_tracking(tool_exec, row)
     end
 end
 
+local function append_runtime_tool_messages(state, results)
+    state.messages = state.messages or {}
+    state.messages.runtime_messages = state.messages.runtime_messages or {}
+    for _, row in ipairs(results or {}) do
+        if type(row) == "table" and row.is_control ~= true then
+            local content = ""
+            if row.ok == true then
+                content = tostring(row.result or "")
+            else
+                content = "Error: " .. tostring(row.error or "tool_exec_failed")
+            end
+            state.messages.runtime_messages[#state.messages.runtime_messages + 1] = {
+                role = "tool",
+                name = tostring(row.tool or ""),
+                tool_call_id = tostring(row.call_id or ""),
+                content = content,
+            }
+        end
+    end
+end
+
 function M.run(state, _ctx)
     state.tool_exec = state.tool_exec or {}
     state.planner = state.planner or {}
@@ -124,6 +145,7 @@ function M.run(state, _ctx)
         update_working_memory_from_call(state.working_memory, row)
         update_read_tracking(state.tool_exec, row)
     end
+    append_runtime_tool_messages(state, state.tool_exec.results)
 
     if result.control_action == "finish" then
         state.termination.finish_requested = true
