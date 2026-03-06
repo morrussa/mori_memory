@@ -395,13 +395,12 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.experience.runtime_policy = experience_policy.normalize_runtime_policy(
         state.experience.runtime_policy or (((state.experience or {}).policy) or {})
     )
-    state.experience.audit = tostring(state.experience.audit or state.experience.hints or "")
-    state.experience.hints = nil
+    state.experience.audit = tostring(state.experience.audit or "")
     state.experience.behavior_match = state.experience.behavior_match or { selected_id = "", match_score = 0 }
     state.experience.behavior_match.selected_id = tostring(state.experience.behavior_match.selected_id or "")
     state.experience.behavior_match.match_score = tonumber(state.experience.behavior_match.match_score) or 0
     state.experience.writeback = state.experience.writeback or { written = false, policy_id = "" }
-    state.experience.writeback.policy_id = tostring(state.experience.writeback.policy_id or state.experience.writeback.experience_id or "")
+    state.experience.writeback.policy_id = tostring(state.experience.writeback.policy_id or "")
     state.episode = state.episode or {
         current = { turn_index = 0, topic_anchor = "" },
         recent = { items = {}, summary = "", count = 0, latest_episode_id = "" },
@@ -759,7 +758,6 @@ function M.run_turn(args)
         experience_behavior_match_selected = tostring((((state or {}).experience or {}).behavior_match or {}).selected_id or ""),
         experience_behavior_match_score = tonumber(((((state or {}).experience or {}).behavior_match or {}).match_score) or 0) or 0,
         experience_audit = tostring((((state or {}).experience or {}).audit) or ""),
-        experience_hints = tostring((((state or {}).experience or {}).audit) or ""),
         experience_runtime_policy = (((state or {}).experience or {}).runtime_policy) or {},
         experience_written = (((((state or {}).experience or {}).writeback) or {}).written) == true,
         episode_id = tostring((((((state or {}).episode or {}).writeback) or {}).episode_id) or ""),

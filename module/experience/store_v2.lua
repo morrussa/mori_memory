@@ -908,7 +908,6 @@ function M.get_stats()
         total_candidates = total,
         risky_candidates = risky,
         storage_root = storage_root(),
-        dropped_legacy_v1 = true,
     }
 end
 

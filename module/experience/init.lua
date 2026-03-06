@@ -6,13 +6,11 @@ local M = {}
 local util = require("module.graph.util")
 
 -- 子模块
-M.store = require("module.experience.store")
 M.store_v2 = require("module.experience.store_v2")
 M.retriever = require("module.experience.retriever")
 M.adaptive = require("module.experience.adaptive")
 M.run_builder = require("module.experience.run_builder")
 M.policy = require("module.experience.policy")
-M.builder = require("module.experience.builder") -- legacy topic-based builder
 
 M._initialized = false
 
@@ -24,7 +22,6 @@ function M.init()
     end
 
     M.adaptive.load()
-    M.store.init()
     M.store_v2.init()
     M._initialized = true
 
@@ -37,7 +34,6 @@ function M.finalize()
         return true
     end
     M.adaptive.save_to_disk()
-    M.store.save()
     M.store_v2.save()
     print("[Experience] Module finalized")
     return true
@@ -45,31 +41,12 @@ end
 
 -- ==================== 核心API ====================
 
--- 添加经验
-function M.add_experience(experience)
-    return M.store.add(experience)
-end
-
-function M.observe(observation)
-    return M.store.upsert_observation(observation)
-end
-
 function M.observe_v2(observation)
     return M.store_v2.observe_v2(observation)
 end
 
--- 相关性门控检索（核心检索方法）
-function M.retrieve(query, options)
-    return M.retriever.retrieve(query, options)
-end
-
 function M.retrieve_v2(query, options)
     return M.store_v2.retrieve_v2(query, options)
-end
-
--- 带反馈的检索
-function M.retrieve_with_feedback(query, options)
-    return M.retriever.retrieve_with_feedback(query, options)
 end
 
 -- 记录效用反馈
@@ -139,10 +116,6 @@ function M.compose_planner_prior(candidates, recommendation, risks)
 end
 
 function M.save_all()
-    local ok_v1, err_v1 = M.store.save()
-    if not ok_v1 then
-        return false, err_v1
-    end
     local ok_v2, err_v2 = M.store_v2.save()
     if not ok_v2 then
         return false, err_v2
@@ -153,11 +126,9 @@ end
 -- ==================== 统计信息 ====================
 
 function M.get_stats()
-    local store_stats = M.store.get_stats()
     local store_v2_stats = M.store_v2.get_stats()
     local adaptive_stats = M.adaptive.get_stats()
     return {
-        store = store_stats,
         store_v2 = store_v2_stats,
         adaptive = adaptive_stats
     }

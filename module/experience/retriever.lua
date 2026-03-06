@@ -1,4 +1,3 @@
-local store = require("module.experience.store")
 local policy = require("module.experience.policy")
 local adaptive = require("module.experience.adaptive")
 
@@ -117,34 +116,6 @@ function M.extract_query_features(query)
     return features
 end
 
-function M.retrieve(query, options)
-    local features = M.extract_query_features(query)
-    local items = store.retrieve(features, options or {})
-    local strategy = "partial"
-    if #items > 0 and trim((items[1] or {}).policy_key) == trim(features.policy_key) then
-        strategy = "exact"
-    elseif #items == 0 then
-        strategy = "empty"
-    end
-    return items, {
-        strategy = strategy,
-        query = features,
-        result_count = #items,
-    }
-end
-
-function M.retrieve_intersection_priority(query, options)
-    return M.retrieve(query, options)
-end
-
-function M.retrieve_with_feedback(query, options)
-    local results, strategy_info = M.retrieve(query, options)
-    local feedback = function(_effective_ids)
-        return
-    end
-    return results, feedback, strategy_info
-end
-
 function M.record_utility_feedback(_retrieved_items, _effective_ids)
     local retrieved_ids = {}
     for _, item in ipairs(_retrieved_items or {}) do
@@ -157,12 +128,6 @@ function M.record_utility_feedback(_retrieved_items, _effective_ids)
         retrieved_ids = retrieved_ids,
         effective_ids = type(_effective_ids) == "table" and _effective_ids or {},
     })
-end
-
-function M.get_stats()
-    return {
-        store = store.get_stats(),
-    }
 end
 
 return M

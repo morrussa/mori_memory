@@ -125,39 +125,6 @@ local function apply_default_auto_fallback(state, query, reason)
     return state
 end
 
-local function apply_v1(state, query)
-    local items, strategy = experience.retrieve(query, {
-        limit = 3,
-    })
-    local runtime_policy = experience.policy.merge_runtime_policies(items or {})
-    local audit = experience.policy.summarize_runtime_policy(runtime_policy)
-    apply_budget_policy(state, runtime_policy)
-
-    state.experience = state.experience or {}
-    state.experience.version = "v1"
-    state.experience.kind = "graph_policy"
-    state.experience.query = query
-    state.experience.retrieved = {
-        items = items or {},
-        ids = collect_candidate_ids(items or {}),
-        strategy = tostring((strategy or {}).strategy or ""),
-    }
-    state.experience.candidates = {}
-    state.experience.recommendation = { id = "", confidence = 0, reason = "" }
-    state.experience.runtime_policy = runtime_policy
-    state.experience.audit = audit
-    state.experience.feedback = state.experience.feedback or { effective_ids = {} }
-    state.experience.writeback = state.experience.writeback or { written = false, policy_id = "" }
-    state.experience.behavior_match = state.experience.behavior_match or { selected_id = "", match_score = 0 }
-
-    state.context = state.context or {}
-    state.context.applied_policy = audit
-    state.context.policy_context = audit
-    state.context.experience_context = audit
-    state.context.experience_prior = ""
-    return state
-end
-
 local function apply_v2(state, query)
     local cfg = v2_cfg()
     local limit = math.max(1, math.floor(tonumber(cfg.candidate_limit) or 5))
@@ -253,7 +220,7 @@ function M.run(state, _ctx)
 
     local query = build_query(state)
     if not v2_enabled() then
-        return apply_v1(state, query)
+        return apply_default_auto_fallback(state, query, "experience_v2_disabled")
     end
 
     local ok, next_state = pcall(apply_v2, state, query)

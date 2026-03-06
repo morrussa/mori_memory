@@ -199,7 +199,7 @@ local function normalize_episode(episode)
     normalized.files_written = sort_strings(normalized.files_written)
     normalized.retrieved_policy_ids = sort_strings(normalized.retrieved_policy_ids)
     normalized.effective_policy_ids = sort_strings(normalized.effective_policy_ids)
-    normalized.policy_writeback.policy_id = tostring(normalized.policy_writeback.policy_id or normalized.policy_writeback.experience_id or "")
+    normalized.policy_writeback.policy_id = tostring(normalized.policy_writeback.policy_id or "")
 
     return normalized
 end

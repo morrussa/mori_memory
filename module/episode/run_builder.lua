@@ -208,7 +208,7 @@ function M.build_from_state(state)
         effective_policy_ids = collect_effective_ids((((experience or {}).feedback) or {}).effective_ids),
         policy_writeback = {
             written = (((experience or {}).writeback or {}).written) == true,
-            policy_id = trim((((experience or {}).writeback or {}).policy_id) or ((((experience or {}).writeback or {}).experience_id) or "")),
+            policy_id = trim((((experience or {}).writeback or {}).policy_id) or ""),
         },
         memory_writeback = {
             items = shallow_copy_array(writeback.items or writeback.facts or {}),

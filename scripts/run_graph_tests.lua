@@ -739,11 +739,8 @@ local function run_case(case)
         ensure((snapshot.experience_written == true) == (case.expect_experience_written == true), case.id .. ": experience_written mismatch")
     end
     local expected_audit = case.experience_audit_contains
-    if expected_audit == nil then
-        expected_audit = case.experience_hints_contains
-    end
     if expected_audit ~= nil then
-        ensure(tostring(snapshot.experience_audit or snapshot.experience_hints or ""):find(tostring(expected_audit), 1, true) ~= nil,
+        ensure(tostring(snapshot.experience_audit or ""):find(tostring(expected_audit), 1, true) ~= nil,
             case.id .. ": experience audit mismatch")
     end
     if case.expect_planner_mode ~= nil then

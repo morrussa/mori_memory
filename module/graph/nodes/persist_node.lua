@@ -9,10 +9,6 @@ local util = require("module.graph.util")
 local M = {}
 local MATCH_THRESHOLD = 0.65
 
-local function is_v2_enabled_for_state(state)
-    return tostring((((state or {}).experience) or {}).version or "") == "v2"
-end
-
 local function build_effective_ids(selected_id, match_score, success)
     local effective_ids = {}
     if success ~= true then
@@ -82,46 +78,30 @@ function M.run(state, _ctx)
     state.experience.feedback = state.experience.feedback or { effective_ids = {} }
     state.experience.behavior_match = state.experience.behavior_match or { selected_id = "", match_score = 0 }
 
-    if is_v2_enabled_for_state(state) then
-        local selected_id, match_score = experience.match_behavior_to_candidate(observation, retrieved_items)
-        if util.trim(selected_id or "") == "" and #(((observation or {}).candidate_ids) or {}) > 0 then
-            selected_id, match_score = experience.match_behavior_to_candidate(observation, ((observation or {}).candidate_ids) or {})
-        end
+    local selected_id, match_score = experience.match_behavior_to_candidate(observation, retrieved_items)
+    if util.trim(selected_id or "") == "" and #(((observation or {}).candidate_ids) or {}) > 0 then
+        selected_id, match_score = experience.match_behavior_to_candidate(observation, ((observation or {}).candidate_ids) or {})
+    end
 
-        state.experience.behavior_match.selected_id = tostring(selected_id or "")
-        state.experience.behavior_match.match_score = tonumber(match_score) or 0
-        observation.behavior_match = {
-            selected_id = tostring(selected_id or ""),
-            match_score = tonumber(match_score) or 0,
-        }
+    state.experience.behavior_match.selected_id = tostring(selected_id or "")
+    state.experience.behavior_match.match_score = tonumber(match_score) or 0
+    observation.behavior_match = {
+        selected_id = tostring(selected_id or ""),
+        match_score = tonumber(match_score) or 0,
+    }
 
-        local ok, updated_candidate_ids = experience.observe_v2(observation)
-        local policy_id = pick_primary_policy_id(updated_candidate_ids, selected_id, match_score)
-        state.experience.writeback.written = ok == true
-        state.experience.writeback.policy_id = ok and policy_id or ""
+    local ok, updated_candidate_ids = experience.observe_v2(observation)
+    local policy_id = pick_primary_policy_id(updated_candidate_ids, selected_id, match_score)
+    state.experience.writeback.written = ok == true
+    state.experience.writeback.policy_id = ok and policy_id or ""
 
-        local effective_ids = build_effective_ids(selected_id, match_score, success)
-        state.experience.feedback.effective_ids = effective_ids
-        if #retrieved_items > 0 then
-            if success then
-                experience.record_utility_feedback(retrieved_items, effective_ids)
-            else
-                experience.record_utility_feedback(retrieved_items, {})
-            end
-        end
-    else
-        local ok, policy_id = experience.observe(observation)
-        state.experience.writeback.written = ok == true
-        state.experience.writeback.policy_id = ok and tostring(policy_id or "") or ""
-
-        local effective_ids = build_effective_ids(policy_id, 1.0, success)
-        state.experience.feedback.effective_ids = effective_ids
-        if #retrieved_items > 0 then
-            if success then
-                experience.record_utility_feedback(retrieved_items, effective_ids)
-            else
-                experience.record_utility_feedback(retrieved_items, {})
-            end
+    local effective_ids = build_effective_ids(selected_id, match_score, success)
+    state.experience.feedback.effective_ids = effective_ids
+    if #retrieved_items > 0 then
+        if success then
+            experience.record_utility_feedback(retrieved_items, effective_ids)
+        else
+            experience.record_utility_feedback(retrieved_items, {})
         end
     end
 
