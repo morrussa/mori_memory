@@ -4,6 +4,7 @@
 
 local M = {}
 
+local ffi = require("ffi")
 local config = require("module.config")
 local persistence = require("module.persistence")
 local tool = require("module.tool")
@@ -134,6 +135,342 @@ local function sort_strings(values)
         return tostring(a) < tostring(b)
     end)
     return values
+end
+
+local bin_debug
+
+local function list_dir_files(path)
+    if type(tool.list_files) == "function" then
+        local ok, files = pcall(tool.list_files, path)
+        if ok and type(files) == "table" then
+            return files
+        end
+        bin_debug("list_files_tool_failed path=%s err=%s", tostring(path), tostring(files))
+    end
+
+    local cmd = string.format('ls -1A "%s" 2>/dev/null', tostring(path):gsub('"', '\\"'))
+    local proc = io.popen(cmd)
+    if not proc then
+        bin_debug("list_files_fallback_failed path=%s", tostring(path))
+        return {}
+    end
+
+    local files = {}
+    for line in proc:lines() do
+        if line ~= "" then
+            files[#files + 1] = line
+        end
+    end
+    proc:close()
+    return files
+end
+
+local BIN_MAGIC = "EXPB1"
+local TAG_NIL = 0
+local TAG_FALSE = 1
+local TAG_TRUE = 2
+local TAG_NUMBER = 3
+local TAG_STRING = 4
+local TAG_ARRAY = 5
+local TAG_MAP = 6
+local TAG_VECTOR = 7
+
+bin_debug = function(fmt, ...)
+    print(string.format("[ExperienceStore][BIN] " .. tostring(fmt), ...))
+end
+
+local function preview_string(s, max_len)
+    local text = tostring(s or ""):gsub("[%c]", "?")
+    max_len = math.max(8, math.floor(tonumber(max_len) or 64))
+    if #text > max_len then
+        text = text:sub(1, max_len) .. "..."
+    end
+    return text
+end
+
+local function preview_value(value)
+    local tv = type(value)
+    if value == nil then
+        return "nil"
+    end
+    if tv == "string" then
+        return string.format("%q", preview_string(value, 72))
+    end
+    if tv == "number" or tv == "boolean" then
+        return tostring(value)
+    end
+    if tv == "table" then
+        local is_array, n = false, 0
+        for k, _ in pairs(value) do
+            if type(k) ~= "number" then
+                is_array = false
+                n = -1
+                break
+            end
+            if k > n then
+                n = k
+            end
+            is_array = true
+        end
+        if is_array then
+            return string.format("<array len=%d>", math.max(0, n))
+        end
+        local count = 0
+        for _ in pairs(value) do
+            count = count + 1
+        end
+        return string.format("<map keys=%d>", count)
+    end
+    return "<" .. tv .. ">"
+end
+
+local function sorted_map_keys(tbl)
+    local keys = {}
+    for k, _ in pairs(tbl or {}) do
+        if type(k) ~= "string" then
+            error(string.format("unsupported_non_string_key:%s", tostring(k)))
+        end
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    return keys
+end
+
+local function is_array_table(tbl)
+    local count = 0
+    local max_idx = 0
+    for k, _ in pairs(tbl or {}) do
+        if type(k) ~= "number" or k < 1 or math.floor(k) ~= k then
+            return false, 0
+        end
+        count = count + 1
+        if k > max_idx then
+            max_idx = k
+        end
+    end
+    return max_idx == count, count
+end
+
+local function is_numeric_array(tbl)
+    local is_array, count = is_array_table(tbl)
+    if not is_array then
+        return false, count
+    end
+
+    for i = 1, count do
+        if type(tbl[i]) ~= "number" then
+            return false, count
+        end
+    end
+
+    return true, count
+end
+
+local function pack_u32(value)
+    local buf = ffi.new("uint32_t[1]")
+    buf[0] = tonumber(value) or 0
+    return ffi.string(buf, 4)
+end
+
+local function pack_f64(value)
+    local buf = ffi.new("double[1]")
+    buf[0] = tonumber(value) or 0.0
+    return ffi.string(buf, 8)
+end
+
+local function read_u8(data, pos, label)
+    if pos > #data then
+        error(string.format("unexpected_eof_u8:%s:%d", tostring(label), pos))
+    end
+    return data:byte(pos), pos + 1
+end
+
+local function read_u32(data, pos, label)
+    if pos + 3 > #data then
+        error(string.format("unexpected_eof_u32:%s:%d", tostring(label), pos))
+    end
+
+    local buf = ffi.new("uint32_t[1]")
+    ffi.copy(buf, ffi.cast("const uint8_t*", data) + (pos - 1), 4)
+    return tonumber(buf[0]), pos + 4
+end
+
+local function read_f64(data, pos, label)
+    if pos + 7 > #data then
+        error(string.format("unexpected_eof_f64:%s:%d", tostring(label), pos))
+    end
+
+    local buf = ffi.new("double[1]")
+    ffi.copy(buf, ffi.cast("const uint8_t*", data) + (pos - 1), 8)
+    return tonumber(buf[0]), pos + 8
+end
+
+local function read_raw_string(data, pos, label)
+    local len
+    len, pos = read_u32(data, pos, label)
+    if len < 0 or pos + len - 1 > #data then
+        error(string.format("unexpected_eof_string:%s:%d:%d", tostring(label), pos, len))
+    end
+    local value = data:sub(pos, pos + len - 1)
+    return value, pos + len
+end
+
+local function encode_value(chunks, value, path)
+    local value_type = type(value)
+
+    if value == nil then
+        bin_debug("encode path=%s type=nil value=nil", tostring(path))
+        chunks[#chunks + 1] = string.char(TAG_NIL)
+        return
+    end
+
+    if value_type == "boolean" then
+        bin_debug("encode path=%s type=bool value=%s", tostring(path), tostring(value))
+        chunks[#chunks + 1] = string.char(value and TAG_TRUE or TAG_FALSE)
+        return
+    end
+
+    if value_type == "number" then
+        bin_debug("encode path=%s type=number value=%s", tostring(path), tostring(value))
+        chunks[#chunks + 1] = string.char(TAG_NUMBER)
+        chunks[#chunks + 1] = pack_f64(value)
+        return
+    end
+
+    if value_type == "string" then
+        bin_debug(
+            "encode path=%s type=string len=%d preview=%s",
+            tostring(path),
+            #value,
+            preview_value(value)
+        )
+        chunks[#chunks + 1] = string.char(TAG_STRING)
+        chunks[#chunks + 1] = pack_u32(#value)
+        chunks[#chunks + 1] = value
+        return
+    end
+
+    if value_type ~= "table" then
+        error(string.format("unsupported_type:%s:%s", tostring(path), value_type))
+    end
+
+    local is_vector, vector_len = is_numeric_array(value)
+    if is_vector then
+        bin_debug(
+            "encode path=%s type=vector len=%d preview=%s",
+            tostring(path),
+            vector_len,
+            preview_value(value)
+        )
+        chunks[#chunks + 1] = string.char(TAG_VECTOR)
+        chunks[#chunks + 1] = tool.vector_to_bin(value)
+        return
+    end
+
+    local is_array, item_count = is_array_table(value)
+    if is_array then
+        bin_debug("encode path=%s type=array len=%d", tostring(path), item_count)
+        chunks[#chunks + 1] = string.char(TAG_ARRAY)
+        chunks[#chunks + 1] = pack_u32(item_count)
+        for i = 1, item_count do
+            encode_value(chunks, value[i], string.format("%s[%d]", tostring(path), i))
+        end
+        return
+    end
+
+    local keys = sorted_map_keys(value)
+    bin_debug("encode path=%s type=map keys=%d", tostring(path), #keys)
+    chunks[#chunks + 1] = string.char(TAG_MAP)
+    chunks[#chunks + 1] = pack_u32(#keys)
+
+    for _, key in ipairs(keys) do
+        local key_path = tostring(path) .. "." .. tostring(key)
+        bin_debug("encode_key path=%s key=%s", tostring(path), tostring(key))
+        chunks[#chunks + 1] = pack_u32(#key)
+        chunks[#chunks + 1] = key
+        encode_value(chunks, value[key], key_path)
+    end
+end
+
+local function decode_value(data, pos, path)
+    local tag
+    tag, pos = read_u8(data, pos, path)
+
+    if tag == TAG_NIL then
+        bin_debug("decode path=%s type=nil value=nil", tostring(path))
+        return nil, pos
+    end
+
+    if tag == TAG_FALSE then
+        bin_debug("decode path=%s type=bool value=false", tostring(path))
+        return false, pos
+    end
+
+    if tag == TAG_TRUE then
+        bin_debug("decode path=%s type=bool value=true", tostring(path))
+        return true, pos
+    end
+
+    if tag == TAG_NUMBER then
+        local value
+        value, pos = read_f64(data, pos, path)
+        bin_debug("decode path=%s type=number value=%s", tostring(path), tostring(value))
+        return value, pos
+    end
+
+    if tag == TAG_STRING then
+        local value
+        value, pos = read_raw_string(data, pos, path)
+        bin_debug(
+            "decode path=%s type=string len=%d preview=%s",
+            tostring(path),
+            #value,
+            preview_value(value)
+        )
+        return value, pos
+    end
+
+    if tag == TAG_VECTOR then
+        local vec, consumed = tool.bin_to_vector(data, pos - 1)
+        if not vec or consumed <= 0 then
+            error(string.format("decode_vector_failed:%s:%d", tostring(path), pos))
+        end
+        pos = pos + consumed
+        bin_debug(
+            "decode path=%s type=vector len=%d preview=%s",
+            tostring(path),
+            #vec,
+            preview_value(vec)
+        )
+        return vec, pos
+    end
+
+    if tag == TAG_ARRAY then
+        local count
+        count, pos = read_u32(data, pos, path)
+        bin_debug("decode path=%s type=array len=%d", tostring(path), count)
+        local arr = {}
+        for i = 1, count do
+            arr[i], pos = decode_value(data, pos, string.format("%s[%d]", tostring(path), i))
+        end
+        return arr, pos
+    end
+
+    if tag == TAG_MAP then
+        local count
+        count, pos = read_u32(data, pos, path)
+        bin_debug("decode path=%s type=map keys=%d", tostring(path), count)
+        local map = {}
+        for i = 1, count do
+            local key
+            key, pos = read_raw_string(data, pos, string.format("%s{key%d}", tostring(path), i))
+            bin_debug("decode_key path=%s key=%s", tostring(path), tostring(key))
+            map[key], pos = decode_value(data, pos, string.format("%s.%s", tostring(path), tostring(key)))
+        end
+        return map, pos
+    end
+
+    error(string.format("unknown_tag:%s:%d:%d", tostring(path), pos, tag))
 end
 
 -- ==================== 初始化 ====================
@@ -373,6 +710,87 @@ function M.ensure_embedding(experience)
     return nil
 end
 
+function M.serialize_experience_binary(experience)
+    if not experience or type(experience) ~= "table" then
+        return nil, "invalid_experience"
+    end
+
+    local exp_id = tostring(experience.id or "unknown")
+    bin_debug("serialize_begin id=%s", exp_id)
+
+    local chunks = { BIN_MAGIC }
+    local ok, err = pcall(encode_value, chunks, experience, "$")
+    if not ok then
+        bin_debug("serialize_error id=%s err=%s", exp_id, tostring(err))
+        return nil, tostring(err)
+    end
+
+    local blob = table.concat(chunks)
+    bin_debug("serialize_done id=%s bytes=%d", exp_id, #blob)
+    return blob
+end
+
+function M.deserialize_experience_binary(blob, source_label)
+    source_label = tostring(source_label or "<memory>")
+    if type(blob) ~= "string" or blob == "" then
+        return nil, "empty_blob"
+    end
+
+    if blob:sub(1, #BIN_MAGIC) ~= BIN_MAGIC then
+        return nil, "invalid_magic"
+    end
+
+    bin_debug("deserialize_begin source=%s bytes=%d", source_label, #blob)
+
+    local ok, decoded, next_pos = pcall(function()
+        local value, pos = decode_value(blob, #BIN_MAGIC + 1, "$")
+        return value, pos
+    end)
+
+    if not ok then
+        bin_debug("deserialize_error source=%s err=%s", source_label, tostring(decoded))
+        return nil, tostring(decoded)
+    end
+
+    if next_pos ~= (#blob + 1) then
+        bin_debug(
+            "deserialize_trailing source=%s next_pos=%d blob_len=%d",
+            source_label,
+            tonumber(next_pos) or -1,
+            #blob
+        )
+        return nil, "trailing_bytes"
+    end
+
+    if type(decoded) ~= "table" then
+        return nil, "decoded_not_table"
+    end
+
+    bin_debug(
+        "deserialize_done source=%s id=%s keys=%d",
+        source_label,
+        tostring(decoded.id or "unknown"),
+        #sorted_map_keys(decoded)
+    )
+    return decoded
+end
+
+function M.rebuild_index()
+    M.experience_index = {}
+
+    local ids = {}
+    for id in pairs(M.experiences) do
+        ids[#ids + 1] = id
+    end
+    sort_strings(ids)
+
+    for _, id in ipairs(ids) do
+        M.update_index(M.experiences[id])
+    end
+
+    bin_debug("rebuild_index experiences=%d index_keys=%d", #ids, M._count_index_keys())
+end
+
 -- ==================== 经验检索 ====================
 
 function M.retrieve(options)
@@ -587,84 +1005,130 @@ function M.save()
         return true
     end
 
+    bin_debug("save_begin total_experiences=%d", M.count_experiences())
+    local all_saved = true
+
     -- 保存索引
     local ok, err = persistence.write_atomic(INDEX_FILE, "w", function(f)
         -- 写入版本号
-        f:write("VERSION=1\n")
-
-        -- 写入索引
-        for key, ids in pairs(M.experience_index) do
-            f:write(string.format("%s=%s\n", key, table.concat(ids, ",")))
+        local write_ok, write_err = f:write("VERSION=1\n")
+        if not write_ok then
+            return false, write_err
         end
 
+        -- 写入索引
+        local index_keys = {}
+        for key in pairs(M.experience_index) do
+            index_keys[#index_keys + 1] = key
+        end
+        sort_strings(index_keys)
+
+        for _, key in ipairs(index_keys) do
+            local ids = M.experience_index[key] or {}
+            local ok_line, err_line = f:write(string.format("%s=%s\n", key, table.concat(ids, ",")))
+            if not ok_line then
+                return false, err_line
+            end
+        end
+
+        bin_debug("save_index path=%s keys=%d", INDEX_FILE, #index_keys)
         return true
     end)
 
     if not ok then
+        bin_debug("save_index_error path=%s err=%s", INDEX_FILE, tostring(err))
         return false, err
     end
 
     -- 保存每个经验
-    for id, exp in pairs(M.experiences) do
-        local exp_file = string.format("%s/%s.lua", EXPERIENCES_DIR, id)
-        local ok2, err2 = persistence.write_atomic(exp_file, "w", function(f)
-            f:write("-- Experience: " .. id .. "\n")
-            f:write("return " .. tool.json_encode(exp) .. "\n")
-            return true
-        end)
+    local ids = {}
+    for id in pairs(M.experiences) do
+        ids[#ids + 1] = id
+    end
+    sort_strings(ids)
 
-        if not ok2 then
-            print(string.format("[ExperienceStore] Failed to save experience %s: %s", id, err2))
+    for _, id in ipairs(ids) do
+        local exp = M.experiences[id]
+        local exp_file = string.format("%s/%s.bin", EXPERIENCES_DIR, id)
+        local blob, blob_err = M.serialize_experience_binary(exp)
+
+        if not blob then
+            print(string.format("[ExperienceStore] Failed to encode experience %s: %s", id, tostring(blob_err)))
+            all_saved = false
+        else
+            local ok2, err2 = persistence.write_atomic(exp_file, "wb", function(f)
+                local write_ok, write_err = f:write(blob)
+                if not write_ok then
+                    return false, write_err
+                end
+                bin_debug("save_experience id=%s path=%s bytes=%d", id, exp_file, #blob)
+                return true
+            end)
+
+            if not ok2 then
+                print(string.format("[ExperienceStore] Failed to save experience %s: %s", id, err2))
+                all_saved = false
+            end
         end
     end
 
-    M._dirty = false
-    return true
+    M._dirty = not all_saved
+    bin_debug("save_done total_experiences=%d all_saved=%s", #ids, tostring(all_saved))
+    return all_saved, all_saved and nil or "experience_save_failed"
 end
 
 function M.load()
-    -- 加载索引
-    local f = io.open(INDEX_FILE, "r")
-    if f then
-        local version = f:read("*l")
-        if version ~= "VERSION=1" then
-            f:close()
-            print("[ExperienceStore] Index version mismatch, starting fresh")
-            return
-        end
+    M.experiences = {}
+    M.experience_index = {}
 
-        for line in f:lines() do
-            line = tostring(line or ""):gsub("^%s*(.-)%s*$", "%1")
-            if line ~= "" then
-                local key, ids_str = line:match("^([^=]+)=(.+)$")
-                if key and ids_str then
-                    local ids = {}
-                    for id in ids_str:gmatch("[^,]+") do
-                        table.insert(ids, id)
+    local exp_files = list_dir_files(EXPERIENCES_DIR)
+    table.sort(exp_files)
+
+    local loaded_bin = 0
+    local needs_resave = false
+
+    for _, file in ipairs(exp_files) do
+        if file:match("%.bin$") then
+            local path = string.format("%s/%s", EXPERIENCES_DIR, file)
+            local f = io.open(path, "rb")
+            if not f then
+                bin_debug("load_open_failed path=%s", path)
+            else
+                local raw = f:read("*a") or ""
+                f:close()
+
+                local exp, decode_err = M.deserialize_experience_binary(raw, path)
+                if exp and exp.id then
+                    M.experiences[exp.id] = exp
+                    loaded_bin = loaded_bin + 1
+                    bin_debug("load_experience_bin id=%s path=%s", tostring(exp.id), path)
+                    if type(exp.embedding) ~= "table" or #exp.embedding == 0 then
+                        local rebuilt = M.ensure_embedding(exp)
+                        if rebuilt and #rebuilt > 0 then
+                            needs_resave = true
+                        end
+                        bin_debug("load_bin_rebuilt_embedding id=%s", tostring(exp.id))
                     end
-                    M.experience_index[key] = ids
+                else
+                    print(string.format("[ExperienceStore] Failed to decode binary experience %s: %s", path, tostring(decode_err)))
                 end
             end
-        end
-
-        f:close()
-    end
-
-    -- 加载所有经验
-    local exp_files = tool.list_files(EXPERIENCES_DIR)
-    for _, file in ipairs(exp_files) do
-        if file:match("%.lua$") then
+        elseif file:match("%.lua$") then
             local path = string.format("%s/%s", EXPERIENCES_DIR, file)
-            local ok, exp = pcall(dofile, path)
-            if ok and exp and exp.id then
-                M.experiences[exp.id] = exp
-            end
+            bin_debug("ignore_legacy_json path=%s", path)
         end
     end
+
+    M.rebuild_index()
 
     M._loaded = true
-    print(string.format("[ExperienceStore] Loaded %d experiences", 
-        M.count_experiences()))
+    M._dirty = needs_resave
+    print(string.format(
+        "[ExperienceStore] Loaded %d experiences (bin=%d, dirty=%s)",
+        M.count_experiences(),
+        loaded_bin,
+        tostring(M._dirty)
+    ))
 end
 
 -- ==================== 统计信息 ====================
