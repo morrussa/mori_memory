@@ -18,8 +18,30 @@ local function assert_luajit_only()
     end
 end
 
+-- 检查对象是否可调用（支持 Lua function 和 Lupa userdata）
+local function is_callable(obj)
+    if type(obj) == "function" then
+        return true
+    end
+    -- Lupa 传递的 Python 函数是 userdata 或 table，尝试检测
+    local ok, _ = pcall(function()
+        return obj and obj.__call or (getmetatable(obj) or {}).__call
+    end)
+    if ok then
+        return true
+    end
+    -- 最后尝试直接调用检查（Lupa 的 Python 函数可以直接调用）
+    if obj ~= nil then
+        local ok2, _ = pcall(function()
+            obj({})
+        end)
+        return ok2
+    end
+    return false
+end
+
 local function emit_stream(stream_sink, event_name, payload)
-    if type(stream_sink) ~= "function" then
+    if not is_callable(stream_sink) then
         return
     end
     local ok, err = pcall(stream_sink, {

@@ -175,7 +175,15 @@ function M.run(state, _ctx)
                 end
 
                 -- 更新context fragment
-                if READ_EVIDENCE_TOOLS[tostring(row.tool or "")] then
+                local tool_name = tostring(row.tool or "")
+                local is_read_evidence = READ_EVIDENCE_TOOLS[tool_name]
+                local read_path = tostring((row.args or {}).path or "")
+                
+                -- DEBUG: 打印工具检查详情
+                print(string.format("[ToolsNode][DEBUG] tool=%s is_read_evidence=%s path=%s",
+                    tool_name, tostring(is_read_evidence), read_path))
+                
+                if is_read_evidence then
                     state.tool_exec.read_evidence_total = state.tool_exec.read_evidence_total + 1
                     processed_fragments[#processed_fragments + 1] = string.format(
                         "[Tool:%s]\n%s",
@@ -183,7 +191,6 @@ function M.run(state, _ctx)
                         processed_text
                     )
                     -- 记录已读取的文件路径
-                    local read_path = tostring((row.args or {}).path or "")
                     if read_path ~= "" then
                         state.tool_exec.read_files = state.tool_exec.read_files or {}
                         -- 使用统一的路径标准化

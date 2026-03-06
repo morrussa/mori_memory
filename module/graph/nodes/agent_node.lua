@@ -14,10 +14,32 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
+-- 检查对象是否可调用（支持 Lua function 和 Lupa userdata）
+local function is_callable(obj)
+    if type(obj) == "function" then
+        return true
+    end
+    -- Lupa 传递的 Python 函数是 userdata 或 table，尝试检测
+    local ok, _ = pcall(function()
+        return obj and obj.__call or (getmetatable(obj) or {}).__call
+    end)
+    if ok then
+        return true
+    end
+    -- 最后尝试直接调用检查（Lupa 的 Python 函数可以直接调用）
+    if obj ~= nil then
+        local ok2, _ = pcall(function()
+            obj({})
+        end)
+        return ok2
+    end
+    return false
+end
+
 -- 发送流式事件
 local function emit_stream(state, event_name, payload)
     local sink = state.stream_sink
-    if type(sink) ~= "function" then
+    if not is_callable(sink) then
         return
     end
     local ok, err = pcall(sink, {
@@ -215,7 +237,10 @@ end
 
 local function has_uploads(state)
     local rows = ((state or {}).uploads) or {}
-    return type(rows) == "table" and #rows > 0
+    local result = type(rows) == "table" and #rows > 0
+    print(string.format("[HasUploads][DEBUG] state.uploads type=%s len=%d result=%s",
+        type(rows), #rows, tostring(result)))
+    return result
 end
 
 local function collect_history_rows(state)
@@ -271,10 +296,15 @@ local function has_followup_read_intent(user_input)
 end
 
 local function should_require_file_read(state)
-    if has_uploads(state) then
+    local has_up = has_uploads(state)
+    local has_hist = has_history_tool_path(state)
+    print(string.format("[ShouldRequire][DEBUG] has_uploads=%s has_history_tool_path=%s",
+        tostring(has_up), tostring(has_hist)))
+    
+    if has_up then
         return true
     end
-    if not has_history_tool_path(state) then
+    if not has_hist then
         return false
     end
     local user_input = tostring((((state or {}).input or {}).message) or "")
@@ -316,8 +346,11 @@ local function collect_known_tool_paths(state)
     local seen = {}
 
     local uploads = ((state or {}).uploads) or {}
-    for _, item in ipairs(uploads) do
+    print(string.format("[CollectPaths][DEBUG] state.uploads count=%d", #uploads))
+    for i, item in ipairs(uploads) do
         local p = normalize_tool_path((item or {}).tool_path or (item or {}).path)
+        print(string.format("[CollectPaths][DEBUG] upload[%d]: tool_path=%s path=%s normalized=%s",
+            i, tostring((item or {}).tool_path or "?"), tostring((item or {}).path or "?"), tostring(p)))
         if p ~= "" and not seen[p] then
             seen[p] = true
             out[#out + 1] = p
@@ -333,6 +366,7 @@ local function collect_known_tool_paths(state)
     end
 
     extract_tool_paths_from_text((((state or {}).input or {}).message) or "", out, seen)
+    print(string.format("[CollectPaths][DEBUG] total known_paths=%d", #out))
     return out
 end
 
@@ -381,9 +415,12 @@ local function build_forced_read_calls(state, max_calls)
         already_read_count = already_read_count + 1
     end
 
-    -- DEBUG
+    -- DEBUG: 打印known_paths详细信息
     print(string.format("[BuildForced][DEBUG] known_paths=%d already_read=%d limit=%d",
         #known_paths, already_read_count, limit))
+    for i, p in ipairs(known_paths) do
+        print(string.format("[BuildForced][DEBUG] known_paths[%d]=%s", i, tostring(p)))
+    end
 
     -- 为每个未读取的文件构建读取调用
     local call_idx = 0
@@ -433,14 +470,30 @@ end
 local function enforce_file_read_guard(state, tool_calls)
     local calls = tool_calls or {}
     
+    -- DEBUG: 打印uploads详细信息
+    local uploads_debug = {}
+    for i, item in ipairs(state.uploads or {}) do
+        uploads_debug[#uploads_debug + 1] = string.format("[%d] name=%s tool_path=%s path=%s",
+            i,
+            tostring(item.name or "?"),
+            tostring(item.tool_path or "?"),
+            tostring(item.path or "?")
+        )
+    end
+    print(string.format("[EnforceGuard][DEBUG] state.uploads count=%d items=%s",
+        #(state.uploads or {}),
+        table.concat(uploads_debug, "; ")))
+    
     -- 如果 agent 调用了 finish_turn，不要强制添加其他工具
     for _, call in ipairs(calls) do
         if call.tool == "finish_turn" or call.tool == "continue_task" then
+            print("[EnforceGuard][DEBUG] Agent called finish_turn/continue_task, returning as-is")
             return calls
         end
     end
     
     if not should_require_file_read(state) then
+        print("[EnforceGuard][DEBUG] should_require_file_read returned false, returning as-is")
         return calls
     end
     

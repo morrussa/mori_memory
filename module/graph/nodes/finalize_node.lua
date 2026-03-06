@@ -9,10 +9,32 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
+-- 检查对象是否可调用（支持 Lua function 和 Lupa userdata）
+local function is_callable(obj)
+    if type(obj) == "function" then
+        return true
+    end
+    -- Lupa 传递的 Python 函数是 userdata 或 table，尝试检测
+    local ok, _ = pcall(function()
+        return obj and obj.__call or (getmetatable(obj) or {}).__call
+    end)
+    if ok then
+        return true
+    end
+    -- 最后尝试直接调用检查（Lupa 的 Python 函数可以直接调用）
+    if obj ~= nil then
+        local ok2, _ = pcall(function()
+            obj({})
+        end)
+        return ok2
+    end
+    return false
+end
+
 -- 发送流式事件
 local function emit_stream(state, event_name, payload)
     local sink = state.stream_sink
-    if type(sink) ~= "function" then
+    if not is_callable(sink) then
         return
     end
     local ok, err = pcall(sink, {
