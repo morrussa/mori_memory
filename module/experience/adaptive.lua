@@ -66,6 +66,11 @@ local function make_default_state()
             by_tool = {}       -- 按工具检索的评分
         },
 
+        -- [新增] 经验效用评分（独立于route_score）
+        -- 用于记录特定经验ID的效用性（是否在实际使用中有效）
+        experience_utility_scores = {},  -- id -> utility_score
+        experience_utility_counts = {},  -- id -> 使用次数
+
         -- 学习统计
         learning_events = 0,
         successful_retrievals = 0,
@@ -164,6 +169,13 @@ function M.load()
                         if route_scores then
                             route_scores[route_key] = tonumber(score) or 0.0
                         end
+                    end
+                -- [新增] 处理经验效用评分
+                elseif k == "exp_utility" then
+                    local exp_id, score, count = v:match("^([^,]+),([%+%-]?[%d%.eE]+),([%+%-]?[%d%.eE]+)$")
+                    if exp_id and score then
+                        M.state.experience_utility_scores[exp_id] = tonumber(score) or 0.5
+                        M.state.experience_utility_counts[exp_id] = tonumber(count) or 0
                     end
                 -- 处理标量值
                 else
@@ -270,6 +282,17 @@ function M.save_to_disk()
                     if not ok_route then
                         return false, err_route
                     end
+                end
+            end
+        end
+
+        -- [新增] 写入经验效用评分
+        for exp_id, score in pairs(M.state.experience_utility_scores) do
+            local count = tonumber(M.state.experience_utility_counts[exp_id]) or 0
+            if count > 0 then
+                local ok_util, err_util = f:write(string.format("exp_utility=%s,%.10f,%.2f\n", exp_id, score, count))
+                if not ok_util then
+                    return false, err_util
                 end
             end
         end
@@ -724,6 +747,12 @@ function M.get_stats()
         end
     end
 
+    -- [新增] 效用评分统计
+    local utility_n = 0
+    for _ in pairs(M.state.experience_utility_scores) do
+        utility_n = utility_n + 1
+    end
+
     local output_success_rate = 0.0
     local total_outputs = M.state.output_success_total + M.state.output_failure_total
     if total_outputs > 0 then
@@ -747,6 +776,8 @@ function M.get_stats()
         output_success_rate = output_success_rate,
         -- [新增] 检索路由统计
         route_score_count = route_n,
+        -- [新增] 效用评分统计
+        utility_score_count = utility_n,
     }
 end
 
@@ -762,6 +793,65 @@ function M._compute_retrieval_rate()
     local total = M.state.successful_retrievals + M.state.failed_retrievals
     if total == 0 then return 0.0 end
     return M.state.successful_retrievals / total
+end
+
+-- ==================== [新增] 经验效用学习 ====================
+
+--- 记录经验效用反馈
+-- 用于学习哪些经验在实际使用中真正有效
+-- @param experience_id 经验ID
+-- @param utility 效用值 (0.0 无效 ~ 1.0 有效)
+function M.record_experience_utility(experience_id, utility)
+    if not experience_id then return end
+
+    local cfg = adaptive_cfg()
+    if cfg.enabled ~= true then return end
+
+    local lr = cfg.utility_learning_rate or 0.1
+
+    -- 更新效用评分（只更新目标经验）
+    local current_score = M.state.experience_utility_scores[experience_id] or 0.5
+    local new_score = current_score + lr * (utility - current_score)
+    M.state.experience_utility_scores[experience_id] = clamp(new_score, 0.0, 1.0)
+    M.state.experience_utility_counts[experience_id] = (M.state.experience_utility_counts[experience_id] or 0) + 1
+
+    M.mark_dirty()
+end
+
+--- 获取经验效用评分
+-- @param experience_id 经验ID
+-- @return 效用评分 (默认 0.5)
+function M.get_experience_utility(experience_id)
+    if not experience_id then return 0.5 end
+    return tonumber(M.state.experience_utility_scores[experience_id]) or 0.5
+end
+
+--- 批量获取经验效用评分
+-- @param experience_ids 经验ID列表
+-- @return id -> utility_score 映射
+function M.get_utility_scores_batch(experience_ids)
+    local result = {}
+    for _, id in ipairs(experience_ids or {}) do
+        result[id] = M.get_experience_utility(id)
+    end
+    return result
+end
+
+--- 更新经验效用（基于检索后的使用反馈）
+-- @param event 包含 retrieved_ids (检索返回的ID列表) 和 effective_ids (真正有效的ID集合)
+function M.update_utility_from_feedback(event)
+    local cfg = adaptive_cfg()
+    if cfg.enabled ~= true then return end
+
+    local retrieved_ids = event and event.retrieved_ids or {}
+    local effective_ids = event and event.effective_ids or {}
+
+    for _, exp_id in ipairs(retrieved_ids) do
+        local is_effective = effective_ids[exp_id] == true
+        M.record_experience_utility(exp_id, is_effective and 1.0 or 0.0)
+    end
+
+    M.mark_dirty()
 end
 
 -- 初始化

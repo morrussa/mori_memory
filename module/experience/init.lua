@@ -8,7 +8,7 @@ local M = {}
 M.store = require("module.experience.store")
 M.builder = require("module.experience.builder")
 M.retriever = require("module.experience.retriever")
-M.adaptive = require("module.experience.adaptive")  -- [新增]
+M.adaptive = require("module.experience.adaptive")
 
 -- ==================== 初始化 ====================
 
@@ -32,41 +32,26 @@ function M.finalize()
     print("[Experience] Module finalized")
 end
 
--- ==================== 便捷API ====================
+-- ==================== 核心API ====================
 
 -- 添加经验
 function M.add_experience(experience)
     return M.store.add(experience)
 end
 
--- 检索经验
-function M.retrieve_experience(options)
-    return M.retriever.retrieve_hybrid(options)
+-- 交集优先检索（核心检索方法）
+function M.retrieve(query, options)
+    return M.retriever.retrieve_intersection_priority(query, options)
 end
 
--- 检查潜在失败
-function M.check_failure_risk(proposed_solution, current_context)
-    return M.retriever.check_potential_failure(proposed_solution, current_context)
+-- 带反馈的检索
+function M.retrieve_with_feedback(query, options)
+    return M.retriever.retrieve_with_feedback(query, options)
 end
 
--- 检索成功案例
-function M.get_success_cases(task_description, current_context)
-    return M.retriever.retrieve_success_cases(task_description, current_context)
-end
-
--- [新增] 获取推荐输出策略
-function M.get_recommended_output_strategy(context_sig, task_type)
-    return M.retriever.get_recommended_output_strategy(context_sig, task_type)
-end
-
--- [新增] 记录输出结果（用于自适应学习）
-function M.record_output_result(strategy, context_sig, task_type, success)
-    M.retriever.record_output_result(strategy, context_sig, task_type, success)
-end
-
--- [新增] 记录检索反馈
-function M.record_retrieval_feedback(results, positive_ids, negative_ids)
-    M.retriever.record_retrieval_feedback(results, positive_ids, negative_ids)
+-- 记录效用反馈
+function M.record_utility_feedback(retrieved_ids, effective_ids)
+    M.retriever.record_utility_feedback(retrieved_ids, effective_ids)
 end
 
 -- ==================== 统计信息 ====================
