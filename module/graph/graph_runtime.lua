@@ -155,18 +155,39 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.context = state.context or {
         memory_context = "",
         experience_context = "",
+        policy_context = "",
         tool_context = "",
         planner_context = "",
     }
+    state.context.policy_context = state.context.policy_context or ""
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
     state.recall = state.recall or { triggered = false, context = "", score = nil }
     state.experience = state.experience or {
         query = {},
-        retrieved = { items = {}, ids = {}, strategy = "" },
+        retrieved = { items = {}, ids = {}, strategy = "", failure_items = {}, failure_ids = {}, failure_strategy = "" },
         hints = "",
+        kind = "policy",
         feedback = { effective_ids = {} },
         writeback = { written = false },
     }
+    state.experience.kind = state.experience.kind or "policy"
+    state.experience.retrieved = state.experience.retrieved or {}
+    state.experience.retrieved.items = state.experience.retrieved.items or {}
+    state.experience.retrieved.ids = state.experience.retrieved.ids or {}
+    state.experience.retrieved.strategy = state.experience.retrieved.strategy or ""
+    state.experience.retrieved.failure_items = state.experience.retrieved.failure_items or {}
+    state.experience.retrieved.failure_ids = state.experience.retrieved.failure_ids or {}
+    state.experience.retrieved.failure_strategy = state.experience.retrieved.failure_strategy or ""
+    state.episode = state.episode or {
+        current = { turn_index = 0, topic_anchor = "" },
+        writeback = { written = false, episode_id = "" },
+    }
+    state.episode.current = state.episode.current or { turn_index = 0, topic_anchor = "" }
+    state.episode.current.turn_index = tonumber(state.episode.current.turn_index) or 0
+    state.episode.current.topic_anchor = tostring(state.episode.current.topic_anchor or "")
+    state.episode.writeback = state.episode.writeback or { written = false, episode_id = "" }
+    state.episode.writeback.written = state.episode.writeback.written == true
+    state.episode.writeback.episode_id = tostring(state.episode.writeback.episode_id or "")
     state.planner = state.planner or { raw = "", tool_calls = {}, errors = {}, force_reason = "", missing_terminal_signal = false }
     state.tool_exec = state.tool_exec or {
         loop_count = 0,
@@ -454,6 +475,8 @@ function M.run_turn(args)
         experience_retrieved_ids = (((((state or {}).experience or {}).retrieved) or {}).ids) or {},
         experience_hints = tostring((((state or {}).experience or {}).hints) or ""),
         experience_written = (((((state or {}).experience or {}).writeback) or {}).written) == true,
+        episode_id = tostring((((((state or {}).episode or {}).writeback) or {}).episode_id) or ""),
+        episode_written = (((((state or {}).episode or {}).writeback) or {}).written) == true,
         planner_calls = #((((state or {}).planner or {}).tool_calls) or {}),
         tool_results = (((state or {}).tool_exec or {}).results) or {},
         tool_executed = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0,

@@ -107,6 +107,7 @@ local function setup_stubs(case)
         if k:match("^module%.graph")
             or k:match("^module%.memory")
             or k:match("^module%.experience")
+            or k:match("^module%.episode")
             or k == "module.tool"
             or k == "module.config" then
             package.loaded[k] = nil
@@ -184,6 +185,11 @@ local function setup_stubs(case)
                     enabled = true,
                     route_learning_rate = 0.10,
                     utility_learning_rate = 0.10,
+                },
+            },
+            episode = {
+                storage = {
+                    root = tostring(case.episode_root or ("memory/episodes_test/" .. tostring(case.id))),
                 },
             },
         }

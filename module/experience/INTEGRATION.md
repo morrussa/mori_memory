@@ -1,6 +1,8 @@
 
 # Experience模块集成文档
 
+> 注：本文档中的 topic bridge 流程仅用于兼容旧方案。当前主图已经改为 `graph run -> run_builder -> policy memory`，run 级执行历史应写入独立 episode 层。
+
 ## 概述
 
 本文档说明Experience模块与Topic系统的集成方式，以及如何在Agent中使用Experience模块。

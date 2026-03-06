@@ -3,6 +3,7 @@ local topic = require("module.memory.topic")
 local tool = require("module.tool")
 local memory_core = require("module.graph.memory_core")
 local experience = require("module.experience")
+local episode = require("module.episode")
 
 local M = {}
 
@@ -53,6 +54,11 @@ function M.run(state, _ctx)
         state.context.topic_summary = summary
     end
 
+    state.episode = state.episode or {}
+    state.episode.current = state.episode.current or {}
+    state.episode.current.turn_index = current_turn
+    state.episode.current.topic_anchor = tostring((topic.get_topic_anchor and topic.get_topic_anchor(current_turn)) or "")
+
     experience.init()
 
     local current_experience = experience.run_builder.build_from_state(state)
@@ -91,6 +97,18 @@ function M.run(state, _ctx)
 
     experience.adaptive.save_to_disk()
     experience.store.save()
+
+    episode.init()
+    local current_episode = episode.run_builder.build_from_state(state)
+    local episode_ok, episode_id = episode.add_episode(current_episode)
+    local episode_saved = false
+    if episode_ok then
+        episode_saved = episode.store.save() == true
+    end
+
+    state.episode.writeback = state.episode.writeback or { written = false, episode_id = "" }
+    state.episode.writeback.written = episode_ok == true and episode_saved == true
+    state.episode.writeback.episode_id = (episode_ok == true and episode_saved == true) and tostring(episode_id or "") or ""
 
     return state
 end

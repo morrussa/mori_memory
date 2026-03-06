@@ -9,10 +9,10 @@ local HINT_LABELS = {
     "兜底",
 }
 
-local function build_hint_text(items)
+local function build_hint_text(success_items, failure_items)
     local lines = {}
 
-    for idx, item in ipairs(items or {}) do
+    for idx, item in ipairs(success_items or {}) do
         local label = HINT_LABELS[idx]
         if not label then
             break
@@ -20,7 +20,19 @@ local function build_hint_text(items)
 
         local text = util.trim((item or {}).description or "")
         if text ~= "" then
-            lines[#lines + 1] = string.format("%s：%s", label, text)
+            lines[#lines + 1] = string.format("%s路径：%s", label, text)
+        end
+    end
+
+    local failure_count = 0
+    for _, item in ipairs(failure_items or {}) do
+        local text = util.trim((item or {}).description or "")
+        if text ~= "" then
+            failure_count = failure_count + 1
+            lines[#lines + 1] = string.format("避免%d：%s", failure_count, text)
+            if failure_count >= 2 then
+                break
+            end
         end
     end
 
@@ -64,6 +76,20 @@ function M.run(state, _ctx)
         language = features.language,
         read_only = read_only,
     })
+    local failure_items, failure_strategy = experience.retrieve({
+        text = user_input,
+        task_type = features.task_type,
+        domain = features.domain,
+        language = features.language,
+        context_signature = context_signature,
+    }, {
+        type = "failure",
+        limit = 2,
+        context_signature = context_signature,
+        domain = features.domain,
+        language = features.language,
+        read_only = read_only,
+    })
 
     local ids = {}
     for _, item in ipairs(items or {}) do
@@ -72,9 +98,17 @@ function M.run(state, _ctx)
         end
     end
 
-    local hints = build_hint_text(items)
+    local failure_ids = {}
+    for _, item in ipairs(failure_items or {}) do
+        if item and item.id then
+            failure_ids[#failure_ids + 1] = item.id
+        end
+    end
+
+    local hints = build_hint_text(items, failure_items)
 
     state.experience = state.experience or {}
+    state.experience.kind = "policy"
     state.experience.query = {
         task_type = features.task_type,
         domain = features.domain,
@@ -85,12 +119,16 @@ function M.run(state, _ctx)
         items = items or {},
         ids = ids,
         strategy = tostring((strategy or {}).strategy or ""),
+        failure_items = failure_items or {},
+        failure_ids = failure_ids,
+        failure_strategy = tostring((failure_strategy or {}).strategy or ""),
     }
     state.experience.hints = hints
     state.experience.feedback = state.experience.feedback or { effective_ids = {} }
     state.experience.writeback = state.experience.writeback or { written = false }
 
     state.context = state.context or {}
+    state.context.policy_context = hints
     state.context.experience_context = hints
     return state
 end

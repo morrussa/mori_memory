@@ -9,6 +9,7 @@ M.store = require("module.experience.store")
 M.retriever = require("module.experience.retriever")
 M.adaptive = require("module.experience.adaptive")
 M.run_builder = require("module.experience.run_builder")
+M.builder = require("module.experience.builder") -- legacy topic-based builder
 
 M._initialized = false
 

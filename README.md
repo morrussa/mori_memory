@@ -16,14 +16,21 @@
 
 1. `ingest_node`
 2. `recall_node`
-3. `context_node`
-4. `agent_node`
-5. `tools_node`
-6. `agent_node`（循环）
-7. `finalize_node`
-8. `writeback_node`
-9. `persist_node`
-10. `end`
+3. `experience_node`（policy retrieval）
+4. `context_node`
+5. `planner_node`
+6. `tool_exec_node` / `repair_node`（循环）
+7. `responder_node`
+8. `finalize_node`
+9. `writeback_node`
+10. `persist_node`
+11. `end`
+
+执行层分为三层：
+
+- `memory/*`：长期事实记忆
+- `episode/*`：run 级执行历史
+- `experience/*`：策略/惯性记忆（policy memory）
 
 循环约束：
 
@@ -36,12 +43,13 @@
 - `module/graph/graph_runtime.lua`：图执行引擎
 - `module/graph/graph_builder.lua`：节点与转移
 - `module/graph/conversation_source.lua`：会话历史与系统提示词装配
+- `module/episode/*`：run 级 episode 存储与构建
 - `module/graph/nodes/*`：节点实现
 - `module/graph/checkpoint_store.lua`：FFI 二进制快照
 - `module/graph/trace_writer.lua`：JSONL trace
 - `module/graph/tool_registry_v2.lua`：工具执行层（file + external provider）
 - `module/graph/providers/*`：provider 抽象与 qwen 实现
-- `module/graph/nodes/router_node.lua|planner_node.lua|repair_node.lua|responder_node.lua`：retired（保留文件，不再接入主图）
+- `module/graph/nodes/router_node.lua|agent_node.lua|tools_node.lua`：retired（保留文件，不再接入主图）
 
 旧 `module/agent/*` 核心链路已删除。
 

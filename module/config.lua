@@ -361,6 +361,11 @@ local DEFAULT_SETTINGS = {
             utility_learning_rate = 0.10,
         },
     },
+    episode = {
+        storage = {
+            root = "memory/episodes",
+        },
+    },
     topic = {--在退出时，如果topic没有闭合，在topic.bin的第一行写下 current_turn\x1F<topic_head_vec>\x1F<topic_now_vec> ，topic.bin的第一行永远留给这个用途。
         make_cluster1 = 4,--当一个topic建立时，它向前make_cluster1步以建立头质心，
         make_cluster2 = 3,--当头质心建立完成后，它会向后make_cluster2步以建立尾质心，并且每一次建立完成后都与头质心对比

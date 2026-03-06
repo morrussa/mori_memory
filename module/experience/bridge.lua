@@ -1,11 +1,10 @@
 
 -- module/experience/bridge.lua
--- Topic和Experience之间的桥接层
--- 设计原则：松散耦合，单向依赖（topic -> experience）
+-- 已弃用的 Topic -> Experience 兼容桥。
+-- 主图现在直接基于 graph run 写入 policy memory；该桥仅保留给旧的离线/兼容流程。
 
 local M = {}
 
-local topic = require("module.memory.topic")
 local experience = require("module.experience")
 
 -- ==================== 配置 ====================

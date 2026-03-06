@@ -15,6 +15,7 @@ local REQUIRED_KEYS = {
     "router_decision",
     "recall",
     "experience",
+    "episode",
     "planner",
     "tool_exec",
     "repair",
@@ -187,6 +188,7 @@ function M.new_state(args)
         context = {
             memory_context = "",
             experience_context = "",
+            policy_context = "",
             tool_context = "",
             planner_context = "",
         },
@@ -206,13 +208,27 @@ function M.new_state(args)
                 items = {},
                 ids = {},
                 strategy = "",
+                failure_items = {},
+                failure_ids = {},
+                failure_strategy = "",
             },
             hints = "",
+            kind = "policy",
             feedback = {
                 effective_ids = {},
             },
             writeback = {
                 written = false,
+            },
+        },
+        episode = {
+            current = {
+                turn_index = 0,
+                topic_anchor = "",
+            },
+            writeback = {
+                written = false,
+                episode_id = "",
             },
         },
         planner = {
