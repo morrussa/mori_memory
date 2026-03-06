@@ -47,14 +47,30 @@ function M.resolve_next(current, state, node_result)
     -- 条件边
     if edge.conditional then
         local cfg = config.get("graph", {})
-        for target, condition_fn in pairs(edge.branches or {}) do
-            if type(condition_fn) == "function" then
-                local ok, result = pcall(condition_fn, state, cfg)
-                if ok and result then
-                    return target, nil
+        local branches = edge.branches or {}
+
+        if #branches > 0 then
+            for _, branch in ipairs(branches) do
+                local target = branch.to or branch.target
+                local condition_fn = branch.when or branch.condition
+                if type(target) == "string" and type(condition_fn) == "function" then
+                    local ok, result = pcall(condition_fn, state, cfg)
+                    if ok and result then
+                        return target, nil
+                    end
+                end
+            end
+        else
+            for target, condition_fn in pairs(branches) do
+                if type(condition_fn) == "function" then
+                    local ok, result = pcall(condition_fn, state, cfg)
+                    if ok and result then
+                        return target, nil
+                    end
                 end
             end
         end
+
         return nil, nil
     end
     

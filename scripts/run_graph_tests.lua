@@ -218,6 +218,8 @@ local function setup_stubs(case)
     end
 
     package.preload["module.tool"] = function()
+        local ffi = require("ffi")
+
         local function file_exists(path)
             local f = io.open(path, "rb")
             if f then
@@ -245,6 +247,48 @@ local function setup_stubs(case)
             return dot / math.sqrt(norm_a * norm_b)
         end
 
+        local function vector_to_bin(vec)
+            if type(vec) ~= "table" then
+                return ""
+            end
+
+            local n = #vec
+            local elem_size = ffi.sizeof("float")
+            local buf_size = 4 + n * elem_size
+            local buf = ffi.new("uint8_t[?]", buf_size)
+
+            ffi.cast("uint32_t*", buf)[0] = n
+
+            local flt_arr = ffi.cast("float*", buf + 4)
+            for i = 1, n do
+                flt_arr[i - 1] = tonumber(vec[i]) or 0
+            end
+
+            return ffi.string(buf, buf_size)
+        end
+
+        local function bin_to_vector(bin, offset)
+            offset = tonumber(offset) or 0
+            if type(bin) ~= "string" or #bin < offset + 4 then
+                return nil, 0
+            end
+
+            local p = ffi.cast("const uint8_t*", bin) + offset
+            local n = ffi.cast("const uint32_t*", p)[0]
+            local elem_size = ffi.sizeof("float")
+            local expected_len = 4 + n * elem_size
+            if #bin < offset + expected_len then
+                return nil, 0
+            end
+
+            local flt_arr = ffi.cast("const float*", p + 4)
+            local vec = {}
+            for i = 0, n - 1 do
+                vec[i + 1] = flt_arr[i]
+            end
+            return vec, expected_len
+        end
+
         return {
             get_embedding_query = function(_text)
                 return { 0.1, 0.2, 0.3 }
@@ -254,6 +298,8 @@ local function setup_stubs(case)
             end,
             cosine_similarity = cosine_similarity,
             file_exists = file_exists,
+            vector_to_bin = vector_to_bin,
+            bin_to_vector = bin_to_vector,
         }
     end
 
@@ -783,19 +829,20 @@ local function build_cases()
             case.agent_steps = {
                 mk_agent_step("need_but_no_steps", { call }),
             }
-            case.expect_route = "respond"
-            case.expect_loops = 0
-            case.expect_tool_executed = 0
+            case.expect_route = "tool_loop"
+            case.expect_loops = 1
+            case.expect_tool_executed = 1
             case.min_tool_executed = nil
             case.expect_stop_reason = "remaining_steps_exhausted"
             case.final_contains = "Sorry, need more steps"
-            case.min_tool_events = 0
+            case.min_tool_events = 1
         elseif i == 20 then
             case.input = "读取我上传文件前几行"
             case.uploads = {
                 { name = "a.txt", path = "./workspace/download/a.txt", tool_path = "download/a.txt", bytes = 5 },
             }
             case.expect_uploads_count = 1
+            case.expect_loops = 2
         end
 
         cases[#cases + 1] = case

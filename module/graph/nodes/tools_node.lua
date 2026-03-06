@@ -80,6 +80,7 @@ function M.run(state, _ctx)
         failed_total = 0,
         read_evidence_total = 0,
         results = {},
+        all_results = {},
         context_fragments = {},
         truncated_count = 0,
         total_result_chars = 0,
@@ -95,6 +96,7 @@ function M.run(state, _ctx)
     end
 
     local result = tool_registry.execute_calls(calls)
+    local prior_stop_reason = util.trim(state.agent_loop.stop_reason)
 
     -- DEBUG
     print(string.format("[ToolsNode][DEBUG] result: executed=%d failed=%d control_action=%s",
@@ -207,6 +209,10 @@ function M.run(state, _ctx)
     end
 
     state.tool_exec.results = processed_results
+    state.tool_exec.all_results = state.tool_exec.all_results or {}
+    for _, row in ipairs(processed_results) do
+        state.tool_exec.all_results[#state.tool_exec.all_results + 1] = row
+    end
     state.tool_exec.context_fragments = processed_fragments
     state.tool_exec.parallel_groups = tonumber(result.parallel_groups) or 0
 
@@ -247,7 +253,7 @@ function M.run(state, _ctx)
     state.agent_loop.pending_tool_calls = {}
     
     -- 只有在没有 finish_turn 控制信号时才清除停止原因
-    if control_action ~= "finish" then
+    if control_action ~= "finish" and prior_stop_reason ~= "remaining_steps_exhausted" then
         -- 清除可能的停止原因，让循环可以继续
         if util.trim(state.agent_loop.stop_reason) ~= "" then
             state.agent_loop.stop_reason = ""

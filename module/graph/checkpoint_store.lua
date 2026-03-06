@@ -184,6 +184,11 @@ function M.save_checkpoint(run_id, seq, node_name, state, next_node)
     local payload_len = #payload
 
     local full_state = serialize_state(state)
+    if type(full_state) == "table" then
+        full_state = encode_payload(full_state)
+    else
+        full_state = tostring(full_state or "")
+    end
     local state_len = #full_state
     local next_node_bytes = tostring(next_node or "")
     local next_node_len = #next_node_bytes

@@ -83,7 +83,7 @@ function M.build_from_state(state)
     local tool_exec = ((state or {}).tool_exec) or {}
     local repair = ((state or {}).repair) or {}
 
-    local tools_used, tool_sequence = collect_successful_tools(tool_exec.results or {})
+    local tools_used, tool_sequence = collect_successful_tools(tool_exec.all_results or tool_exec.results or {})
     local path_text = (#tool_sequence > 0) and table.concat(tool_sequence, ">") or "direct"
     local mode = (#tool_sequence > 0) and "tool" or "direct"
     local success, outcome_reason = detect_success(state)

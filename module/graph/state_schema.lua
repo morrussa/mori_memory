@@ -210,6 +210,7 @@ function M.new_state(args)
             failed_total = 0,
             read_evidence_total = 0,
             results = {},
+            all_results = {},
             context_fragments = {},
             truncated_count = 0,
             total_result_chars = 0,

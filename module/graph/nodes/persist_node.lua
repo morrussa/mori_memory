@@ -69,7 +69,24 @@ function M.run(state, _ctx)
     state.experience.feedback.effective_ids = effective_ids
 
     if #retrieved_items > 0 then
-        experience.record_utility_feedback(retrieved_items, effective_ids)
+        local success = current_experience
+            and current_experience.outcome
+            and current_experience.outcome.success == true
+
+        if success then
+            local matched_items = {}
+            for _, item in ipairs(retrieved_items) do
+                if item and effective_ids[item.id] == true then
+                    matched_items[#matched_items + 1] = item
+                end
+            end
+
+            if #matched_items > 0 then
+                experience.record_utility_feedback(matched_items, effective_ids)
+            end
+        else
+            experience.record_utility_feedback(retrieved_items, {})
+        end
     end
 
     experience.adaptive.save_to_disk()

@@ -269,20 +269,34 @@ function M.run_turn(args)
     end
 
     local trace_summary = build_trace_summary(state)
+    local checkpoint_ok, checkpoint_err = checkpoint_store.flush(true)
+    if not checkpoint_ok then
+        print(string.format("[GraphRuntime][WARN] checkpoint flush failed: %s", tostring(checkpoint_err)))
+    end
+
+    local tool_exec = (((state or {}).tool_exec) or {})
+    local executed_total = tonumber((tool_exec.executed_total) or 0) or 0
+    local failed_total = tonumber((tool_exec.failed_total) or 0) or 0
+    local loop_count = tonumber((tool_exec.loop_count) or 0) or 0
+    local effective_route = (((state or {}).router_decision or {}).route) or ""
+    if loop_count > 0 or executed_total > 0 or failed_total > 0 then
+        effective_route = "tool_loop"
+    end
+
     _G.mori_last_run_id = state.run_id
     _G.mori_last_trace_summary = trace_summary
     _G.mori_last_state_snapshot = {
         run_id = state.run_id,
         uploads_count = #((state.uploads) or {}),
-        route = (((state or {}).router_decision or {}).route) or "",
+        route = effective_route,
         recall_triggered = (((state or {}).recall or {}).triggered) == true,
         experience_retrieved_ids = (((((state or {}).experience or {}).retrieved) or {}).ids) or {},
         experience_hints = tostring((((state or {}).experience or {}).hints) or ""),
         experience_written = (((((state or {}).experience or {}).writeback) or {}).written) == true,
         planner_calls = #((((state or {}).agent_loop or {}).pending_tool_calls) or {}),
         tool_results = (((state or {}).tool_exec or {}).results) or {},
-        tool_executed = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0,
-        tool_failed = tonumber((((state or {}).tool_exec or {}).failed_total) or 0) or 0,
+        tool_executed = executed_total,
+        tool_failed = failed_total,
         stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or ""),
         remaining_steps = tonumber((((state or {}).agent_loop or {}).remaining_steps) or 0) or 0,
         writeback_facts = (((state or {}).writeback or {}).facts) or {},
