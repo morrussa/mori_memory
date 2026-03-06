@@ -190,6 +190,14 @@ local function setup_stubs(case)
                 storage = {
                     root = tostring(case.experience_root or ("memory/experience_graph_policy_test/" .. tostring(case.id))),
                 },
+                v2 = {
+                    enabled = case.experience_v2_enabled ~= false,
+                    candidate_limit = tonumber(case.experience_v2_candidate_limit) or 5,
+                    min_support_for_recommend = tonumber(case.experience_v2_min_support) or 3,
+                    min_confidence_for_recommend = tonumber(case.experience_v2_min_confidence) or 0.72,
+                    hard_fallback_on_error = case.experience_v2_hard_fallback ~= false,
+                    recency_half_life_days = 30,
+                },
                 retriever = {
                     fetch_multiplier = 8,
                     relevance_gate = 0.20,
@@ -711,6 +719,22 @@ local function run_case(case)
     if case.min_experience_retrieved ~= nil then
         ensure(#(snapshot.experience_retrieved_ids or {}) >= tonumber(case.min_experience_retrieved), case.id .. ": experience_retrieved too small")
     end
+    if case.expect_experience_version ~= nil then
+        ensure(tostring(snapshot.experience_version or "") == tostring(case.expect_experience_version), case.id .. ": experience_version mismatch")
+    end
+    if case.min_experience_candidates ~= nil then
+        ensure(#(snapshot.experience_candidate_ids or {}) >= tonumber(case.min_experience_candidates), case.id .. ": experience_candidate_ids too small")
+    end
+    if case.expect_recommendation_empty ~= nil then
+        local has_rec = tostring(snapshot.experience_recommendation_id or "") ~= ""
+        ensure(has_rec == (case.expect_recommendation_empty ~= true), case.id .. ": recommendation empty mismatch")
+    end
+    if case.expect_recommendation_id ~= nil then
+        ensure(tostring(snapshot.experience_recommendation_id or "") == tostring(case.expect_recommendation_id), case.id .. ": recommendation id mismatch")
+    end
+    if case.min_recommendation_confidence ~= nil then
+        ensure((tonumber(snapshot.experience_recommendation_confidence) or 0) >= tonumber(case.min_recommendation_confidence), case.id .. ": recommendation confidence too small")
+    end
     if case.expect_experience_written ~= nil then
         ensure((snapshot.experience_written == true) == (case.expect_experience_written == true), case.id .. ": experience_written mismatch")
     end
@@ -739,6 +763,14 @@ local function run_case(case)
     if case.expect_context_include_episode ~= nil then
         ensure(((((snapshot.experience_runtime_policy or {}).context) or {}).include_episode) == case.expect_context_include_episode,
             case.id .. ": include_episode mismatch")
+    end
+    if case.expect_behavior_match_selected ~= nil then
+        local selected = tostring(snapshot.experience_behavior_match_selected or "")
+        local has_selected = selected ~= ""
+        ensure(has_selected == (case.expect_behavior_match_selected == true), case.id .. ": behavior_match selected mismatch")
+    end
+    if case.min_behavior_match_score ~= nil then
+        ensure((tonumber(snapshot.experience_behavior_match_score) or 0) >= tonumber(case.min_behavior_match_score), case.id .. ": behavior_match score too small")
     end
     if case.expect_tool_loop_max ~= nil then
         ensure((tonumber(snapshot.tool_loop_max) or 0) == tonumber(case.expect_tool_loop_max), case.id .. ": tool_loop_max mismatch")
@@ -808,6 +840,20 @@ local function run_experience_policy_checks()
         min_tool_executed = 1,
         expect_experience_written = true,
     })
+    run_case({
+        id = "exp_tool_seed_c",
+        category = "file",
+        experience_root = root_tool,
+        input = "debug lua file policy",
+        agent_steps = {
+            mk_agent_step("need_tool_seed_c", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "exp_tool_seed_read_c"),
+            }),
+            mk_agent_step("tool_seed_done_c", {}),
+        },
+        min_tool_executed = 1,
+        expect_experience_written = true,
+    })
     ensure(count_experience_bins(root_tool) == 1, "policy upsert should keep a single item for same key")
     local tool_query = run_case({
         id = "exp_tool_query",
@@ -817,6 +863,7 @@ local function run_experience_policy_checks()
         agent_steps = {
             mk_agent_step("tool_query_done", {}),
         },
+        expect_experience_version = "v2",
         min_experience_retrieved = 1,
         expect_planner_mode = "tool_first",
         experience_audit_contains = "planner.mode=tool_first",
@@ -845,6 +892,16 @@ local function run_experience_policy_checks()
         expect_experience_written = true,
     })
     run_case({
+        id = "exp_direct_seed_c",
+        category = "no_tool",
+        experience_root = root_direct,
+        input = "explain lua policy",
+        agent_steps = {
+            mk_agent_step("direct_seed_done_c", {}),
+        },
+        expect_experience_written = true,
+    })
+    run_case({
         id = "exp_direct_query",
         category = "no_tool",
         experience_root = root_direct,
@@ -852,6 +909,7 @@ local function run_experience_policy_checks()
         agent_steps = {
             mk_agent_step("direct query answer", {}),
         },
+        expect_experience_version = "v2",
         min_experience_retrieved = 1,
         expect_planner_mode = "direct_first",
         experience_audit_contains = "planner.mode=direct_first",
@@ -879,6 +937,7 @@ local function run_experience_policy_checks()
         agent_steps = {
             mk_agent_step("recall_force_query_done", {}),
         },
+        expect_experience_version = "v2",
         expect_recall = true,
         expect_recall_mode = "force",
         min_experience_retrieved = 1,
@@ -906,6 +965,7 @@ local function run_experience_policy_checks()
         agent_steps = {
             mk_agent_step("recall_suppress_query_done", {}),
         },
+        expect_experience_version = "v2",
         expect_recall = false,
         expect_recall_mode = "suppress",
         expect_context_include_memory = false,
@@ -940,8 +1000,10 @@ local function run_experience_policy_checks()
         agent_steps = {
             mk_agent_step("force_read_query_done", {}),
         },
+        expect_experience_version = "v2",
         min_experience_retrieved = 1,
         expect_force_read_before_write = true,
+        expect_behavior_match_selected = true,
     })
     local planner_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
     ensure(
@@ -955,9 +1017,10 @@ local function run_experience_policy_checks()
             planner_prompt:sub(math.max(1, #planner_prompt - 400), #planner_prompt)
         )
     )
+    ensure(planner_prompt:find("[ExperienceCandidatesV2]", 1, true) ~= nil, "planner contract missing ExperienceCandidatesV2 block")
 
     local root_budget = "memory/experience_graph_policy_test/budget"
-    for idx = 1, 2 do
+    for idx = 1, 3 do
         run_case({
             id = "exp_budget_seed_" .. tostring(idx),
             category = "file",
@@ -987,10 +1050,84 @@ local function run_experience_policy_checks()
         agent_steps = {
             mk_agent_step("budget_query_done", {}),
         },
+        expect_experience_version = "v2",
         min_experience_retrieved = 1,
         expect_tool_loop_max = 7,
         expect_remaining_steps = 28,
     })
+
+    local root_low_support = "memory/experience_graph_policy_test/low_support"
+    run_case({
+        id = "exp_low_support_seed",
+        category = "no_tool",
+        experience_root = root_low_support,
+        input = "low support fallback policy",
+        agent_steps = {
+            mk_agent_step("low_support_seed_done", {}),
+        },
+        expect_experience_written = true,
+    })
+    run_case({
+        id = "exp_low_support_query",
+        category = "no_tool",
+        experience_root = root_low_support,
+        input = "low support fallback policy",
+        agent_steps = {
+            mk_agent_step("low_support_query_done", {}),
+        },
+        expect_experience_version = "v2",
+        min_experience_retrieved = 1,
+        expect_planner_mode = "auto",
+        experience_audit_contains = "accepted=false",
+    })
+
+    local root_risky = "memory/experience_graph_policy_test/risky"
+    for idx = 1, 3 do
+        run_case({
+            id = "exp_risky_success_seed_" .. tostring(idx),
+            category = "no_tool",
+            experience_root = root_risky,
+            input = "debug lua risky path",
+            agent_steps = {
+                mk_agent_step("risky_success_done_" .. tostring(idx), {}),
+            },
+            expect_experience_written = true,
+        })
+    end
+    for idx = 1, 6 do
+        local fail_call = mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "risky_fail_read_" .. tostring(idx))
+        run_case({
+            id = "exp_risky_fail_seed_" .. tostring(idx),
+            category = "file",
+            experience_root = root_risky,
+            input = "debug lua risky path",
+            tool_loop_max = 2,
+            agent_steps = {
+                mk_agent_step("risky_fail_loop_" .. tostring(idx), { fail_call }),
+            },
+            agent_default_step = mk_agent_step("risky_fail_loop_" .. tostring(idx), { fail_call }),
+            expect_stop_reason = "tool_loop_max_exceeded",
+            min_tool_executed = 2,
+            expect_experience_written = true,
+        })
+    end
+    local risky_query = run_case({
+        id = "exp_risky_query",
+        category = "no_tool",
+        experience_root = root_risky,
+        input = "debug lua risky path",
+        agent_steps = {
+            mk_agent_step("risky_query_done", {}),
+        },
+        expect_experience_version = "v2",
+        min_experience_retrieved = 2,
+        min_experience_candidates = 2,
+        expect_planner_mode = "direct_first",
+        experience_audit_contains = "planner.mode=direct_first",
+    })
+    local risky_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
+    ensure(risky_prompt:find("[FailureWarnings]", 1, true) ~= nil, "planner contract missing FailureWarnings block")
+    ensure(tostring(risky_query.snapshot.experience_recommendation_id or "") ~= "", "risky query missing recommendation")
 
     local root_read_only = "memory/experience_graph_policy_test/readonly"
     run_case({
@@ -1017,11 +1154,11 @@ local function run_experience_policy_checks()
         agent_steps = {
             mk_agent_step("readonly_done", {}),
         },
-        min_experience_retrieved = 1,
+        expect_experience_retrieved = 0,
         expect_experience_written = false,
     })
     ensure(count_experience_bins(root_read_only) == before_read_only, "read_only unexpectedly wrote policy")
-    ensure(#(read_only_result.snapshot.experience_retrieved_ids or {}) >= 1, "read_only retrieval missing")
+    ensure(#(read_only_result.snapshot.experience_retrieved_ids or {}) == 0, "read_only retrieval should not reuse non-readonly family")
 
     local topic_src = assert(io.open("module/memory/topic.lua", "r"))
     local topic_text = topic_src:read("*a") or ""

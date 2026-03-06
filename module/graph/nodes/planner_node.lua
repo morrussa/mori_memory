@@ -126,6 +126,7 @@ local function ensure_contract_system_message(messages, state)
     local repair_policy = ((runtime_policy or {}).repair) or {}
     local recall_policy = ((runtime_policy or {}).recall) or {}
     local context_policy = ((runtime_policy or {}).context) or {}
+    local experience_prior = util.trim((((state or {}).context or {}).experience_prior) or "")
     local contract = table.concat({
         "You are the planner for a single-session tool agent.",
         "Return tool calls when more work is needed.",
@@ -178,6 +179,9 @@ local function ensure_contract_system_message(messages, state)
     end
     if #policy_lines > 0 then
         contract = table.concat({ contract, "", "[GraphPolicy]", table.concat(policy_lines, "\n") }, "\n")
+    end
+    if experience_prior ~= "" then
+        contract = table.concat({ contract, "", experience_prior }, "\n")
     end
 
     if #out > 0 and tostring((out[1] or {}).role or "") == "system" then

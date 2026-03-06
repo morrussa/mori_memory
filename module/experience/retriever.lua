@@ -1,5 +1,6 @@
 local store = require("module.experience.store")
 local policy = require("module.experience.policy")
+local adaptive = require("module.experience.adaptive")
 
 local M = {}
 
@@ -75,6 +76,7 @@ function M.extract_query_features(query)
         features.has_uploads = query.has_uploads == true
         features.contract_shape = trim(query.contract_shape or "")
         features.policy_key = trim(query.policy_key or "")
+        features.family_key = trim(query.family_key or query.policy_key or "")
         features.context_signature = type(query.context_signature) == "table" and query.context_signature or {}
     end
 
@@ -109,6 +111,9 @@ function M.extract_query_features(query)
     if trim(features.policy_key) == "" then
         features.policy_key = policy.build_policy_key(features)
     end
+    if trim(features.family_key) == "" then
+        features.family_key = features.policy_key
+    end
     return features
 end
 
@@ -141,7 +146,17 @@ function M.retrieve_with_feedback(query, options)
 end
 
 function M.record_utility_feedback(_retrieved_items, _effective_ids)
-    return
+    local retrieved_ids = {}
+    for _, item in ipairs(_retrieved_items or {}) do
+        local id = trim((item or {}).id or item)
+        if id ~= "" then
+            retrieved_ids[#retrieved_ids + 1] = id
+        end
+    end
+    adaptive.update_utility_from_feedback({
+        retrieved_ids = retrieved_ids,
+        effective_ids = type(_effective_ids) == "table" and _effective_ids or {},
+    })
 end
 
 function M.get_stats()

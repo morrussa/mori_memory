@@ -258,6 +258,7 @@ function M.new_state(args)
             memory_context = "",
             experience_context = "",
             policy_context = "",
+            experience_prior = "",
             tool_context = "",
             planner_context = "",
         },
@@ -272,17 +273,30 @@ function M.new_state(args)
             score = nil,
         },
         experience = {
+            version = "v2",
             query = {},
             retrieved = {
                 items = {},
                 ids = {},
                 strategy = "",
             },
+            candidates = {},
+            recommendation = {
+                id = "",
+                confidence = 0,
+                reason = "",
+                support = 0,
+                accepted = false,
+            },
             runtime_policy = experience_policy.default_runtime_policy(),
             audit = "",
             kind = "graph_policy",
             feedback = {
                 effective_ids = {},
+            },
+            behavior_match = {
+                selected_id = "",
+                match_score = 0,
             },
             writeback = {
                 written = false,

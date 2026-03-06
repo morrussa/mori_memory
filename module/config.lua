@@ -345,6 +345,14 @@ local DEFAULT_SETTINGS = {
         storage = {
             root = "memory/experience_graph_policy",
         },
+        v2 = {
+            enabled = true,
+            candidate_limit = 5,
+            min_support_for_recommend = 3,
+            min_confidence_for_recommend = 0.72,
+            hard_fallback_on_error = true,
+            recency_half_life_days = 30,
+        },
         retriever = {
             fetch_multiplier = 8, -- 初始候选放大量，供 relevance gate + joint rerank 使用。
             relevance_gate = 0.32, -- relevance 硬门基础阈值；不足时仅逐级放宽该门限。
