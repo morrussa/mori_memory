@@ -72,6 +72,22 @@ local function update_working_memory_from_call(memory, row)
     end
 end
 
+local function update_read_tracking(tool_exec, row)
+    if type(row) ~= "table" or row.ok ~= true then
+        return
+    end
+
+    local args = row.args or {}
+    local tool_name = tostring(row.tool or "")
+    if tool_name == "read_file" or tool_name == "read_lines" or tool_name == "search_file" then
+        tool_exec.read_files = tool_exec.read_files or {}
+        mark_set(tool_exec.read_files, args.path)
+        tool_exec.read_evidence_total = (tonumber(tool_exec.read_evidence_total) or 0) + 1
+    elseif tool_name == "search_files" then
+        tool_exec.read_evidence_total = (tonumber(tool_exec.read_evidence_total) or 0) + 1
+    end
+end
+
 function M.run(state, _ctx)
     state.tool_exec = state.tool_exec or {}
     state.planner = state.planner or {}
@@ -86,6 +102,8 @@ function M.run(state, _ctx)
     state.tool_exec.results = {}
     state.tool_exec.all_results = ensure_sequence(state.tool_exec.all_results)
     state.tool_exec.context_fragments = {}
+    state.tool_exec.read_files = state.tool_exec.read_files or {}
+    state.tool_exec.read_evidence_total = tonumber(state.tool_exec.read_evidence_total) or 0
     state.repair.pending = false
     state.repair.retry_requested = false
 
@@ -104,6 +122,7 @@ function M.run(state, _ctx)
     for _, row in ipairs(state.tool_exec.results or {}) do
         state.tool_exec.all_results[#state.tool_exec.all_results + 1] = row
         update_working_memory_from_call(state.working_memory, row)
+        update_read_tracking(state.tool_exec, row)
     end
 
     if result.control_action == "finish" then

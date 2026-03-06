@@ -22,6 +22,10 @@ local SIDE_EFFECT_TOOLS = {
     apply_patch = true,
     exec_command = true,
 }
+local DIRECTORY_SCAN_TOOLS = {
+    list_files = true,
+    search_files = true,
+}
 
 local function graph_cfg()
     return ((config.settings or {}).graph or {})
@@ -63,6 +67,21 @@ local function get_field(obj, key)
     return nil
 end
 
+local function normalize_tool_args(raw_args)
+    if type(raw_args) == "table" then
+        return raw_args
+    end
+    if raw_args == nil then
+        return {}
+    end
+
+    local parsed, _err = util.parse_lua_table_literal(tostring(raw_args))
+    if type(parsed) == "table" then
+        return parsed
+    end
+    return {}
+end
+
 local function normalize_tool_calls(raw)
     local out = {}
     if type(raw) == "table" then
@@ -71,7 +90,7 @@ local function normalize_tool_calls(raw)
             if name ~= "" then
                 out[#out + 1] = {
                     tool = name,
-                    args = get_field(item, "args") or {},
+                    args = normalize_tool_args(get_field(item, "args")),
                     call_id = util.trim(get_field(item, "id") or get_field(item, "call_id") or ("planner_call_" .. tostring(idx))),
                 }
             end
@@ -88,7 +107,7 @@ local function normalize_tool_calls(raw)
         if name ~= "" then
             out[#out + 1] = {
                 tool = name,
-                args = get_field(item, "args") or {},
+                args = normalize_tool_args(get_field(item, "args")),
                 call_id = util.trim(get_field(item, "id") or get_field(item, "call_id") or ("planner_call_" .. tostring(i))),
             }
         end
@@ -241,6 +260,122 @@ local function find_avoided_tool(calls, avoid_tools)
         end
     end
     return ""
+end
+
+local function collect_upload_paths(state)
+    local out = {}
+    local seen = {}
+    for _, item in ipairs(((state or {}).uploads) or {}) do
+        local path = util.normalize_tool_path(((item or {}).tool_path) or ((item or {}).path) or "")
+        if path ~= "" and not seen[path] then
+            seen[path] = true
+            out[#out + 1] = path
+        end
+    end
+    return out
+end
+
+local function has_content_read_call(calls)
+    for _, call in ipairs(calls or {}) do
+        local tool_name = util.trim((call or {}).tool)
+        if tool_name == "read_file" or tool_name == "read_lines" or tool_name == "search_file" or tool_name == "search_files" then
+            return true
+        end
+    end
+    return false
+end
+
+local function is_directory_scan_only(calls)
+    if type(calls) ~= "table" or #calls == 0 then
+        return false
+    end
+    for _, call in ipairs(calls or {}) do
+        if not DIRECTORY_SCAN_TOOLS[util.trim((call or {}).tool)] then
+            return false
+        end
+    end
+    return true
+end
+
+local function has_prior_directory_scan(state)
+    for _, row in ipairs(((((state or {}).tool_exec) or {}).all_results) or {}) do
+        if type(row) == "table" and row.ok == true and DIRECTORY_SCAN_TOOLS[util.trim(row.tool or "")] then
+            return true
+        end
+    end
+    return false
+end
+
+local function wants_read_lines(state)
+    local q = tostring((((state or {}).input or {}).message) or "")
+    return q:find("前几行", 1, true) ~= nil
+        or q:find("几行", 1, true) ~= nil
+        or q:lower():find("line", 1, true) ~= nil
+        or q:lower():find("lines", 1, true) ~= nil
+        or q:find("配置", 1, true) ~= nil
+        or q:lower():find("config", 1, true) ~= nil
+end
+
+local function build_forced_upload_read_calls(state, max_calls)
+    local read_files = ((((state or {}).tool_exec) or {}).read_files) or {}
+    local unread_paths = {}
+    for _, path in ipairs(collect_upload_paths(state)) do
+        if read_files[path] ~= true then
+            unread_paths[#unread_paths + 1] = path
+        end
+    end
+
+    local calls = {}
+    local limit = math.max(1, math.floor(tonumber(max_calls) or 1))
+    local use_lines = wants_read_lines(state)
+    for _, path in ipairs(unread_paths) do
+        if #calls >= limit then
+            break
+        end
+        if use_lines then
+            calls[#calls + 1] = {
+                tool = "read_lines",
+                args = {
+                    path = path,
+                    start_line = 1,
+                    max_lines = 220,
+                },
+                call_id = string.format("planner_guard_read_lines_%d", #calls + 1),
+            }
+        else
+            calls[#calls + 1] = {
+                tool = "read_file",
+                args = {
+                    path = path,
+                    max_chars = 2400,
+                },
+                call_id = string.format("planner_guard_read_file_%d", #calls + 1),
+            }
+        end
+    end
+    return calls
+end
+
+local function enforce_upload_read_guard(state, tool_calls)
+    if #(((state or {}).uploads) or {}) == 0 then
+        return tool_calls, ""
+    end
+    if has_content_read_call(tool_calls) then
+        return tool_calls, ""
+    end
+    if not is_directory_scan_only(tool_calls) then
+        return tool_calls, ""
+    end
+    if not has_prior_directory_scan(state) then
+        return tool_calls, ""
+    end
+
+    local max_calls = math.max(1, math.floor(tonumber((((graph_cfg() or {}).planner or {}).max_calls_per_loop) or 6)))
+    local forced = build_forced_upload_read_calls(state, max_calls)
+    if #forced == 0 then
+        return tool_calls, ""
+    end
+    return forced, "upload_read_guard"
 end
 
 function M.run(state, _ctx)
@@ -402,12 +537,17 @@ function M.run(state, _ctx)
         return state
     end
 
-    state.planner.tool_calls = tool_calls
-    state.agent_loop.pending_tool_calls = tool_calls
+    local guarded_calls, force_reason = enforce_upload_read_guard(state, tool_calls)
+    state.planner.tool_calls = guarded_calls
+    state.agent_loop.pending_tool_calls = guarded_calls
 
     local plan_names = {}
-    for _, call in ipairs(tool_calls) do
+    for _, call in ipairs(guarded_calls) do
         plan_names[#plan_names + 1] = call.tool
+    end
+    state.planner.force_reason = util.trim(force_reason or "")
+    if state.planner.force_reason ~= "" then
+        state.context.planner_context = "Uploads already listed. Read unread uploaded files instead of repeating directory scans."
     end
     state.working_memory.current_plan = table.concat(plan_names, " -> ")
     state.working_memory.plan_step_index = (tonumber(state.working_memory.plan_step_index) or 0) + 1

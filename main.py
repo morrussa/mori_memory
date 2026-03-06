@@ -402,6 +402,7 @@ class AIPipeline:
     _tool_args_lua_parser = None
 
     def __init__(self):
+        self.lua_runtime = None
         self.llm_large = None   # GPU 大模型（生成用）
         self.llm_embed = None   # GGUF Embedding 模型
         self.suppress_large_webui_log = False
@@ -471,6 +472,15 @@ class AIPipeline:
     def _extract_chat_text(output: dict) -> str:
         text, _tool_calls = AIPipeline._extract_chat_text_and_tool_calls(output)
         return text
+
+    def _luaify(self, value):
+        lua_runtime = getattr(self, "lua_runtime", None)
+        if lua_runtime is None:
+            return value
+        try:
+            return _py_to_lua_value(lua_runtime, value)
+        except Exception:
+            return value
 
     @staticmethod
     def _extract_chat_text_and_tool_calls(output: dict):
@@ -2010,10 +2020,10 @@ class AIPipeline:
                 }
             )
 
-        return {
+        return self._luaify({
             "content": str(text or ""),
             "tool_calls": normalized_calls,
-        }
+        })
 
     def load_models(self, large_model_path: str, embedding_model_path: str):
         print("[Python] Loading models...")
@@ -2363,6 +2373,17 @@ class MoriLocalWebUIBridge:
         if not rel.startswith("../"):
             return f"./{rel}"
         return abs_path.replace("\\", "/")
+
+    def _agent_display_path(self, rel_path: str = "") -> str:
+        """Return a display path prefixed with the workspace virtual root."""
+        base = self.workspace_virtual_root.rstrip("/")
+        rel = str(rel_path or "").strip().replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        rel = rel.lstrip("/")
+        if not rel:
+            return base
+        return f"{base}/{rel}"
 
     def _default_session_status_snapshot(self):
         return {
@@ -3071,6 +3092,7 @@ def main():
 
     lua = LuaRuntime(unpack_returned_tuples=True)
     pipeline = AIPipeline()
+    pipeline.lua_runtime = lua
     lua.globals()['py_pipeline'] = pipeline
     lua.globals()['MORI_RUN_MODE'] = run_mode
 

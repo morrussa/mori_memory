@@ -782,6 +782,24 @@ local function run_case(case)
         local n = math.min(count_events(events, "tool_call"), count_events(events, "tool_result"))
         ensure(n >= case.min_tool_events, case.id .. ": tool events too small")
     end
+    if case.min_file_call_counts ~= nil then
+        local counts = {}
+        for _, name in ipairs(CURRENT.file_calls or {}) do
+            counts[name] = (counts[name] or 0) + 1
+        end
+        for name, expected in pairs(case.min_file_call_counts or {}) do
+            ensure((counts[name] or 0) >= tonumber(expected), case.id .. ": file call count too small for " .. tostring(name))
+        end
+    end
+    if case.max_file_call_counts ~= nil then
+        local counts = {}
+        for _, name in ipairs(CURRENT.file_calls or {}) do
+            counts[name] = (counts[name] or 0) + 1
+        end
+        for name, expected in pairs(case.max_file_call_counts or {}) do
+            ensure((counts[name] or 0) <= tonumber(expected), case.id .. ": file call count too large for " .. tostring(name))
+        end
+    end
 
     return {
         run_id = trace.run_id,
@@ -1244,6 +1262,65 @@ local function build_cases()
 
         cases[#cases + 1] = case
     end
+
+    cases[#cases + 1] = {
+        id = "file_string_args_regression",
+        category = "file",
+        input = "inspect uploaded files via planner string args",
+        uploads = {
+            { name = "a.txt", path = "./workspace/download/a.txt", tool_path = "download/a.txt", bytes = 5 },
+        },
+        agent_steps = {
+            mk_agent_step("need_file_tool_string_args", {
+                {
+                    name = "list_files",
+                    args = '{prefix="/mori/workspace/download"}',
+                    id = "file_string_args_call",
+                    type = "tool_call",
+                },
+            }),
+            mk_agent_step("file_string_args_done", {}),
+        },
+        min_tool_executed = 1,
+        expect_tool_failed = 0,
+        expect_loops = 1,
+        expect_uploads_count = 1,
+        expect_writeback_saved = 1,
+        min_tool_events = 1,
+        final_contains = "file_string_args_done",
+    }
+
+    cases[#cases + 1] = {
+        id = "file_repeat_list_guard",
+        category = "file",
+        input = "看看上传的文件",
+        uploads = {
+            { name = "a.txt", path = "./workspace/download/a.txt", tool_path = "download/a.txt", bytes = 5 },
+            { name = "b.txt", path = "./workspace/download/b.txt", tool_path = "download/b.txt", bytes = 5 },
+        },
+        agent_steps = {
+            mk_agent_step("list_first", {
+                mk_tool_call("list_files", { prefix = "download" }, "guard_list_first"),
+            }),
+            mk_agent_step("list_again", {
+                mk_tool_call("list_files", { prefix = "download" }, "guard_list_second"),
+            }),
+            mk_agent_step("guard_done", {}),
+        },
+        min_tool_executed = 3,
+        expect_tool_failed = 0,
+        expect_loops = 2,
+        expect_uploads_count = 2,
+        expect_writeback_saved = 1,
+        min_tool_events = 3,
+        min_file_call_counts = {
+            read_file = 2,
+        },
+        max_file_call_counts = {
+            list_files = 1,
+        },
+        final_contains = "guard_done",
+    }
 
     -- No-tool 10
     for i = 1, 10 do
@@ -1930,7 +2007,7 @@ local function main()
     end
 
     local cases = build_cases()
-    ensure(#cases == 60, "expected exactly 60 cases")
+    ensure(#cases == 62, "expected exactly 62 cases")
 
     local case_filter = tostring(os.getenv("CASE_FILTER") or "")
     if case_filter ~= "" then
@@ -1957,7 +2034,7 @@ local function main()
     if case_filter == "" then
         local expected_dist = {
             memory = 20,
-            file = 20,
+            file = 22,
             no_tool = 10,
             external = 10,
         }
