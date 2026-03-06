@@ -269,6 +269,23 @@ local function new_run_id()
 end
 
 local function now_ms()
+    -- 使用 LuaJIT 的 FFI 获取高精度时间戳
+    if type(jit) == "table" and ffi then
+        ffi.cdef[[
+            typedef long time_t;
+            typedef struct timespec {
+                time_t tv_sec;
+                long tv_nsec;
+            } timespec;
+            int clock_gettime(int clk_id, struct timespec *tp);
+        ]]
+        local CLOCK_REALTIME = 0
+        local ts = ffi.new("struct timespec")
+        if ffi.C.clock_gettime(CLOCK_REALTIME, ts) == 0 then
+            return tonumber(ts.tv_sec) * 1000 + math.floor(tonumber(ts.tv_nsec) / 1000000)
+        end
+    end
+    -- 回退到秒级精度
     return math.floor((os.time() or 0) * 1000)
 end
 

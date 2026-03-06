@@ -9,6 +9,9 @@ local config = require("module.config")
 
 local M = {}
 
+-- 全局 checkpoint 序号计数器（确保跨 run 的唯一性）
+local _global_checkpoint_seq = 0
+
 local function assert_luajit_only()
     if type(jit) ~= "table" then
         error("[GraphRuntime] LuaJIT is required")
@@ -57,16 +60,15 @@ local function trace(run_id, event_name, payload)
     end
 end
 
-local function checkpoint(state, node_name)
+local function checkpoint(state, node_name, next_node)
     state.checkpoint_meta = state.checkpoint_meta or { seq = 0, last_node = "" }
-    local seq = (tonumber(state.checkpoint_meta.seq) or 0) + 1
+    _global_checkpoint_seq = _global_checkpoint_seq + 1
+    local seq = _global_checkpoint_seq
     state.checkpoint_meta.seq = seq
     state.checkpoint_meta.last_node = node_name
 
-    local ok, err = checkpoint_store.save_checkpoint(state.run_id, seq, node_name, state)
-    if not ok then
-        print(string.format("[GraphRuntime][WARN] checkpoint failed: %s", tostring(err)))
-    end
+    -- 使用 dirty 标记模式，延迟保存
+    checkpoint_store.mark_dirty(state.run_id, seq, node_name, next_node, state, nil)
 end
 
 local function summarize_node(state, node_name)
@@ -222,7 +224,8 @@ function M.run_turn(args)
         local duration = math.max(0, node_end_ms - node_start_ms)
         state.metrics.node_durations_ms[current] = duration
 
-        checkpoint(state, current)
+        -- checkpoint 时传入下一个节点（支持恢复）
+        checkpoint(state, current, next_node_name)
 
         local summary = summarize_node(state, current)
         summary.duration_ms = duration

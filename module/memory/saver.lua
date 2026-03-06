@@ -15,8 +15,12 @@ function M.flush_all(force)
     local history = require("module.memory.history")
     local heat = require("module.memory.heat")   -- 延迟加载 heat 模块
     local adaptive = require("module.memory.adaptive")
+    local checkpoint_store = require("module.graph.checkpoint_store")
 
     print("[Saver] === 开始原子保存 raw 文件 ===")
+
+    -- 记录保存前的状态，用于失败时恢复
+    local saved_modules = {}
 
     local function run_save(name, fn)
         local ok, err = fn()
@@ -25,9 +29,11 @@ function M.flush_all(force)
             print(string.format("[Saver][ERROR] %s 保存失败: %s", name, tostring(err)))
             return false
         end
+        saved_modules[#saved_modules + 1] = name
         return true
     end
 
+    -- 按顺序保存各个模块
     if not run_save("memory_index.bin", memory.save_index_to_disk) then return false end
     if not run_save("cluster_index.bin", cluster.save_to_disk) then return false end
     if not run_save("cluster_shards", memory.save_dirty_shards) then return false end
@@ -36,6 +42,9 @@ function M.flush_all(force)
 
     -- 保存 pending_cold 任务队列
     if not run_save("pending_cold.txt", heat.save_pending) then return false end
+
+    -- 保存 graph checkpoint
+    if not run_save("graph_checkpoint", function() return checkpoint_store.flush(force) end) then return false end
 
     local pack_ok, pack_err = pcall(function()
         py_pipeline:pack_state()
@@ -47,7 +56,7 @@ function M.flush_all(force)
     end
 
     M.dirty = false
-    print("[Saver] raw 文件 + state.zst 已更新")
+    print("[Saver] raw 文件 + state.zst + checkpoint 已更新 (已保存模块: " .. table.concat(saved_modules, ", ") .. ")")
     return true
 end
 
