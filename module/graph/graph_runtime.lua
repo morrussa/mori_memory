@@ -136,6 +136,7 @@ function M.run_turn(args)
         uploads = args.uploads or {},
         conversation_history = conversation_history,
         system_prompt = base_system_prompt,
+        stream_sink = stream_sink,
     })
     state.repair.max_attempts = math.max(0, math.floor(tonumber((cfg.repair or {}).max_attempts) or 2))
     state.agent_loop = state.agent_loop or {}
@@ -223,12 +224,15 @@ function M.run_turn(args)
     state.metrics.finished_at_ms = util.now_ms()
     local final_text = tostring((((state or {}).final_response or {}).message) or "")
 
-    local stream_chunk_chars = math.max(1, math.floor(tonumber((cfg.streaming or {}).token_chunk_chars) or 24))
-    for _, chunk in ipairs(chunk_text(final_text, stream_chunk_chars)) do
-        emit_stream(stream_sink, "token", {
-            run_id = state.run_id,
-            token = chunk,
-        })
+    -- 只有在 agent_node 没有发送过 token 时才发送
+    if not state._streaming_sent and final_text ~= "" then
+        local stream_chunk_chars = math.max(1, math.floor(tonumber((cfg.streaming or {}).token_chunk_chars) or 24))
+        for _, chunk in ipairs(chunk_text(final_text, stream_chunk_chars)) do
+            emit_stream(stream_sink, "token", {
+                run_id = state.run_id,
+                token = chunk,
+            })
+        end
     end
 
     local trace_summary = build_trace_summary(state)

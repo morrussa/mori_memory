@@ -197,6 +197,7 @@ function M.new_state(args)
             truncated_count = 0,
             total_result_chars = 0,
             large_results = {},
+            read_files = {},  -- 新增：记录所有已读取的文件路径
         },
         repair = {
             attempts = 0,
@@ -219,6 +220,7 @@ function M.new_state(args)
             seq = 0,
             last_node = "",
         },
+        stream_sink = args.stream_sink, -- 可选的流式输出回调
     }
 end
 

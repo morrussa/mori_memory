@@ -83,10 +83,25 @@ function M.run(state, _ctx)
         context_fragments = {},
         truncated_count = 0,
         total_result_chars = 0,
+        read_files = {},  -- 记录所有已读取的文件路径
     }
 
     local calls = state.agent_loop.pending_tool_calls or {}
+
+    -- DEBUG
+    print(string.format("[ToolsNode][DEBUG] executing %d tool calls", #calls))
+    for i, call in ipairs(calls) do
+        print(string.format("[ToolsNode][DEBUG] call[%d]: %s", i, tostring(call.tool or "unknown")))
+    end
+
     local result = tool_registry.execute_calls(calls)
+
+    -- DEBUG
+    print(string.format("[ToolsNode][DEBUG] result: executed=%d failed=%d control_action=%s",
+        tonumber(result.executed) or 0,
+        tonumber(result.failed) or 0,
+        tostring(result.control_action or "nil")
+    ))
 
     state.tool_exec.loop_count = (tonumber(state.tool_exec.loop_count) or 0) + 1
     state.tool_exec.executed = tonumber(result.executed) or 0
@@ -97,51 +112,91 @@ function M.run(state, _ctx)
     state.tool_exec.truncated_count = 0
     state.tool_exec.total_result_chars = 0
 
+    -- 处理控制信号
+    local control_action = result.control_action
+    local control_data = result.control_data
+    
+    -- 如果收到 finish_turn 信号，设置最终消息和停止原因
+    if control_action == "finish" then
+        state.agent_loop.stop_reason = "finish_turn_called"
+        if result.final_message and result.final_message ~= "" then
+            state.final_response = state.final_response or {}
+            state.final_response.message = result.final_message
+            state.final_response.from_control_tool = true
+        end
+    end
+    
+    -- 如果收到 continue_task 信号，确保循环继续
+    -- (通过不清除 pending_tool_calls 的方式让 agent_node 在下一轮处理)
+    -- continue_task 的理由会被添加到下一个消息中
+
     -- 处理工具结果，进行大小优化
     local processed_results = {}
     local processed_fragments = {}
     for _, row in ipairs(result.call_results or {}) do
-        local processed_row = {
-            call_id = row.call_id,
-            tool = row.tool,
-            args = row.args,
-            ok = row.ok,
-            error = row.error,
-            result = row.result,
-            original_chars = #(tostring(row.result or "")),
-            was_truncated = false,
-            from_cache = false,
-        }
+        -- 跳过控制工具的结果（它们不产生文件上下文）
+        if row.is_control then
+            processed_results[#processed_results + 1] = {
+                call_id = row.call_id,
+                tool = row.tool,
+                args = row.args,
+                ok = row.ok,
+                error = row.error,
+                result = row.result,
+                is_control = true,
+            }
+        else
+            local processed_row = {
+                call_id = row.call_id,
+                tool = row.tool,
+                args = row.args,
+                ok = row.ok,
+                error = row.error,
+                result = row.result,
+                original_chars = #(tostring(row.result or "")),
+                was_truncated = false,
+                from_cache = false,
+            }
 
-        if row.ok == true and row.result then
-            -- 使用context_manager处理结果
-            local processed_text, from_cache, original_len = context_manager.process_tool_result(
-                row.tool,
-                row.args,
-                row.result
-            )
-            processed_row.result = processed_text
-            processed_row.from_cache = from_cache
-            processed_row.original_chars = original_len
-            processed_row.was_truncated = (original_len > #processed_text)
-
-            if processed_row.was_truncated then
-                state.tool_exec.truncated_count = (state.tool_exec.truncated_count or 0) + 1
-            end
-
-            -- 更新context fragment
-            if READ_EVIDENCE_TOOLS[tostring(row.tool or "")] then
-                state.tool_exec.read_evidence_total = state.tool_exec.read_evidence_total + 1
-                processed_fragments[#processed_fragments + 1] = string.format(
-                    "[Tool:%s]\n%s",
+            if row.ok == true and row.result then
+                -- 使用context_manager处理结果
+                local processed_text, from_cache, original_len = context_manager.process_tool_result(
                     row.tool,
-                    processed_text
+                    row.args,
+                    row.result
                 )
-            end
-        end
+                processed_row.result = processed_text
+                processed_row.from_cache = from_cache
+                processed_row.original_chars = original_len
+                processed_row.was_truncated = (original_len > #processed_text)
 
-        processed_results[#processed_results + 1] = processed_row
-        state.tool_exec.total_result_chars = (state.tool_exec.total_result_chars or 0) + #(processed_row.result or "")
+                if processed_row.was_truncated then
+                    state.tool_exec.truncated_count = (state.tool_exec.truncated_count or 0) + 1
+                end
+
+                -- 更新context fragment
+                if READ_EVIDENCE_TOOLS[tostring(row.tool or "")] then
+                    state.tool_exec.read_evidence_total = state.tool_exec.read_evidence_total + 1
+                    processed_fragments[#processed_fragments + 1] = string.format(
+                        "[Tool:%s]\n%s",
+                        row.tool,
+                        processed_text
+                    )
+                    -- 记录已读取的文件路径
+                    local read_path = tostring((row.args or {}).path or "")
+                    if read_path ~= "" then
+                        state.tool_exec.read_files = state.tool_exec.read_files or {}
+                        -- 使用统一的路径标准化
+                        read_path = util.normalize_tool_path(read_path)
+                        state.tool_exec.read_files[read_path] = true
+                        print(string.format("[ToolsNode][DEBUG] Recorded read file: %s", read_path))
+                    end
+                end
+            end
+
+            processed_results[#processed_results + 1] = processed_row
+            state.tool_exec.total_result_chars = (state.tool_exec.total_result_chars or 0) + #(processed_row.result or "")
+        end
     end
 
     state.tool_exec.results = processed_results
@@ -153,13 +208,24 @@ function M.run(state, _ctx)
     -- 构建工具消息时进行最终大小检查
     local max_tool_msg_chars = TOOL_RESULT_HARD_MAX_CHARS
     for _, row in ipairs(state.tool_exec.results) do
-        local msg = build_tool_message(row)
-        -- 对过大的tool消息进行最终截断
-        if #msg.content > max_tool_msg_chars then
-            msg.content = util.utf8_take(msg.content, max_tool_msg_chars)
-                .. "\n[Output truncated to prevent context overflow]"
+        -- 控制工具的消息也需要添加到 runtime_messages
+        if row.is_control then
+            state.messages.runtime_messages[#state.messages.runtime_messages + 1] = {
+                role = "tool",
+                name = tostring(row.tool or ""),
+                tool_call_id = tostring(row.call_id or ""),
+                content = row.ok and "Control signal processed." or ("Error: " .. tostring(row.error or "")),
+                status = row.ok and "success" or "error",
+            }
+        else
+            local msg = build_tool_message(row)
+            -- 对过大的tool消息进行最终截断
+            if #msg.content > max_tool_msg_chars then
+                msg.content = util.utf8_take(msg.content, max_tool_msg_chars)
+                    .. "\n[Output truncated to prevent context overflow]"
+            end
+            state.messages.runtime_messages[#state.messages.runtime_messages + 1] = msg
         end
-        state.messages.runtime_messages[#state.messages.runtime_messages + 1] = msg
     end
 
     -- 检查上下文预算
@@ -172,8 +238,25 @@ function M.run(state, _ctx)
     end
 
     state.agent_loop.pending_tool_calls = {}
-    if util.trim(state.agent_loop.stop_reason) == "" then
-        state.agent_loop.stop_reason = ""
+    
+    -- 只有在没有 finish_turn 控制信号时才清除停止原因
+    if control_action ~= "finish" then
+        -- 清除可能的停止原因，让循环可以继续
+        if util.trim(state.agent_loop.stop_reason) ~= "" then
+            state.agent_loop.stop_reason = ""
+        end
+    end
+    
+    -- 如果是 continue_task，添加一个系统提示让 agent 知道要继续
+    if control_action == "continue" and control_data then
+        local continue_hint = string.format(
+            "[System] Agent requested to continue: %s",
+            tostring(control_data.reason or "continuing task")
+        )
+        state.messages.runtime_messages[#state.messages.runtime_messages + 1] = {
+            role = "user",
+            content = continue_hint,
+        }
     end
 
     return state

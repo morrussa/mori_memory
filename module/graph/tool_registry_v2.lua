@@ -2,6 +2,7 @@ local util = require("module.graph.util")
 local config = require("module.config")
 local file_tools = require("module.graph.file_tools")
 local code_tools = require("module.graph.code_tools")
+local control_tools = require("module.graph.control_tools")
 local provider_registry = require("module.graph.providers.registry")
 local context_manager = require("module.graph.context_manager")
 
@@ -120,6 +121,12 @@ function M.get_supported_tools()
             tools[name] = true
         end
     end
+    -- 添加控制工具
+    for name, enabled in pairs(control_tools.supported_tools() or {}) do
+        if enabled then
+            tools[name] = true
+        end
+    end
     local provider_state = create_provider_state()
     if provider_state.enabled and provider_state.provider then
         for _, schema in ipairs(provider_state.provider:list_tools() or {}) do
@@ -160,6 +167,18 @@ function M.get_tool_schemas()
         end
     end
 
+    -- 添加控制工具 schema
+    for _, schema in ipairs(control_tools.get_tool_schemas() or {}) do
+        if type(schema) == "table" then
+            local fn = schema["function"] or {}
+            local name = util.trim(fn.name)
+            if name ~= "" and (not seen[name]) then
+                seen[name] = true
+                out[#out + 1] = schema
+            end
+        end
+    end
+
     local provider_state = create_provider_state()
     if provider_state.enabled and provider_state.provider then
         for _, schema in ipairs(provider_state.provider:list_tools() or {}) do
@@ -176,6 +195,12 @@ function M.get_tool_schemas()
     return out
 end
 
+-- 控制工具集合
+local CONTROL_TOOLS = {
+    finish_turn = true,
+    continue_task = true,
+}
+
 function M.execute_calls(calls)
     local out = {
         executed = 0,
@@ -186,6 +211,9 @@ function M.execute_calls(calls)
         parallel_groups = 0,
         total_result_chars = 0,
         large_results = {}, -- 记录大结果
+        -- 控制信号
+        control_action = nil,  -- "finish" | "continue"
+        control_data = nil,    -- 控制工具返回的数据
     }
 
     if type(calls) ~= "table" or #calls == 0 then
@@ -201,6 +229,7 @@ function M.execute_calls(calls)
 
     local serial_calls = {}
     local no_side_effect_count = 0
+    local control_call = nil  -- 存储第一个控制工具调用
 
     for i, raw in ipairs(calls) do
         local call, err = normalize_call(raw, i)
@@ -226,11 +255,56 @@ function M.execute_calls(calls)
                     result = "",
                 }
             else
-                if NO_SIDE_EFFECT_TOOLS[call.tool] then
-                    no_side_effect_count = no_side_effect_count + 1
+                -- 检查是否是控制工具
+                if CONTROL_TOOLS[call.tool] then
+                    -- 只处理第一个控制工具，忽略其他的
+                    if control_call == nil then
+                        control_call = call
+                    end
+                else
+                    if NO_SIDE_EFFECT_TOOLS[call.tool] then
+                        no_side_effect_count = no_side_effect_count + 1
+                    end
+                    serial_calls[#serial_calls + 1] = call
                 end
-                serial_calls[#serial_calls + 1] = call
             end
+        end
+    end
+
+    -- 优先处理控制工具
+    if control_call then
+        local ok, result_or_err, control_info = control_tools.execute(control_call)
+        if ok and control_info then
+            out.control_action = control_info.action
+            out.control_data = control_info
+            
+            -- 记录控制工具执行结果
+            out.executed = out.executed + 1
+            out.call_results[#out.call_results + 1] = {
+                call_id = control_call.call_id,
+                tool = control_call.tool,
+                args = control_call.args,
+                ok = true,
+                error = "",
+                result = tostring(result_or_err),
+                is_control = true,
+            }
+            
+            -- 如果是 finish_turn，设置最终消息
+            if control_info.action == "finish" then
+                out.final_message = control_info.message
+            end
+        else
+            out.failed = out.failed + 1
+            out.call_results[#out.call_results + 1] = {
+                call_id = control_call.call_id,
+                tool = control_call.tool,
+                args = control_call.args,
+                ok = false,
+                error = tostring(result_or_err or "control_tool_failed"),
+                result = "",
+                is_control = true,
+            }
         end
     end
 

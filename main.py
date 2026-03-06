@@ -1381,8 +1381,8 @@ class AIPipeline:
         context_lines = self._coerce_int_arg(args.get("context_lines"), 0)
         if context_lines < 0:
             context_lines = 0
-        if context_lines > 8:
-            context_lines = 8
+        if context_lines > 30:  # 增加上限以支持 Codex 风格的上下文窗口
+            context_lines = 30
 
         case_sensitive = self._coerce_bool_arg(args.get("case_sensitive"), False)
         regex_mode = self._coerce_bool_arg(args.get("regex"), False)
@@ -1507,8 +1507,8 @@ class AIPipeline:
         context_lines = self._coerce_int_arg(args.get("context_lines"), 0)
         if context_lines < 0:
             context_lines = 0
-        if context_lines > 8:
-            context_lines = 8
+        if context_lines > 30:  # 增加上限以支持 Codex 风格的上下文窗口
+            context_lines = 30
 
         case_sensitive = self._coerce_bool_arg(args.get("case_sensitive"), False)
         regex_mode = self._coerce_bool_arg(args.get("regex"), False)

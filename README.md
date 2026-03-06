@@ -113,6 +113,8 @@ external provider 默认关闭，必须显式白名单启用。
 
 ### CLI
 
+source .venv/bin/activate
+
 ```bash
 MORI_RUN_MODE=cli python3 main.py
 # 或直接强制终端模式（忽略环境变量）：

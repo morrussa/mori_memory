@@ -8,6 +8,44 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
+-- 发送流式事件
+local function emit_stream(state, event_name, payload)
+    local sink = state.stream_sink
+    if type(sink) ~= "function" then
+        return
+    end
+    local ok, err = pcall(sink, {
+        event = event_name,
+        data = payload or {},
+    })
+    if not ok then
+        print(string.format("[ResponderNode][WARN] stream emit failed: %s", tostring(err)))
+    end
+end
+
+-- 分块发送文本作为 token 事件
+local function emit_tokens(state, text, chunk_chars)
+    local s = tostring(text or "")
+    if s == "" then
+        return
+    end
+    local n = math.max(1, math.floor(tonumber(chunk_chars) or 24))
+    local buf = {}
+    local count = 0
+    for ch in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        buf[#buf + 1] = ch
+        count = count + 1
+        if count >= n then
+            emit_stream(state, "token", { token = table.concat(buf) })
+            buf = {}
+            count = 0
+        end
+    end
+    if #buf > 0 then
+        emit_stream(state, "token", { token = table.concat(buf) })
+    end
+end
+
 local FILE_TOOLS = {
     list_files = true,
     read_file = true,
@@ -97,12 +135,18 @@ function M.run(state, _ctx)
     local file_tool_evidence = has_file_tool_evidence(state)
 
     if strict_tool_honesty and uploads_present and not file_tool_evidence then
+        local fallback_msg = "我还没有成功读取你上传的附件内容。请重试这次请求，我会先执行文件工具再给出基于附件的结论。"
         state.final_response = {
-            message = "我还没有成功读取你上传的附件内容。请重试这次请求，我会先执行文件工具再给出基于附件的结论。",
+            message = fallback_msg,
             context_meta = {
                 policy = "missing_upload_tool_evidence",
             },
         }
+        -- 流式发送 fallback 消息
+        local stream_cfg = graph_cfg().streaming or {}
+        local chunk_chars = tonumber(stream_cfg.token_chunk_chars) or 24
+        emit_tokens(state, fallback_msg, chunk_chars)
+        state._streaming_sent = true
         return state
     end
 
@@ -132,6 +176,15 @@ function M.run(state, _ctx)
         message = final_text,
         context_meta = meta,
     }
+
+    -- 流式发送最终回复
+    if final_text ~= "" then
+        local stream_cfg = graph_cfg().streaming or {}
+        local chunk_chars = tonumber(stream_cfg.token_chunk_chars) or 24
+        emit_tokens(state, final_text, chunk_chars)
+        state._streaming_sent = true
+    end
+
     return state
 end
 

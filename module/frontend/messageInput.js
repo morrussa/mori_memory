@@ -321,6 +321,7 @@ class MessageInput extends HTMLElement {
     this._pendingFiles = [];
     this._uploadLimits = { ...CLIENT_UPLOAD_LIMITS };
     this._isSending = false;
+    this._isAgentRunning = false;
 
     // Event listeners
     this._textarea.addEventListener('input', this._handleInput.bind(this));
@@ -542,7 +543,19 @@ class MessageInput extends HTMLElement {
   }
 
   _updateUIState(isSending) {
-    if (isSending) {
+    this._isSending = isSending;
+    this._updateUIFromState();
+  }
+
+  _updateUIFromState() {
+    const isDisabled = this._isSending || this._isAgentRunning;
+    console.log('[MessageInput] _updateUIFromState:', { 
+      isSending: this._isSending, 
+      isAgentRunning: this._isAgentRunning,
+      isDisabled 
+    });
+    
+    if (isDisabled) {
       this._inputContainer.classList.add('disabled');
       this._sendBtn.classList.add('sending');
       this._sendBtn.disabled = true;
@@ -575,6 +588,12 @@ class MessageInput extends HTMLElement {
     this._pendingFiles = [];
     this._renderFileList();
     this._adjustTextareaHeight();
+  }
+
+  setAgentRunning(running) {
+    console.log('[MessageInput] setAgentRunning:', running);
+    this._isAgentRunning = running;
+    this._updateUIFromState();
   }
 }
 

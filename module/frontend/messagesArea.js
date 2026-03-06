@@ -13,6 +13,7 @@ messagesAreaTemplate.innerHTML = `
     flex: 1;
     overflow: hidden;
     background: var(--color-bg-primary);
+    position: relative;
   }
 
   #messagesContainer {
@@ -24,6 +25,128 @@ messagesAreaTemplate.innerHTML = `
     flex-direction: column;
     gap: var(--space-md);
     scroll-behavior: smooth;
+    padding-bottom: 60px;
+  }
+
+  /* Progress Status Bar */
+  #progressBar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--color-surface);
+    border-top: 1px solid var(--color-border);
+    padding: var(--space-sm) var(--space-lg);
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    font-size: var(--font-size-sm);
+    color: var(--color-text-secondary);
+    z-index: var(--z-sticky);
+    transition: opacity var(--transition-normal), transform var(--transition-normal);
+    opacity: 0;
+    transform: translateY(100%);
+    pointer-events: none;
+  }
+
+  #progressBar.visible {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+
+  .progress-indicator {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex: 1;
+    min-width: 0;
+  }
+
+  .progress-spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--color-border);
+    border-top-color: var(--color-primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    flex-shrink: 0;
+  }
+
+  .progress-icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
+
+  .progress-icon.tool {
+    color: var(--color-warning);
+  }
+
+  .progress-icon.thinking {
+    color: var(--color-info);
+  }
+
+  .progress-icon.success {
+    color: var(--color-success);
+  }
+
+  .progress-icon.error {
+    color: var(--color-error);
+  }
+
+  .progress-text {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .progress-detail {
+    color: var(--color-text-tertiary);
+    font-size: var(--font-size-xs);
+    margin-left: var(--space-sm);
+  }
+
+  .progress-tools {
+    display: flex;
+    gap: var(--space-xs);
+    margin-left: auto;
+  }
+
+  .tool-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: 2px var(--space-sm);
+    background: var(--color-tool-bg);
+    border: 1px solid var(--color-warning);
+    border-radius: var(--radius-full);
+    font-size: var(--font-size-xs);
+    color: var(--color-warning);
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tool-badge.running {
+    border-color: var(--color-info);
+    color: var(--color-info);
+    background: var(--color-info-light);
+  }
+
+  .tool-badge.success {
+    border-color: var(--color-success);
+    color: var(--color-success-dark);
+    background: var(--color-success-light);
+  }
+
+  .tool-badge.error {
+    border-color: var(--color-error);
+    color: var(--color-error);
+    background: var(--color-error-light);
   }
 
   /* Welcome Screen */
@@ -618,6 +741,13 @@ messagesAreaTemplate.innerHTML = `
     </div>
   </div>
 </div>
+<div id="progressBar">
+  <div class="progress-indicator">
+    <span class="progress-spinner"></span>
+    <span class="progress-text">准备中...</span>
+  </div>
+  <div class="progress-tools" id="progressTools"></div>
+</div>
 `;
 
 class MessagesArea extends HTMLElement {
@@ -634,10 +764,149 @@ class MessagesArea extends HTMLElement {
     this.hasMessages = false;
     this.isStreaming = false;
     this.messageCount = 0;
+    
+    // Progress state
+    this.progressBar = this.shadowRoot.querySelector('#progressBar');
+    this.progressText = this.shadowRoot.querySelector('.progress-text');
+    this.progressTools = this.shadowRoot.querySelector('#progressTools');
+    this.progressIndicator = this.shadowRoot.querySelector('.progress-indicator');
+    this.activeTools = new Map(); // callId -> {name, status}
+    this.currentPhase = null;
+    this.currentPhaseDetail = null;
+    this.hideTimeout = null;
   }
 
   init(worker) {
     this.worker = worker;
+  }
+
+  // ===== Progress Bar Methods =====
+  showProgress(text, type = 'running') {
+    if (this.hideTimeout) {
+      clearTimeout(this.hideTimeout);
+      this.hideTimeout = null;
+    }
+    
+    // Add tool count if there are active tools
+    let displayText = text;
+    if (this.activeTools && this.activeTools.size > 0) {
+      const toolNames = Array.from(this.activeTools.values()).map(t => t.name);
+      const toolCount = this.activeTools.size;
+      if (toolCount === 1) {
+        displayText = `${text} (执行工具: ${toolNames[0]})`;
+      } else {
+        displayText = `${text} (${toolCount}个工具执行中)`;
+      }
+    }
+    
+    this.progressText.textContent = displayText;
+    this.progressBar.classList.add('visible');
+    
+    // Update spinner/icon based on type
+    const spinner = this.progressIndicator.querySelector('.progress-spinner');
+    if (type === 'success' || type === 'error') {
+      spinner.style.display = 'none';
+      let icon = this.progressIndicator.querySelector('.progress-icon');
+      if (!icon) {
+        icon = document.createElement('span');
+        icon.className = 'progress-icon';
+        this.progressIndicator.insertBefore(icon, this.progressText);
+      }
+      icon.className = `progress-icon ${type}`;
+      icon.innerHTML = type === 'success' 
+        ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+    } else {
+      spinner.style.display = '';
+      const icon = this.progressIndicator.querySelector('.progress-icon');
+      if (icon) icon.remove();
+    }
+  }
+
+  hideProgress(delay = 500) {
+    if (this.hideTimeout) {
+      clearTimeout(this.hideTimeout);
+    }
+    this.hideTimeout = setTimeout(() => {
+      this.progressBar.classList.remove('visible');
+      this.activeTools.clear();
+      this.renderToolBadges();
+      this.hideTimeout = null;
+    }, delay);
+  }
+
+  setProgressPhase(phase, detail = null) {
+    this.currentPhase = phase;
+    this.currentPhaseDetail = detail;
+    this.refreshProgressText();
+  }
+
+  refreshProgressText() {
+    const phase = this.currentPhase;
+    const detail = this.currentPhaseDetail;
+    const phaseTexts = {
+      'run_start': '开始执行',
+      'node_start': detail ? `执行节点: ${detail}` : '执行节点',
+      'node_end': detail ? `节点完成: ${detail}` : '节点完成',
+      'thinking': '思考中...',
+      'tool_call': '调用工具',
+      'streaming': '生成回复',
+      'run_done': '完成',
+      'idle': '就绪'
+    };
+    const text = phaseTexts[phase] || phase;
+    const type = phase === 'run_done' ? 'success' : 'running';
+    this.showProgress(text, type);
+  }
+
+  addToolBadge(callId, toolName, status = 'running') {
+    this.activeTools.set(callId, { name: toolName, status });
+    this.renderToolBadges();
+    this.refreshProgressText();
+  }
+
+  updateToolBadge(callId, status) {
+    const tool = this.activeTools.get(callId);
+    if (tool) {
+      tool.status = status;
+      this.renderToolBadges();
+      this.refreshProgressText();
+    }
+  }
+
+  removeToolBadge(callId) {
+    this.activeTools.delete(callId);
+    this.renderToolBadges();
+    this.refreshProgressText();
+  }
+
+  renderToolBadges() {
+    this.progressTools.innerHTML = '';
+    
+    // Only show first 3 tools
+    const tools = Array.from(this.activeTools.entries()).slice(0, 3);
+    
+    tools.forEach(([callId, { name, status }]) => {
+      const badge = document.createElement('span');
+      badge.className = `tool-badge ${status}`;
+      badge.textContent = name.length > 12 ? name.slice(0, 12) + '...' : name;
+      this.progressTools.appendChild(badge);
+    });
+    
+    if (this.activeTools.size > 3) {
+      const more = document.createElement('span');
+      more.className = 'tool-badge';
+      more.textContent = `+${this.activeTools.size - 3}`;
+      this.progressTools.appendChild(more);
+    }
+  }
+
+  clearProgress() {
+    this.activeTools.clear();
+    this.currentPhase = null;
+    this.currentPhaseDetail = null;
+    this.renderToolBadges();
+    this.hideProgress(0);
   }
 
   // SVG Icons

@@ -18,7 +18,7 @@ local DEFAULT_SETTINGS = {
     },
     graph = {
         input_token_budget = 12000,
-        tool_loop_max = 5,
+        tool_loop_max = 10,
         max_nodes_per_run = 128,
         router = {
             max_tokens = 48,

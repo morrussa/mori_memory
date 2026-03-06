@@ -14,6 +14,44 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
+-- 发送流式事件
+local function emit_stream(state, event_name, payload)
+    local sink = state.stream_sink
+    if type(sink) ~= "function" then
+        return
+    end
+    local ok, err = pcall(sink, {
+        event = event_name,
+        data = payload or {},
+    })
+    if not ok then
+        print(string.format("[AgentNode][WARN] stream emit failed: %s", tostring(err)))
+    end
+end
+
+-- 分块发送文本作为 token 事件
+local function emit_tokens(state, text, chunk_chars)
+    local s = tostring(text or "")
+    if s == "" then
+        return
+    end
+    local n = math.max(1, math.floor(tonumber(chunk_chars) or 24))
+    local buf = {}
+    local count = 0
+    for ch in s:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        buf[#buf + 1] = ch
+        count = count + 1
+        if count >= n then
+            emit_stream(state, "token", { token = table.concat(buf) })
+            buf = {}
+            count = 0
+        end
+    end
+    if #buf > 0 then
+        emit_stream(state, "token", { token = table.concat(buf) })
+    end
+end
+
 local function has_method(runtime, method_name)
     if runtime == nil then
         return false
@@ -222,16 +260,14 @@ local function has_file_intent(user_input)
 end
 
 local function has_followup_read_intent(user_input)
+    -- 简化：移除大部分关键词检测
+    -- 现在 agent 应该通过 continue_task 工具来表达继续意图
+    -- 这里只保留最基本的检测，用于处理用户明确要求继续的情况
     local q = lower_text(user_input)
     if q == "" then
         return false
     end
-    return q == "再试一次"
-        or q == "继续"
-        or q == "继续吧"
-        or q == "..."
-        or q:find("再来一次", 1, true) ~= nil
-        or q:find("倒是读", 1, true) ~= nil
+    return q == "再试一次" or q == "继续"
 end
 
 local function should_require_file_read(state)
@@ -249,25 +285,7 @@ local function should_require_file_read(state)
 end
 
 local function normalize_tool_path(raw)
-    local path = util.trim(raw)
-    if path == "" then
-        return ""
-    end
-    path = tostring(path):gsub("\\", "/")
-
-    while path:sub(1, 2) == "./" do
-        path = path:sub(3)
-    end
-    if path:sub(1, 10) == "workspace/" then
-        path = path:sub(11)
-    end
-    local idx = path:find("/workspace/", 1, true)
-    if idx then
-        path = path:sub(idx + 11)
-    end
-
-    path = path:gsub("^/+", "")
-    return util.trim(path)
+    return util.normalize_tool_path(raw)
 end
 
 local function extract_tool_paths_from_text(text, out, seen)
@@ -345,7 +363,6 @@ local function build_forced_read_calls(state, max_calls)
     local calls = {}
     local limit = math.max(1, math.floor(tonumber(max_calls) or 1))
     local known_paths = collect_known_tool_paths(state)
-    local path = tostring(known_paths[1] or "")
     local q = lower_text((((state or {}).input or {}).message) or "")
     local wants_lines = (
         q:find("前几行", 1, true) ~= nil
@@ -357,52 +374,98 @@ local function build_forced_read_calls(state, max_calls)
         or q:find("模型设置", 1, true) ~= nil
     )
 
-    if path == "" then
+    -- 从 tool_exec.read_files 中获取已读取的文件路径
+    local already_read = state.tool_exec.read_files or {}
+    local already_read_count = 0
+    for _ in pairs(already_read) do
+        already_read_count = already_read_count + 1
+    end
+
+    -- DEBUG
+    print(string.format("[BuildForced][DEBUG] known_paths=%d already_read=%d limit=%d",
+        #known_paths, already_read_count, limit))
+
+    -- 为每个未读取的文件构建读取调用
+    local call_idx = 0
+    for _, path in ipairs(known_paths) do
+        if call_idx >= limit then
+            break
+        end
+        -- 跳过已经读取过的文件
+        if not already_read[path] then
+            if wants_lines then
+                calls[#calls + 1] = {
+                    tool = "read_lines",
+                    args = {
+                        path = path,
+                        start_line = 1,
+                        max_lines = 220,
+                    },
+                    call_id = string.format("guard_read_lines_%d", call_idx + 1),
+                }
+            else
+                calls[#calls + 1] = {
+                    tool = "read_file",
+                    args = {
+                        path = path,
+                        max_chars = 2400,
+                    },
+                    call_id = string.format("guard_read_file_%d", call_idx + 1),
+                }
+            end
+            call_idx = call_idx + 1
+            print(string.format("[BuildForced][DEBUG] Added read call for: %s", path))
+        end
+    end
+
+    -- 如果没有找到任何路径，尝试列出download目录
+    if #calls == 0 and #known_paths == 0 then
         calls[#calls + 1] = {
             tool = "list_files",
             args = { prefix = "download" },
             call_id = "guard_list_files_1",
         }
-        return calls
     end
 
-    if wants_lines then
-        calls[#calls + 1] = {
-            tool = "read_lines",
-            args = {
-                path = path,
-                start_line = 1,
-                max_lines = 220,
-            },
-            call_id = "guard_read_lines_1",
-        }
-    else
-        calls[#calls + 1] = {
-            tool = "read_file",
-            args = {
-                path = path,
-                max_chars = 2400,
-            },
-            call_id = "guard_read_file_1",
-        }
-    end
-
-    if #calls > limit then
-        for i = #calls, limit + 1, -1 do
-            table.remove(calls, i)
-        end
-    end
     return calls
 end
 
 local function enforce_file_read_guard(state, tool_calls)
     local calls = tool_calls or {}
+    
+    -- 如果 agent 调用了 finish_turn，不要强制添加其他工具
+    for _, call in ipairs(calls) do
+        if call.tool == "finish_turn" or call.tool == "continue_task" then
+            return calls
+        end
+    end
+    
     if not should_require_file_read(state) then
         return calls
     end
-    if has_read_evidence(state) then
+    
+    -- 检查是否有上传文件和已读取文件数量
+    local uploads_count = #(state.uploads or {})
+    local read_files = state.tool_exec.read_files or {}
+    local read_count = 0
+    for _ in pairs(read_files) do
+        read_count = read_count + 1
+    end
+    
+    -- DEBUG
+    print(string.format("[EnforceGuard][DEBUG] uploads=%d read_count=%d calls=%d",
+        uploads_count, read_count, #calls))
+    
+    -- 如果有上传文件，且读取文件数少于上传数量，说明还有未读取的文件
+    local has_unread_uploads = uploads_count > 0 and read_count < uploads_count
+    
+    -- 如果没有未读取的上传文件，且已有读取证据，则不需要强制
+    if not has_unread_uploads and has_read_evidence(state) then
+        print("[EnforceGuard][DEBUG] No unread uploads, skipping")
         return calls
     end
+    
+    print(string.format("[EnforceGuard][DEBUG] Has unread uploads or no evidence, forcing reads: %s", tostring(has_unread_uploads)))
 
     local max_calls = math.max(1, math.floor(tonumber((((graph_cfg() or {}).planner or {}).max_calls_per_loop) or 6)))
     if #calls <= 0 then
@@ -427,66 +490,7 @@ local function enforce_file_read_guard(state, tool_calls)
     return calls
 end
 
-local function append_finish_tool_schema(tools)
-    local out = {}
-    local seen_finish = false
-    for _, item in ipairs(tools or {}) do
-        out[#out + 1] = item
-        local fn = type(item) == "table" and item["function"] or nil
-        local name = util.trim(type(fn) == "table" and fn.name or "")
-        if name == "finish_turn" then
-            seen_finish = true
-        end
-    end
-    if seen_finish then
-        return out
-    end
-    out[#out + 1] = {
-        type = "function",
-        ["function"] = {
-            name = "finish_turn",
-            description = "Finish current turn when no more tools are needed; put final user-facing answer in message.",
-            parameters = {
-                type = "object",
-                properties = {
-                    message = { type = "string", description = "Final response to user" },
-                },
-                required = { "message" },
-            },
-        },
-    }
-    return out
-end
 
-local function split_finish_calls(calls, fallback_content)
-    local out = {}
-    local saw_finish = false
-    local finish_message = ""
-    local fallback = util.trim(fallback_content or "")
-
-    for _, call in ipairs(calls or {}) do
-        if util.trim((call or {}).tool) == "finish_turn" then
-            saw_finish = true
-            local args = type((call or {}).args) == "table" and (call or {}).args or {}
-            local msg = util.trim(
-                args.message
-                or args.final
-                or args.answer
-                or args.content
-                or args.text
-            )
-            if msg == "" then
-                msg = fallback
-            end
-            if finish_message == "" then
-                finish_message = msg
-            end
-        else
-            out[#out + 1] = call
-        end
-    end
-    return out, saw_finish, finish_message
-end
 
 local function parse_model_output(raw)
     if type(raw) == "string" then
@@ -546,10 +550,10 @@ local function call_agent_with_tools(state)
         seed = tonumber(cfg.seed) or 42,
     }
 
-    local tools = append_finish_tool_schema(tool_registry.get_tool_schemas())
+    local tools = tool_registry.get_tool_schemas()
     local tool_choice = cfg.tool_choice
     if util.trim(tool_choice) == "" then
-        tool_choice = "required"
+        tool_choice = "auto"
     end
     local parallel_tool_calls = util.to_bool(cfg.parallel_tool_calls, true)
 
@@ -603,6 +607,14 @@ function M.run(state, _ctx)
     }
     state.planner = state.planner or { tool_calls = {}, errors = {}, raw = "", force_reason = "" }
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
+
+    -- DEBUG: 打印当前状态
+    print(string.format("[AgentNode][DEBUG] iteration=%d remaining_steps=%d uploads_count=%d stop_reason='%s'",
+        tonumber(state.agent_loop.iteration) or 0,
+        tonumber(state.agent_loop.remaining_steps) or 0,
+        #(state.uploads or {}),
+        tostring(state.agent_loop.stop_reason or "")
+    ))
 
     -- 检查上下文预算
     local stats = context_manager.get_context_stats(state)
@@ -664,11 +676,16 @@ function M.run(state, _ctx)
         return state
     end
 
-    local guarded_calls = enforce_file_read_guard(state, out.tool_calls or {})
-    local tool_calls, model_done, finish_message = split_finish_calls(guarded_calls, out.content)
+    local tool_calls = enforce_file_read_guard(state, out.tool_calls or {})
     local assistant_content = tostring(out.content or "")
-    if model_done and #tool_calls <= 0 and util.trim(finish_message) ~= "" then
-        assistant_content = finish_message
+
+    -- DEBUG: 打印LLM响应信息
+    print(string.format("[AgentNode][DEBUG] LLM response: content_len=%d tool_calls_count=%d",
+        #assistant_content,
+        #tool_calls
+    ))
+    for i, call in ipairs(tool_calls) do
+        print(string.format("[AgentNode][DEBUG] tool_call[%d]: %s", i, tostring(call.tool or "unknown")))
     end
 
     -- 如果预算紧张，在assistant消息中添加提示
@@ -681,6 +698,15 @@ function M.run(state, _ctx)
         content = assistant_content,
         tool_calls = tool_calls,
     }
+
+    -- 流式发送 assistant 回复（如果有内容且无工具调用）
+    if #tool_calls == 0 and assistant_content ~= "" then
+        local stream_cfg = graph_cfg().streaming or {}
+        local chunk_chars = tonumber(stream_cfg.token_chunk_chars) or 24
+        -- 标记已发送，避免在 graph_runtime 中重复发送
+        state._streaming_sent = true
+        emit_tokens(state, assistant_content, chunk_chars)
+    end
 
     state.agent_loop.iteration = (tonumber(state.agent_loop.iteration) or 0) + 1
     state.agent_loop.remaining_steps = math.max(0, (tonumber(state.agent_loop.remaining_steps) or 0) - 1)
@@ -696,13 +722,10 @@ function M.run(state, _ctx)
     end
 
     if #tool_calls > 0 and (tonumber(state.agent_loop.remaining_steps) or 0) <= 0 then
-        state.agent_loop.pending_tool_calls = {}
+        -- 步数已用尽，但允许执行已生成的工具调用
+        -- 设置停止原因，以便工具执行后循环停止
         state.agent_loop.stop_reason = "remaining_steps_exhausted"
-        state.planner.tool_calls = {}
-    elseif model_done and #tool_calls <= 0 then
-        state.agent_loop.stop_reason = "model_done"
-    elseif util.trim(state.agent_loop.stop_reason) == "" then
-        state.agent_loop.stop_reason = ""
+        -- 不清空 pending_tool_calls，让工具可以执行
     end
 
     -- 记录上下文统计

@@ -47,9 +47,9 @@ function M.build()
             local pending_calls = (((state or {}).agent_loop or {}).pending_tool_calls) or {}
             local stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or "")
 
-            if stop_reason ~= "" then
-                return "finalize_node"
-            end
+            -- DEBUG
+            print(string.format("[GraphBuilder][DEBUG] from agent_node: loop_count=%d pending_calls=%d stop_reason='%s'",
+                loop_count, #pending_calls, stop_reason))
 
             if #pending_calls > 0 then
                 if loop_count >= tool_loop_max then
@@ -58,12 +58,27 @@ function M.build()
                     state.agent_loop.stop_reason = "tool_loop_max_exceeded"
                     return "finalize_node"
                 end
+                -- 即使有停止原因，也允许执行已生成的工具调用
+                -- 但如果是模型调用失败，则直接结束
+                if stop_reason == "model_call_failed" then
+                    return "finalize_node"
+                end
                 return "tools_node"
+            end
+
+            -- 没有待处理工具调用，但有停止原因，则结束
+            if stop_reason ~= "" then
+                return "finalize_node"
             end
 
             return "finalize_node"
         end
         if current == "tools_node" then
+            -- 检查是否有 finish_turn 控制信号
+            local stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or "")
+            if stop_reason == "finish_turn_called" then
+                return "finalize_node"
+            end
             return "agent_node"
         end
         if current == "finalize_node" then

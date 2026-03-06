@@ -128,8 +128,12 @@
         break;
 
       case 'error':
+        console.log('[Controller] error event:', payload);
         messagesArea.handleError(payload && payload.message ? payload.message : '未知错误');
         toolElsById.clear();
+        if (typeof messageInput.setAgentRunning === 'function') {
+          messageInput.setAgentRunning(false);
+        }
         break;
 
       case 'uploads':
@@ -139,33 +143,46 @@
         break;
 
       case 'runStart': {
+        console.log('[Controller] runStart event:', payload);
         const runId = payload && payload.run_id ? payload.run_id : '';
-        messagesArea.appendSystemMessage(`Run started${runId ? `: ${runId}` : ''}`);
+        messagesArea.setProgressPhase('run_start', runId);
+        if (typeof messageInput.setAgentRunning === 'function') {
+          messageInput.setAgentRunning(true);
+        }
         break;
       }
 
       case 'nodeStart': {
-        const nodeName = payload && payload.node ? payload.node : 'unknown_node';
-        messagesArea.appendSystemMessage(`Node start: ${nodeName}`);
+        const nodeName = payload && payload.node ? payload.node : '';
+        messagesArea.setProgressPhase('node_start', nodeName);
         break;
       }
 
       case 'nodeEnd': {
-        const nodeName = payload && payload.node ? payload.node : 'unknown_node';
+        const nodeName = payload && payload.node ? payload.node : '';
         const duration = payload && payload.duration_ms ? ` (${payload.duration_ms}ms)` : '';
-        messagesArea.appendSystemMessage(`Node end: ${nodeName}${duration}`);
+        messagesArea.setProgressPhase('node_end', nodeName + duration);
         break;
       }
 
       case 'runDone': {
-        const runId = payload && payload.run_id ? payload.run_id : '';
-        messagesArea.appendSystemMessage(`Run done${runId ? `: ${runId}` : ''}`);
+        console.log('[Controller] runDone event:', payload);
+        messagesArea.setProgressPhase('run_done');
+        messagesArea.hideProgress(1000);
+        if (typeof messageInput.setAgentRunning === 'function') {
+          messageInput.setAgentRunning(false);
+        }
         break;
       }
 
       // Agent-specific events
       case 'toolCall':
         // Tool call started
+        messagesArea.addToolBadge(
+          payload.callId || 'unknown',
+          payload.name || 'unknown',
+          'running'
+        );
         const toolEl = messagesArea.appendToolCall(
           payload.name || 'unknown',
           payload.arguments || {},
@@ -179,9 +196,11 @@
       case 'toolResult':
         // Tool call completed
         let resultEl = null;
-        if (payload.callId && toolElsById.has(String(payload.callId))) {
-          resultEl = toolElsById.get(String(payload.callId));
-          toolElsById.delete(String(payload.callId));
+        const callId = payload.callId ? String(payload.callId) : null;
+        
+        if (callId && toolElsById.has(callId)) {
+          resultEl = toolElsById.get(callId);
+          toolElsById.delete(callId);
         } else {
           const first = toolElsById.entries().next();
           if (!first.done) {
@@ -189,6 +208,14 @@
             toolElsById.delete(first.value[0]);
           }
         }
+        
+        // Update progress badge
+        if (callId) {
+          messagesArea.updateToolBadge(callId, payload.error ? 'error' : 'success');
+          // Remove badge after a short delay
+          setTimeout(() => messagesArea.removeToolBadge(callId), 1500);
+        }
+        
         if (resultEl) {
           messagesArea.updateToolStatus(
             resultEl,
@@ -200,12 +227,13 @@
 
       case 'thinking':
         // Thinking/reasoning process
+        messagesArea.setProgressPhase('thinking');
         messagesArea.appendThinkingBlock(payload.content || '');
         break;
 
       case 'status':
         // Status update message
-        messagesArea.appendSystemMessage(payload.message || '');
+        messagesArea.showProgress(payload.message || '');
         break;
 
       default:

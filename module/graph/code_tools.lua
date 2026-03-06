@@ -565,41 +565,65 @@ function M.execute(call)
             return false, "runtime_unavailable"
         end
         
-        -- 构建搜索模式：匹配函数定义
-        local search_patterns = {
-            "function%s+" .. pattern,
-            "local%s+function%s+" .. pattern,
-            pattern .. "%s*%(",
-            "class%s+" .. pattern,
-            "def%s+" .. pattern,
-            "const%s+" .. pattern,
-        }
+        local max_hits = math.max(5, math.floor(tonumber(args.max_hits) or 20))
+        local prefix = util.trim(args.prefix or "")
         
+        -- 构建搜索参数（使用正确的 args_raw 格式）
+        local search_args = {
+            pattern = pattern,
+            prefix = prefix,
+            regex = true,
+            case_sensitive = true,
+            max_hits = max_hits,
+            max_files = 30,
+            per_file_hits = 3,
+        }
+        local args_lua = util.encode_lua_value(search_args, 0)
+        
+        local ok, search_result = pcall(function()
+            return runtime:search_files(args_lua, 30, 400, 30, 200, 5, 20)
+        end)
+        
+        if not ok then
+            return false, tostring(search_result)
+        end
+        
+        -- 解析搜索结果
+        -- 格式: #N file=... line=...
+        --       >123 | code line
         local results = {}
         local seen = {}
-        local max_hits = math.max(5, math.floor(tonumber(args.max_hits) or 20))
+        local current_file = nil
+        local current_line = nil
+        local current_snippet = nil
         
-        for _, search_pat in ipairs(search_patterns) do
+        for line in tostring(search_result):gmatch("[^\n]+") do
             if #results >= max_hits then break end
             
-            local ok, search_result = pcall(function()
-                return runtime:search_files(args.prefix or "", search_pat, max_hits, 10, 2)
-            end)
+            -- 匹配: #1 file=module/foo.lua line=42
+            local file, lnum = line:match("#%d+%s+file=([^%s]+)%s+line=(%d+)")
+            if file and lnum then
+                current_file = file
+                current_line = tonumber(lnum)
+                current_snippet = nil
+            end
             
-            if ok then
-                for line in tostring(search_result):gmatch("[^\n]+") do
-                    if #results >= max_hits then break end
-                    
-                    local file, lnum, text = line:match("^([^:]+):(%d+):(.*)$")
-                    if file and lnum and not seen[file .. ":" .. lnum] then
-                        seen[file .. ":" .. lnum] = true
-                        results[#results + 1] = {
-                            file = file,
-                            line = tonumber(lnum),
-                            snippet = util.trim(text):sub(1, 80),
-                        }
-                    end
+            -- 匹配: > 42 | function foo()
+            local code_line = line:match("^>%s*%d+%s*|%s*(.+)$")
+            if code_line and current_file and current_line then
+                current_snippet = util.trim(code_line):sub(1, 80)
+                local key = current_file .. ":" .. current_line
+                if not seen[key] then
+                    seen[key] = true
+                    results[#results + 1] = {
+                        file = current_file,
+                        line = current_line,
+                        snippet = current_snippet,
+                    }
                 end
+                current_file = nil
+                current_line = nil
+                current_snippet = nil
             end
         end
         

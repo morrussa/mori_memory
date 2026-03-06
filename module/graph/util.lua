@@ -272,6 +272,28 @@ local function now_ms()
     return math.floor((os.time() or 0) * 1000)
 end
 
+local function normalize_tool_path(raw)
+    local path = trim(raw)
+    if path == "" then
+        return ""
+    end
+    path = tostring(path):gsub("\\", "/")
+
+    while path:sub(1, 2) == "./" do
+        path = path:sub(3)
+    end
+    if path:sub(1, 10) == "workspace/" then
+        path = path:sub(11)
+    end
+    local idx = path:find("/workspace/", 1, true)
+    if idx then
+        path = path:sub(idx + 11)
+    end
+
+    path = path:gsub("^/+", "")
+    return trim(path)
+end
+
 M.trim = trim
 M.to_bool = to_bool
 M.cfg_number = cfg_number
@@ -284,5 +306,6 @@ M.json_encode = json_encode
 M.ensure_dir = ensure_dir
 M.new_run_id = new_run_id
 M.now_ms = now_ms
+M.normalize_tool_path = normalize_tool_path
 
 return M
