@@ -4,13 +4,10 @@ local checkpoint_store = require("module.graph.checkpoint_store")
 local trace_writer = require("module.graph.trace_writer")
 local conversation_source = require("module.graph.conversation_source")
 local util = require("module.graph.util")
+local command = require("module.graph.command")
 local config = require("module.config")
 
 local M = {}
-
-local function graph_cfg()
-    return ((config.settings or {}).graph or {})
-end
 
 local function assert_luajit_only()
     if type(jit) ~= "table" then
@@ -145,7 +142,7 @@ function M.run_turn(args)
         return ""
     end
 
-    local cfg = graph_cfg()
+    local cfg = config.get("graph", {})
     local stream_sink = args.stream_sink
     local conversation_history, base_system_prompt = conversation_source.resolve_conversation(
         args.conversation_history,
@@ -208,7 +205,17 @@ function M.run_turn(args)
             seq = guard,
         })
 
-        state = node.run(state, {})
+        -- 执行节点，支持返回 Command 对象
+        local node_result = node.run(state, {})
+        
+        -- 处理 Command 返回值
+        local next_node_name, updates = graph.resolve_next(current, state, node_result)
+        
+        -- 应用 Command 的状态更新
+        if updates then
+            command.apply_update(state, updates)
+        end
+        
         state_schema.assert_valid(state)
 
         local node_end_ms = util.now_ms()
@@ -240,7 +247,8 @@ function M.run_turn(args)
             end
         end
 
-        current = graph.next_node(current, state)
+        -- 使用解析出的下一个节点（支持 Command 返回值）
+        current = next_node_name
     end
 
     state.metrics.finished_at_ms = util.now_ms()

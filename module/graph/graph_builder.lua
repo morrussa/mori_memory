@@ -1,4 +1,6 @@
+local command = require("module.graph.command")
 local config = require("module.config")
+local EDGES = require("module.graph.settings.edges")
 
 local ingest_node = require("module.graph.nodes.ingest_node")
 local context_node = require("module.graph.nodes.context_node")
@@ -12,8 +14,64 @@ local end_node = require("module.graph.nodes.end_node")
 
 local M = {}
 
-local function graph_cfg()
-    return ((config.settings or {}).graph or {})
+---解析下一个节点
+---@param current string 当前节点名称
+---@param state table 当前状态
+---@param node_result any 节点执行结果（可能是 Command）
+---@return string|nil next_node 下一个节点名称（nil 表示结束）
+---@return table|nil updates 状态更新（来自 Command）
+function M.resolve_next(current, state, node_result)
+    -- 优先处理 Command 返回值
+    if command.is_command(node_result) then
+        local target = command.get_target(node_result)
+        local updates = node_result.update
+        
+        -- 特殊处理
+        if target == command.END then
+            return nil, updates
+        end
+        if target == command.SELF then
+            return current, updates
+        end
+        
+        return target, updates
+    end
+    
+    -- 使用声明式边解析
+    local edge = EDGES[current]
+    if not edge then
+        return nil, nil
+    end
+    
+    -- 条件边
+    if edge.conditional then
+        local cfg = config.get("graph", {})
+        for target, condition_fn in pairs(edge.branches or {}) do
+            if type(condition_fn) == "function" then
+                local ok, result = pcall(condition_fn, state, cfg)
+                if ok and result then
+                    return target, nil
+                end
+            end
+        end
+        return nil, nil
+    end
+    
+    -- 静态边
+    if edge.to == command.END then
+        return nil, nil
+    end
+    
+    return edge.to, nil
+end
+
+---兼容旧版：next_node 函数（保留向后兼容）
+---@param current string 当前节点名称
+---@param state table 当前状态
+---@return string|nil
+function M.next_node(current, state)
+    local next_target, _ = M.resolve_next(current, state, nil)
+    return next_target or "end"
 end
 
 function M.build()
@@ -29,74 +87,11 @@ function M.build()
         ["end"] = end_node,
     }
 
-    local function next_node(current, state)
-        local cfg = graph_cfg()
-        local tool_loop_max = math.max(1, math.floor(tonumber(cfg.tool_loop_max) or 5))
-
-        if current == "ingest_node" then
-            return "recall_node"
-        end
-        if current == "recall_node" then
-            return "context_node"
-        end
-        if current == "context_node" then
-            return "agent_node"
-        end
-        if current == "agent_node" then
-            local loop_count = tonumber((((state or {}).tool_exec or {}).loop_count) or 0) or 0
-            local pending_calls = (((state or {}).agent_loop or {}).pending_tool_calls) or {}
-            local stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or "")
-
-            -- DEBUG
-            print(string.format("[GraphBuilder][DEBUG] from agent_node: loop_count=%d pending_calls=%d stop_reason='%s'",
-                loop_count, #pending_calls, stop_reason))
-
-            if #pending_calls > 0 then
-                if loop_count >= tool_loop_max then
-                    state.agent_loop = state.agent_loop or {}
-                    state.agent_loop.pending_tool_calls = {}
-                    state.agent_loop.stop_reason = "tool_loop_max_exceeded"
-                    return "finalize_node"
-                end
-                -- 即使有停止原因，也允许执行已生成的工具调用
-                -- 但如果是模型调用失败，则直接结束
-                if stop_reason == "model_call_failed" then
-                    return "finalize_node"
-                end
-                return "tools_node"
-            end
-
-            -- 没有待处理工具调用，但有停止原因，则结束
-            if stop_reason ~= "" then
-                return "finalize_node"
-            end
-
-            return "finalize_node"
-        end
-        if current == "tools_node" then
-            -- 检查是否有 finish_turn 控制信号
-            local stop_reason = tostring((((state or {}).agent_loop or {}).stop_reason) or "")
-            if stop_reason == "finish_turn_called" then
-                return "finalize_node"
-            end
-            return "agent_node"
-        end
-        if current == "finalize_node" then
-            return "writeback_node"
-        end
-        if current == "writeback_node" then
-            return "persist_node"
-        end
-        if current == "persist_node" then
-            return "end"
-        end
-        return "end"
-    end
-
     return {
         start_node = "ingest_node",
         nodes = nodes,
-        next_node = next_node,
+        next_node = M.next_node,  -- 兼容旧版
+        resolve_next = M.resolve_next,  -- 新版 API
     }
 end
 
