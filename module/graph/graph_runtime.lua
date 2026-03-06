@@ -149,18 +149,25 @@ local function load_episode_continuity(task_id)
     return continuity
 end
 
-local function merge_working_memory(base, restored)
+local function merge_working_memory(base, restored, opts)
     local out = base or {}
     local extra = restored or {}
+    opts = opts or {}
+    local prefer_restored = opts.prefer_restored == true
 
     out.current_plan = util.trim(out.current_plan or "")
-    if out.current_plan == "" then
+    if (prefer_restored and util.trim(extra.current_plan or "") ~= "") or out.current_plan == "" then
         out.current_plan = tostring(extra.current_plan or "")
     end
 
     out.plan_step_index = tonumber(out.plan_step_index) or 0
-    if out.plan_step_index <= 0 then
-        out.plan_step_index = tonumber(extra.plan_step_index) or 0
+    local restored_step_index = tonumber(extra.plan_step_index) or 0
+    if (prefer_restored and restored_step_index > 0) or out.plan_step_index <= 0 then
+        if prefer_restored then
+            out.plan_step_index = math.max(out.plan_step_index, restored_step_index)
+        else
+            out.plan_step_index = restored_step_index
+        end
     end
 
     out.files_read_set = out.files_read_set or {}
@@ -177,24 +184,41 @@ local function merge_working_memory(base, restored)
         end
     end
 
-    if type(out.patches_applied) ~= "table" or #out.patches_applied == 0 then
+    if prefer_restored and type(extra.patches_applied) == "table" and #extra.patches_applied > 0 then
+        out.patches_applied = extra.patches_applied
+    elseif type(out.patches_applied) ~= "table" or #out.patches_applied == 0 then
         out.patches_applied = extra.patches_applied or {}
     end
-    if type(out.command_history_tail) ~= "table" or #out.command_history_tail == 0 then
+
+    if prefer_restored and type(extra.command_history_tail) == "table" and #extra.command_history_tail > 0 then
+        out.command_history_tail = extra.command_history_tail
+    elseif type(out.command_history_tail) ~= "table" or #out.command_history_tail == 0 then
         out.command_history_tail = extra.command_history_tail or {}
     end
 
     out.last_tool_batch_summary = util.trim(out.last_tool_batch_summary or "")
-    if out.last_tool_batch_summary == "" then
+    if (prefer_restored and util.trim(extra.last_tool_batch_summary or "") ~= "") or out.last_tool_batch_summary == "" then
         out.last_tool_batch_summary = tostring(extra.last_tool_batch_summary or "")
     end
 
     out.last_repair_error = util.trim(out.last_repair_error or "")
-    if out.last_repair_error == "" then
+    if (prefer_restored and util.trim(extra.last_repair_error or "") ~= "") or out.last_repair_error == "" then
         out.last_repair_error = tostring(extra.last_repair_error or "")
     end
 
     return out
+end
+
+local function continuity_is_newer(active_task, continuity)
+    local latest_episode_id = util.trim((continuity or {}).latest_episode_id or "")
+    if latest_episode_id == "" then
+        return false
+    end
+    local known_episode_id = util.trim((active_task or {}).last_episode_id or "")
+    if known_episode_id == "" then
+        return true
+    end
+    return known_episode_id ~= latest_episode_id
 end
 
 local function apply_episode_continuity(state)
@@ -240,10 +264,15 @@ local function apply_episode_continuity(state)
     if util.trim(active_task.status or "") == "" and util.trim(continuity.latest_status or "") ~= "" then
         active_task.status = tostring(continuity.latest_status or "")
     end
+    local prefer_restored = continuity_is_newer(active_task, continuity)
     if util.trim(continuity.latest_episode_id or "") ~= "" then
         active_task.last_episode_id = tostring(continuity.latest_episode_id or "")
     end
-    state.working_memory = merge_working_memory(state.working_memory or {}, continuity.restored_working_memory or {})
+    state.working_memory = merge_working_memory(
+        state.working_memory or {},
+        continuity.restored_working_memory or {},
+        { prefer_restored = prefer_restored }
+    )
 
     return continuity
 end

@@ -41,22 +41,6 @@ local function format_episode_line(index, episode)
     return line
 end
 
-local function shallow_copy_array(src)
-    local out = {}
-    for i = 1, #(src or {}) do
-        out[i] = src[i]
-    end
-    return out
-end
-
-local function shallow_copy_map(src)
-    local out = {}
-    for k, v in pairs(src or {}) do
-        out[k] = v
-    end
-    return out
-end
-
 local function push_tail(seq, item, max_items)
     if type(seq) ~= "table" or type(item) ~= "table" then
         return
@@ -74,15 +58,6 @@ local function merge_flag_map(dst, src)
             dst[tostring(key)] = true
         end
     end
-end
-
-local function has_true_entries(tbl)
-    for _, enabled in pairs(tbl or {}) do
-        if enabled then
-            return true
-        end
-    end
-    return false
 end
 
 local function merge_snapshot(into, snapshot)
