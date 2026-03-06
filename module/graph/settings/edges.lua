@@ -13,7 +13,8 @@ local command = require("module.graph.command")
 
 return {
     ingest_node = { to = "task_node" },
-    task_node = { to = "recall_node" },
+    task_node = { to = "recall_policy_node" },
+    recall_policy_node = { to = "recall_node" },
     recall_node = { to = "context_node" },
 
     context_node = { to = "planner_node" },
@@ -21,6 +22,12 @@ return {
     planner_node = {
         conditional = true,
         branches = {
+            {
+                to = "recall_reentry_node",
+                when = function(state, _cfg)
+                    return (((((state or {}).recall or {}).reentry) or {}).pending) == true
+                end,
+            },
             {
                 to = "responder_node",
                 when = function(state, _cfg)
@@ -47,6 +54,12 @@ return {
         conditional = true,
         branches = {
             {
+                to = "recall_reentry_node",
+                when = function(state, _cfg)
+                    return (((((state or {}).recall or {}).reentry) or {}).pending) == true
+                end,
+            },
+            {
                 to = "repair_node",
                 when = function(state, _cfg)
                     return ((((state or {}).repair or {}).pending) == true)
@@ -64,6 +77,12 @@ return {
     repair_node = {
         conditional = true,
         branches = {
+            {
+                to = "recall_reentry_node",
+                when = function(state, _cfg)
+                    return (((((state or {}).recall or {}).reentry) or {}).pending) == true
+                end,
+            },
             {
                 to = "responder_node",
                 when = function(state, _cfg)
@@ -85,6 +104,7 @@ return {
         },
     },
 
+    recall_reentry_node = { to = "planner_node" },
     responder_node = { to = "finalize_node" },
 
     finalize_node = { to = "writeback_node" },

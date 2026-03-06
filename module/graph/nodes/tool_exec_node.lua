@@ -1,6 +1,7 @@
 local util = require("module.graph.util")
 local tool_registry = require("module.graph.tool_registry_v2")
 local config = require("module.config")
+local recall_reentry = require("module.graph.recall_reentry")
 
 local M = {}
 
@@ -169,6 +170,10 @@ function M.run(state, _ctx)
     else
         state.context.planner_context = ""
         state.working_memory.last_repair_error = ""
+    end
+
+    if state.repair.pending == true then
+        recall_reentry.request_from_tool_exec(state)
     end
 
     local max_chars = math.max(120, math.floor(tonumber((((graph_cfg() or {}).tools or {}).file_context_max_chars) or 1600)))

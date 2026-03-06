@@ -112,7 +112,9 @@ local function setup_stubs(case)
         agent_default_step = case.agent_default_step,
         last_messages = {},
         last_task_prompt = "",
+        last_recall_policy_prompt = "",
         task_decision = case.task_decision,
+        recall_policy = case.recall_policy,
     }
 
     for _, step in ipairs(case.agent_steps or {}) do
@@ -414,6 +416,22 @@ local function setup_stubs(case)
                     },
                 })
                 return encode_lua_value(decision)
+            end
+            if prompt:find("[RecallPolicy]", 1, true) ~= nil or prompt:find("[LatestUserTurn]", 1, true) ~= nil then
+                if prompt:find("recall policy compiler", 1, true) ~= nil or prompt:find("[ModePresets]", 1, true) ~= nil then
+                    CURRENT.last_recall_policy_prompt = prompt
+                    local policy = CURRENT.recall_policy or {
+                        mode = "project",
+                        confidence = 0.5,
+                        force = false,
+                        suppress = false,
+                        preferred_type = "Project",
+                        allowed_types = { "Project", "Artifact", "Constraint", "Decision", "Status", "Fact" },
+                        blocked_types = { "User", "Person", "Preference" },
+                        reason = "stub_recall_policy",
+                    }
+                    return encode_lua_value(policy)
+                end
             end
             return "FALLBACK_" .. tostring(case.id)
         end,

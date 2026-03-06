@@ -76,8 +76,43 @@ local function ai_cfg()
     return ((config.settings or {}).ai_query or {})
 end
 
+local function graph_recall_cfg()
+    return ((((config.settings or {}).graph or {}).recall) or {})
+end
+
+local function cluster_type_bonus()
+    return tonumber((((config.settings or {}).memory_types or {}).cluster_type_bonus)) or 0.0
+end
+
 local function is_read_only(opts)
     return type(opts) == "table" and opts.read_only == true
+end
+
+local function derive_type_filters(opts)
+    opts = opts or {}
+    local allowed_types = memory.build_type_filter(opts.allowed_types)
+    local blocked_types = memory.build_type_filter(opts.blocked_types)
+    local preferred_type = memory.match_type_name(opts.preferred_type)
+
+    if (not preferred_type) and allowed_types then
+        local only_name = nil
+        local count = 0
+        for type_name in pairs(allowed_types) do
+            only_name = type_name
+            count = count + 1
+            if count > 1 then
+                only_name = nil
+                break
+            end
+        end
+        preferred_type = only_name
+    end
+
+    if preferred_type and blocked_types and blocked_types[preferred_type] then
+        preferred_type = nil
+    end
+
+    return allowed_types, blocked_types, preferred_type
 end
 
 local function clamp(v, lo, hi)
@@ -863,7 +898,7 @@ local function adjust_gate_on_result(hit, opts)
     adaptive.mark_dirty()
 end
 
-local function top_probe_clusters(vec, probe_clusters, super_topn, turn, opts)
+local function top_probe_clusters(vec, probe_clusters, super_topn, turn, opts, preferred_type)
     local cfg = ai_cfg()
     local cand, ops0 = cluster.super_candidate_clusters(vec, super_topn)
     if #cand <= 0 then
@@ -885,6 +920,9 @@ local function top_probe_clusters(vec, probe_clusters, super_topn, turn, opts)
         if clu and clu.centroid then
             local sim = tool.cosine_similarity(vec, clu.centroid)
             ops = ops + 1
+            if preferred_type and preferred_type ~= "" then
+                sim = sim + cluster.get_cluster_type_affinity(cid, preferred_type) * cluster_type_bonus()
+            end
             if use_expected then
                 sim = sim + estimate_cluster_expected_recall(cid) * bonus_scale
             end
@@ -1254,10 +1292,14 @@ local function topic_random_lift(turn, current_anchor, stable_ready, opts)
     adaptive.add_counter("topic_lift_executed", #picked)
 end
 
-local function to_sorted_pairs(turn_best)
+local function to_sorted_pairs(turn_best, turn_mem)
     local out = {}
     for turn, score in pairs(turn_best) do
-        out[#out + 1] = { turn = turn, score = score }
+        out[#out + 1] = {
+            turn = turn,
+            score = score,
+            mem_idx = turn_mem and turn_mem[turn] or nil,
+        }
     end
     table.sort(out, function(a, b) return a.score > b.score end)
     return out
@@ -1328,6 +1370,306 @@ local function apply_refinement(turn, hits_all, candidate_samples, selected_memo
     })
 end
 
+local function trim_text(s)
+    return tostring(s or ""):gsub("^%s*(.-)%s*$", "%1")
+end
+
+local function compact_text(s, max_chars)
+    local text = tostring(s or "")
+    text = text:gsub("%s+", " ")
+    text = trim_text(text)
+    local limit = math.max(16, math.floor(tonumber(max_chars) or 96))
+    if #text <= limit then
+        return text
+    end
+    return text:sub(1, math.max(1, limit - 3)) .. "..."
+end
+
+local function sorted_unique_numbers(rows)
+    local seen = {}
+    local out = {}
+    for _, raw in ipairs(rows or {}) do
+        local n = math.floor(tonumber(raw) or -1)
+        if n >= 1 and not seen[n] then
+            seen[n] = true
+            out[#out + 1] = n
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function topic_meta_for_key(topic_key, current_turn)
+    local key = tostring(topic_key or "")
+    if key == "" then
+        return nil
+    end
+
+    if key:match("^A:%d+$") then
+        local start_turn = tonumber(key:match("^A:(%d+)$"))
+        if start_turn then
+            return {
+                key = key,
+                start_turn = start_turn,
+                end_turn = math.max(start_turn, tonumber(current_turn) or start_turn),
+                summary = "",
+                is_active = true,
+            }
+        end
+    end
+
+    if key:match("^C:%d+$") then
+        local idx = tonumber(key:match("^C:(%d+)$"))
+        local rec = idx and (topic.topics or {})[idx] or nil
+        if rec then
+            return {
+                key = key,
+                start_turn = tonumber(rec.start) or 1,
+                end_turn = tonumber(rec.end_) or tonumber(current_turn) or tonumber(rec.start) or 1,
+                summary = tostring(rec.summary or ""),
+                is_active = false,
+            }
+        end
+    end
+
+    if key:match("^S:%d+$") then
+        local start_turn = tonumber(key:match("^S:(%d+)$"))
+        if start_turn then
+            local active_start = tonumber((topic.active_topic or {}).start)
+            if active_start and start_turn == active_start then
+                return {
+                    key = key,
+                    start_turn = start_turn,
+                    end_turn = math.max(start_turn, tonumber(current_turn) or start_turn),
+                    summary = "",
+                    is_active = true,
+                }
+            end
+            for _, rec in ipairs(topic.topics or {}) do
+                if tonumber(rec.start) == start_turn then
+                    return {
+                        key = key,
+                        start_turn = tonumber(rec.start) or start_turn,
+                        end_turn = tonumber(rec.end_) or tonumber(current_turn) or start_turn,
+                        summary = tostring(rec.summary or ""),
+                        is_active = false,
+                    }
+                end
+            end
+        end
+    end
+
+    return {
+        key = key,
+        start_turn = 1,
+        end_turn = math.max(1, tonumber(current_turn) or 1),
+        summary = "",
+        is_active = false,
+    }
+end
+
+local function nearest_selected_distance(turn_value, selected_turns)
+    local best = math.huge
+    for _, selected_turn in ipairs(selected_turns or {}) do
+        local dist = math.abs((tonumber(turn_value) or 0) - (tonumber(selected_turn) or 0))
+        if dist < best then
+            best = dist
+        end
+    end
+    if best == math.huge then
+        return 0
+    end
+    return best
+end
+
+local function expand_topic_turns(topic_key, selected_turns, current_turn, cfg)
+    local max_turns = math.max(1, math.floor(tonumber((cfg or {}).compiled_context_max_turns_per_topic) or 4))
+    local selected = sorted_unique_numbers(selected_turns)
+    if #selected <= 0 then
+        return {}
+    end
+    if tostring(topic_key or ""):match("^turn:%d+$") then
+        while #selected > max_turns do
+            table.remove(selected)
+        end
+        return selected
+    end
+
+    local meta = topic_meta_for_key(topic_key, current_turn)
+    local neighbor_window = math.max(0, math.floor(tonumber((cfg or {}).compiled_context_neighbor_window) or 1))
+    local used = {}
+    local out = {}
+
+    local function try_add(turn_value)
+        local t = math.floor(tonumber(turn_value) or -1)
+        if t < 1 or used[t] then
+            return
+        end
+        if meta then
+            if t < tonumber(meta.start_turn) or t > tonumber(meta.end_turn) then
+                return
+            end
+        end
+        if topic_key_for_turn(t) ~= topic_key then
+            return
+        end
+        used[t] = true
+        out[#out + 1] = t
+    end
+
+    for _, turn_value in ipairs(selected) do
+        try_add(turn_value)
+    end
+
+    local candidates = {}
+    for _, turn_value in ipairs(selected) do
+        for delta = 1, neighbor_window do
+            candidates[#candidates + 1] = turn_value - delta
+            candidates[#candidates + 1] = turn_value + delta
+        end
+    end
+    candidates = sorted_unique_numbers(candidates)
+    table.sort(candidates, function(a, b)
+        local da = nearest_selected_distance(a, selected)
+        local db = nearest_selected_distance(b, selected)
+        if da == db then
+            return a > b
+        end
+        return da < db
+    end)
+
+    for _, turn_value in ipairs(candidates) do
+        if #out >= max_turns then
+            break
+        end
+        try_add(turn_value)
+    end
+
+    table.sort(out)
+    while #out > max_turns do
+        table.remove(out)
+    end
+    return out
+end
+
+local function build_topic_fallback_summary(turns, cfg)
+    for _, turn_value in ipairs(turns or {}) do
+        local entry = history.get_by_turn(turn_value)
+        if entry then
+            local user_part, _ = history.parse_entry(entry)
+            local snippet = compact_text(user_part, tonumber((cfg or {}).compiled_context_summary_chars) or 96)
+            if snippet ~= "" then
+                return "主要围绕：" .. snippet
+            end
+        end
+    end
+    return ""
+end
+
+local function format_type_summary(type_counts)
+    local items = {}
+    for type_name, count in pairs(type_counts or {}) do
+        local n = math.max(0, math.floor(tonumber(count) or 0))
+        if n > 0 then
+            items[#items + 1] = { name = tostring(type_name), count = n }
+        end
+    end
+    table.sort(items, function(a, b)
+        if a.count == b.count then
+            return a.name < b.name
+        end
+        return a.count > b.count
+    end)
+
+    if #items <= 0 then
+        return ""
+    end
+
+    local parts = {}
+    for i = 1, math.min(3, #items) do
+        parts[#parts + 1] = string.format("%s(%d)", items[i].name, items[i].count)
+    end
+    return table.concat(parts, ", ")
+end
+
+local function build_compiled_memory_context(selected, current_turn, cfg)
+    local topic_groups = {}
+    local topic_order = {}
+
+    for _, item in ipairs(selected or {}) do
+        local topic_key = topic_key_for_turn(item.turn) or ("turn:" .. tostring(item.turn))
+        local bucket = topic_groups[topic_key]
+        if not bucket then
+            bucket = {
+                key = topic_key,
+                score = tonumber(item.score) or 0.0,
+                turns = {},
+                type_counts = {},
+            }
+            topic_groups[topic_key] = bucket
+            topic_order[#topic_order + 1] = bucket
+        else
+            bucket.score = math.max(bucket.score, tonumber(item.score) or 0.0)
+        end
+        bucket.turns[#bucket.turns + 1] = item.turn
+        if item.mem_idx then
+            local type_name = memory.get_type_name(item.mem_idx)
+            bucket.type_counts[type_name] = (bucket.type_counts[type_name] or 0) + 1
+        end
+    end
+
+    table.sort(topic_order, function(a, b)
+        if a.score == b.score then
+            return tostring(a.key) < tostring(b.key)
+        end
+        return a.score > b.score
+    end)
+
+    local max_topics = math.max(1, math.floor(tonumber((cfg or {}).compiled_context_max_topics) or 3))
+    local user_chars = math.max(24, math.floor(tonumber((cfg or {}).compiled_context_user_chars) or 72))
+    local ai_chars = math.max(24, math.floor(tonumber((cfg or {}).compiled_context_ai_chars) or 96))
+    local lines = { "【相关记忆摘要】" }
+
+    for idx = 1, math.min(max_topics, #topic_order) do
+        local bucket = topic_order[idx]
+        local topic_turns = expand_topic_turns(bucket.key, bucket.turns, current_turn, cfg)
+        local meta = topic_meta_for_key(bucket.key, current_turn)
+        local summary = trim_text((meta or {}).summary or "")
+        if summary == "" then
+            summary = build_topic_fallback_summary(topic_turns, cfg)
+        end
+
+        lines[#lines + 1] = string.format("主题%d | 来源turn: %s", idx, table.concat(sorted_unique_numbers(bucket.turns), ", "))
+        if summary ~= "" then
+            lines[#lines + 1] = "摘要：" .. compact_text(summary, tonumber((cfg or {}).compiled_context_summary_chars) or 120)
+        end
+        local type_summary = format_type_summary(bucket.type_counts)
+        if type_summary ~= "" then
+            lines[#lines + 1] = "类型：" .. type_summary
+        end
+        lines[#lines + 1] = "线索："
+
+        for _, turn_value in ipairs(topic_turns) do
+            local entry = history.get_by_turn(turn_value)
+            if entry then
+                local user_part, ai_part = history.parse_entry(entry)
+                local user_snippet = compact_text(user_part, user_chars)
+                local ai_snippet = compact_text(ai_part, ai_chars)
+                local detail = string.format("- 第%d轮：用户=%s", turn_value, user_snippet ~= "" and user_snippet or "(空)")
+                if ai_snippet ~= "" then
+                    detail = detail .. "；助手=" .. ai_snippet
+                end
+                lines[#lines + 1] = detail
+            end
+        end
+    end
+
+    if #lines <= 1 then
+        return ""
+    end
+    return table.concat(lines, "\n")
+end
+
 local function retrieve(user_input, user_vec, current_turn, current_info, current_anchor, opts)
     opts = opts or {}
     local read_only = is_read_only(opts)
@@ -1356,6 +1698,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local per_cluster_limit = math.max(2, tonumber(cfg.refinement_probe_per_cluster_limit) or 12)
     local base_scan_limit = math.max(per_cluster_limit, max_memory)
     local persistent_cap = math.max(1, tonumber(cfg.persistent_explore_candidate_cap) or 32)
+    local allowed_types, blocked_types, preferred_type = derive_type_filters(opts)
 
     local current_topic_key = topic_key_for_current(current_turn, current_info)
 
@@ -1454,7 +1797,9 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
-    local cluster_ids_for_preload, _ = top_probe_clusters(primary_qptr, probe_clusters, query_topn, current_turn, opts)
+    local cluster_ids_for_preload, _ = top_probe_clusters(
+        primary_qptr, probe_clusters, query_topn, current_turn, opts, preferred_type
+    )
     local preloaded_clusters = smart_preload_cold_memories(
         primary_qptr, current_turn, current_topic_key, current_info, cluster_ids_for_preload, opts
     )
@@ -1467,6 +1812,13 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             mem_best_effective[mem_idx] = effective
             mem_best_source[mem_idx] = source or "hot"
         end
+    end
+
+    local function type_filter_pass(mem_idx)
+        if not allowed_types and not blocked_types then
+            return true
+        end
+        return select(1, memory.type_matches(mem_idx, allowed_types, blocked_types))
     end
 
     local function build_primary_candidates()
@@ -1518,7 +1870,9 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 end
             end
         else
-            local cluster_ids, _ = top_probe_clusters(qptr, probe_clusters, query_topn, current_turn, opts)
+            local cluster_ids, _ = top_probe_clusters(
+                qptr, probe_clusters, query_topn, current_turn, opts, preferred_type
+            )
             local persistent_probe_clusters_vec = {}
 
             if q_idx == 1 and persistent_extra_budget > 0 and #cluster_ids > 0 then
@@ -1560,6 +1914,8 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 local sim_results = cluster.find_sim_in_cluster(qptr, cid, {
                     only_hot = true,
                     max_results = scan_limit,
+                    allowed_types = allowed_types,
+                    blocked_types = blocked_types,
                 })
 
                 for _, mem in ipairs(sim_results) do
@@ -1582,14 +1938,16 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
         if current_topic_key and M._topic_cache_anchor == current_topic_key and next(M._topic_cache_mem) ~= nil then
             for mem_idx, _ in pairs(M._topic_cache_mem) do
-                local sim = get_sim_cached(q_idx, qptr, mem_idx)
-                if sim then
+                if type_filter_pass(mem_idx) then
+                    local sim = get_sim_cached(q_idx, qptr, mem_idx)
+                    if sim then
                     local sim_pos = math.max(0.0, sim)
                     local effective = (sim_pos ^ power) * weight
                     if sim >= min_gate then
                         effective = effective * (tonumber(cfg.topic_cache_weight) or 1.02)
                     end
                     update_mem_best(mem_idx, sim, effective, get_mem_cluster_cached(mem_idx), "cache")
+                    end
                 end
             end
         end
@@ -1597,9 +1955,11 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         if next(M._preload_cache_mem) ~= nil then
             local preload_scored = {}
             for mem_idx, _ in pairs(M._preload_cache_mem) do
-                local sim = get_sim_cached(q_idx, qptr, mem_idx)
-                if sim then
+                if type_filter_pass(mem_idx) then
+                    local sim = get_sim_cached(q_idx, qptr, mem_idx)
+                    if sim then
                     preload_scored[#preload_scored + 1] = { mem_idx = mem_idx, sim = sim }
+                    end
                 end
             end
             table.sort(preload_scored, function(a, b) return a.sim > b.sim end)
@@ -1655,7 +2015,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local candidate_samples = collect_candidate_samples(kept_best_sim, kept_best_cluster, kept_best_effective, sample_limit)
 
     local selected = {}
-    local ranked = to_sorted_pairs(turn_best)
+    local ranked = to_sorted_pairs(turn_best, turn_mem)
     if #ranked <= 0 then
         print(string.format(
             "[Recall] 空召回（preloaded_clusters=%d, kept_memories=%d, dropped_by_memory_gate=%d, keyword_mode=%s）",
@@ -1817,27 +2177,14 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         secondary_near_mode_used and "near_lossless" or keyword_perf_mode
     ))
 
-    local memory_text_lines = {}
-    for _, item in ipairs(selected) do
-        local entry = history.get_by_turn(item.turn)
-        if entry then
-            local user_part, ai_part = history.parse_entry(entry)
-            if user_part then
-                memory_text_lines[#memory_text_lines + 1] =
-                    string.format("第%d轮 用户：%s\n助手：%s", item.turn, user_part, ai_part)
-            end
-        end
-    end
-
-    if #memory_text_lines > 0 then
-        return "【相关记忆】\n" .. table.concat(memory_text_lines, "\n\n")
-    end
-    return ""
+    return build_compiled_memory_context(selected, current_turn, cfg)
 end
 
 function M.check_and_retrieve(user_input, user_vec, opts)
     opts = opts or {}
     local read_only = is_read_only(opts)
+    local policy_decided = opts.policy_decided == true
+    local legacy_trigger_enabled = graph_recall_cfg().legacy_trigger_enabled == true
     if opts.suppress == true then
         return ""
     end
@@ -1855,8 +2202,8 @@ function M.check_and_retrieve(user_input, user_vec, opts)
     topic_random_lift(current_turn, current_key, stable_ready, opts)
 
     local should_recall = opts.force == true
-    if not should_recall then
-        should_recall = select(1, need_recall(user_input, user_vec, current_turn))
+    if (not should_recall) and (not policy_decided) and legacy_trigger_enabled then
+        should_recall = select(1, need_recall(user_input, user_vec, current_turn, opts))
     end
     if should_recall then
         if not read_only then

@@ -17,7 +17,7 @@ local MANIFEST_PATH = ROOT_DIR .. "/manifest.txt"
 local INDEX_PATH = ROOT_DIR .. "/memory_index.bin"
 
 local INDEX_MAGIC = "MID3"
-local INDEX_VERSION = 1
+local INDEX_VERSION = 2
 local SHARD_MAGIC = "SHD3"
 local SHARD_VERSION = 1
 
@@ -53,6 +53,119 @@ local function shallow_copy_array(src)
     local out = {}
     for i = 1, #(src or {}) do
         out[i] = src[i]
+    end
+    return out
+end
+
+local function trim_str(s)
+    return tostring(s or ""):gsub("^%s*(.-)%s*$", "%1")
+end
+
+local function type_cfg()
+    return ((config.settings or {}).memory_types or {})
+end
+
+local function allowed_type_maps()
+    local cfg = type_cfg()
+    local ordered = {}
+    local exact = {}
+    local folded = {}
+
+    for _, raw in ipairs(cfg.allowed or {}) do
+        local name = trim_str(raw)
+        if name ~= "" and not exact[name] then
+            ordered[#ordered + 1] = name
+            exact[name] = true
+            folded[name:lower()] = name
+        end
+    end
+
+    if #ordered <= 0 then
+        ordered[1] = "Fact"
+        exact.Fact = true
+        folded.fact = "Fact"
+    end
+
+    return ordered, exact, folded
+end
+
+local function default_type_name()
+    local cfg = type_cfg()
+    local ordered, exact, folded = allowed_type_maps()
+    local raw = trim_str(cfg.default or "")
+    if raw ~= "" then
+        local alias = (cfg.aliases or {})[raw] or (cfg.aliases or {})[raw:lower()]
+        local candidate = trim_str(alias or raw)
+        if exact[candidate] then
+            return candidate
+        end
+        if folded[candidate:lower()] then
+            return folded[candidate:lower()]
+        end
+    end
+    return ordered[1] or "Fact"
+end
+
+local function resolve_type_name(raw, fallback_default)
+    local cfg = type_cfg()
+    local _, exact, folded = allowed_type_maps()
+    local key = trim_str(raw)
+    if key == "" then
+        return fallback_default and default_type_name() or nil
+    end
+
+    local alias = (cfg.aliases or {})[key] or (cfg.aliases or {})[key:lower()]
+    local candidate = trim_str(alias or key)
+    if candidate ~= "" then
+        if exact[candidate] then
+            return candidate
+        end
+        local lower = folded[candidate:lower()]
+        if lower then
+            return lower
+        end
+    end
+
+    return fallback_default and default_type_name() or nil
+end
+
+function M.get_allowed_type_names()
+    local ordered = allowed_type_maps()
+    return shallow_copy_array(ordered)
+end
+
+function M.get_default_type_name()
+    return default_type_name()
+end
+
+function M.normalize_type_name(raw)
+    return resolve_type_name(raw, true)
+end
+
+function M.match_type_name(raw)
+    return resolve_type_name(raw, false)
+end
+
+function M.build_type_filter(raw_types)
+    if raw_types == nil then
+        return nil
+    end
+
+    local items = raw_types
+    if type(items) ~= "table" then
+        items = { items }
+    end
+
+    local out = {}
+    for _, raw in ipairs(items) do
+        local name = resolve_type_name(raw, false)
+        if name then
+            out[name] = true
+        end
+    end
+
+    if next(out) == nil then
+        return nil
     end
     return out
 end
@@ -189,11 +302,13 @@ local function write_manifest()
 end
 
 local function build_index_record(line, mem)
+    local type_name = tostring(mem.type_name or M.get_default_type_name())
     local topic_anchor = tostring(mem.topic_anchor or "")
     local turns = mem.turns or {}
+    local type_len = #type_name
     local topic_len = #topic_anchor
     local turn_count = #turns
-    local record_size = 4 + 4 + 4 + 4 + 2 + topic_len + 2 + (turn_count * 4)
+    local record_size = 4 + 4 + 4 + 4 + 2 + type_len + 2 + topic_len + 2 + (turn_count * 4)
 
     local buf = ffi.new("uint8_t[?]", record_size)
     local base = 0
@@ -209,6 +324,14 @@ local function build_index_record(line, mem)
 
     ffi.cast("int32_t*", buf + base)[0] = math.floor(tonumber(mem.cluster_id) or -1)
     base = base + 4
+
+    ffi.cast("uint16_t*", buf + base)[0] = type_len
+    base = base + 2
+
+    if type_len > 0 then
+        ffi.copy(buf + base, type_name, type_len)
+        base = base + type_len
+    end
 
     ffi.cast("uint16_t*", buf + base)[0] = topic_len
     base = base + 2
@@ -281,7 +404,7 @@ local function load_index_binary()
     local dim = tonumber(header[2]) or VECTOR_DIM
     local next_line_header = tonumber(header[3]) or (count + 1)
 
-    if version ~= INDEX_VERSION then
+    if version ~= 1 and version ~= INDEX_VERSION then
         return false, "index_version_mismatch"
     end
 
@@ -293,7 +416,8 @@ local function load_index_binary()
     local loaded = 0
     while offset + 4 <= #data and loaded < count do
         local rec_len = tonumber(ffi.cast("const uint32_t*", p + offset)[0]) or 0
-        if rec_len < 20 or (offset + rec_len) > #data then
+        local min_record_size = (version >= 2) and 22 or 20
+        if rec_len < min_record_size or (offset + rec_len) > #data then
             break
         end
 
@@ -306,6 +430,17 @@ local function load_index_binary()
 
         local cluster_id = tonumber(ffi.cast("const int32_t*", p + base)[0]) or -1
         base = base + 4
+
+        local type_name = M.get_default_type_name()
+        if version >= 2 then
+            local type_len = tonumber(ffi.cast("const uint16_t*", p + base)[0]) or 0
+            base = base + 2
+            if type_len > 0 then
+                if base + type_len > offset + rec_len then break end
+                type_name = M.normalize_type_name(ffi.string(p + base, type_len))
+                base = base + type_len
+            end
+        end
 
         local topic_len = tonumber(ffi.cast("const uint16_t*", p + base)[0]) or 0
         base = base + 2
@@ -337,6 +472,7 @@ local function load_index_binary()
                 heat = heat,
                 cluster_id = cluster_id,
                 topic_anchor = topic_anchor,
+                type_name = type_name,
             }
             topic_index_add(topic_anchor, line)
             loaded = loaded + 1
@@ -544,6 +680,54 @@ function M.get_topic_anchor(line)
     return mem.topic_anchor
 end
 
+function M.get_type_name(line)
+    local idx = normalize_line(line)
+    if not idx then
+        return M.get_default_type_name()
+    end
+    local mem = M.memories[idx]
+    if not mem then
+        return M.get_default_type_name()
+    end
+    local type_name = trim_str(mem.type_name or "")
+    if type_name == "" then
+        type_name = M.get_default_type_name()
+        mem.type_name = type_name
+    end
+    return type_name
+end
+
+function M.set_type_name(line, type_name)
+    local idx = normalize_line(line)
+    if not idx then return false end
+    local mem = M.memories[idx]
+    if not mem then return false end
+
+    local new_name = M.normalize_type_name(type_name)
+    local old_name = M.get_type_name(idx)
+    if old_name == new_name then
+        return true
+    end
+
+    mem.type_name = new_name
+    if cluster and cluster.on_memory_type_change then
+        cluster.on_memory_type_change(idx, old_name, new_name)
+    end
+    record_dirty_index()
+    return true
+end
+
+function M.type_matches(line, allowed_types, blocked_types)
+    local type_name = M.get_type_name(line)
+    if blocked_types and blocked_types[type_name] then
+        return false, type_name
+    end
+    if allowed_types and (not allowed_types[type_name]) then
+        return false, type_name
+    end
+    return true, type_name
+end
+
 function M.iter_topic_lines(topic_anchor, only_cold)
     local out = {}
     local bucket = M.topic_index[tostring(topic_anchor or "")]
@@ -697,6 +881,7 @@ function M.iterate_all()
                 heat = 0,
                 turns = {},
                 topic_anchor = nil,
+                type_name = M.get_default_type_name(),
                 vec = nil,
             }
         end
@@ -704,6 +889,7 @@ function M.iterate_all()
             heat = tonumber(mem.heat) or 0,
             turns = shallow_copy_array(mem.turns),
             topic_anchor = mem.topic_anchor,
+            type_name = M.get_type_name(i),
             vec = M.return_mem_vec(i),
         }
     end
@@ -794,8 +980,9 @@ function M.save_to_disk()
     return true
 end
 
-function M.add_memory(vec, turn)
+function M.add_memory(vec, turn, opts)
     local heat_mod = require("module.memory.heat")
+    opts = opts or {}
 
     if type(vec) ~= "table" or #vec <= 0 then
         return nil, "invalid_vector"
@@ -804,9 +991,14 @@ function M.add_memory(vec, turn)
     local new_heat = tonumber((config.settings.heat or {}).new_memory_heat) or 43000
     local merge_limit = adaptive.get_merge_limit((config.settings or {}).merge_limit or 0.95)
     local cluster_sim_th = tonumber((((config.settings or {}).cluster or {}).cluster_sim)) or 0.72
+    local strict_type = type_cfg().merge_strict ~= false
+    local type_name = M.normalize_type_name(opts.type_name)
+    local allowed_types = strict_type and { [type_name] = true } or nil
 
     local best_id, best_sim = cluster.find_best_cluster(vec, {
         super_topn = (((config.settings or {}).cluster or {}).supercluster_topn_add),
+        preferred_type = type_name,
+        strict_type = strict_type,
     })
 
     local sim_results = {}
@@ -814,6 +1006,7 @@ function M.add_memory(vec, turn)
         sim_results = cluster.find_sim_in_cluster(vec, best_id, {
             only_hot = true,
             max_results = FAST_SCAN_TOPK,
+            allowed_types = allowed_types,
         })
     end
 
@@ -851,13 +1044,17 @@ function M.add_memory(vec, turn)
         heat = 0,
         cluster_id = -1,
         topic_anchor = topic_anchor,
+        type_name = type_name,
     }
     topic_index_add(topic_anchor, new_line)
 
     next_line = next_line + 1
     record_dirty_index()
 
-    local cid = cluster.add(vec, new_line)
+    local cid = cluster.add(vec, new_line, {
+        preferred_type = type_name,
+        strict_type = strict_type,
+    })
     if cid then
         M.set_cluster_id(new_line, cid)
         M.store_vector(new_line, cid, vec)
