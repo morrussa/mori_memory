@@ -9,6 +9,7 @@ local util = require("module.graph.util")
 local command = require("module.graph.command")
 local config = require("module.config")
 local episode = require("module.episode")
+local experience_policy = require("module.experience.policy")
 
 local M = {}
 
@@ -292,10 +293,12 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
 
     state.agent_loop = state.agent_loop or {
         remaining_steps = 25,
+        tool_loop_max = 0,
         pending_tool_calls = {},
         stop_reason = "",
         iteration = 0,
     }
+    state.agent_loop.tool_loop_max = tonumber(state.agent_loop.tool_loop_max) or 0
     state.task = state.task or {
         turn_units = {},
         contract = state_schema.normalize_task_contract({}, ""),
@@ -334,29 +337,36 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
         memory_context = "",
         experience_context = "",
         policy_context = "",
+        applied_policy = "",
         tool_context = "",
         planner_context = "",
     }
     state.context.task_context = state.context.task_context or ""
     state.context.policy_context = state.context.policy_context or ""
+    state.context.applied_policy = state.context.applied_policy or ""
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
     state.recall = state.recall or { triggered = false, context = "", score = nil }
     state.experience = state.experience or {
         query = {},
-        retrieved = { items = {}, ids = {}, strategy = "", failure_items = {}, failure_ids = {}, failure_strategy = "" },
-        hints = "",
-        kind = "policy",
+        retrieved = { items = {}, ids = {}, strategy = "" },
+        runtime_policy = experience_policy.default_runtime_policy(),
+        audit = "",
+        kind = "graph_policy",
         feedback = { effective_ids = {} },
-        writeback = { written = false },
+        writeback = { written = false, policy_id = "" },
     }
-    state.experience.kind = state.experience.kind or "policy"
+    state.experience.kind = state.experience.kind or "graph_policy"
     state.experience.retrieved = state.experience.retrieved or {}
     state.experience.retrieved.items = state.experience.retrieved.items or {}
     state.experience.retrieved.ids = state.experience.retrieved.ids or {}
     state.experience.retrieved.strategy = state.experience.retrieved.strategy or ""
-    state.experience.retrieved.failure_items = state.experience.retrieved.failure_items or {}
-    state.experience.retrieved.failure_ids = state.experience.retrieved.failure_ids or {}
-    state.experience.retrieved.failure_strategy = state.experience.retrieved.failure_strategy or ""
+    state.experience.runtime_policy = experience_policy.normalize_runtime_policy(
+        state.experience.runtime_policy or (((state.experience or {}).policy) or {})
+    )
+    state.experience.audit = tostring(state.experience.audit or state.experience.hints or "")
+    state.experience.hints = nil
+    state.experience.writeback = state.experience.writeback or { written = false, policy_id = "" }
+    state.experience.writeback.policy_id = tostring(state.experience.writeback.policy_id or state.experience.writeback.experience_id or "")
     state.episode = state.episode or {
         current = { turn_index = 0, topic_anchor = "" },
         recent = { items = {}, summary = "", count = 0, latest_episode_id = "" },
@@ -387,7 +397,18 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     }
     state.repair = state.repair or { attempts = 0, max_attempts = 2, last_error = "", retry_requested = false, pending = false }
     state.final_response = state.final_response or { message = "" }
-    state.writeback = state.writeback or { facts = {}, saved = 0 }
+    state.writeback = state.writeback or {}
+    if state.writeback.items == nil and type(state.writeback.facts) == "table" then
+        state.writeback.items = state.writeback.facts
+    end
+    if state.writeback.saved_count == nil and state.writeback.saved ~= nil then
+        state.writeback.saved_count = state.writeback.saved
+    end
+    if util.trim(state.writeback.ingest_strategy or "") == "" then
+        state.writeback.ingest_strategy = "atomic_fact"
+    end
+    state.writeback.items = state.writeback.items or {}
+    state.writeback.saved_count = tonumber(state.writeback.saved_count) or 0
     state.metrics = state.metrics or { started_at_ms = util.now_ms(), finished_at_ms = nil, node_durations_ms = {} }
     state.checkpoint_meta = state.checkpoint_meta or { seq = 0, last_node = "" }
     state.session = state.session or { mode = "single", active_task = {} }
@@ -688,7 +709,9 @@ function M.run_turn(args)
         task_contract_acceptance_count = #(((((state or {}).task or {}).contract or {}).acceptance_criteria) or {}),
         recall_triggered = (((state or {}).recall or {}).triggered) == true,
         experience_retrieved_ids = (((((state or {}).experience or {}).retrieved) or {}).ids) or {},
-        experience_hints = tostring((((state or {}).experience or {}).hints) or ""),
+        experience_audit = tostring((((state or {}).experience or {}).audit) or ""),
+        experience_hints = tostring((((state or {}).experience or {}).audit) or ""),
+        experience_runtime_policy = (((state or {}).experience or {}).runtime_policy) or {},
         experience_written = (((((state or {}).experience or {}).writeback) or {}).written) == true,
         episode_id = tostring((((((state or {}).episode or {}).writeback) or {}).episode_id) or ""),
         episode_written = (((((state or {}).episode or {}).writeback) or {}).written) == true,
@@ -698,8 +721,12 @@ function M.run_turn(args)
         tool_failed = tonumber((((state or {}).tool_exec or {}).failed_total) or 0) or 0,
         stop_reason = tostring((((state or {}).termination or {}).stop_reason) or ""),
         remaining_steps = tonumber((((state or {}).agent_loop or {}).remaining_steps) or 0) or 0,
-        writeback_facts = (((state or {}).writeback or {}).facts) or {},
-        writeback_saved = tonumber((((state or {}).writeback or {}).saved) or 0) or 0,
+        tool_loop_max = tonumber((((state or {}).agent_loop or {}).tool_loop_max) or 0) or 0,
+        writeback_items = (((state or {}).writeback or {}).items) or {},
+        writeback_facts = (((state or {}).writeback or {}).items) or {},
+        writeback_saved_count = tonumber((((state or {}).writeback or {}).saved_count) or 0) or 0,
+        writeback_saved = tonumber((((state or {}).writeback or {}).saved_count) or 0) or 0,
+        writeback_ingest_strategy = tostring((((state or {}).writeback or {}).ingest_strategy) or ""),
         session_status = session_snapshot,
     }
 

@@ -343,7 +343,7 @@ local DEFAULT_SETTINGS = {
     },
     experience = {
         storage = {
-            root = "memory/experience_policy",
+            root = "memory/experience_graph_policy",
         },
         retriever = {
             fetch_multiplier = 8, -- 初始候选放大量，供 relevance gate + joint rerank 使用。

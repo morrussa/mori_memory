@@ -8,19 +8,13 @@ local util = require("module.graph.util")
 
 local M = {}
 
-local function build_effective_ids(retrieved_items, current_experience)
+local function build_effective_ids(retrieved_items, policy_id, success)
     local effective_ids = {}
-    if not current_experience or not current_experience.outcome or current_experience.outcome.success ~= true then
+    if success ~= true or util.trim(policy_id or "") == "" then
         return effective_ids
     end
-
-    local success_key = tostring(current_experience.success_key or "")
-    if success_key == "" then
-        return effective_ids
-    end
-
     for _, item in ipairs(retrieved_items or {}) do
-        if tostring((item or {}).success_key or "") == success_key and item.id then
+        if tostring((item or {}).id or "") == tostring(policy_id) and item.id then
             effective_ids[item.id] = true
             break
         end
@@ -44,10 +38,10 @@ function M.run(state, _ctx)
     history.add_history(user_input, final_text)
     topic.update_assistant(current_turn, final_text)
 
-    local facts = (((state or {}).writeback or {}).facts) or {}
-    local saved = memory_core.save_turn_memory(facts, current_turn)
+    local items = (((state or {}).writeback or {}).items) or {}
+    local saved = memory_core.save_ingest_items(items, current_turn)
     state.writeback = state.writeback or {}
-    state.writeback.saved = tonumber(saved) or 0
+    state.writeback.saved_count = tonumber(saved) or 0
 
     local summary = topic.get_summary and topic.get_summary(current_turn)
     if summary and summary ~= "" then
@@ -62,24 +56,21 @@ function M.run(state, _ctx)
 
     experience.init()
 
-    local current_experience = experience.run_builder.build_from_state(state)
-    local ok, exp_id = experience.add_experience(current_experience)
+    local observation = experience.run_builder.build_from_state(state)
+    local ok, policy_id = experience.observe(observation)
 
     state.experience = state.experience or {}
-    state.experience.writeback = state.experience.writeback or { written = false }
+    state.experience.writeback = state.experience.writeback or { written = false, policy_id = "" }
     state.experience.feedback = state.experience.feedback or { effective_ids = {} }
     state.experience.writeback.written = ok == true
-    state.experience.writeback.experience_id = ok and exp_id or nil
+    state.experience.writeback.policy_id = ok and tostring(policy_id or "") or ""
 
     local retrieved_items = ((((state or {}).experience or {}).retrieved or {}).items) or {}
-    local effective_ids = build_effective_ids(retrieved_items, current_experience)
+    local success = observation and observation.success == true
+    local effective_ids = build_effective_ids(retrieved_items, policy_id, success)
     state.experience.feedback.effective_ids = effective_ids
 
     if #retrieved_items > 0 then
-        local success = current_experience
-            and current_experience.outcome
-            and current_experience.outcome.success == true
-
         if success then
             local matched_items = {}
             for _, item in ipairs(retrieved_items) do
@@ -96,7 +87,6 @@ function M.run(state, _ctx)
         end
     end
 
-    experience.adaptive.save_to_disk()
     experience.store.save()
 
     episode.init()

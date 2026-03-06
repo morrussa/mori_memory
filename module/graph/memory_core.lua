@@ -88,7 +88,7 @@ local function build_repair_prompt(raw)
 ]], tostring(raw or ""))
 end
 
-function M.extract_atomic_facts(user_input, assistant_text)
+function M.extract_atomic_items(user_input, assistant_text)
     local cfg = fact_cfg()
     local max_facts = math.max(1, math.floor(tonumber(cfg.max_facts) or 8))
     local max_parse_items = math.max(max_facts, math.floor(tonumber(cfg.max_parse_items) or 12))
@@ -138,13 +138,13 @@ function M.extract_atomic_facts(user_input, assistant_text)
     return facts
 end
 
-function M.save_turn_memory(facts, mem_turn)
+function M.save_ingest_items(items, mem_turn)
     if history.get_turn() ~= mem_turn then
         print(string.format("[GraphMemory][WARN] history turn mismatch: history=%d current=%d", history.get_turn(), mem_turn))
     end
 
     local saved = 0
-    for _, fact in ipairs(facts or {}) do
+    for _, fact in ipairs(items or {}) do
         local fact_vec = tool.get_embedding_passage(fact)
         local line, err = memory.add_memory(fact_vec, mem_turn)
         if line then
@@ -162,5 +162,8 @@ function M.save_turn_memory(facts, mem_turn)
 
     return saved
 end
+
+M.extract_atomic_facts = M.extract_atomic_items
+M.save_turn_memory = M.save_ingest_items
 
 return M

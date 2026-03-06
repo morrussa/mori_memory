@@ -13,6 +13,7 @@ function M.run(state, _ctx)
     state.context = state.context or {}
     state.working_memory = state.working_memory or {}
     state.planner = state.planner or {}
+    state.experience = state.experience or {}
 
     local pending = state.repair.pending == true or util.trim(state.repair.last_error or "") ~= ""
     if not pending then
@@ -20,11 +21,19 @@ function M.run(state, _ctx)
         return state
     end
 
+    local runtime_policy = state.experience.runtime_policy or {}
+    local repair_policy = ((runtime_policy or {}).repair) or {}
+    local planner_policy = ((runtime_policy or {}).planner) or {}
+    local repair_mode = util.trim((repair_policy or {}).mode or "normal")
+
     local max_attempts = tonumber(state.repair.max_attempts)
     if not max_attempts then
         max_attempts = math.max(0, math.floor(tonumber((graph_cfg().repair or {}).max_attempts) or 2))
-        state.repair.max_attempts = max_attempts
     end
+    if repair_mode == "fail_fast" then
+        max_attempts = math.min(max_attempts, 1)
+    end
+    state.repair.max_attempts = max_attempts
 
     state.repair.attempts = (tonumber(state.repair.attempts) or 0) + 1
     local last_error = util.trim(state.repair.last_error or "repair_required")
@@ -44,12 +53,28 @@ function M.run(state, _ctx)
         return state
     end
 
-    state.context.planner_context = table.concat({
+    local lines = {
         "Repair the previous step.",
         "Last error: " .. last_error,
         "Do not repeat the same invalid tool batch.",
         "If the task is complete, call finish_turn.",
-    }, "\n")
+    }
+    if repair_mode == "eager" then
+        lines[#lines + 1] = "Repair policy: aggressively change the failed plan instead of retrying a similar batch."
+    elseif repair_mode == "fail_fast" then
+        lines[#lines + 1] = "Repair policy: this is the final repair attempt; if repair is not possible, stop."
+    end
+    local avoid = {}
+    for tool_name, enabled in pairs((planner_policy or {}).avoid_tools or {}) do
+        if enabled then
+            avoid[#avoid + 1] = tostring(tool_name)
+        end
+    end
+    table.sort(avoid)
+    if #avoid > 0 then
+        lines[#lines + 1] = "Do not use avoided tools: " .. table.concat(avoid, ", ")
+    end
+    state.context.planner_context = table.concat(lines, "\n")
     state.repair.pending = false
     state.repair.retry_requested = true
     state.planner.tool_calls = {}

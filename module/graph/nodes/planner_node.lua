@@ -7,6 +7,21 @@ local config = require("module.config")
 local M = {}
 
 local NEED_MORE_STEPS_TEXT = "Sorry, need more steps to process this request."
+local READ_TOOLS = {
+    list_files = true,
+    read_file = true,
+    read_lines = true,
+    search_file = true,
+    search_files = true,
+    code_outline = true,
+    project_structure = true,
+    code_symbols = true,
+}
+local SIDE_EFFECT_TOOLS = {
+    write_file = true,
+    apply_patch = true,
+    exec_command = true,
+}
 
 local function graph_cfg()
     return ((config.settings or {}).graph or {})
@@ -106,6 +121,11 @@ local function ensure_contract_system_message(messages, state)
         }
     end
     local profile = util.trim((((state or {}).context or {}).task_profile) or "general")
+    local runtime_policy = (((state or {}).experience) or {}).runtime_policy or {}
+    local planner_policy = ((runtime_policy or {}).planner) or {}
+    local repair_policy = ((runtime_policy or {}).repair) or {}
+    local recall_policy = ((runtime_policy or {}).recall) or {}
+    local context_policy = ((runtime_policy or {}).context) or {}
     local contract = table.concat({
         "You are the planner for a single-session tool agent.",
         "Return tool calls when more work is needed.",
@@ -115,6 +135,50 @@ local function ensure_contract_system_message(messages, state)
         "Available workspace root: " .. util.workspace_virtual_root(),
         "Current task profile: " .. profile,
     }, "\n")
+
+    local policy_lines = {}
+    local planner_mode = util.trim((planner_policy or {}).mode or "auto")
+    if planner_mode == "tool_first" then
+        policy_lines[#policy_lines + 1] = "Planner policy: prefer tool calls before finalizing the turn."
+    elseif planner_mode == "direct_first" then
+        policy_lines[#policy_lines + 1] = "Planner policy: if a direct answer is sufficient, call finish_turn immediately."
+    elseif planner_mode == "evidence_first" then
+        policy_lines[#policy_lines + 1] = "Planner policy: collect concrete evidence with tools before the final reply."
+    end
+
+    local preferred_chain = (planner_policy or {}).preferred_tool_chain or {}
+    if #preferred_chain > 0 then
+        policy_lines[#policy_lines + 1] = "Preferred tool chain: " .. table.concat(preferred_chain, " -> ")
+    end
+
+    local avoid = {}
+    for tool_name, enabled in pairs((planner_policy or {}).avoid_tools or {}) do
+        if enabled then
+            avoid[#avoid + 1] = tostring(tool_name)
+        end
+    end
+    table.sort(avoid)
+    if #avoid > 0 then
+        policy_lines[#policy_lines + 1] = "Avoid these tools unless no alternative exists: " .. table.concat(avoid, ", ")
+    end
+    if (planner_policy or {}).force_read_before_write == true then
+        policy_lines[#policy_lines + 1] = "If any write-capable tool is needed, read relevant files or workspace context first."
+    end
+    if util.trim((repair_policy or {}).mode or "normal") ~= "normal" then
+        policy_lines[#policy_lines + 1] = "Repair mode: " .. tostring((repair_policy or {}).mode)
+    end
+    if util.trim((recall_policy or {}).mode or "auto") ~= "auto" then
+        policy_lines[#policy_lines + 1] = "Recall mode: " .. tostring((recall_policy or {}).mode)
+    end
+    if (context_policy or {}).include_memory == false then
+        policy_lines[#policy_lines + 1] = "Memory context may be absent by policy."
+    end
+    if (context_policy or {}).include_episode == false then
+        policy_lines[#policy_lines + 1] = "Episode continuity context may be absent by policy."
+    end
+    if #policy_lines > 0 then
+        contract = table.concat({ contract, "", "[GraphPolicy]", table.concat(policy_lines, "\n") }, "\n")
+    end
 
     if #out > 0 and tostring((out[1] or {}).role or "") == "system" then
         out[1].content = table.concat({ tostring(out[1].content or ""), "", "[PlannerContract]", contract }, "\n")
@@ -135,6 +199,44 @@ local function set_terminal_failure(state, status, stop_reason, message)
     state.agent_loop.pending_tool_calls = {}
     state.planner = state.planner or {}
     state.planner.tool_calls = {}
+end
+
+local function has_previous_reads(state)
+    local files = ((((state or {}).working_memory) or {}).files_read_set) or {}
+    for _, enabled in pairs(files) do
+        if enabled then
+            return true
+        end
+    end
+    return false
+end
+
+local function has_read_tool(calls)
+    for _, call in ipairs(calls or {}) do
+        if READ_TOOLS[util.trim((call or {}).tool)] then
+            return true
+        end
+    end
+    return false
+end
+
+local function has_side_effect_tool(calls)
+    for _, call in ipairs(calls or {}) do
+        if SIDE_EFFECT_TOOLS[util.trim((call or {}).tool)] then
+            return true
+        end
+    end
+    return false
+end
+
+local function find_avoided_tool(calls, avoid_tools)
+    for _, call in ipairs(calls or {}) do
+        local tool_name = util.trim((call or {}).tool)
+        if tool_name ~= "" and ((avoid_tools or {})[tool_name] == true) then
+            return tool_name
+        end
+    end
+    return ""
 end
 
 function M.run(state, _ctx)
@@ -158,7 +260,13 @@ function M.run(state, _ctx)
         return state
     end
 
-    local tool_loop_max = math.max(1, math.floor(tonumber((graph_cfg() or {}).tool_loop_max) or 5))
+    local tool_loop_max = tonumber(state.agent_loop.tool_loop_max)
+    if not tool_loop_max or tool_loop_max <= 0 then
+        tool_loop_max = math.max(1, math.floor(tonumber((graph_cfg() or {}).tool_loop_max) or 5))
+        state.agent_loop.tool_loop_max = tool_loop_max
+    else
+        tool_loop_max = math.max(1, math.floor(tool_loop_max))
+    end
     local loop_count = tonumber((((state or {}).tool_exec or {}).loop_count) or 0) or 0
     if loop_count >= tool_loop_max then
         set_terminal_failure(state, "failed", "tool_loop_max_exceeded", NEED_MORE_STEPS_TEXT)
@@ -209,6 +317,8 @@ function M.run(state, _ctx)
 
     local parsed = parse_model_output(result_or_err)
     state.planner.raw = parsed.raw ~= "" and parsed.raw or parsed.content
+    local runtime_policy = (((state or {}).experience) or {}).runtime_policy or {}
+    local planner_policy = ((runtime_policy or {}).planner) or {}
 
     local finish_call = nil
     local tool_calls = {}
@@ -248,11 +358,43 @@ function M.run(state, _ctx)
     end
 
     if #tool_calls == 0 then
+        if util.trim((planner_policy or {}).mode or "auto") == "direct_first" and util.trim(parsed.content or "") ~= "" then
+            state.termination.finish_requested = true
+            state.termination.final_message = util.trim(parsed.content or "")
+            state.termination.final_status = "completed"
+            state.termination.stop_reason = "finish_turn_called"
+            state.agent_loop.stop_reason = "finish_turn_called"
+            state.agent_loop.pending_tool_calls = {}
+            state.working_memory.current_plan = "finish_turn"
+            return state
+        end
         state.planner.missing_terminal_signal = true
         state.planner.errors[#state.planner.errors + 1] = "missing_terminal_signal"
         state.repair.pending = true
         state.repair.last_error = "missing_terminal_signal"
         state.working_memory.last_repair_error = "missing_terminal_signal"
+        return state
+    end
+
+    local avoided_tool = find_avoided_tool(tool_calls, (planner_policy or {}).avoid_tools or {})
+    if avoided_tool ~= "" then
+        state.planner.errors[#state.planner.errors + 1] = "policy_avoid_tool:" .. avoided_tool
+        state.repair.pending = true
+        state.repair.last_error = "policy_avoid_tool:" .. avoided_tool
+        state.working_memory.last_repair_error = state.repair.last_error
+        state.context.planner_context = "Do not use avoided tool: " .. avoided_tool
+        return state
+    end
+
+    if (planner_policy or {}).force_read_before_write == true
+        and has_side_effect_tool(tool_calls)
+        and not has_read_tool(tool_calls)
+        and not has_previous_reads(state) then
+        state.planner.errors[#state.planner.errors + 1] = "missing_read_before_write"
+        state.repair.pending = true
+        state.repair.last_error = "missing_read_before_write"
+        state.working_memory.last_repair_error = "missing_read_before_write"
+        state.context.planner_context = "Read relevant workspace context before using write-capable tools."
         return state
     end
 

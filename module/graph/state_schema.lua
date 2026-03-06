@@ -1,4 +1,5 @@
 local util = require("module.graph.util")
+local experience_policy = require("module.experience.policy")
 
 local M = {}
 
@@ -232,6 +233,7 @@ function M.new_state(args)
         },
         agent_loop = {
             remaining_steps = 25,
+            tool_loop_max = 0,
             pending_tool_calls = {},
             stop_reason = "",
             iteration = 0,
@@ -275,17 +277,16 @@ function M.new_state(args)
                 items = {},
                 ids = {},
                 strategy = "",
-                failure_items = {},
-                failure_ids = {},
-                failure_strategy = "",
             },
-            hints = "",
-            kind = "policy",
+            runtime_policy = experience_policy.default_runtime_policy(),
+            audit = "",
+            kind = "graph_policy",
             feedback = {
                 effective_ids = {},
             },
             writeback = {
                 written = false,
+                policy_id = "",
             },
         },
         episode = {
@@ -373,8 +374,9 @@ function M.new_state(args)
             resumed_from_checkpoint = args.resumed_from_checkpoint == true,
         },
         writeback = {
-            facts = {},
-            saved = 0,
+            items = {},
+            ingest_strategy = "atomic_fact",
+            saved_count = 0,
         },
         metrics = {
             started_at_ms = util.now_ms(),

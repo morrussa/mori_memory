@@ -12,10 +12,14 @@ end
 function M.run(state, _ctx)
     local user_input = tostring((((state or {}).input or {}).message) or "")
     local read_only = (((state or {}).input or {}).read_only) == true
+    local runtime_policy = (((state or {}).experience) or {}).runtime_policy or {}
+    local recall_mode = tostring((((runtime_policy or {}).recall) or {}).mode or "auto")
 
     local user_vec_q = tool.get_embedding_query(user_input)
     local memory_context = recall.check_and_retrieve(user_input, user_vec_q, {
         read_only = read_only,
+        force = recall_mode == "force",
+        suppress = recall_mode == "suppress",
     })
 
     memory_context = util.trim(memory_context)

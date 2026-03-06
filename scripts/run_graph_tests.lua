@@ -188,7 +188,7 @@ local function setup_stubs(case)
             time = { maintenance_task = 9999999 },
             experience = {
                 storage = {
-                    root = tostring(case.experience_root or ("memory/experience_policy_test/" .. tostring(case.id))),
+                    root = tostring(case.experience_root or ("memory/experience_graph_policy_test/" .. tostring(case.id))),
                 },
                 retriever = {
                     fetch_multiplier = 8,
@@ -330,9 +330,13 @@ local function setup_stubs(case)
 
     package.preload["module.memory.recall"] = function()
         return {
-            check_and_retrieve = function(user_input, _vec, _opts)
+            check_and_retrieve = function(user_input, _vec, opts)
+                opts = opts or {}
+                if opts.suppress == true then
+                    return ""
+                end
                 local s = tostring(user_input or "")
-                if s:find("MEMORY_HIT", 1, true) then
+                if s:find("MEMORY_HIT", 1, true) or opts.force == true then
                     return "memory_context_for_" .. s
                 end
                 return ""
@@ -366,6 +370,16 @@ local function setup_stubs(case)
 
     package.preload["module.graph.memory_core"] = function()
         return {
+            extract_atomic_items = function(_user, assistant)
+                local text = tostring(assistant or "")
+                if text == "" then
+                    return {}
+                end
+                return { "fact_for_" .. tostring(case.id) }
+            end,
+            save_ingest_items = function(items, _turn)
+                return #(items or {})
+            end,
             extract_atomic_facts = function(_user, assistant)
                 local text = tostring(assistant or "")
                 if text == "" then
@@ -659,6 +673,30 @@ local function run_case(case)
     if case.experience_hints_contains ~= nil then
         ensure(tostring(snapshot.experience_hints or ""):find(tostring(case.experience_hints_contains), 1, true) ~= nil, case.id .. ": experience hints mismatch")
     end
+    if case.expect_planner_mode ~= nil then
+        ensure(tostring((((snapshot.experience_runtime_policy or {}).planner) or {}).mode or "") == tostring(case.expect_planner_mode), case.id .. ": planner mode mismatch")
+    end
+    if case.expect_recall_mode ~= nil then
+        ensure(tostring((((snapshot.experience_runtime_policy or {}).recall) or {}).mode or "") == tostring(case.expect_recall_mode), case.id .. ": recall mode mismatch")
+    end
+    if case.expect_force_read_before_write ~= nil then
+        ensure(((((snapshot.experience_runtime_policy or {}).planner) or {}).force_read_before_write) == case.expect_force_read_before_write,
+            case.id .. ": force_read_before_write mismatch")
+    end
+    if case.expect_context_include_memory ~= nil then
+        ensure(((((snapshot.experience_runtime_policy or {}).context) or {}).include_memory) == case.expect_context_include_memory,
+            case.id .. ": include_memory mismatch")
+    end
+    if case.expect_context_include_episode ~= nil then
+        ensure(((((snapshot.experience_runtime_policy or {}).context) or {}).include_episode) == case.expect_context_include_episode,
+            case.id .. ": include_episode mismatch")
+    end
+    if case.expect_tool_loop_max ~= nil then
+        ensure((tonumber(snapshot.tool_loop_max) or 0) == tonumber(case.expect_tool_loop_max), case.id .. ": tool_loop_max mismatch")
+    end
+    if case.expect_remaining_steps ~= nil then
+        ensure((tonumber(snapshot.remaining_steps) or 0) == tonumber(case.expect_remaining_steps), case.id .. ": remaining_steps mismatch")
+    end
     if case.final_contains ~= nil then
         ensure(tostring(output):find(tostring(case.final_contains), 1, true) ~= nil, case.id .. ": final text mismatch")
     end
@@ -676,14 +714,14 @@ local function run_case(case)
 end
 
 local function count_experience_bins(root)
-    local dir = string.format("%s/experiences", tostring(root))
+    local dir = string.format("%s/items", tostring(root))
     local proc = io.popen(string.format('ls -1A "%s" 2>/dev/null', dir))
     if not proc then
         return 0
     end
     local count = 0
     for line in proc:lines() do
-        if line:sub(-4) == ".bin" then
+        if line:sub(-4) == ".lua" then
             count = count + 1
         end
     end
@@ -692,122 +730,210 @@ local function count_experience_bins(root)
 end
 
 local function run_experience_policy_checks()
-    local root_write = "memory/experience_policy_test/write"
-    local write_case = {
-        id = "exp_write_seed",
+    local root_tool = "memory/experience_graph_policy_test/tool_first"
+    run_case({
+        id = "exp_tool_seed_a",
         category = "file",
-        experience_root = root_write,
+        experience_root = root_tool,
         input = "debug lua file policy",
         agent_steps = {
-            mk_agent_step("need_file_seed", {
-                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "exp_seed_read"),
+            mk_agent_step("need_tool_seed_a", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "exp_tool_seed_read_a"),
             }),
-            mk_agent_step("seed_done", {}),
+            mk_agent_step("tool_seed_done_a", {}),
         },
         min_tool_executed = 1,
         expect_experience_written = true,
-        expect_experience_retrieved = 0,
-    }
-    local write_result = run_case(write_case)
-    ensure(count_experience_bins(root_write) == 1, "experience write seed count mismatch")
-
-    local retrieve_case = {
-        id = "exp_retrieve_hit",
-        category = "no_tool",
-        experience_root = root_write,
+    })
+    run_case({
+        id = "exp_tool_seed_b",
+        category = "file",
+        experience_root = root_tool,
         input = "debug lua file policy",
         agent_steps = {
-            mk_agent_step("retrieve_done", {}),
-        },
-        min_experience_retrieved = 1,
-        expect_experience_written = true,
-        experience_hints_contains = "task=coding",
-    }
-    local retrieve_result = run_case(retrieve_case)
-    ensure(#(retrieve_result.snapshot.experience_retrieved_ids or {}) >= 1, "experience retrieval missing")
-
-    local root_rank = "memory/experience_policy_test/rank"
-    run_case({
-        id = "exp_rank_fast",
-        category = "file",
-        experience_root = root_rank,
-        input = "debug lua ranking path",
-        agent_steps = {
-            mk_agent_step("rank_fast_need", {
-                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "rank_fast_read"),
+            mk_agent_step("need_tool_seed_b", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "exp_tool_seed_read_b"),
             }),
-            mk_agent_step("rank_fast_done", {}),
+            mk_agent_step("tool_seed_done_b", {}),
         },
         min_tool_executed = 1,
         expect_experience_written = true,
     })
-    run_case({
-        id = "exp_rank_slow",
-        category = "file",
-        experience_root = root_rank,
-        input = "debug lua ranking path",
-        agent_steps = {
-            mk_agent_step("rank_slow_need_a", {
-                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "rank_slow_read"),
-            }),
-            mk_agent_step("rank_slow_need_b", {
-                mk_tool_call("list_files", { prefix = "download" }, "rank_slow_list"),
-            }),
-            mk_agent_step("rank_slow_done", {}),
-        },
-        min_tool_executed = 2,
-        expect_experience_written = true,
-    })
-    local rank_result = run_case({
-        id = "exp_rank_query",
+    ensure(count_experience_bins(root_tool) == 1, "policy upsert should keep a single item for same key")
+    local tool_query = run_case({
+        id = "exp_tool_query",
         category = "no_tool",
-        experience_root = root_rank,
-        input = "debug lua ranking path",
+        experience_root = root_tool,
+        input = "debug lua file policy",
         agent_steps = {
-            mk_agent_step("rank_query_done", {}),
+            mk_agent_step("tool_query_done", {}),
         },
-        min_experience_retrieved = 2,
-        experience_hints_contains = "task=coding",
+        min_experience_retrieved = 1,
+        expect_planner_mode = "tool_first",
+        experience_hints_contains = "planner.mode=tool_first",
     })
-    ensure(tostring(rank_result.snapshot.experience_hints or ""):find("task=coding", 1, true) ~= nil,
-        "experience ranking missing secondary path")
+    ensure(#(tool_query.snapshot.experience_retrieved_ids or {}) >= 1, "tool-first retrieval missing")
 
-    local root_feedback = "memory/experience_policy_test/feedback"
+    local root_direct = "memory/experience_graph_policy_test/direct_first"
     run_case({
-        id = "exp_feedback_seed",
-        category = "file",
-        experience_root = root_feedback,
-        input = "debug lua feedback path",
+        id = "exp_direct_seed_a",
+        category = "no_tool",
+        experience_root = root_direct,
+        input = "explain lua policy",
         agent_steps = {
-            mk_agent_step("feedback_seed_need", {
-                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "feedback_seed_read"),
-            }),
-            mk_agent_step("feedback_seed_done", {}),
+            mk_agent_step("direct_seed_done_a", {}),
         },
-        min_tool_executed = 1,
         expect_experience_written = true,
     })
-    local fail_result = run_case({
-        id = "exp_feedback_fail",
-        category = "file",
-        experience_root = root_feedback,
-        input = "debug lua feedback path",
-        remaining_steps = 1,
+    run_case({
+        id = "exp_direct_seed_b",
+        category = "no_tool",
+        experience_root = root_direct,
+        input = "explain lua policy",
         agent_steps = {
-            mk_agent_step("feedback_fail_need", {
-                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "feedback_fail_read"),
-            }),
+            mk_agent_step("direct_seed_done_b", {}),
         },
-        expect_stop_reason = "remaining_steps_exhausted",
         expect_experience_written = true,
+    })
+    run_case({
+        id = "exp_direct_query",
+        category = "no_tool",
+        experience_root = root_direct,
+        input = "explain lua policy",
+        agent_steps = {
+            mk_agent_step("direct query answer", {}),
+        },
+        min_experience_retrieved = 1,
+        expect_planner_mode = "direct_first",
+        experience_hints_contains = "planner.mode=direct_first",
+    })
+
+    local root_recall_force = "memory/experience_graph_policy_test/recall_force"
+    for idx = 1, 3 do
+        run_case({
+            id = "exp_recall_force_seed_" .. tostring(idx),
+            category = "memory",
+            experience_root = root_recall_force,
+            input = "MEMORY_HIT recall policy",
+            agent_steps = {
+                mk_agent_step("recall_force_done_" .. tostring(idx), {}),
+            },
+            expect_recall = true,
+            expect_experience_written = true,
+        })
+    end
+    run_case({
+        id = "exp_recall_force_query",
+        category = "memory",
+        experience_root = root_recall_force,
+        input = "recall policy followup",
+        agent_steps = {
+            mk_agent_step("recall_force_query_done", {}),
+        },
+        expect_recall = true,
+        expect_recall_mode = "force",
         min_experience_retrieved = 1,
     })
-    local fail_retrieved_id = ((fail_result.snapshot.experience_retrieved_ids or {})[1])
-    ensure(type(fail_retrieved_id) == "string" and fail_retrieved_id ~= "", "feedback test missing retrieved id")
-    local exp_adaptive = require("module.experience.adaptive")
-    ensure(exp_adaptive.get_experience_utility(fail_retrieved_id) < 0.5, "negative feedback did not lower utility")
 
-    local root_read_only = "memory/experience_policy_test/readonly"
+    local root_recall_suppress = "memory/experience_graph_policy_test/recall_suppress"
+    for idx = 1, 3 do
+        run_case({
+            id = "exp_recall_suppress_seed_" .. tostring(idx),
+            category = "no_tool",
+            experience_root = root_recall_suppress,
+            input = "plain suppress policy",
+            agent_steps = {
+                mk_agent_step("recall_suppress_done_" .. tostring(idx), {}),
+            },
+            expect_recall = false,
+            expect_experience_written = true,
+        })
+    end
+    run_case({
+        id = "exp_recall_suppress_query",
+        category = "memory",
+        experience_root = root_recall_suppress,
+        input = "MEMORY_HIT plain suppress policy",
+        agent_steps = {
+            mk_agent_step("recall_suppress_query_done", {}),
+        },
+        expect_recall = false,
+        expect_recall_mode = "suppress",
+        expect_context_include_memory = false,
+        min_experience_retrieved = 1,
+    })
+
+    local root_force_read = "memory/experience_graph_policy_test/force_read"
+    for idx = 1, 3 do
+        run_case({
+            id = "exp_force_read_seed_" .. tostring(idx),
+            category = "file",
+            experience_root = root_force_read,
+            input = "implement lua file change",
+            agent_steps = {
+                mk_agent_step("force_read_step_a_" .. tostring(idx), {
+                    mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "force_read_read_" .. tostring(idx)),
+                }),
+                mk_agent_step("force_read_step_b_" .. tostring(idx), {
+                    mk_tool_call("write_file", { path = "download/a.txt", content = "x" }, "force_read_write_" .. tostring(idx)),
+                }),
+                mk_agent_step("force_read_done_" .. tostring(idx), {}),
+            },
+            min_tool_executed = 2,
+            expect_experience_written = true,
+        })
+    end
+    local force_read_query = run_case({
+        id = "exp_force_read_query",
+        category = "no_tool",
+        experience_root = root_force_read,
+        input = "implement lua file change",
+        agent_steps = {
+            mk_agent_step("force_read_query_done", {}),
+        },
+        min_experience_retrieved = 1,
+        expect_force_read_before_write = true,
+    })
+    ensure(tostring((((CURRENT.last_messages or {})[1] or {}).content) or ""):find("write%-capable tools", 1, false) ~= nil,
+        "planner contract missing read-before-write guidance")
+
+    local root_budget = "memory/experience_graph_policy_test/budget"
+    for idx = 1, 2 do
+        run_case({
+            id = "exp_budget_seed_" .. tostring(idx),
+            category = "file",
+            experience_root = root_budget,
+            input = "debug lua budget path",
+            agent_steps = {
+                mk_agent_step("budget_need_a_" .. tostring(idx), {
+                    mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "budget_read_" .. tostring(idx)),
+                }),
+                mk_agent_step("budget_need_b_" .. tostring(idx), {
+                    mk_tool_call("list_files", { prefix = "download" }, "budget_list_" .. tostring(idx)),
+                }),
+                mk_agent_step("budget_need_c_" .. tostring(idx), {
+                    mk_tool_call("search_file", { path = "download/a.txt", pattern = "x" }, "budget_search_" .. tostring(idx)),
+                }),
+                mk_agent_step("budget_done_" .. tostring(idx), {}),
+            },
+            min_tool_executed = 3,
+            expect_experience_written = true,
+        })
+    end
+    run_case({
+        id = "exp_budget_query",
+        category = "no_tool",
+        experience_root = root_budget,
+        input = "debug lua budget path",
+        agent_steps = {
+            mk_agent_step("budget_query_done", {}),
+        },
+        min_experience_retrieved = 1,
+        expect_tool_loop_max = 7,
+        expect_remaining_steps = 28,
+    })
+
+    local root_read_only = "memory/experience_graph_policy_test/readonly"
     run_case({
         id = "exp_readonly_seed",
         category = "file",
@@ -834,9 +960,8 @@ local function run_experience_policy_checks()
         },
         min_experience_retrieved = 1,
         expect_experience_written = false,
-        experience_hints_contains = "task=coding",
     })
-    ensure(count_experience_bins(root_read_only) == before_read_only, "read_only unexpectedly wrote experience")
+    ensure(count_experience_bins(root_read_only) == before_read_only, "read_only unexpectedly wrote policy")
     ensure(#(read_only_result.snapshot.experience_retrieved_ids or {}) >= 1, "read_only retrieval missing")
 
     local topic_src = assert(io.open("module/memory/topic.lua", "r"))

@@ -208,11 +208,12 @@ function M.build_from_state(state)
         effective_policy_ids = collect_effective_ids((((experience or {}).feedback) or {}).effective_ids),
         policy_writeback = {
             written = (((experience or {}).writeback or {}).written) == true,
-            experience_id = trim((((experience or {}).writeback or {}).experience_id) or ""),
+            policy_id = trim((((experience or {}).writeback or {}).policy_id) or ((((experience or {}).writeback or {}).experience_id) or "")),
         },
         memory_writeback = {
-            facts = shallow_copy_array(writeback.facts or {}),
-            saved = tonumber(writeback.saved) or 0,
+            items = shallow_copy_array(writeback.items or writeback.facts or {}),
+            ingest_strategy = trim(writeback.ingest_strategy or "atomic_fact"),
+            saved_count = tonumber(writeback.saved_count or writeback.saved) or 0,
         },
         working_memory_snapshot = build_working_memory_snapshot(working_memory),
         metrics = {

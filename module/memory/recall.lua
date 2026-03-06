@@ -1838,6 +1838,9 @@ end
 function M.check_and_retrieve(user_input, user_vec, opts)
     opts = opts or {}
     local read_only = is_read_only(opts)
+    if opts.suppress == true then
+        return ""
+    end
     user_vec = user_vec or tool.get_embedding_query(user_input)
 
     local current_turn = history.get_turn() + 1
@@ -1851,7 +1854,10 @@ function M.check_and_retrieve(user_input, user_vec, opts)
     local stable_ready = update_topic_stability(current_key, user_vec, opts)
     topic_random_lift(current_turn, current_key, stable_ready, opts)
 
-    local should_recall, _ = need_recall(user_input, user_vec, current_turn)
+    local should_recall = opts.force == true
+    if not should_recall then
+        should_recall = select(1, need_recall(user_input, user_vec, current_turn))
+    end
     if should_recall then
         if not read_only then
             M._last_recall_attempt_turn = current_turn

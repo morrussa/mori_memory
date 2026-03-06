@@ -168,8 +168,9 @@ local function normalize_episode(episode)
         effective_policy_ids = shallow_copy_array((episode or {}).effective_policy_ids or {}),
         policy_writeback = shallow_copy_map((episode or {}).policy_writeback or {}),
         memory_writeback = {
-            facts = shallow_copy_array((((episode or {}).memory_writeback) or {}).facts or {}),
-            saved = tonumber((((episode or {}).memory_writeback) or {}).saved) or 0,
+            items = shallow_copy_array((((episode or {}).memory_writeback) or {}).items or ((((episode or {}).memory_writeback) or {}).facts) or {}),
+            ingest_strategy = tostring(((((episode or {}).memory_writeback) or {}).ingest_strategy) or "atomic_fact"),
+            saved_count = tonumber(((((episode or {}).memory_writeback) or {}).saved_count) or ((((episode or {}).memory_writeback) or {}).saved)) or 0,
         },
         working_memory_snapshot = {
             current_plan = tostring(((((episode or {}).working_memory_snapshot) or {}).current_plan) or ""),
@@ -198,6 +199,7 @@ local function normalize_episode(episode)
     normalized.files_written = sort_strings(normalized.files_written)
     normalized.retrieved_policy_ids = sort_strings(normalized.retrieved_policy_ids)
     normalized.effective_policy_ids = sort_strings(normalized.effective_policy_ids)
+    normalized.policy_writeback.policy_id = tostring(normalized.policy_writeback.policy_id or normalized.policy_writeback.experience_id or "")
 
     return normalized
 end

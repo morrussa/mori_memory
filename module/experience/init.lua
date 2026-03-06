@@ -9,6 +9,7 @@ M.store = require("module.experience.store")
 M.retriever = require("module.experience.retriever")
 M.adaptive = require("module.experience.adaptive")
 M.run_builder = require("module.experience.run_builder")
+M.policy = require("module.experience.policy")
 M.builder = require("module.experience.builder") -- legacy topic-based builder
 
 M._initialized = false
@@ -45,9 +46,13 @@ function M.add_experience(experience)
     return M.store.add(experience)
 end
 
+function M.observe(observation)
+    return M.store.upsert_observation(observation)
+end
+
 -- 相关性门控检索（核心检索方法）
 function M.retrieve(query, options)
-    return M.retriever.retrieve_intersection_priority(query, options)
+    return M.retriever.retrieve(query, options)
 end
 
 -- 带反馈的检索
