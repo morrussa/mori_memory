@@ -125,7 +125,6 @@ local function setup_stubs(case)
     for k, _ in pairs(package.loaded) do
         if k:match("^module%.graph")
             or k:match("^module%.memory")
-            or k:match("^module%.experience")
             or k:match("^module%.episode")
             or k == "module.tool"
             or k == "module.config" then
@@ -186,34 +185,6 @@ local function setup_stubs(case)
                 cli = { debug_trace = false },
             },
             time = { maintenance_task = 9999999 },
-            experience = {
-                storage = {
-                    root = tostring(case.experience_root or ("memory/experience_graph_policy_test/" .. tostring(case.id))),
-                },
-                v2 = {
-                    enabled = case.experience_v2_enabled ~= false,
-                    candidate_limit = tonumber(case.experience_v2_candidate_limit) or 5,
-                    min_support_for_recommend = tonumber(case.experience_v2_min_support) or 3,
-                    min_confidence_for_recommend = tonumber(case.experience_v2_min_confidence) or 0.72,
-                    hard_fallback_on_error = case.experience_v2_hard_fallback ~= false,
-                    recency_half_life_days = 30,
-                },
-                retriever = {
-                    fetch_multiplier = 8,
-                    relevance_gate = 0.20,
-                    context_threshold = 0.20,
-                    semantic_threshold = 0.0,
-                    semantic_scan_limit = 48,
-                    min_needed_ratio = 0.34,
-                    exploration_slots = 0,
-                    utility_confidence_count = 2,
-                },
-                adaptive = {
-                    enabled = true,
-                    route_learning_rate = 0.10,
-                    utility_learning_rate = 0.10,
-                },
-            },
             episode = {
                 storage = {
                     root = tostring(case.episode_root or ("memory/episodes_test/" .. tostring(case.id))),
@@ -562,10 +533,6 @@ local function cleanup_graph_dirs()
     os.execute('rm -rf "memory/v3/graph/traces"')
     os.execute('rm -f "memory/v3/graph/session_state.lua"')
     os.execute('rm -f "memory/v3/graph/session_state.json"')
-    os.execute('rm -rf "memory/experience_policy"')
-    os.execute('rm -rf "memory/experience_graph_policy"')
-    os.execute('rm -rf "memory/experience_policy_test"')
-    os.execute('rm -rf "memory/experience_graph_policy_test"')
     os.execute('rm -rf "memory/episodes"')
     os.execute('rm -rf "memory/episodes_test"')
 end

@@ -174,7 +174,6 @@ function M.build_from_state(state)
     local tool_exec = ((state or {}).tool_exec) or {}
     local repair = ((state or {}).repair) or {}
     local writeback = ((state or {}).writeback) or {}
-    local experience = ((state or {}).experience) or {}
     local episode_state = ((state or {}).episode) or {}
     local episode_current = (episode_state.current or {})
 
@@ -204,12 +203,6 @@ function M.build_from_state(state)
         files_read = sorted_set_keys(working_memory.files_read_set),
         files_written = sorted_set_keys(working_memory.files_written_set),
         uploads = copy_uploads((state or {}).uploads or {}),
-        retrieved_policy_ids = shallow_copy_array((((experience or {}).retrieved or {}).ids) or {}),
-        effective_policy_ids = collect_effective_ids((((experience or {}).feedback) or {}).effective_ids),
-        policy_writeback = {
-            written = (((experience or {}).writeback or {}).written) == true,
-            policy_id = trim((((experience or {}).writeback or {}).policy_id) or ""),
-        },
         memory_writeback = {
             items = shallow_copy_array(writeback.items or writeback.facts or {}),
             ingest_strategy = trim(writeback.ingest_strategy or "atomic_fact"),

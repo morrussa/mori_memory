@@ -291,11 +291,13 @@ function M.run(state, _ctx)
     end
 
     local remaining_steps = tonumber(state.agent_loop.remaining_steps) or 0
+    local terminal_only = false
     if remaining_steps <= 0 then
-        set_terminal_failure(state, "failed", "remaining_steps_exhausted", NEED_MORE_STEPS_TEXT)
-        return state
+        terminal_only = true
+        state.agent_loop.remaining_steps = 0
+    else
+        state.agent_loop.remaining_steps = remaining_steps - 1
     end
-    state.agent_loop.remaining_steps = remaining_steps - 1
     state.agent_loop.iteration = (tonumber(state.agent_loop.iteration) or 0) + 1
 
     local runtime = _G.py_pipeline
@@ -349,6 +351,11 @@ function M.run(state, _ctx)
         state.repair.pending = true
         state.repair.last_error = "invalid_mixed_terminal_batch"
         state.working_memory.last_repair_error = "invalid_mixed_terminal_batch"
+        return state
+    end
+
+    if terminal_only and not finish_call then
+        set_terminal_failure(state, "failed", "remaining_steps_exhausted", NEED_MORE_STEPS_TEXT)
         return state
     end
 
