@@ -568,6 +568,40 @@ local function ensure(condition, msg)
     end
 end
 
+local function capture_print_lines(fn)
+    local original_print = print
+    local lines = {}
+
+    print = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do
+            parts[#parts + 1] = tostring(select(i, ...))
+        end
+        local line = table.concat(parts, "\t")
+        lines[#lines + 1] = line
+        original_print(...)
+    end
+
+    local results = { xpcall(fn, debug.traceback) }
+    print = original_print
+
+    if not results[1] then
+        error(results[2], 0)
+    end
+
+    table.remove(results, 1)
+    return lines, unpack(results)
+end
+
+local function ensure_no_log_line(lines, needle, label)
+    for _, line in ipairs(lines or {}) do
+        ensure(
+            tostring(line or ""):find(tostring(needle), 1, true) == nil,
+            string.format("%s: unexpected log line: %s", tostring(label or "log_check"), tostring(line or ""))
+        )
+    end
+end
+
 local function assert_event_order(events, case_id)
     ensure(#events > 0, case_id .. ": empty stream events")
     ensure((events[1] or {}).event == "run_start", case_id .. ": first event must be run_start")
@@ -1818,15 +1852,19 @@ local function main()
         ensure(first_run_id ~= nil, "no successful run to validate artifacts")
         run_artifact_check(first_run_id)
         run_experience_policy_checks()
-        run_v2_feature_checks()
+        local v2_logs = capture_print_lines(run_v2_feature_checks)
+        ensure_no_log_line(v2_logs, "[GraphRuntime][WARN] stream emit failed", "v2_feature_checks")
 
-        run_consistency_check({
-            id = "consistency",
-            input = "MEMORY_HIT consistency check",
-            agent_steps = {
-                mk_agent_step("consistency_done", {}),
-            },
-        })
+        local consistency_logs = capture_print_lines(function()
+            run_consistency_check({
+                id = "consistency",
+                input = "MEMORY_HIT consistency check",
+                agent_steps = {
+                    mk_agent_step("consistency_done", {}),
+                },
+            })
+        end)
+        ensure_no_log_line(consistency_logs, "[GraphRuntime][WARN] stream emit failed", "consistency_check")
     end
 
     local hit_rate = passed / #cases

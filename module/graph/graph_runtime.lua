@@ -25,15 +25,33 @@ local function is_callable(obj)
     if type(obj) == "function" then
         return true
     end
-    local ok, _ = pcall(function()
-        return obj and obj.__call or (getmetatable(obj) or {}).__call
+    if obj == nil then
+        return false
+    end
+
+    local obj_type = type(obj)
+    local ok, callable = pcall(function()
+        local mt = getmetatable(obj)
+        if obj_type == "table" then
+            local direct = rawget(obj, "__call")
+            if direct ~= nil then
+                return direct
+            end
+        else
+            local direct = obj.__call
+            if direct ~= nil then
+                return direct
+            end
+        end
+        return mt and mt.__call or nil
     end)
-    if ok then
+    if ok and callable ~= nil then
         return true
     end
-    if obj ~= nil then
+
+    if obj_type == "userdata" then
         local ok2, _ = pcall(function()
-            obj({})
+            return obj({})
         end)
         return ok2
     end
