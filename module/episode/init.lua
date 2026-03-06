@@ -2,6 +2,7 @@ local M = {}
 
 M.store = require("module.episode.store")
 M.run_builder = require("module.episode.run_builder")
+M.continuity = require("module.episode.continuity")
 
 M._initialized = false
 
@@ -28,6 +29,10 @@ end
 
 function M.get_recent_by_task(task_id, limit)
     return M.store.get_recent_by_task(task_id, limit)
+end
+
+function M.build_task_continuity(task_id, opts)
+    return M.continuity.build_for_task(task_id, opts)
 end
 
 return M

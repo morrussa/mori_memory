@@ -226,6 +226,12 @@ function M.new_state(args)
                 turn_index = 0,
                 topic_anchor = "",
             },
+            recent = {
+                items = {},
+                summary = "",
+                count = 0,
+                latest_episode_id = "",
+            },
             writeback = {
                 written = false,
                 episode_id = "",
@@ -273,6 +279,7 @@ function M.new_state(args)
                 carryover_summary = util.trim(session_active_task.carryover_summary or ""),
                 last_user_message = user_input,
                 profile = util.trim(session_active_task.profile or args.task_profile or ""),
+                last_episode_id = util.trim(session_active_task.last_episode_id or ""),
             },
         },
         working_memory = {

@@ -104,6 +104,11 @@ local function compose_system_prompt(base_system_prompt, state)
         lines[#lines + 1] = "[PolicyHints]"
         lines[#lines + 1] = tostring(policy_context)
     end
+    local recent_episode_summary = util.trim((((state or {}).episode or {}).recent or {}).summary or "")
+    if recent_episode_summary ~= "" then
+        lines[#lines + 1] = "[RecentEpisodes]"
+        lines[#lines + 1] = tostring(recent_episode_summary)
+    end
     if util.trim((context or {}).tool_context or "") ~= "" then
         lines[#lines + 1] = "[ToolContext]"
         lines[#lines + 1] = tostring(context.tool_context)

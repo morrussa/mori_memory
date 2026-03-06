@@ -7,6 +7,7 @@ local conversation_source = require("module.graph.conversation_source")
 local util = require("module.graph.util")
 local command = require("module.graph.command")
 local config = require("module.config")
+local episode = require("module.episode")
 
 local M = {}
 
@@ -134,6 +135,64 @@ local function build_trace_summary(state)
     }
 end
 
+local function load_episode_continuity(task_id)
+    local task = util.trim(task_id or "")
+    if task == "" then
+        return nil
+    end
+
+    episode.init()
+    local continuity = episode.build_task_continuity(task, { limit = 3 })
+    if type(continuity) ~= "table" or (tonumber(continuity.count) or 0) <= 0 then
+        return nil
+    end
+    return continuity
+end
+
+local function apply_episode_continuity(state)
+    if type(state) ~= "table" then
+        return nil
+    end
+
+    state.session = state.session or { active_task = {} }
+    state.session.active_task = state.session.active_task or {}
+    local active_task = state.session.active_task
+
+    local continuity = load_episode_continuity(active_task.task_id)
+    state.episode = state.episode or {}
+    state.episode.recent = state.episode.recent or {
+        items = {},
+        summary = "",
+        count = 0,
+        latest_episode_id = "",
+    }
+
+    if not continuity then
+        state.episode.recent.items = {}
+        state.episode.recent.summary = ""
+        state.episode.recent.count = 0
+        state.episode.recent.latest_episode_id = tostring(active_task.last_episode_id or "")
+        return nil
+    end
+
+    state.episode.recent.items = continuity.items or {}
+    state.episode.recent.summary = tostring(continuity.summary or "")
+    state.episode.recent.count = tonumber(continuity.count) or 0
+    state.episode.recent.latest_episode_id = tostring(continuity.latest_episode_id or "")
+
+    if util.trim(active_task.carryover_summary or "") == "" and util.trim(continuity.latest_summary or "") ~= "" then
+        active_task.carryover_summary = tostring(continuity.latest_summary or "")
+    end
+    if util.trim(active_task.profile or "") == "" and util.trim(continuity.latest_profile or "") ~= "" then
+        active_task.profile = tostring(continuity.latest_profile or "")
+    end
+    if util.trim(continuity.latest_episode_id or "") ~= "" then
+        active_task.last_episode_id = tostring(continuity.latest_episode_id or "")
+    end
+
+    return continuity
+end
+
 local function ensure_v2_shape(state, args, conversation_history, base_system_prompt)
     state.state_version = state_schema.STATE_VERSION
     state.input = state.input or {}
@@ -180,11 +239,17 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.experience.retrieved.failure_strategy = state.experience.retrieved.failure_strategy or ""
     state.episode = state.episode or {
         current = { turn_index = 0, topic_anchor = "" },
+        recent = { items = {}, summary = "", count = 0, latest_episode_id = "" },
         writeback = { written = false, episode_id = "" },
     }
     state.episode.current = state.episode.current or { turn_index = 0, topic_anchor = "" }
     state.episode.current.turn_index = tonumber(state.episode.current.turn_index) or 0
     state.episode.current.topic_anchor = tostring(state.episode.current.topic_anchor or "")
+    state.episode.recent = state.episode.recent or { items = {}, summary = "", count = 0, latest_episode_id = "" }
+    state.episode.recent.items = state.episode.recent.items or {}
+    state.episode.recent.summary = tostring(state.episode.recent.summary or "")
+    state.episode.recent.count = tonumber(state.episode.recent.count) or 0
+    state.episode.recent.latest_episode_id = tostring(state.episode.recent.latest_episode_id or "")
     state.episode.writeback = state.episode.writeback or { written = false, episode_id = "" }
     state.episode.writeback.written = state.episode.writeback.written == true
     state.episode.writeback.episode_id = tostring(state.episode.writeback.episode_id or "")
@@ -207,6 +272,7 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.checkpoint_meta = state.checkpoint_meta or { seq = 0, last_node = "" }
     state.session = state.session or { mode = "single", active_task = {} }
     state.session.active_task = state.session.active_task or {}
+    state.session.active_task.last_episode_id = tostring(state.session.active_task.last_episode_id or "")
     state.working_memory = state.working_memory or {
         current_plan = "",
         plan_step_index = 0,
@@ -254,6 +320,7 @@ local function build_new_state(args, conversation_history, base_system_prompt, s
         working_memory = working_memory,
         task_profile = util.trim(active_task.profile or ""),
     })
+    apply_episode_continuity(state)
     return state, false, ""
 end
 
@@ -278,6 +345,7 @@ local function maybe_resume_state(args, conversation_history, base_system_prompt
 
     local state = checkpoint.full_state
     ensure_v2_shape(state, args, conversation_history, base_system_prompt)
+    apply_episode_continuity(state)
     state.recovery.resumable_run_id = resumable_run_id
     state.recovery.last_checkpoint_seq = tonumber(checkpoint.seq) or 0
     state.recovery.next_node = util.trim(checkpoint.next_node or "")

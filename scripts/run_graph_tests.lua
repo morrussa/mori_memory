@@ -94,6 +94,7 @@ local function setup_stubs(case)
         file_calls = {},
         agent_steps = {},
         agent_default_step = case.agent_default_step,
+        last_messages = {},
     }
 
     for _, step in ipairs(case.agent_steps or {}) do
@@ -362,6 +363,7 @@ local function setup_stubs(case)
 
     _G.py_pipeline = {
         generate_chat_with_tools_sync = function(_, _messages, _params, _tools, _tool_choice, _parallel_tool_calls)
+            CURRENT.last_messages = _messages or {}
             local step = nil
             if #CURRENT.agent_steps > 0 then
                 step = table.remove(CURRENT.agent_steps, 1)
@@ -509,6 +511,8 @@ local function cleanup_graph_dirs()
     os.execute('rm -f "memory/v3/graph/session_state.json"')
     os.execute('rm -rf "memory/experience_policy"')
     os.execute('rm -rf "memory/experience_policy_test"')
+    os.execute('rm -rf "memory/episodes"')
+    os.execute('rm -rf "memory/episodes_test"')
 end
 
 local function ensure(condition, msg)
@@ -1128,9 +1132,30 @@ local function run_v2_feature_checks()
         },
     })
     local checkpoint_store = require("module.graph.checkpoint_store")
+    local episode = require("module.episode")
     local session_store = require("module.graph.session_store")
     local state_schema = require("module.graph.state_schema")
     local graph_runtime = require("module.graph.graph_runtime")
+
+    episode.init()
+    local ep_ok, ep_id = episode.add_episode({
+        id = "ep_resume_seed",
+        run_id = "resume_seed_run",
+        task_id = "task_resume_fixture",
+        goal = "resume original task",
+        profile = "workspace",
+        status = "partial",
+        stop_reason = "need_more_steps",
+        success = false,
+        summary = "episode_summary_fixture",
+        tool_sequence = { "read_file" },
+        files_read = { "/mori/workspace/demo.lua" },
+        final_text = "Need continue",
+        created_at = os.time(),
+        created_at_ms = 1234567890,
+    })
+    ensure(ep_ok == true and tostring(ep_id or "") ~= "", "resume episode seed failed")
+    ensure(episode.store.save() == true, "resume episode save failed")
 
     local resume_run_id = "resume_fixture"
     local resume_state = state_schema.new_state({
@@ -1203,6 +1228,9 @@ local function run_v2_feature_checks()
     ensure(meta.resumed == true, "resume metadata missing resumed=true")
     ensure(tostring(resumed_output):find("resume_completed", 1, true) ~= nil, "resume output mismatch")
     ensure(tostring((((session_snapshot or {}).recovery or {}).resumable_run_id) or "") == "", "resume recovery should be cleared after success")
+    local system_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
+    ensure(system_prompt:find("[RecentEpisodes]", 1, true) ~= nil, "resume continuity missing recent episodes block")
+    ensure(system_prompt:find("episode_summary_fixture", 1, true) ~= nil, "resume continuity missing episode summary")
 end
 
 local function main()

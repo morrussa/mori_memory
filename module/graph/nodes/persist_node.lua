@@ -4,6 +4,7 @@ local tool = require("module.tool")
 local memory_core = require("module.graph.memory_core")
 local experience = require("module.experience")
 local episode = require("module.episode")
+local util = require("module.graph.util")
 
 local M = {}
 
@@ -109,6 +110,27 @@ function M.run(state, _ctx)
     state.episode.writeback = state.episode.writeback or { written = false, episode_id = "" }
     state.episode.writeback.written = episode_ok == true and episode_saved == true
     state.episode.writeback.episode_id = (episode_ok == true and episode_saved == true) and tostring(episode_id or "") or ""
+
+    if episode_ok == true and episode_saved == true then
+        state.session = state.session or { active_task = {} }
+        state.session.active_task = state.session.active_task or {}
+        state.session.active_task.last_episode_id = tostring(episode_id or "")
+
+        local carryover_parts = {
+            tostring(current_episode.summary or ""),
+        }
+        local final_preview = util.trim(final_text)
+        if final_preview ~= "" then
+            carryover_parts[#carryover_parts + 1] = "reply=" .. util.utf8_take(final_preview, 220)
+        end
+        state.session.active_task.carryover_summary = util.utf8_take(table.concat(carryover_parts, " | "), 600)
+
+        state.episode.recent = state.episode.recent or { items = {}, summary = "", count = 0, latest_episode_id = "" }
+        state.episode.recent.items = { current_episode }
+        state.episode.recent.summary = tostring(current_episode.summary or "")
+        state.episode.recent.count = 1
+        state.episode.recent.latest_episode_id = tostring(episode_id or "")
+    end
 
     return state
 end
