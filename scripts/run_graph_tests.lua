@@ -1122,11 +1122,44 @@ local function run_v2_feature_checks()
     ensure(util.normalize_tool_path("../escape.txt") == "", "parent traversal should be rejected")
     ensure(util.normalize_tool_path("/tmp/outside.txt") == "", "absolute physical path should be rejected")
     ensure(util.normalize_tool_path("workspace/legacy.txt") == "", "legacy workspace alias should be rejected")
+    ensure(
+        util.should_continue_task(
+            "MEMORY_HIT case 2",
+            {
+                goal = "MEMORY_HIT case 1",
+                status = "completed",
+                carryover_summary = "FINAL_memory_1",
+            },
+            {
+                current_plan = "finish_turn",
+            },
+            {}
+        ) == false,
+        "templated new task should not be treated as followup"
+    )
+    ensure(
+        util.should_continue_task(
+            "把 demo.lua 也顺手测一下",
+            {
+                goal = "fix demo.lua and run tests",
+                status = "open",
+                carryover_summary = "patch pending",
+            },
+            {
+                current_plan = "apply patch",
+                files_read_set = {
+                    ["/mori/workspace/demo.lua"] = true,
+                },
+            },
+            {}
+        ) == true,
+        "implicit file followup heuristic mismatch"
+    )
 
     setup_stubs({
         id = "v2_resume",
         category = "file",
-        input = "继续",
+        input = "把剩下的改完并跑一下测试",
         agent_steps = {
             mk_agent_step("resume_completed", {}),
         },
@@ -1227,7 +1260,7 @@ local function run_v2_feature_checks()
     ensure(session_ok == true, "resume session save failed: " .. tostring(session_err))
 
     local resumed_output = graph_runtime.run_turn({
-        user_input = "继续",
+        user_input = "把剩下的改完并跑一下测试",
         read_only = false,
         uploads = {},
         conversation_history = {
@@ -1246,6 +1279,251 @@ local function run_v2_feature_checks()
     ensure(system_prompt:find("current_plan=read_file -> apply_patch", 1, true) ~= nil, "resume continuity missing restored current_plan")
     ensure(system_prompt:find("files_read=1", 1, true) ~= nil, "resume continuity missing restored file counts")
     ensure(system_prompt:find("read demo.lua and prepared patch", 1, true) ~= nil, "resume continuity missing restored tool summary")
+
+    setup_stubs({
+        id = "v2_same_task_step",
+        category = "file",
+        input = "继续把剩下的改完",
+        agent_steps = {
+            mk_agent_step("same_task_step_done", {}),
+        },
+    })
+    local same_step_session_ok, same_step_session_err = session_store.save({
+        last_run_id = "same_step_previous_run",
+        active_task = {
+            task_id = "task_same_step_fixture",
+            goal = "fix demo.lua and run tests",
+            status = "open",
+            carryover_summary = "patch pending",
+            last_user_message = "fix demo.lua and run tests",
+            profile = "workspace",
+            last_episode_id = "",
+        },
+        working_memory = {
+            current_plan = "apply patch",
+            plan_step_index = 2,
+            files_read_set = {
+                ["/mori/workspace/demo.lua"] = true,
+            },
+            files_written_set = {},
+            patches_applied = {},
+            command_history_tail = {},
+            last_tool_batch_summary = "read demo.lua and prepared patch",
+            last_repair_error = "",
+        },
+        recovery = {
+            resumable_run_id = "",
+            last_checkpoint_seq = 0,
+            next_node = "",
+            resumed_from_checkpoint = false,
+        },
+        stats = {
+            files_read_count = 1,
+            files_written_count = 0,
+        },
+    })
+    ensure(same_step_session_ok == true, "same step session save failed: " .. tostring(same_step_session_err))
+
+    local same_step_output = graph_runtime.run_turn({
+        user_input = "继续把剩下的改完",
+        read_only = false,
+        uploads = {},
+        conversation_history = {
+            { role = "system", content = "SYSTEM_PROMPT" },
+        },
+        stream_sink = nil,
+    })
+    ensure(tostring(same_step_output):find("same_task_step_done", 1, true) ~= nil, "same task step output mismatch")
+    local same_step_snapshot = _G.mori_session_status or {}
+    ensure(tostring((((same_step_snapshot or {}).active_task or {}).task_id) or "") == "task_same_step_fixture", "same task step should keep the same task_id")
+    ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "same_task_step", "explicit continue should be classified as same_task_step")
+
+    setup_stubs({
+        id = "v2_followup_implicit",
+        category = "file",
+        input = "把 demo.lua 也顺手测一下",
+        agent_steps = {
+            mk_agent_step("implicit_followup_done", {}),
+        },
+    })
+    local followup_session_ok, followup_session_err = session_store.save({
+        last_run_id = "followup_previous_run",
+        active_task = {
+            task_id = "task_followup_fixture",
+            goal = "fix demo.lua and run tests",
+            status = "open",
+            carryover_summary = "patch pending",
+            last_user_message = "fix demo.lua and run tests",
+            profile = "workspace",
+            last_episode_id = "",
+        },
+        working_memory = {
+            current_plan = "apply patch",
+            plan_step_index = 2,
+            files_read_set = {
+                ["/mori/workspace/demo.lua"] = true,
+            },
+            files_written_set = {},
+            patches_applied = {},
+            command_history_tail = {},
+            last_tool_batch_summary = "read demo.lua and prepared patch",
+            last_repair_error = "",
+        },
+        recovery = {
+            resumable_run_id = "",
+            last_checkpoint_seq = 0,
+            next_node = "",
+            resumed_from_checkpoint = false,
+        },
+        stats = {
+            files_read_count = 1,
+            files_written_count = 0,
+        },
+    })
+    ensure(followup_session_ok == true, "followup session save failed: " .. tostring(followup_session_err))
+
+    local followup_output = graph_runtime.run_turn({
+        user_input = "把 demo.lua 也顺手测一下",
+        read_only = false,
+        uploads = {},
+        conversation_history = {
+            { role = "system", content = "SYSTEM_PROMPT" },
+        },
+        stream_sink = nil,
+    })
+    ensure(tostring(followup_output):find("implicit_followup_done", 1, true) ~= nil, "implicit followup output mismatch")
+    local followup_snapshot = _G.mori_session_status or {}
+    ensure(tostring((((followup_snapshot or {}).active_task or {}).task_id) or "") == "task_followup_fixture", "implicit followup should keep the same task_id")
+    ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "same_task_refine", "implicit followup should be classified as same_task_refine")
+    local followup_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
+    ensure(followup_prompt:find("goal=fix demo.lua and run tests", 1, true) ~= nil, "implicit followup should keep previous goal")
+    ensure(followup_prompt:find("current_plan=apply patch", 1, true) ~= nil, "implicit followup should keep previous working plan")
+
+    setup_stubs({
+        id = "v2_new_task_guard",
+        category = "file",
+        input = "file tool case 2",
+        agent_steps = {
+            mk_agent_step("new_task_need_file", {
+                mk_tool_call("list_files", { prefix = "download" }, "v2_new_task_list"),
+            }),
+            mk_agent_step("new_task_done", {}),
+        },
+    })
+    local new_task_session_ok, new_task_session_err = session_store.save({
+        last_run_id = "new_task_previous_run",
+        active_task = {
+            task_id = "task_memory_fixture",
+            goal = "MEMORY_HIT case 1",
+            status = "completed",
+            carryover_summary = "FINAL_memory_1",
+            last_user_message = "MEMORY_HIT case 1",
+            profile = "general",
+            last_episode_id = "",
+        },
+        working_memory = {
+            current_plan = "finish_turn",
+            plan_step_index = 1,
+            files_read_set = {},
+            files_written_set = {},
+            patches_applied = {},
+            command_history_tail = {},
+            last_tool_batch_summary = "",
+            last_repair_error = "",
+        },
+        recovery = {
+            resumable_run_id = "",
+            last_checkpoint_seq = 0,
+            next_node = "",
+            resumed_from_checkpoint = false,
+        },
+        stats = {
+            files_read_count = 0,
+            files_written_count = 0,
+        },
+    })
+    ensure(new_task_session_ok == true, "new task guard session save failed: " .. tostring(new_task_session_err))
+
+    local new_task_output = graph_runtime.run_turn({
+        user_input = "file tool case 2",
+        read_only = false,
+        uploads = {},
+        conversation_history = {
+            { role = "system", content = "SYSTEM_PROMPT" },
+        },
+        stream_sink = nil,
+    })
+    ensure(tostring(new_task_output):find("new_task_done", 1, true) ~= nil, "new task guard output mismatch")
+    local new_task_snapshot = _G.mori_session_status or {}
+    local new_active_task = (new_task_snapshot or {}).active_task or {}
+    ensure(tostring(new_active_task.task_id or "") ~= "task_memory_fixture", "new task should not keep stale task_id")
+    ensure(tostring(new_active_task.goal or "") == "file tool case 2", "new task should replace stale goal")
+    ensure(tostring(new_active_task.profile or "") == "workspace", "new task should refresh task profile")
+    ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "hard_shift", "new task should be classified as hard_shift")
+    ensure((tonumber((((_G.mori_last_state_snapshot or {}).tool_executed) or 0)) or 0) >= 1, "new task guard should execute file tool")
+
+    setup_stubs({
+        id = "v2_meta_turn",
+        category = "no_tool",
+        input = "现在进度怎样？",
+        agent_steps = {
+            mk_agent_step("meta_turn_done", {}),
+        },
+    })
+    local meta_session_ok, meta_session_err = session_store.save({
+        last_run_id = "meta_previous_run",
+        active_task = {
+            task_id = "task_meta_fixture",
+            goal = "fix demo.lua and run tests",
+            status = "open",
+            carryover_summary = "patch pending",
+            last_user_message = "fix demo.lua and run tests",
+            profile = "workspace",
+            last_episode_id = "",
+        },
+        working_memory = {
+            current_plan = "apply patch",
+            plan_step_index = 2,
+            files_read_set = {
+                ["/mori/workspace/demo.lua"] = true,
+            },
+            files_written_set = {},
+            patches_applied = {},
+            command_history_tail = {},
+            last_tool_batch_summary = "read demo.lua and prepared patch",
+            last_repair_error = "",
+        },
+        recovery = {
+            resumable_run_id = "",
+            last_checkpoint_seq = 0,
+            next_node = "",
+            resumed_from_checkpoint = false,
+        },
+        stats = {
+            files_read_count = 1,
+            files_written_count = 0,
+        },
+    })
+    ensure(meta_session_ok == true, "meta session save failed: " .. tostring(meta_session_err))
+
+    local meta_output = graph_runtime.run_turn({
+        user_input = "现在进度怎样？",
+        read_only = false,
+        uploads = {},
+        conversation_history = {
+            { role = "system", content = "SYSTEM_PROMPT" },
+        },
+        stream_sink = nil,
+    })
+    ensure(tostring(meta_output):find("meta_turn_done", 1, true) ~= nil, "meta turn output mismatch")
+    local meta_snapshot = _G.mori_session_status or {}
+    ensure(tostring((((meta_snapshot or {}).active_task or {}).task_id) or "") == "task_meta_fixture", "meta turn should keep the same task_id")
+    ensure(tostring((((meta_snapshot or {}).active_task or {}).goal) or "") == "fix demo.lua and run tests", "meta turn should keep the same goal")
+    ensure(tostring((((meta_snapshot or {}).active_task or {}).status) or "") == "open", "meta turn should preserve task status")
+    ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "meta_turn", "meta turn should be classified as meta_turn")
+    local meta_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
+    ensure(meta_prompt:find("[TaskDecision]", 1, true) ~= nil, "meta turn should include task decision block")
+    ensure(meta_prompt:find("current_plan=apply patch", 1, true) ~= nil, "meta turn should keep current working plan")
 end
 
 local function main()
@@ -1311,6 +1589,7 @@ local function main()
     printf("Distribution: memory=%d file=%d no_tool=%d external=%d",
         dist.memory, dist.file, dist.no_tool, dist.external)
 
+    ensure(passed == #cases, string.format("case failures detected: %d/%d", passed, #cases))
     ensure(hit_rate >= 0.90, string.format("hit rate below threshold: %.4f", hit_rate))
     printf("All checks passed.")
 end

@@ -49,6 +49,7 @@ end
 
 local function summarize_working_memory(state)
     local active_task = ((((state or {}).session or {}).active_task) or {})
+    local task_decision = ((((state or {}).task or {}).decision) or {})
     local memory = ((state or {}).working_memory) or {}
     local read_count = 0
     local written_count = 0
@@ -61,12 +62,30 @@ local function summarize_working_memory(state)
 
     local lines = {
         "[ActiveTask]",
+        string.format("task_id=%s", tostring(active_task.task_id or "")),
         string.format("goal=%s", tostring(active_task.goal or "")),
         string.format("status=%s", tostring(active_task.status or "")),
         string.format("profile=%s", tostring(active_task.profile or "")),
     }
+    if util.trim(task_decision.kind or "") ~= "" then
+        lines[#lines + 1] = string.format("decision=%s", tostring(task_decision.kind or ""))
+    end
     if util.trim(active_task.carryover_summary or "") ~= "" then
         lines[#lines + 1] = string.format("carryover=%s", tostring(active_task.carryover_summary))
+    end
+    local contract = ((((state or {}).task or {}).contract) or active_task.contract or {})
+    if util.trim((contract or {}).goal or "") ~= "" then
+        lines[#lines + 1] = "[TaskContract]"
+        lines[#lines + 1] = string.format("goal=%s", tostring((contract or {}).goal or ""))
+        for _, item in ipairs((contract or {}).deliverables or {}) do
+            lines[#lines + 1] = "deliverable=" .. tostring(item)
+        end
+        for _, item in ipairs((contract or {}).acceptance_criteria or {}) do
+            lines[#lines + 1] = "acceptance=" .. tostring(item)
+        end
+        for _, item in ipairs((contract or {}).non_goals or {}) do
+            lines[#lines + 1] = "non_goal=" .. tostring(item)
+        end
     end
     lines[#lines + 1] = "[WorkingMemory]"
     lines[#lines + 1] = string.format("current_plan=%s", tostring(memory.current_plan or ""))
@@ -98,6 +117,9 @@ local function compose_system_prompt(base_system_prompt, state)
     if util.trim((context or {}).memory_context or "") ~= "" then
         lines[#lines + 1] = "[MemoryContext]"
         lines[#lines + 1] = tostring(context.memory_context)
+    end
+    if util.trim((context or {}).task_context or "") ~= "" then
+        lines[#lines + 1] = tostring(context.task_context)
     end
     local policy_context = util.trim((context or {}).policy_context or (context or {}).experience_context or "")
     if policy_context ~= "" then

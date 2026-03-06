@@ -1,5 +1,6 @@
 local util = require("module.graph.util")
 local persistence = require("module.persistence")
+local state_schema = require("module.graph.state_schema")
 
 local M = {}
 
@@ -40,6 +41,7 @@ local function default_payload()
             last_user_message = "",
             profile = "",
             last_episode_id = "",
+            contract = state_schema.normalize_task_contract({}, ""),
         },
         working_memory = {
             current_plan = "",
@@ -101,6 +103,7 @@ local function normalize(payload)
     out.active_task.last_user_message = util.trim(active_task.last_user_message or "")
     out.active_task.profile = util.trim(active_task.profile or "")
     out.active_task.last_episode_id = util.trim(active_task.last_episode_id or "")
+    out.active_task.contract = state_schema.normalize_task_contract(active_task.contract, out.active_task.goal)
 
     local memory = copy_table(payload.working_memory)
     out.working_memory.current_plan = util.trim(memory.current_plan or "")

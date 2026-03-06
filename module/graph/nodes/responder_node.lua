@@ -64,6 +64,7 @@ function M.run(state, _ctx)
     state.final_response = state.final_response or {}
     state.session = state.session or { active_task = {} }
     state.session.active_task = state.session.active_task or {}
+    state.task = state.task or {}
 
     local final_text = util.trim(state.termination.final_message or "")
     if final_text == "" then
@@ -73,10 +74,16 @@ function M.run(state, _ctx)
     state.final_response.message = final_text
     state.final_response.status = util.trim(state.termination.final_status or "completed")
     state.final_response.stop_reason = util.trim(state.termination.stop_reason or "")
-    state.session.active_task.carryover_summary = util.utf8_take(final_text, 600)
+    local task_decision = (state.task.decision or {})
+    local decision_kind = util.trim(task_decision.kind or "")
+    if decision_kind ~= "meta_turn" then
+        state.session.active_task.carryover_summary = util.utf8_take(final_text, 600)
+    end
 
     local status = state.final_response.status
-    if status == "completed" then
+    if decision_kind == "meta_turn" and util.trim(task_decision.previous_status or state.session.active_task.status or "") ~= "" then
+        state.session.active_task.status = util.trim(task_decision.previous_status or state.session.active_task.status or "")
+    elseif status == "completed" then
         state.session.active_task.status = "completed"
     elseif status == "need_more_info" then
         state.session.active_task.status = "waiting_user"

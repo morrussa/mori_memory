@@ -12,7 +12,8 @@
 local command = require("module.graph.command")
 
 return {
-    ingest_node = { to = "recall_node" },
+    ingest_node = { to = "task_node" },
+    task_node = { to = "recall_node" },
     recall_node = { to = "experience_node" },
     experience_node = { to = "context_node" },
 

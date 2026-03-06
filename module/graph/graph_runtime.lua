@@ -1,5 +1,6 @@
 local state_schema = require("module.graph.state_schema")
 local graph_builder = require("module.graph.graph_builder")
+local task_node = require("module.graph.nodes.task_node")
 local checkpoint_store = require("module.graph.checkpoint_store")
 local session_store = require("module.graph.session_store")
 local trace_writer = require("module.graph.trace_writer")
@@ -295,13 +296,46 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
         stop_reason = "",
         iteration = 0,
     }
+    state.task = state.task or {
+        turn_units = {},
+        contract = state_schema.normalize_task_contract({}, ""),
+        decision = {
+            kind = "",
+            confidence = 0,
+            reasons = {},
+            changed = false,
+            previous_task_id = "",
+            previous_goal = "",
+            previous_status = "",
+            target_task_id = "",
+            updated_goal = "",
+        },
+    }
+    state.task.turn_units = state.task.turn_units or {}
+    state.task.contract = state_schema.normalize_task_contract(
+        state.task.contract or (((state.session or {}).active_task) or {}).contract,
+        util.trim((((((state.session or {}).active_task) or {}).goal) or state.input.message or ""))
+    )
+    state.task.decision = state.task.decision or {
+        kind = "",
+        confidence = 0,
+        reasons = {},
+        changed = false,
+        previous_task_id = "",
+        previous_goal = "",
+        previous_status = "",
+        target_task_id = "",
+        updated_goal = "",
+    }
     state.context = state.context or {
+        task_context = "",
         memory_context = "",
         experience_context = "",
         policy_context = "",
         tool_context = "",
         planner_context = "",
     }
+    state.context.task_context = state.context.task_context or ""
     state.context.policy_context = state.context.policy_context or ""
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
     state.recall = state.recall or { triggered = false, context = "", score = nil }
@@ -357,6 +391,10 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.session = state.session or { mode = "single", active_task = {} }
     state.session.active_task = state.session.active_task or {}
     state.session.active_task.last_episode_id = tostring(state.session.active_task.last_episode_id or "")
+    state.session.active_task.contract = state_schema.normalize_task_contract(
+        state.session.active_task.contract,
+        util.trim(state.session.active_task.goal or state.input.message or "")
+    )
     state.working_memory = state.working_memory or {
         current_plan = "",
         plan_step_index = 0,
@@ -374,9 +412,14 @@ end
 
 local function build_new_state(args, conversation_history, base_system_prompt, session_state)
     local user_input = util.trim(args.user_input or "")
-    local continue_request = util.is_continue_request(user_input)
-    local carry_active_task = continue_request and type((session_state or {}).active_task) == "table" and util.trim(((session_state or {}).active_task or {}).goal or "") ~= ""
-    local active_task = carry_active_task and (session_state.active_task or {}) or {
+    local has_session_task = type((session_state or {}).active_task) == "table"
+        and (
+            util.trim(((session_state or {}).active_task or {}).task_id or "") ~= ""
+            or util.trim(((session_state or {}).active_task or {}).goal or "") ~= ""
+            or util.trim(((session_state or {}).active_task or {}).profile or "") ~= ""
+            or util.trim(((session_state or {}).active_task or {}).status or "") ~= ""
+        )
+    local active_task = has_session_task and (session_state.active_task or {}) or {
         task_id = "",
         goal = user_input,
         status = "open",
@@ -392,7 +435,7 @@ local function build_new_state(args, conversation_history, base_system_prompt, s
         active_task.status = "open"
     end
 
-    local working_memory = carry_active_task and ((session_state or {}).working_memory or {}) or nil
+    local working_memory = has_session_task and ((session_state or {}).working_memory or {}) or nil
     local state = state_schema.new_state({
         user_input = user_input,
         read_only = args.read_only == true,
@@ -415,7 +458,18 @@ local function maybe_resume_state(args, conversation_history, base_system_prompt
         return nil, false, "", "no_resumable_run"
     end
 
-    if not util.is_continue_request(args.user_input or "") then
+    local continuity = load_episode_continuity(((((session_state or {}).active_task) or {}).task_id) or "")
+    local resume_decision = task_node.decide({
+        user_input = args.user_input or "",
+        active_task = ((session_state or {}).active_task) or {},
+        working_memory = ((session_state or {}).working_memory) or {},
+        recovery = recovery,
+        recent_episode_summary = continuity and continuity.summary or "",
+        checkpoint_available = true,
+    })
+    if type(resume_decision) ~= "table"
+        or util.trim(resume_decision.kind or "") ~= "same_task_step"
+        or (tonumber(resume_decision.confidence) or 0) < 0.5 then
         return nil, false, "", "resume_not_requested"
     end
 
@@ -623,6 +677,10 @@ function M.run_turn(args)
         run_id = state.run_id,
         uploads_count = #((state.uploads) or {}),
         route = (((state or {}).router_decision or {}).route) or "",
+        task_decision_kind = tostring((((state or {}).task or {}).decision or {}).kind or ""),
+        task_decision_confidence = tonumber(((((state or {}).task or {}).decision or {}).confidence)) or 0,
+        task_contract_goal = tostring((((state or {}).task or {}).contract or {}).goal or ""),
+        task_contract_acceptance_count = #(((((state or {}).task or {}).contract or {}).acceptance_criteria) or {}),
         recall_triggered = (((state or {}).recall or {}).triggered) == true,
         experience_retrieved_ids = (((((state or {}).experience or {}).retrieved) or {}).ids) or {},
         experience_hints = tostring((((state or {}).experience or {}).hints) or ""),

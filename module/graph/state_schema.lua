@@ -11,6 +11,7 @@ local REQUIRED_KEYS = {
     "uploads",
     "messages",
     "agent_loop",
+    "task",
     "context",
     "router_decision",
     "recall",
@@ -28,6 +29,52 @@ local REQUIRED_KEYS = {
     "termination",
     "recovery",
 }
+
+local function normalize_string_list(raw, limit)
+    local out = {}
+    if type(raw) ~= "table" then
+        return out
+    end
+
+    local max_items = math.max(0, math.floor(tonumber(limit) or 0))
+    if max_items <= 0 then
+        return out
+    end
+
+    for _, item in ipairs(raw) do
+        local text = util.utf8_take(util.trim(item or ""), 180)
+        if text ~= "" then
+            out[#out + 1] = text
+            if #out >= max_items then
+                break
+            end
+        end
+    end
+    return out
+end
+
+local function normalize_task_contract(raw, fallback_goal)
+    local contract = type(raw) == "table" and raw or {}
+    local goal = util.utf8_take(util.trim(contract.goal or fallback_goal or ""), 320)
+    local deliverables = normalize_string_list(contract.deliverables, 6)
+    local acceptance_criteria = normalize_string_list(contract.acceptance_criteria, 6)
+    local non_goals = normalize_string_list(contract.non_goals, 6)
+
+    if goal ~= "" and #deliverables == 0 then
+        deliverables[1] = goal
+    end
+    if goal ~= "" and #acceptance_criteria == 0 then
+        acceptance_criteria[1] = "Address goal: " .. util.utf8_take(goal, 120)
+        acceptance_criteria[2] = "Provide a result summary to the user"
+    end
+
+    return {
+        goal = goal,
+        deliverables = deliverables,
+        acceptance_criteria = acceptance_criteria,
+        non_goals = non_goals,
+    }
+end
 
 local function get_field(obj, key)
     if obj == nil then
@@ -160,6 +207,10 @@ function M.new_state(args)
     if active_status == "" then
         active_status = "open"
     end
+    local active_contract = normalize_task_contract(session_active_task.contract, active_goal)
+    if util.trim(active_contract.goal or "") ~= "" then
+        active_goal = util.trim(active_contract.goal or "")
+    end
 
     local restored_memory = args.working_memory
     if type(restored_memory) ~= "table" then
@@ -185,7 +236,23 @@ function M.new_state(args)
             stop_reason = "",
             iteration = 0,
         },
+        task = {
+            turn_units = { user_input },
+            contract = normalize_task_contract(session_active_task.contract, active_goal),
+            decision = {
+                kind = "",
+                confidence = 0,
+                reasons = {},
+                changed = false,
+                previous_task_id = "",
+                previous_goal = "",
+                previous_status = "",
+                target_task_id = "",
+                updated_goal = "",
+            },
+        },
         context = {
+            task_context = "",
             memory_context = "",
             experience_context = "",
             policy_context = "",
@@ -280,6 +347,7 @@ function M.new_state(args)
                 last_user_message = user_input,
                 profile = util.trim(session_active_task.profile or args.task_profile or ""),
                 last_episode_id = util.trim(session_active_task.last_episode_id or ""),
+                contract = active_contract,
             },
         },
         working_memory = {
@@ -320,6 +388,8 @@ function M.new_state(args)
         stream_sink = args.stream_sink,
     }
 end
+
+M.normalize_task_contract = normalize_task_contract
 
 function M.validate(state)
     if type(state) ~= "table" then

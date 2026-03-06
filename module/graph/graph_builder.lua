@@ -3,6 +3,7 @@ local config = require("module.config")
 local EDGES = require("module.graph.settings.edges")
 
 local ingest_node = require("module.graph.nodes.ingest_node")
+local task_node = require("module.graph.nodes.task_node")
 local context_node = require("module.graph.nodes.context_node")
 local recall_node = require("module.graph.nodes.recall_node")
 local experience_node = require("module.graph.nodes.experience_node")
@@ -96,6 +97,7 @@ end
 function M.build()
     local nodes = {
         ingest_node = ingest_node,
+        task_node = task_node,
         recall_node = recall_node,
         experience_node = experience_node,
         context_node = context_node,

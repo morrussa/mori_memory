@@ -60,11 +60,15 @@ end
 local function detect_task_profile(state)
     local session = ((state or {}).session) or {}
     local active_task = session.active_task or {}
+    local task_decision = ((((state or {}).task or {}).decision) or {})
     local existing = util.trim(active_task.profile or "")
     local user_input = tostring((((state or {}).input or {}).message) or "")
     local lower = user_input:lower()
+    local working_memory = ((state or {}).working_memory) or {}
 
-    if util.is_continue_request(user_input) and existing ~= "" then
+    local decision_kind = util.trim(task_decision.kind or "")
+    if (decision_kind == "same_task_step" or decision_kind == "same_task_refine" or decision_kind == "meta_turn")
+        and existing ~= "" then
         return existing
     end
 
@@ -84,7 +88,6 @@ local function detect_task_profile(state)
         return "code"
     end
 
-    local working_memory = ((state or {}).working_memory) or {}
     for path, _ in pairs((working_memory.files_read_set or {})) do
         if has_code_extension(path) then
             return "code"
