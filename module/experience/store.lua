@@ -9,11 +9,6 @@ local config = require("module.config")
 local persistence = require("module.persistence")
 local tool = require("module.tool")
 
--- 存储配置
-local STORAGE_ROOT = "memory/experiences"
-local INDEX_FILE = STORAGE_ROOT .. "/experience_index.txt"
-local EXPERIENCES_DIR = STORAGE_ROOT .. "/experiences"
-
 -- 运行时状态
 M.experiences = {}           -- 所有经验 {id -> experience}
 M.experience_index = {}     -- 多维索引 {key -> [id1, id2, ...]}
@@ -58,6 +53,23 @@ M.INDEX_TYPES = INDEX_TYPES
 
 local function ensure_dir(path)
     os.execute(string.format('mkdir -p "%s"', tostring(path):gsub('"', '\\"')))
+end
+
+local function storage_root()
+    local cfg = ((config.settings or {}).experience or {}).storage or {}
+    local root = tostring(cfg.root or "memory/experience_policy")
+    if root == "" then
+        root = "memory/experience_policy"
+    end
+    return root
+end
+
+local function index_file()
+    return storage_root() .. "/experience_index.txt"
+end
+
+local function experiences_dir()
+    return storage_root() .. "/experiences"
 end
 
 local function generate_id()
@@ -476,8 +488,8 @@ end
 -- ==================== 初始化 ====================
 
 function M.init()
-    ensure_dir(STORAGE_ROOT)
-    ensure_dir(EXPERIENCES_DIR)
+    ensure_dir(storage_root())
+    ensure_dir(experiences_dir())
     M.load()
 end
 
@@ -1009,7 +1021,13 @@ function M.save()
     local all_saved = true
 
     -- 保存索引
-    local ok, err = persistence.write_atomic(INDEX_FILE, "w", function(f)
+    local index_path = index_file()
+    local exp_dir = experiences_dir()
+
+    ensure_dir(storage_root())
+    ensure_dir(exp_dir)
+
+    local ok, err = persistence.write_atomic(index_path, "w", function(f)
         -- 写入版本号
         local write_ok, write_err = f:write("VERSION=1\n")
         if not write_ok then
@@ -1031,12 +1049,12 @@ function M.save()
             end
         end
 
-        bin_debug("save_index path=%s keys=%d", INDEX_FILE, #index_keys)
+        bin_debug("save_index path=%s keys=%d", index_path, #index_keys)
         return true
     end)
 
     if not ok then
-        bin_debug("save_index_error path=%s err=%s", INDEX_FILE, tostring(err))
+        bin_debug("save_index_error path=%s err=%s", index_path, tostring(err))
         return false, err
     end
 
@@ -1049,7 +1067,7 @@ function M.save()
 
     for _, id in ipairs(ids) do
         local exp = M.experiences[id]
-        local exp_file = string.format("%s/%s.bin", EXPERIENCES_DIR, id)
+        local exp_file = string.format("%s/%s.bin", exp_dir, id)
         local blob, blob_err = M.serialize_experience_binary(exp)
 
         if not blob then
@@ -1081,7 +1099,8 @@ function M.load()
     M.experiences = {}
     M.experience_index = {}
 
-    local exp_files = list_dir_files(EXPERIENCES_DIR)
+    local exp_dir = experiences_dir()
+    local exp_files = list_dir_files(exp_dir)
     table.sort(exp_files)
 
     local loaded_bin = 0
@@ -1089,7 +1108,7 @@ function M.load()
 
     for _, file in ipairs(exp_files) do
         if file:match("%.bin$") then
-            local path = string.format("%s/%s", EXPERIENCES_DIR, file)
+            local path = string.format("%s/%s", exp_dir, file)
             local f = io.open(path, "rb")
             if not f then
                 bin_debug("load_open_failed path=%s", path)
@@ -1114,7 +1133,7 @@ function M.load()
                 end
             end
         elseif file:match("%.lua$") then
-            local path = string.format("%s/%s", EXPERIENCES_DIR, file)
+            local path = string.format("%s/%s", exp_dir, file)
             bin_debug("ignore_legacy_json path=%s", path)
         end
     end

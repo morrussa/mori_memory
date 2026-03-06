@@ -104,70 +104,147 @@ local function setup_stubs(case)
     end
 
     for k, _ in pairs(package.loaded) do
-        if k:match("^module%.graph") or k:match("^module%.memory") or k == "module.tool" or k == "module.config" then
+        if k:match("^module%.graph")
+            or k:match("^module%.memory")
+            or k:match("^module%.experience")
+            or k == "module.tool"
+            or k == "module.config" then
             package.loaded[k] = nil
         end
     end
 
     package.preload["module.config"] = function()
-        return {
-            settings = {
-                graph = {
-                    input_token_budget = 12000,
-                    tool_loop_max = math.max(1, math.floor(tonumber(case.tool_loop_max) or 5)),
-                    max_nodes_per_run = 128,
-                    router = { max_tokens = 48, temperature = 0.0, seed = 7 },
-                    agent = {
-                        max_tokens = 512,
-                        temperature = 0.0,
-                        seed = 42,
-                        remaining_steps = math.max(1, math.floor(tonumber(case.remaining_steps) or 25)),
-                        tool_choice = "auto",
-                        parallel_tool_calls = true,
-                    },
-                    planner = { max_tokens = 256, temperature = 0.1, seed = 11, max_calls_per_loop = 6 },
-                    repair = { max_attempts = 2, max_tokens = 256, temperature = 0.0, seed = 29 },
-                    responder = { max_tokens = 256, temperature = 0.0, seed = 42 },
-                    recall = { enable_on_respond = true },
-                    streaming = { token_chunk_chars = 16 },
-                    tools = { file_context_max_chars = 4000 },
-                    file_tools = {
-                        list_default_limit = 12,
-                        list_hard_limit = 64,
-                        read_default_max_chars = 3000,
-                        read_hard_max_chars = 12000,
-                        read_lines_default_max_lines = 220,
-                        read_lines_hard_max_lines = 1200,
-                        search_default_max_hits = 20,
-                        search_hard_max_hits = 200,
-                        search_files_default_max_hits = 30,
-                        search_files_hard_max_hits = 400,
-                        search_files_default_max_files = 24,
-                        search_files_hard_max_files = 200,
-                        search_files_default_per_file_hits = 5,
-                        search_files_hard_per_file_hits = 20,
-                    },
-                    providers = {
-                        external = {
-                            enabled = case.external_enabled == true,
-                            provider = "qwen",
-                            allowlist = case.external_allowlist or {},
-                            context_inject = true,
-                            context_max_chars = 800,
-                        },
-                    },
-                    fact_extractor = {
-                        verify_pass = false,
-                        max_facts = 8,
-                    },
-                    cli = { debug_trace = false },
+        local settings = {
+            graph = {
+                input_token_budget = 12000,
+                tool_loop_max = math.max(1, math.floor(tonumber(case.tool_loop_max) or 5)),
+                max_nodes_per_run = 128,
+                router = { max_tokens = 48, temperature = 0.0, seed = 7 },
+                agent = {
+                    max_tokens = 512,
+                    temperature = 0.0,
+                    seed = 42,
+                    remaining_steps = math.max(1, math.floor(tonumber(case.remaining_steps) or 25)),
+                    tool_choice = "auto",
+                    parallel_tool_calls = true,
                 },
-                time = { maintenance_task = 9999999 },
+                planner = { max_tokens = 256, temperature = 0.1, seed = 11, max_calls_per_loop = 6 },
+                repair = { max_attempts = 2, max_tokens = 256, temperature = 0.0, seed = 29 },
+                responder = { max_tokens = 256, temperature = 0.0, seed = 42 },
+                recall = { enable_on_respond = true },
+                streaming = { token_chunk_chars = 16 },
+                tools = { file_context_max_chars = 4000 },
+                file_tools = {
+                    list_default_limit = 12,
+                    list_hard_limit = 64,
+                    read_default_max_chars = 3000,
+                    read_hard_max_chars = 12000,
+                    read_lines_default_max_lines = 220,
+                    read_lines_hard_max_lines = 1200,
+                    search_default_max_hits = 20,
+                    search_hard_max_hits = 200,
+                    search_files_default_max_hits = 30,
+                    search_files_hard_max_hits = 400,
+                    search_files_default_max_files = 24,
+                    search_files_hard_max_files = 200,
+                    search_files_default_per_file_hits = 5,
+                    search_files_hard_per_file_hits = 20,
+                },
+                providers = {
+                    external = {
+                        enabled = case.external_enabled == true,
+                        provider = "qwen",
+                        allowlist = case.external_allowlist or {},
+                        context_inject = true,
+                        context_max_chars = 800,
+                    },
+                },
+                fact_extractor = {
+                    verify_pass = false,
+                    max_facts = 8,
+                },
+                cli = { debug_trace = false },
             },
+            time = { maintenance_task = 9999999 },
+            experience = {
+                storage = {
+                    root = tostring(case.experience_root or ("memory/experience_policy_test/" .. tostring(case.id))),
+                },
+                retriever = {
+                    fetch_multiplier = 8,
+                    relevance_gate = 0.20,
+                    context_threshold = 0.20,
+                    semantic_threshold = 0.0,
+                    semantic_scan_limit = 48,
+                    min_needed_ratio = 0.34,
+                    exploration_slots = 0,
+                    utility_confidence_count = 2,
+                },
+                adaptive = {
+                    enabled = true,
+                    route_learning_rate = 0.10,
+                    utility_learning_rate = 0.10,
+                },
+            },
+        }
+
+        local function get_by_path(root, path)
+            local cur = root
+            if type(path) ~= "string" or path == "" then
+                return cur
+            end
+            for seg in path:gmatch("[^%.]+") do
+                if type(cur) ~= "table" then
+                    return nil
+                end
+                cur = cur[seg]
+                if cur == nil then
+                    return nil
+                end
+            end
+            return cur
+        end
+
+        return {
+            settings = settings,
+            get = function(path, fallback)
+                local value = get_by_path(settings, path)
+                if value == nil then
+                    return fallback
+                end
+                return value
+            end,
         }
     end
 
     package.preload["module.tool"] = function()
+        local function file_exists(path)
+            local f = io.open(path, "rb")
+            if f then
+                f:close()
+                return true
+            end
+            return false
+        end
+
+        local function cosine_similarity(a, b)
+            local dot = 0
+            local norm_a = 0
+            local norm_b = 0
+            local len = math.max(#(a or {}), #(b or {}))
+            for i = 1, len do
+                local va = tonumber((a or {})[i]) or 0
+                local vb = tonumber((b or {})[i]) or 0
+                dot = dot + va * vb
+                norm_a = norm_a + va * va
+                norm_b = norm_b + vb * vb
+            end
+            if norm_a <= 0 or norm_b <= 0 then
+                return 0.0
+            end
+            return dot / math.sqrt(norm_a * norm_b)
+        end
+
         return {
             get_embedding_query = function(_text)
                 return { 0.1, 0.2, 0.3 }
@@ -175,6 +252,8 @@ local function setup_stubs(case)
             get_embedding_passage = function(_text)
                 return { 0.3, 0.2, 0.1 }
             end,
+            cosine_similarity = cosine_similarity,
+            file_exists = file_exists,
         }
     end
 
@@ -338,6 +417,8 @@ local function cleanup_graph_dirs()
     os.execute('mkdir -p "memory/v3/graph"')
     os.execute('rm -rf "memory/v3/graph/checkpoints"')
     os.execute('rm -rf "memory/v3/graph/traces"')
+    os.execute('rm -rf "memory/experience_policy"')
+    os.execute('rm -rf "memory/experience_policy_test"')
 end
 
 local function ensure(condition, msg)
@@ -393,7 +474,7 @@ local function run_case(case)
 
     local output = graph_runtime.run_turn({
         user_input = case.input,
-        read_only = false,
+        read_only = case.read_only == true,
         uploads = case.uploads or {},
         conversation_history = conversation_history,
         stream_sink = function(evt)
@@ -441,6 +522,18 @@ local function run_case(case)
     if case.expect_stop_reason ~= nil then
         ensure(tostring(snapshot.stop_reason or "") == tostring(case.expect_stop_reason), case.id .. ": stop_reason mismatch")
     end
+    if case.expect_experience_retrieved ~= nil then
+        ensure(#(snapshot.experience_retrieved_ids or {}) == tonumber(case.expect_experience_retrieved), case.id .. ": experience_retrieved mismatch")
+    end
+    if case.min_experience_retrieved ~= nil then
+        ensure(#(snapshot.experience_retrieved_ids or {}) >= tonumber(case.min_experience_retrieved), case.id .. ": experience_retrieved too small")
+    end
+    if case.expect_experience_written ~= nil then
+        ensure((snapshot.experience_written == true) == (case.expect_experience_written == true), case.id .. ": experience_written mismatch")
+    end
+    if case.experience_hints_contains ~= nil then
+        ensure(tostring(snapshot.experience_hints or ""):find(tostring(case.experience_hints_contains), 1, true) ~= nil, case.id .. ": experience hints mismatch")
+    end
     if case.final_contains ~= nil then
         ensure(tostring(output):find(tostring(case.final_contains), 1, true) ~= nil, case.id .. ": final text mismatch")
     end
@@ -452,7 +545,179 @@ local function run_case(case)
     return {
         run_id = trace.run_id,
         trace = trace,
+        snapshot = snapshot,
+        output = output,
     }
+end
+
+local function count_experience_bins(root)
+    local dir = string.format("%s/experiences", tostring(root))
+    local proc = io.popen(string.format('ls -1A "%s" 2>/dev/null', dir))
+    if not proc then
+        return 0
+    end
+    local count = 0
+    for line in proc:lines() do
+        if line:sub(-4) == ".bin" then
+            count = count + 1
+        end
+    end
+    proc:close()
+    return count
+end
+
+local function run_experience_policy_checks()
+    local root_write = "memory/experience_policy_test/write"
+    local write_case = {
+        id = "exp_write_seed",
+        category = "file",
+        experience_root = root_write,
+        input = "debug lua file policy",
+        agent_steps = {
+            mk_agent_step("need_file_seed", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "exp_seed_read"),
+            }),
+            mk_agent_step("seed_done", {}),
+        },
+        min_tool_executed = 1,
+        expect_experience_written = true,
+        expect_experience_retrieved = 0,
+    }
+    local write_result = run_case(write_case)
+    ensure(count_experience_bins(root_write) == 1, "experience write seed count mismatch")
+
+    local retrieve_case = {
+        id = "exp_retrieve_hit",
+        category = "no_tool",
+        experience_root = root_write,
+        input = "debug lua file policy",
+        agent_steps = {
+            mk_agent_step("retrieve_done", {}),
+        },
+        min_experience_retrieved = 1,
+        expect_experience_written = true,
+        experience_hints_contains = "优先：task=coding lang=lua path=read_file mode=tool stop=ok",
+    }
+    local retrieve_result = run_case(retrieve_case)
+    ensure(#(retrieve_result.snapshot.experience_retrieved_ids or {}) >= 1, "experience retrieval missing")
+
+    local root_rank = "memory/experience_policy_test/rank"
+    run_case({
+        id = "exp_rank_fast",
+        category = "file",
+        experience_root = root_rank,
+        input = "debug lua ranking path",
+        agent_steps = {
+            mk_agent_step("rank_fast_need", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "rank_fast_read"),
+            }),
+            mk_agent_step("rank_fast_done", {}),
+        },
+        min_tool_executed = 1,
+        expect_experience_written = true,
+    })
+    run_case({
+        id = "exp_rank_slow",
+        category = "file",
+        experience_root = root_rank,
+        input = "debug lua ranking path",
+        agent_steps = {
+            mk_agent_step("rank_slow_need_a", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "rank_slow_read"),
+            }),
+            mk_agent_step("rank_slow_need_b", {
+                mk_tool_call("list_files", { prefix = "download" }, "rank_slow_list"),
+            }),
+            mk_agent_step("rank_slow_done", {}),
+        },
+        min_tool_executed = 2,
+        expect_experience_written = true,
+    })
+    local rank_result = run_case({
+        id = "exp_rank_query",
+        category = "no_tool",
+        experience_root = root_rank,
+        input = "debug lua ranking path",
+        agent_steps = {
+            mk_agent_step("rank_query_done", {}),
+        },
+        min_experience_retrieved = 2,
+        experience_hints_contains = "优先：task=coding lang=lua path=read_file mode=tool stop=ok",
+    })
+    ensure(tostring(rank_result.snapshot.experience_hints or ""):find("次优：task=coding lang=lua path=read_file>list_files mode=tool stop=ok", 1, true) ~= nil,
+        "experience ranking missing secondary path")
+
+    local root_feedback = "memory/experience_policy_test/feedback"
+    run_case({
+        id = "exp_feedback_seed",
+        category = "file",
+        experience_root = root_feedback,
+        input = "debug lua feedback path",
+        agent_steps = {
+            mk_agent_step("feedback_seed_need", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "feedback_seed_read"),
+            }),
+            mk_agent_step("feedback_seed_done", {}),
+        },
+        min_tool_executed = 1,
+        expect_experience_written = true,
+    })
+    local fail_result = run_case({
+        id = "exp_feedback_fail",
+        category = "file",
+        experience_root = root_feedback,
+        input = "debug lua feedback path",
+        remaining_steps = 1,
+        agent_steps = {
+            mk_agent_step("feedback_fail_need", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "feedback_fail_read"),
+            }),
+        },
+        expect_stop_reason = "remaining_steps_exhausted",
+        expect_experience_written = true,
+        min_experience_retrieved = 1,
+    })
+    local fail_retrieved_id = ((fail_result.snapshot.experience_retrieved_ids or {})[1])
+    ensure(type(fail_retrieved_id) == "string" and fail_retrieved_id ~= "", "feedback test missing retrieved id")
+    local exp_adaptive = require("module.experience.adaptive")
+    ensure(exp_adaptive.get_experience_utility(fail_retrieved_id) < 0.5, "negative feedback did not lower utility")
+
+    local root_read_only = "memory/experience_policy_test/readonly"
+    run_case({
+        id = "exp_readonly_seed",
+        category = "file",
+        experience_root = root_read_only,
+        input = "debug lua readonly path",
+        agent_steps = {
+            mk_agent_step("readonly_seed_need", {
+                mk_tool_call("read_file", { path = "download/a.txt", max_chars = 80 }, "readonly_seed_read"),
+            }),
+            mk_agent_step("readonly_seed_done", {}),
+        },
+        min_tool_executed = 1,
+        expect_experience_written = true,
+    })
+    local before_read_only = count_experience_bins(root_read_only)
+    local read_only_result = run_case({
+        id = "exp_readonly_query",
+        category = "no_tool",
+        experience_root = root_read_only,
+        input = "debug lua readonly path",
+        read_only = true,
+        agent_steps = {
+            mk_agent_step("readonly_done", {}),
+        },
+        min_experience_retrieved = 1,
+        expect_experience_written = false,
+        experience_hints_contains = "优先：task=coding lang=lua path=read_file mode=tool stop=ok",
+    })
+    ensure(count_experience_bins(root_read_only) == before_read_only, "read_only unexpectedly wrote experience")
+    ensure(#(read_only_result.snapshot.experience_retrieved_ids or {}) >= 1, "read_only retrieval missing")
+
+    local topic_src = assert(io.open("module/memory/topic.lua", "r"))
+    local topic_text = topic_src:read("*a") or ""
+    topic_src:close()
+    ensure(topic_text:find("module.experience.bridge", 1, true) == nil, "topic bridge reference still present")
 end
 
 local function build_cases()
@@ -719,6 +984,7 @@ local function main()
 
     ensure(first_run_id ~= nil, "no successful run to validate artifacts")
     run_artifact_check(first_run_id)
+    run_experience_policy_checks()
 
     run_consistency_check({
         id = "consistency",

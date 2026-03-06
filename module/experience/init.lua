@@ -6,30 +6,35 @@ local M = {}
 
 -- 子模块
 M.store = require("module.experience.store")
-M.builder = require("module.experience.builder")
 M.retriever = require("module.experience.retriever")
 M.adaptive = require("module.experience.adaptive")
+M.run_builder = require("module.experience.run_builder")
+
+M._initialized = false
 
 -- ==================== 初始化 ====================
 
 function M.init()
-    -- 初始化自适应学习系统
+    if M._initialized == true then
+        return
+    end
+
     M.adaptive.load()
-
-    -- 初始化store
     M.store.init()
-
-    -- 初始化builder（会自动注册topic监听器）
-    M.builder.init()
+    M._initialized = true
 
     print("[Experience] Module initialized")
 end
 
 -- 保存状态（退出时调用）
 function M.finalize()
+    if M._initialized ~= true then
+        return true
+    end
     M.adaptive.save_to_disk()
     M.store.save()
     print("[Experience] Module finalized")
+    return true
 end
 
 -- ==================== 核心API ====================

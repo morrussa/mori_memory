@@ -342,6 +342,9 @@ local DEFAULT_SETTINGS = {
         cold_rescue_max_queue = 50000, -- 冷救援队列硬上限，超过后停止入队以保护内存与I/O。
     },
     experience = {
+        storage = {
+            root = "memory/experience_policy",
+        },
         retriever = {
             fetch_multiplier = 8, -- 初始候选放大量，供 relevance gate + joint rerank 使用。
             relevance_gate = 0.32, -- relevance 硬门基础阈值；不足时仅逐级放宽该门限。

@@ -8,7 +8,6 @@ local config = require("module.config")
 local persistence = require("module.persistence")
 local tool = require("module.tool")
 
-local STATE_FILE = "memory/experiences/adaptive_state.txt"
 local VERSION = "EXPAD1"
 
 M.state = nil
@@ -24,6 +23,19 @@ end
 
 local function adaptive_cfg()
     return ((config.settings or {}).experience or {}).adaptive or {}
+end
+
+local function state_file()
+    local storage_cfg = ((config.settings or {}).experience or {}).storage or {}
+    local root = tostring(storage_cfg.root or "memory/experience_policy")
+    if root == "" then
+        root = "memory/experience_policy"
+    end
+    return root .. "/adaptive_state.txt"
+end
+
+local function ensure_dir(path)
+    os.execute(string.format('mkdir -p "%s"', tostring(path):gsub('"', '\\"')))
 end
 
 local function make_default_state()
@@ -99,12 +111,14 @@ end
 function M.load()
     M.reset_defaults()
 
-    if not tool.file_exists(STATE_FILE) then
+    local path = state_file()
+
+    if not tool.file_exists(path) then
         print("[ExperienceAdaptive] adaptive_state.txt 不存在，使用默认状态")
         return
     end
 
-    local f = io.open(STATE_FILE, "r")
+    local f = io.open(path, "r")
     if not f then
         print("[ExperienceAdaptive] adaptive_state.txt 打开失败，使用默认状态")
         return
@@ -207,7 +221,13 @@ end
 function M.save_to_disk()
     if not M.dirty then return true end
 
-    local ok, err = persistence.write_atomic(STATE_FILE, "w", function(f)
+    local path = state_file()
+    local root = path:match("^(.*)/[^/]+$")
+    if root and root ~= "" then
+        ensure_dir(root)
+    end
+
+    local ok, err = persistence.write_atomic(path, "w", function(f)
         local w_ok, w_err = f:write(VERSION .. "\n")
         if not w_ok then
             return false, w_err

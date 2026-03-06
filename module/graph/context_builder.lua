@@ -61,6 +61,10 @@ local function compose_system_prompt(base_system_prompt, context)
         lines[#lines + 1] = "[MemoryContext]"
         lines[#lines + 1] = tostring(context.memory_context)
     end
+    if util.trim((context or {}).experience_context or "") ~= "" then
+        lines[#lines + 1] = "[ExperienceHints]"
+        lines[#lines + 1] = tostring(context.experience_context)
+    end
     if util.trim((context or {}).tool_context or "") ~= "" then
         lines[#lines + 1] = "[ToolContext]"
         lines[#lines + 1] = tostring(context.tool_context)

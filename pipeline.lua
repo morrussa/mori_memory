@@ -8,6 +8,7 @@ local cluster = require("module.memory.cluster")
 local saver =require("module.memory.saver")
 local recall = require("module.memory.recall")
 local adaptive = require("module.memory.adaptive")
+local experience = require("module.experience")
 local app_config = require("module.config")
 local graph_runtime = require("module.graph.graph_runtime")
 local run_mode = tostring(MORI_RUN_MODE or "cli")
@@ -121,6 +122,7 @@ saver.mark_dirty()
 history.load()
 adaptive.load()
 recall.init_all_sentiment_vectors()
+experience.init()
 
 print("[Lua] Pipeline started.")
 
@@ -167,6 +169,7 @@ end
 
 local function shutdown_pipeline()
     print("[Lua] 正在原子保存所有内存数据...")
+    experience.finalize()
     saver.on_exit()
 end
 

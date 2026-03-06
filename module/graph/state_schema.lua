@@ -14,6 +14,7 @@ local REQUIRED_KEYS = {
     "context",
     "router_decision",
     "recall",
+    "experience",
     "planner",
     "tool_exec",
     "repair",
@@ -166,6 +167,7 @@ function M.new_state(args)
         },
         context = {
             memory_context = "",
+            experience_context = "",
             tool_context = "",
             planner_context = "",
         },
@@ -178,6 +180,21 @@ function M.new_state(args)
             triggered = false,
             context = "",
             score = nil,
+        },
+        experience = {
+            query = {},
+            retrieved = {
+                items = {},
+                ids = {},
+                strategy = "",
+            },
+            hints = "",
+            feedback = {
+                effective_ids = {},
+            },
+            writeback = {
+                written = false,
+            },
         },
         planner = {
             raw = "",
