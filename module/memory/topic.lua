@@ -7,6 +7,21 @@ local persistence = require("module.persistence")
 local history_module = require("module.memory.history") -- 依赖 history 进行 rebuild
 local py_pipeline = py_pipeline
 
+-- Experience桥接（可选，轻量级集成）
+local experience_bridge = nil
+local function get_experience_bridge()
+    if not experience_bridge then
+        local ok, mod = pcall(require, "module.experience.bridge")
+        if ok then
+            experience_bridge = mod
+            print("[Topic] Experience bridge loaded")
+        else
+            experience_bridge = false  -- 标记为不可用
+        end
+    end
+    return experience_bridge
+end
+
 -- ==================== 配置读取 ====================
 local T_CONF = config.settings.topic
 local MAKE_CLUSTER1 = T_CONF.make_cluster1 or 3
@@ -326,6 +341,25 @@ local function close_current_topic(end_turn)
     
     print(string.format("[Topic] 话题结束: %d-%d. 摘要: %s", M.active_topic.start, end_turn, summary))
     
+    -- Experience桥接：通知experience系统
+    local bridge = get_experience_bridge()
+    if bridge then
+        local topic_data = {
+            topic_idx = M.active_topic.start,
+            end_turn = end_turn,
+            anchor = "C:" .. tostring(#M.topics + 1),
+            summary = summary,
+            outcome = {
+                success = true,
+                metrics = {
+                    duration = end_turn - M.active_topic.start + 1
+                }
+            },
+            errors = {}
+        }
+        bridge.on_topic_end(topic_data)
+    end
+
     -- 重置状态
     M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
     local ok, err = save_to_disk()
@@ -350,6 +384,19 @@ function M.add_turn(turn, user_text, vector)
         M.active_topic.last_vec = vector
         M.active_topic.head_centroid = nil 
         print("[Topic] 开启新话题: 第" .. turn .. "轮")
+
+        -- Experience桥接：通知experience系统
+        local bridge = get_experience_bridge()
+        if bridge then
+            bridge.on_topic_start({
+                topic_idx = turn,
+                start = turn,
+                context = {
+                    user_text = user_text,
+                    vector = vector
+                }
+            })
+        end
     else
         -- ========== 核心优化：基于论文的话语对建模 ==========
         
@@ -449,7 +496,21 @@ function M.add_turn(turn, user_text, vector)
 end
 
 function M.update_assistant(turn, text)
-    if M.dialogues[turn] then M.dialogues[turn].ai = text end
+    if M.dialogues[turn] then 
+        M.dialogues[turn].ai = text
+
+        -- Experience桥接：通知experience系统话题更新
+        local bridge = get_experience_bridge()
+        if bridge then
+            bridge.on_topic_update({
+                topic_idx = M.active_topic.start or turn,
+                intermediate_state = {
+                    turn = turn,
+                    assistant_text = text
+                }
+            })
+        end
+    end
 end
 
 function M.get_summary(turn)
