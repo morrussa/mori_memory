@@ -95,6 +95,34 @@ local function copy_uploads(rows)
     return out
 end
 
+local function copy_patch_history(rows)
+    local out = {}
+    for _, row in ipairs(rows or {}) do
+        if type(row) == "table" then
+            out[#out + 1] = {
+                patch = util.utf8_take(tostring(row.patch or row.diff or ""), 1200),
+                result = util.utf8_take(tostring(row.result or ""), 240),
+            }
+        end
+    end
+    return out
+end
+
+local function copy_command_history(rows)
+    local out = {}
+    for _, row in ipairs(rows or {}) do
+        if type(row) == "table" then
+            out[#out + 1] = {
+                argv = shallow_copy_array(row.argv or {}),
+                workdir = tostring(row.workdir or ""),
+                ok = row.ok == true,
+                result = util.utf8_take(tostring(row.result or row.error or ""), 320),
+            }
+        end
+    end
+    return out
+end
+
 local function generate_id()
     return string.format("ep_%d_%04x", util.now_ms(), math.random(0, 0xffff))
 end
@@ -142,6 +170,16 @@ local function normalize_episode(episode)
         memory_writeback = {
             facts = shallow_copy_array((((episode or {}).memory_writeback) or {}).facts or {}),
             saved = tonumber((((episode or {}).memory_writeback) or {}).saved) or 0,
+        },
+        working_memory_snapshot = {
+            current_plan = tostring(((((episode or {}).working_memory_snapshot) or {}).current_plan) or ""),
+            plan_step_index = tonumber(((((episode or {}).working_memory_snapshot) or {}).plan_step_index)) or 0,
+            files_read_set = shallow_copy_map(((((episode or {}).working_memory_snapshot) or {}).files_read_set) or {}),
+            files_written_set = shallow_copy_map(((((episode or {}).working_memory_snapshot) or {}).files_written_set) or {}),
+            patches_applied = copy_patch_history(((((episode or {}).working_memory_snapshot) or {}).patches_applied) or {}),
+            command_history_tail = copy_command_history(((((episode or {}).working_memory_snapshot) or {}).command_history_tail) or {}),
+            last_tool_batch_summary = util.utf8_take(tostring(((((episode or {}).working_memory_snapshot) or {}).last_tool_batch_summary) or ""), 1600),
+            last_repair_error = util.utf8_take(tostring(((((episode or {}).working_memory_snapshot) or {}).last_repair_error) or ""), 240),
         },
         metrics = shallow_copy_map((episode or {}).metrics or {}),
     }

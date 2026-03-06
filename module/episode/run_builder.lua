@@ -27,6 +27,14 @@ local function shallow_copy_array(src)
     return out
 end
 
+local function shallow_copy_map(src)
+    local out = {}
+    for k, v in pairs(src or {}) do
+        out[k] = v
+    end
+    return out
+end
+
 local function copy_tool_results(rows)
     local out = {}
     for _, row in ipairs(rows or {}) do
@@ -53,6 +61,34 @@ local function copy_uploads(rows)
                 path = tostring(row.path or ""),
                 tool_path = tostring(row.tool_path or ""),
                 bytes = tonumber(row.bytes) or 0,
+            }
+        end
+    end
+    return out
+end
+
+local function copy_patch_history(rows)
+    local out = {}
+    for _, row in ipairs(rows or {}) do
+        if type(row) == "table" then
+            out[#out + 1] = {
+                patch = util.utf8_take(trim(row.patch or row.diff or ""), 1200),
+                result = util.utf8_take(trim(row.result or ""), 240),
+            }
+        end
+    end
+    return out
+end
+
+local function copy_command_history(rows)
+    local out = {}
+    for _, row in ipairs(rows or {}) do
+        if type(row) == "table" then
+            out[#out + 1] = {
+                argv = shallow_copy_array(row.argv or {}),
+                workdir = trim(row.workdir or ""),
+                ok = row.ok == true,
+                result = util.utf8_take(trim(row.result or row.error or ""), 320),
             }
         end
     end
@@ -118,6 +154,20 @@ local function build_summary(active_task, status, stop_reason, tool_sequence)
     return util.utf8_take(table.concat(parts, " | "), 320)
 end
 
+local function build_working_memory_snapshot(working_memory)
+    local memory = working_memory or {}
+    return {
+        current_plan = trim(memory.current_plan or ""),
+        plan_step_index = tonumber(memory.plan_step_index) or 0,
+        files_read_set = shallow_copy_map(memory.files_read_set or {}),
+        files_written_set = shallow_copy_map(memory.files_written_set or {}),
+        patches_applied = copy_patch_history(memory.patches_applied or {}),
+        command_history_tail = copy_command_history(memory.command_history_tail or {}),
+        last_tool_batch_summary = util.utf8_take(trim(memory.last_tool_batch_summary or ""), 1600),
+        last_repair_error = util.utf8_take(trim(memory.last_repair_error or ""), 240),
+    }
+end
+
 function M.build_from_state(state)
     local active_task = ((((state or {}).session or {}).active_task) or {})
     local working_memory = ((state or {}).working_memory) or {}
@@ -164,6 +214,7 @@ function M.build_from_state(state)
             facts = shallow_copy_array(writeback.facts or {}),
             saved = tonumber(writeback.saved) or 0,
         },
+        working_memory_snapshot = build_working_memory_snapshot(working_memory),
         metrics = {
             loop_count = tonumber(tool_exec.loop_count) or 0,
             executed_total = tonumber(tool_exec.executed_total) or 0,

@@ -1151,6 +1151,18 @@ local function run_v2_feature_checks()
         tool_sequence = { "read_file" },
         files_read = { "/mori/workspace/demo.lua" },
         final_text = "Need continue",
+        working_memory_snapshot = {
+            current_plan = "read_file -> apply_patch",
+            plan_step_index = 3,
+            files_read_set = {
+                ["/mori/workspace/demo.lua"] = true,
+            },
+            files_written_set = {
+                ["/mori/workspace/demo.lua"] = true,
+            },
+            last_tool_batch_summary = "read demo.lua and prepared patch",
+            last_repair_error = "",
+        },
         created_at = os.time(),
         created_at_ms = 1234567890,
     })
@@ -1231,6 +1243,9 @@ local function run_v2_feature_checks()
     local system_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
     ensure(system_prompt:find("[RecentEpisodes]", 1, true) ~= nil, "resume continuity missing recent episodes block")
     ensure(system_prompt:find("episode_summary_fixture", 1, true) ~= nil, "resume continuity missing episode summary")
+    ensure(system_prompt:find("current_plan=read_file -> apply_patch", 1, true) ~= nil, "resume continuity missing restored current_plan")
+    ensure(system_prompt:find("files_read=1", 1, true) ~= nil, "resume continuity missing restored file counts")
+    ensure(system_prompt:find("read demo.lua and prepared patch", 1, true) ~= nil, "resume continuity missing restored tool summary")
 end
 
 local function main()
