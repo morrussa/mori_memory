@@ -1,4 +1,11 @@
+local ok_ffi, ffi = pcall(require, "ffi")
+if not ok_ffi then
+    ffi = nil
+end
+
 local M = {}
+local WORKSPACE_VIRTUAL_ROOT = "/mori/workspace"
+local _clock_gettime_cdef_ready = false
 
 local function trim(s)
     if s == nil then
@@ -271,14 +278,19 @@ end
 local function now_ms()
     -- 使用 LuaJIT 的 FFI 获取高精度时间戳
     if type(jit) == "table" and ffi then
-        ffi.cdef[[
-            typedef long time_t;
-            typedef struct timespec {
-                time_t tv_sec;
-                long tv_nsec;
-            } timespec;
-            int clock_gettime(int clk_id, struct timespec *tp);
-        ]]
+        if not _clock_gettime_cdef_ready then
+            local ok = pcall(function()
+                ffi.cdef[[
+                    typedef long time_t;
+                    typedef struct timespec {
+                        time_t tv_sec;
+                        long tv_nsec;
+                    } timespec;
+                    int clock_gettime(int clk_id, struct timespec *tp);
+                ]]
+            end)
+            _clock_gettime_cdef_ready = ok
+        end
         local CLOCK_REALTIME = 0
         local ts = ffi.new("struct timespec")
         if ffi.C.clock_gettime(CLOCK_REALTIME, ts) == 0 then
@@ -287,6 +299,26 @@ local function now_ms()
     end
     -- 回退到秒级精度
     return math.floor((os.time() or 0) * 1000)
+end
+
+local function workspace_virtual_root()
+    return WORKSPACE_VIRTUAL_ROOT
+end
+
+local function build_workspace_virtual_path(rel_path)
+    local rel = trim(rel_path)
+    if rel == "" then
+        return WORKSPACE_VIRTUAL_ROOT
+    end
+    rel = tostring(rel):gsub("\\", "/")
+    while rel:sub(1, 2) == "./" do
+        rel = rel:sub(3)
+    end
+    rel = rel:gsub("^/+", "")
+    if rel == "" then
+        return WORKSPACE_VIRTUAL_ROOT
+    end
+    return WORKSPACE_VIRTUAL_ROOT .. "/" .. rel
 end
 
 local function normalize_tool_path(raw)
@@ -299,16 +331,75 @@ local function normalize_tool_path(raw)
     while path:sub(1, 2) == "./" do
         path = path:sub(3)
     end
-    if path:sub(1, 10) == "workspace/" then
-        path = path:sub(11)
+
+    if path == WORKSPACE_VIRTUAL_ROOT then
+        return WORKSPACE_VIRTUAL_ROOT
     end
-    local idx = path:find("/workspace/", 1, true)
-    if idx then
-        path = path:sub(idx + 11)
+    if path:sub(1, #WORKSPACE_VIRTUAL_ROOT + 1) == WORKSPACE_VIRTUAL_ROOT .. "/" then
+        local rel = path:sub(#WORKSPACE_VIRTUAL_ROOT + 2)
+        rel = rel:gsub("^/+", "")
+        if rel == "" then
+            return WORKSPACE_VIRTUAL_ROOT
+        end
+        local norm = rel
+        local segments = {}
+        for seg in norm:gmatch("[^/]+") do
+            if seg == ".." then
+                return ""
+            end
+            if seg ~= "." and seg ~= "" then
+                segments[#segments + 1] = seg
+            end
+        end
+        return build_workspace_virtual_path(table.concat(segments, "/"))
+    end
+
+    if path:sub(1, 1) == "/" then
+        return ""
+    end
+
+    if path:sub(1, 10) == "workspace/" or path:sub(1, 12) == "agent_files/" then
+        return ""
+    end
+    local legacy_idx = path:find("/workspace/", 1, true)
+    if legacy_idx then
+        return ""
     end
 
     path = path:gsub("^/+", "")
-    return trim(path)
+    if path == "" then
+        return WORKSPACE_VIRTUAL_ROOT
+    end
+
+    local segments = {}
+    for seg in path:gmatch("[^/]+") do
+        if seg == ".." then
+            return ""
+        end
+        if seg ~= "." and seg ~= "" then
+            segments[#segments + 1] = seg
+        end
+    end
+    return build_workspace_virtual_path(table.concat(segments, "/"))
+end
+
+local function relative_workspace_path(raw)
+    local path = normalize_tool_path(raw)
+    if path == "" then
+        return ""
+    end
+    if path == WORKSPACE_VIRTUAL_ROOT then
+        return ""
+    end
+    return path:sub(#WORKSPACE_VIRTUAL_ROOT + 2)
+end
+
+local function is_continue_request(raw)
+    local text = trim(raw):lower()
+    return text == "继续"
+        or text == "continue"
+        or text == "resume"
+        or text == "go on"
 end
 
 M.trim = trim
@@ -323,6 +414,10 @@ M.json_encode = json_encode
 M.ensure_dir = ensure_dir
 M.new_run_id = new_run_id
 M.now_ms = now_ms
+M.workspace_virtual_root = workspace_virtual_root
+M.build_workspace_virtual_path = build_workspace_virtual_path
 M.normalize_tool_path = normalize_tool_path
+M.relative_workspace_path = relative_workspace_path
+M.is_continue_request = is_continue_request
 
 return M

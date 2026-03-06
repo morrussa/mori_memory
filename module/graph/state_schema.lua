@@ -2,7 +2,7 @@ local util = require("module.graph.util")
 
 local M = {}
 
-M.STATE_VERSION = "v1"
+M.STATE_VERSION = "v2"
 
 local REQUIRED_KEYS = {
     "state_version",
@@ -22,6 +22,10 @@ local REQUIRED_KEYS = {
     "writeback",
     "metrics",
     "checkpoint_meta",
+    "session",
+    "working_memory",
+    "termination",
+    "recovery",
 }
 
 local function get_field(obj, key)
@@ -146,6 +150,21 @@ function M.new_state(args)
         run_id = util.new_run_id()
     end
 
+    local session_active_task = args.active_task
+    if type(session_active_task) ~= "table" then
+        session_active_task = {}
+    end
+    local active_goal = util.trim(session_active_task.goal or user_input)
+    local active_status = util.trim(session_active_task.status or "open")
+    if active_status == "" then
+        active_status = "open"
+    end
+
+    local restored_memory = args.working_memory
+    if type(restored_memory) ~= "table" then
+        restored_memory = {}
+    end
+
     return {
         state_version = M.STATE_VERSION,
         run_id = run_id,
@@ -201,6 +220,8 @@ function M.new_state(args)
             tool_calls = {},
             errors = {},
             force_reason = "",
+            missing_terminal_signal = false,
+            task_profile = util.trim(args.task_profile or session_active_task.profile or ""),
         },
         tool_exec = {
             loop_count = 0,
@@ -215,15 +236,50 @@ function M.new_state(args)
             truncated_count = 0,
             total_result_chars = 0,
             large_results = {},
-            read_files = {},  -- 新增：记录所有已读取的文件路径
+            read_files = {},
         },
         repair = {
             attempts = 0,
             max_attempts = 2,
             last_error = "",
+            retry_requested = false,
+            pending = false,
         },
         final_response = {
             message = "",
+        },
+        session = {
+            mode = "single",
+            active_task = {
+                task_id = util.trim(session_active_task.task_id or ("task_" .. run_id)),
+                goal = active_goal,
+                status = active_status,
+                carryover_summary = util.trim(session_active_task.carryover_summary or ""),
+                last_user_message = user_input,
+                profile = util.trim(session_active_task.profile or args.task_profile or ""),
+            },
+        },
+        working_memory = {
+            current_plan = util.trim(restored_memory.current_plan or ""),
+            plan_step_index = tonumber(restored_memory.plan_step_index) or 0,
+            files_read_set = restored_memory.files_read_set or {},
+            files_written_set = restored_memory.files_written_set or {},
+            patches_applied = restored_memory.patches_applied or {},
+            command_history_tail = restored_memory.command_history_tail or {},
+            last_tool_batch_summary = util.trim(restored_memory.last_tool_batch_summary or ""),
+            last_repair_error = util.trim(restored_memory.last_repair_error or ""),
+        },
+        termination = {
+            finish_requested = false,
+            final_message = "",
+            final_status = "",
+            stop_reason = "",
+        },
+        recovery = {
+            resumable_run_id = util.trim(args.resumable_run_id or ""),
+            last_checkpoint_seq = tonumber(args.last_checkpoint_seq) or 0,
+            next_node = util.trim(args.next_node or ""),
+            resumed_from_checkpoint = args.resumed_from_checkpoint == true,
         },
         writeback = {
             facts = {},
@@ -238,7 +294,7 @@ function M.new_state(args)
             seq = 0,
             last_node = "",
         },
-        stream_sink = args.stream_sink, -- 可选的流式输出回调
+        stream_sink = args.stream_sink,
     }
 end
 

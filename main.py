@@ -421,6 +421,7 @@ class AIPipeline:
         self.agent_files_root = os.path.abspath(
             str(os.environ.get("MORI_AGENT_FILES_DIR", "workspace") or "workspace")
         )
+        self.agent_virtual_root = "/mori/workspace"
         os.makedirs(self.agent_files_root, exist_ok=True)
         self.llama_server_bin = os.environ.get(
             "LLAMA_SERVER_BIN",
@@ -1041,13 +1042,7 @@ class AIPipeline:
         return self._normalize_qwen_tool_result(result)
 
     def _agent_root_display(self) -> str:
-        root = os.path.abspath(self.agent_files_root)
-        rel = os.path.relpath(root, os.getcwd()).replace("\\", "/")
-        if rel == ".":
-            return "."
-        if not rel.startswith("../"):
-            return f"./{rel}"
-        return root.replace("\\", "/")
+        return self.agent_virtual_root
 
     def _agent_display_path(self, rel_path: str = "") -> str:
         base = self._agent_root_display().rstrip("/")
@@ -1057,68 +1052,46 @@ class AIPipeline:
         rel = rel.lstrip("/")
         if not rel:
             return base
-        if base == ".":
-            return "./" + rel
-        return base + "/" + rel
-
-    def _agent_root_aliases(self):
-        aliases = []
-        root_name = os.path.basename(os.path.normpath(self.agent_files_root)).replace("\\", "/")
-        if root_name:
-            aliases.append(root_name + "/")
-
-        rel_root = os.path.relpath(self.agent_files_root, os.getcwd()).replace("\\", "/").strip()
-        while rel_root.startswith("./"):
-            rel_root = rel_root[2:]
-        if rel_root and rel_root != "." and not rel_root.startswith("../"):
-            aliases.append(rel_root.rstrip("/") + "/")
-
-        aliases.extend(["workspace/", "agent_files/"])
-
-        deduped = []
-        seen = set()
-        for item in aliases:
-            if item in seen:
-                continue
-            seen.add(item)
-            deduped.append(item)
-        return deduped
+        return f"{base}/{rel}"
 
     def _normalize_agent_rel_path(self, raw_path: str) -> str:
-        rel = str(raw_path or "").strip().replace("\\", "/")
-        while rel.startswith("./"):
-            rel = rel[2:]
-        for prefix in self._agent_root_aliases():
-            if rel.startswith(prefix):
-                rel = rel[len(prefix) :]
-                break
-        return rel
+        raw = str(raw_path or "").strip().replace("\\", "/")
+        if not raw:
+            return ""
+
+        while raw.startswith("./"):
+            raw = raw[2:]
+
+        virtual_root = self.agent_virtual_root.rstrip("/")
+        if raw == virtual_root:
+            return ""
+        if raw.startswith(virtual_root + "/"):
+            raw = raw[len(virtual_root) + 1 :]
+        elif raw.startswith("workspace/") or raw.startswith("agent_files/"):
+            return ""
+        elif raw.startswith("/"):
+            return ""
+
+        normalized = os.path.normpath(raw).replace("\\", "/")
+        if normalized in {".", ""}:
+            return ""
+        if normalized == ".." or normalized.startswith("../") or normalized.startswith("/"):
+            return ""
+        return normalized
 
     def _resolve_agent_fs_path(self, raw_path: str):
         raw = str(raw_path or "").strip()
         if not raw:
             return "", ""
 
-        root = os.path.abspath(self.agent_files_root)
-        direct_abs = os.path.abspath(raw)
-        if direct_abs != root and direct_abs.startswith(root + os.sep):
-            rel = os.path.relpath(direct_abs, root).replace("\\", "/")
-            rel = os.path.normpath(rel).replace("\\", "/")
-            if rel in {".", ".."} or rel.startswith("../") or rel.startswith("/"):
-                return "", ""
-            return rel, direct_abs
-
         rel = self._normalize_agent_rel_path(raw)
-        if not rel:
-            return "", ""
-
-        rel = os.path.normpath(rel).replace("\\", "/")
-        if rel in {".", ".."} or rel.startswith("../") or rel.startswith("/"):
+        root = os.path.abspath(self.agent_files_root)
+        if rel == "":
+            if raw.replace("\\", "/").rstrip("/") in {"", self.agent_virtual_root.rstrip("/")}:
+                return "", root
             return "", ""
 
         abs_path = os.path.abspath(os.path.join(root, rel))
-        if abs_path == root:
-            return "", ""
         if not (abs_path.startswith(root + os.sep) or abs_path == root):
             return "", ""
         return rel, abs_path
@@ -1150,6 +1123,18 @@ class AIPipeline:
         if not old_name or not new_name:
             return value
         return value.replace(str(old_name), str(new_name))
+
+    def _coerce_workspace_tool_args(self, args_raw, direct_key: str = ""):
+        args = self._parse_tool_arguments_relaxed(args_raw)
+        if isinstance(args, dict) and args:
+            return args
+        if isinstance(args_raw, dict):
+            return dict(args_raw)
+        if isinstance(args_raw, str):
+            raw = args_raw.strip()
+            if raw and direct_key and not raw.startswith("{"):
+                return {direct_key: raw}
+        return {}
 
     # Graph V1 file tools (new names)
     def list_files(self, args_raw="{}", default_limit=12, hard_limit=64):
@@ -1189,10 +1174,20 @@ class AIPipeline:
         )
         return self._alias_tool_output(out, "search_agent_files", "search_files")
 
+    def write_file(self, args_raw="{}"):
+        out = self.write_agent_file(args_raw)
+        return self._alias_tool_output(out, "write_agent_file", "write_file")
+
+    def apply_patch(self, args_raw="{}"):
+        out = self.apply_agent_patch(args_raw)
+        return self._alias_tool_output(out, "apply_agent_patch", "apply_patch")
+
+    def exec_command(self, args_raw="{}"):
+        out = self.exec_agent_command(args_raw)
+        return self._alias_tool_output(out, "exec_agent_command", "exec_command")
+
     def list_agent_files(self, args_raw="{}", default_limit=12, hard_limit=64):
-        args = self._parse_tool_arguments_relaxed(args_raw)
-        if not isinstance(args, dict):
-            args = {}
+        args = self._coerce_workspace_tool_args(args_raw, direct_key="prefix")
 
         limit = int(args.get("limit") or default_limit or 12)
         hard = max(1, int(hard_limit or 64))
@@ -1244,9 +1239,7 @@ class AIPipeline:
         return "\n".join(lines)
 
     def read_agent_file(self, args_raw="{}", default_max_chars=3000, hard_max_chars=12000):
-        args = self._parse_tool_arguments_relaxed(args_raw)
-        if not isinstance(args, dict):
-            args = {}
+        args = self._coerce_workspace_tool_args(args_raw, direct_key="path")
 
         raw_path = str(args.get("path") or args.get("file") or args.get("target") or "").strip()
         if not raw_path:
@@ -1254,7 +1247,7 @@ class AIPipeline:
 
         rel, abs_path = self._resolve_agent_fs_path(raw_path)
         root_display = self._agent_root_display()
-        if not abs_path:
+        if not abs_path or abs_path == os.path.abspath(self.agent_files_root):
             return f"read_agent_file error: path is outside {root_display}"
         if not os.path.isfile(abs_path):
             return f"read_agent_file error: file not found: {self._agent_display_path(rel)}"
@@ -1291,9 +1284,7 @@ class AIPipeline:
         return header + "\n[empty slice]"
 
     def read_agent_file_lines(self, args_raw="{}", default_max_lines=220, hard_max_lines=1200):
-        args = self._parse_tool_arguments_relaxed(args_raw)
-        if not isinstance(args, dict):
-            args = {}
+        args = self._coerce_workspace_tool_args(args_raw, direct_key="path")
 
         raw_path = str(args.get("path") or args.get("file") or args.get("target") or "").strip()
         if not raw_path:
@@ -1301,7 +1292,7 @@ class AIPipeline:
 
         rel, abs_path = self._resolve_agent_fs_path(raw_path)
         root_display = self._agent_root_display()
-        if not abs_path:
+        if not abs_path or abs_path == os.path.abspath(self.agent_files_root):
             return f"read_agent_file_lines error: path is outside {root_display}"
         if not os.path.isfile(abs_path):
             return f"read_agent_file_lines error: file not found: {self._agent_display_path(rel)}"
@@ -1354,9 +1345,7 @@ class AIPipeline:
         return header + "\n[empty slice]"
 
     def search_agent_file(self, args_raw="{}", default_max_hits=20, hard_max_hits=200):
-        args = self._parse_tool_arguments_relaxed(args_raw)
-        if not isinstance(args, dict):
-            args = {}
+        args = self._coerce_workspace_tool_args(args_raw, direct_key="path")
 
         raw_path = str(args.get("path") or args.get("file") or args.get("target") or "").strip()
         if not raw_path:
@@ -1367,7 +1356,7 @@ class AIPipeline:
 
         rel, abs_path = self._resolve_agent_fs_path(raw_path)
         root_display = self._agent_root_display()
-        if not abs_path:
+        if not abs_path or abs_path == os.path.abspath(self.agent_files_root):
             return f"search_agent_file error: path is outside {root_display}"
         if not os.path.isfile(abs_path):
             return f"search_agent_file error: file not found: {self._agent_display_path(rel)}"
@@ -1470,9 +1459,7 @@ class AIPipeline:
         default_per_file_hits=5,
         hard_per_file_hits=20,
     ):
-        args = self._parse_tool_arguments_relaxed(args_raw)
-        if not isinstance(args, dict):
-            args = {}
+        args = self._coerce_workspace_tool_args(args_raw, direct_key="prefix")
 
         pattern = str(args.get("pattern") or args.get("query") or args.get("string") or "").strip()
         if not pattern:
@@ -1622,6 +1609,183 @@ class AIPipeline:
         if not blocks:
             return header + "\n[no matches]"
         return header + "\n" + "\n\n".join(blocks)
+
+    def write_agent_file(self, args_raw="{}"):
+        args = self._coerce_workspace_tool_args(args_raw, direct_key="path")
+        raw_path = str(args.get("path") or args.get("file") or "").strip()
+        if not raw_path:
+            return "write_agent_file error: missing `path`"
+
+        rel, abs_path = self._resolve_agent_fs_path(raw_path)
+        root_display = self._agent_root_display()
+        if not abs_path or abs_path == os.path.abspath(self.agent_files_root):
+            return f"write_agent_file error: path is outside {root_display}"
+
+        content = args.get("content")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            content = str(content)
+
+        mode = str(args.get("mode") or "overwrite").strip().lower() or "overwrite"
+        if mode not in {"overwrite", "append"}:
+            return "write_agent_file error: invalid `mode`"
+
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        try:
+            if mode == "append":
+                with open(abs_path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(content)
+            else:
+                with open(abs_path, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(content)
+        except Exception as e:
+            return f"write_agent_file error: failed to write file: {e}"
+
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                total_chars = len(f.read())
+        except Exception:
+            total_chars = len(content)
+
+        return (
+            f"[write_agent_file] path={self._agent_display_path(rel)} "
+            f"mode={mode} written_chars={len(content)} total_chars={total_chars}"
+        )
+
+    def apply_agent_patch(self, args_raw="{}"):
+        args = self._coerce_workspace_tool_args(args_raw, direct_key="patch")
+        patch_text = args.get("patch")
+        if patch_text is None:
+            patch_text = args.get("diff")
+        patch_text = str(patch_text or "")
+        if not patch_text.strip():
+            return "apply_agent_patch error: missing `patch`"
+
+        rewritten = []
+        touched = []
+        seen = set()
+        for raw_line in patch_text.splitlines():
+            line = raw_line
+            if line.startswith("--- ") or line.startswith("+++ "):
+                header = line[:4]
+                target = line[4:].split("\t", 1)[0].strip()
+                if target != "/dev/null":
+                    rel, abs_path = self._resolve_agent_fs_path(target)
+                    if not abs_path or abs_path == os.path.abspath(self.agent_files_root):
+                        return "apply_agent_patch error: patch touches path outside /mori/workspace"
+                    if rel not in seen:
+                        seen.add(rel)
+                        touched.append(self._agent_display_path(rel))
+                    suffix = line[4 + len(target):]
+                    line = header + rel + suffix
+            rewritten.append(line)
+
+        if not touched:
+            return "apply_agent_patch error: no valid workspace targets found in patch"
+
+        try:
+            proc = subprocess.run(
+                ["patch", "-p0", "--batch", "--forward", "--reject-file", "-"],
+                input=("\n".join(rewritten) + "\n").encode("utf-8"),
+                cwd=self.agent_files_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return "apply_agent_patch error: patch command timed out"
+        except Exception as e:
+            return f"apply_agent_patch error: failed to run patch: {e}"
+
+        stdout_text = proc.stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = proc.stderr.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            detail = stderr_text or stdout_text or "patch failed"
+            return f"apply_agent_patch error: {detail}"
+
+        summary = (
+            f"[apply_agent_patch] touched={len(touched)} "
+            f"targets={', '.join(touched)} exit_code={proc.returncode}"
+        )
+        if stdout_text:
+            summary += "\n" + stdout_text[:2000]
+        return summary
+
+    def exec_agent_command(self, args_raw="{}"):
+        args = self._coerce_workspace_tool_args(args_raw)
+        argv = args.get("argv")
+        if not isinstance(argv, list) or not argv:
+            return "exec_agent_command error: missing `argv`"
+
+        cmd = [str(item) for item in argv if str(item) != ""]
+        if not cmd:
+            return "exec_agent_command error: missing `argv`"
+
+        raw_workdir = str(args.get("workdir") or self.agent_virtual_root).strip() or self.agent_virtual_root
+        rel, abs_workdir = self._resolve_agent_fs_path(raw_workdir)
+        root_abs = os.path.abspath(self.agent_files_root)
+        if raw_workdir.rstrip("/") == self.agent_virtual_root.rstrip("/"):
+            abs_workdir = root_abs
+            rel = ""
+        if not abs_workdir or not os.path.isdir(abs_workdir):
+            return "exec_agent_command error: invalid `workdir`"
+
+        timeout_ms = self._coerce_int_arg(args.get("timeout_ms"), 5000)
+        if timeout_ms < 100:
+            timeout_ms = 100
+        if timeout_ms > 60000:
+            timeout_ms = 60000
+
+        max_output_chars = self._coerce_int_arg(args.get("max_output_chars"), 4000)
+        if max_output_chars < 200:
+            max_output_chars = 200
+        if max_output_chars > 12000:
+            max_output_chars = 12000
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=abs_workdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout_ms / 1000.0,
+                check=False,
+            )
+            timed_out = False
+        except subprocess.TimeoutExpired as e:
+            proc = e
+            timed_out = True
+        except Exception as e:
+            return f"exec_agent_command error: failed to run command: {e}"
+
+        stdout_text = ""
+        stderr_text = ""
+        exit_code = -1
+        if timed_out:
+            stdout_text = bytes(proc.stdout or b"").decode("utf-8", errors="replace")
+            stderr_text = bytes(proc.stderr or b"").decode("utf-8", errors="replace")
+        else:
+            stdout_text = bytes(proc.stdout or b"").decode("utf-8", errors="replace")
+            stderr_text = bytes(proc.stderr or b"").decode("utf-8", errors="replace")
+            exit_code = int(proc.returncode)
+
+        stdout_view = stdout_text[:max_output_chars]
+        stderr_view = stderr_text[:max_output_chars]
+        truncated = len(stdout_view) < len(stdout_text) or len(stderr_view) < len(stderr_text)
+
+        header = (
+            f"[exec_agent_command] cwd={self._agent_display_path(rel)} "
+            f"exit_code={exit_code} timeout={'yes' if timed_out else 'no'} "
+            f"truncated={'yes' if truncated else 'no'}"
+        )
+        if stdout_view:
+            header += "\n[stdout]\n" + stdout_view
+        if stderr_view:
+            header += "\n[stderr]\n" + stderr_view
+        return header
 
     def get_embedding(self, text: str, mode: str = "query"):
         """将文本转换为向量"""
@@ -2162,7 +2326,9 @@ class MoriLocalWebUIBridge:
         self.model_name = str(model_name or "mori-chain")
         self.session_key = str(session_key or "mori").strip() or "mori"
         self.agent_files_root = os.path.abspath(str(agent_files_root or "workspace"))
+        self.workspace_virtual_root = "/mori/workspace"
         self.upload_download_root = os.path.abspath(os.path.join(self.agent_files_root, "download"))
+        self.session_state_json_path = os.path.abspath(os.path.join(os.getcwd(), "memory/v3/graph/session_state.json"))
         self.upload_max_files = max(1, _read_env_int("MORI_WEBUI_UPLOAD_MAX_FILES", 8))
         self.upload_max_file_bytes = max(1024, _read_env_int("MORI_WEBUI_UPLOAD_MAX_FILE_BYTES", 10 * 1024 * 1024))
         self.upload_max_total_bytes = max(
@@ -2174,6 +2340,12 @@ class MoriLocalWebUIBridge:
             _read_env_int("MORI_WEBUI_MAX_BODY_BYTES", 64 * 1024 * 1024),
         )
         self._httpd = None
+        self.last_session_status = self._load_session_status_snapshot()
+        active_task = dict((self.last_session_status or {}).get("active_task") or {})
+        self.last_response_meta = {
+            "task_status": str(active_task.get("status") or ""),
+            "resumed": False,
+        }
 
         if not os.path.isdir(self.frontend_root):
             raise FileNotFoundError(f"Frontend root not found: {self.frontend_root}")
@@ -2191,6 +2363,53 @@ class MoriLocalWebUIBridge:
         if not rel.startswith("../"):
             return f"./{rel}"
         return abs_path.replace("\\", "/")
+
+    def _default_session_status_snapshot(self):
+        return {
+            "api_version": "graph_v2",
+            "session_mode": "single",
+            "last_run_id": "",
+            "active_task": {
+                "task_id": "",
+                "goal": "",
+                "status": "",
+                "carryover_summary": "",
+                "last_user_message": "",
+                "profile": "",
+            },
+            "recovery": {
+                "resumable_run_id": "",
+                "last_checkpoint_seq": 0,
+                "next_node": "",
+                "resumed_from_checkpoint": False,
+            },
+            "stats": {
+                "files_read_count": 0,
+                "files_written_count": 0,
+            },
+        }
+
+    def _load_session_status_snapshot(self):
+        snapshot = self._default_session_status_snapshot()
+        path = self.session_state_json_path
+        if not os.path.isfile(path):
+            return snapshot
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            return snapshot
+        if not isinstance(raw, dict):
+            return snapshot
+        merged = dict(snapshot)
+        merged.update(raw)
+        for key in ("active_task", "recovery", "stats", "working_memory", "last_trace_summary"):
+            value = raw.get(key)
+            if isinstance(value, dict):
+                base = dict(snapshot.get(key) or {})
+                base.update(value)
+                merged[key] = base
+        return merged
 
     @staticmethod
     def _sanitize_upload_token(value: str, fallback: str = "x", limit: int = 48) -> str:
@@ -2251,8 +2470,8 @@ class MoriLocalWebUIBridge:
                 {
                     "name": safe_name,
                     "original_name": original_name,
-                    "path": self._display_path(abs_path),
-                    "tool_path": rel_to_agent_root,
+                    "path": self._agent_display_path(rel_to_agent_root),
+                    "tool_path": self._agent_display_path(rel_to_agent_root),
                     "bytes": size,
                 }
             )
@@ -2261,13 +2480,13 @@ class MoriLocalWebUIBridge:
     def _build_upload_manifest_text(self, saved_files):
         if not saved_files:
             return ""
-        lines = [f"[上传文件已保存到 {self._display_path(self.upload_download_root)}]"]
+        lines = [f"[上传文件已保存到 {self._agent_display_path('download')}]"]
         for item in saved_files:
             lines.append(
                 f"- {item.get('original_name')}: {item.get('path')} "
                 f"(tool_path={item.get('tool_path')}, bytes={int(item.get('bytes') or 0)})"
             )
-        lines.append("如需读取附件内容，请调用 list_files(prefix='download') 并按需 read_file。")
+        lines.append("如需读取附件内容，请调用 list_files(prefix='/mori/workspace/download') 并按需 read_file。")
         return "\n".join(lines)
 
     @staticmethod
@@ -2450,10 +2669,12 @@ class MoriLocalWebUIBridge:
                 assistant_text = str(result[0] or "")
                 run_id = str(result[1] or "")
                 trace = result[2] if len(result) > 2 else {}
+                meta = result[3] if len(result) > 3 else {}
             else:
                 assistant_text = str(result or "")
                 run_id = ""
                 trace = {}
+                meta = {}
         except Exception as e:
             self._send_oai_error(handler, 500, f"Chain execution failed: {e}")
             return
@@ -2465,6 +2686,8 @@ class MoriLocalWebUIBridge:
                 "message": assistant_text,
                 "run_id": run_id,
                 "trace": trace or {},
+                "task_status": str((meta or {}).get("task_status") or ""),
+                "resumed": bool((meta or {}).get("resumed")),
                 "uploads": [
                     {
                         "name": item.get("name"),
@@ -2579,10 +2802,12 @@ class MoriLocalWebUIBridge:
                 assistant_text = str(result[0] or "")
                 run_id = str(result[1] or "")
                 trace = result[2] if len(result) > 2 else {}
+                meta = result[3] if len(result) > 3 else {}
             else:
                 assistant_text = str(result or "")
                 run_id = ""
                 trace = {}
+                meta = {}
         except Exception as e:
             self._send_sse_event(handler, "error", {"message": f"Chain execution failed: {e}"})
             self._send_sse_event(handler, "done", {"message": "", "run_id": "", "trace": {}})
@@ -2607,6 +2832,8 @@ class MoriLocalWebUIBridge:
                     "message": assistant_text,
                     "run_id": run_id,
                     "trace": trace or {},
+                    "task_status": str((meta or {}).get("task_status") or ""),
+                    "resumed": bool((meta or {}).get("resumed")),
                 },
             )
         handler.close_connection = True
@@ -2657,14 +2884,25 @@ class MoriLocalWebUIBridge:
         self._send_bytes(handler, 200, body, ctype)
 
     def _handle_session_status(self, handler: BaseHTTPRequestHandler):
+        snapshot = self._load_session_status_snapshot()
+        self.last_session_status = snapshot
+        active_task = dict(snapshot.get("active_task") or {})
+        recovery = dict(snapshot.get("recovery") or {})
+        stats = dict(snapshot.get("stats") or {})
         self._send_json(
             handler,
             200,
             {
-                "api_version": "graph_v1",
+                "api_version": str(snapshot.get("api_version") or "graph_v2"),
                 "session_mode": "single",
                 "model_name": self.model_name,
-                "upload_dir": self._display_path(self.upload_download_root),
+                "workspace_root": self.workspace_virtual_root,
+                "upload_dir": self.workspace_virtual_root + "/download",
+                "active_task": active_task,
+                "resumable_run": bool(recovery.get("resumable_run_id")),
+                "last_run_id": str(snapshot.get("last_run_id") or ""),
+                "files_read_count": int(stats.get("files_read_count") or 0),
+                "files_written_count": int(stats.get("files_written_count") or 0),
                 "upload_limits": {
                     "max_files": int(self.upload_max_files),
                     "max_file_bytes": int(self.upload_max_file_bytes),
@@ -2891,6 +3129,8 @@ def main():
             if pipeline.llm_large is None:
                 raise RuntimeError("Large model server is not loaded.")
 
+            bridge = None
+
             def bridge_chat(user_text, on_piece=None, _ignored=None, read_only=False, uploads=None):
                 uploads_lua = _py_to_lua_value(lua, uploads or [])
                 assistant_text = str(lua_handler(user_text, on_piece, "", read_only, uploads_lua) or "")
@@ -2898,7 +3138,15 @@ def main():
                 trace = AIPipeline._coerce_lua_value(lua.globals().mori_last_trace_summary)
                 if not isinstance(trace, dict):
                     trace = {}
-                return assistant_text, run_id, trace
+                meta = AIPipeline._coerce_lua_value(lua.globals().mori_last_response_meta)
+                if not isinstance(meta, dict):
+                    meta = {}
+                session_status = AIPipeline._coerce_lua_value(lua.globals().mori_session_status)
+                if isinstance(session_status, dict) and bridge is not None:
+                    bridge.last_session_status = session_status
+                if bridge is not None:
+                    bridge.last_response_meta = meta
+                return assistant_text, run_id, trace, meta
 
             bridge = MoriLocalWebUIBridge(
                 host=bridge_host,

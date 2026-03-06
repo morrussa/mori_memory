@@ -47,16 +47,54 @@ local function extract_history_pairs(conversation_history)
     return out
 end
 
-local function compose_system_prompt(base_system_prompt, context)
+local function summarize_working_memory(state)
+    local active_task = ((((state or {}).session or {}).active_task) or {})
+    local memory = ((state or {}).working_memory) or {}
+    local read_count = 0
+    local written_count = 0
+    for _, _ in pairs(memory.files_read_set or {}) do
+        read_count = read_count + 1
+    end
+    for _, _ in pairs(memory.files_written_set or {}) do
+        written_count = written_count + 1
+    end
+
+    local lines = {
+        "[ActiveTask]",
+        string.format("goal=%s", tostring(active_task.goal or "")),
+        string.format("status=%s", tostring(active_task.status or "")),
+        string.format("profile=%s", tostring(active_task.profile or "")),
+    }
+    if util.trim(active_task.carryover_summary or "") ~= "" then
+        lines[#lines + 1] = string.format("carryover=%s", tostring(active_task.carryover_summary))
+    end
+    lines[#lines + 1] = "[WorkingMemory]"
+    lines[#lines + 1] = string.format("current_plan=%s", tostring(memory.current_plan or ""))
+    lines[#lines + 1] = string.format("plan_step_index=%s", tostring(memory.plan_step_index or 0))
+    lines[#lines + 1] = string.format("files_read=%d", read_count)
+    lines[#lines + 1] = string.format("files_written=%d", written_count)
+    if util.trim(memory.last_tool_batch_summary or "") ~= "" then
+        lines[#lines + 1] = "last_tool_batch:"
+        lines[#lines + 1] = util.utf8_take(tostring(memory.last_tool_batch_summary), 800)
+    end
+    if util.trim(memory.last_repair_error or "") ~= "" then
+        lines[#lines + 1] = string.format("last_repair_error=%s", tostring(memory.last_repair_error))
+    end
+    return table.concat(lines, "\n")
+end
+
+local function compose_system_prompt(base_system_prompt, state)
+    local context = ((state or {}).context) or {}
     local lines = { tostring(base_system_prompt or "") }
-    
-    -- 注入项目知识（如果启用）
-    local pk_overview = project_knowledge.get_project_knowledge()
+
+    local pk_overview = project_knowledge.get_project_knowledge(state)
     if util.trim(pk_overview or "") ~= "" then
         lines[#lines + 1] = ""
         lines[#lines + 1] = pk_overview
     end
-    
+
+    lines[#lines + 1] = summarize_working_memory(state)
+
     if util.trim((context or {}).memory_context or "") ~= "" then
         lines[#lines + 1] = "[MemoryContext]"
         lines[#lines + 1] = tostring(context.memory_context)
@@ -68,6 +106,10 @@ local function compose_system_prompt(base_system_prompt, context)
     if util.trim((context or {}).tool_context or "") ~= "" then
         lines[#lines + 1] = "[ToolContext]"
         lines[#lines + 1] = tostring(context.tool_context)
+    end
+    if util.trim((context or {}).planner_context or "") ~= "" then
+        lines[#lines + 1] = "[PlannerContext]"
+        lines[#lines + 1] = tostring(context.planner_context)
     end
 
     -- 添加预算警告（如果有）
@@ -130,7 +172,7 @@ function M.build_chat_messages(state)
         end
     end
 
-    local system_prompt = compose_system_prompt(base_system_prompt, (state or {}).context or {})
+    local system_prompt = compose_system_prompt(base_system_prompt, state)
     local user_input = tostring((((state or {}).input or {}).message) or "")
 
     local pairs = extract_history_pairs(conversation_history)

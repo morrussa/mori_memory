@@ -64,24 +64,8 @@ local function default_numbers(...)
     return out
 end
 
-local function normalize_rel_path(raw)
-    local path = util.trim(raw)
-    if path == "" then
-        return ""
-    end
-    path = tostring(path):gsub("\\", "/")
-    while path:sub(1, 2) == "./" do
-        path = path:sub(3)
-    end
-    if path:sub(1, 10) == "workspace/" then
-        path = path:sub(11)
-    end
-    local idx = path:find("/workspace/", 1, true)
-    if idx then
-        path = path:sub(idx + 11)
-    end
-    path = path:gsub("^/+", "")
-    return util.trim(path)
+local function normalize_workspace_path(raw)
+    return util.normalize_tool_path(raw)
 end
 
 local function pick_first_nonempty(tbl, keys)
@@ -105,12 +89,12 @@ local function normalize_file_tool_args(name, args)
     if name == "list_files" then
         local prefix = pick_first_nonempty(args, { "prefix", "path_prefix", "dir", "directory", "path" })
         if prefix ~= "" then
-            args.prefix = normalize_rel_path(prefix)
+            args.prefix = normalize_workspace_path(prefix)
         end
         return args
     end
 
-    if name == "read_file" or name == "read_lines" or name == "search_file" then
+    if name == "read_file" or name == "read_lines" or name == "search_file" or name == "write_file" then
         local path = pick_first_nonempty(args, {
             "path",
             "file",
@@ -122,7 +106,7 @@ local function normalize_file_tool_args(name, args)
             "name",
         })
         if path ~= "" then
-            args.path = normalize_rel_path(path)
+            args.path = normalize_workspace_path(path)
         end
         return args
     end
@@ -136,7 +120,23 @@ local function normalize_file_tool_args(name, args)
             "path",
         })
         if prefix ~= "" then
-            args.prefix = normalize_rel_path(prefix)
+            args.prefix = normalize_workspace_path(prefix)
+        end
+        return args
+    end
+
+    if name == "exec_command" then
+        local workdir = pick_first_nonempty(args, { "workdir", "cwd", "dir", "directory", "path" })
+        if workdir ~= "" then
+            args.workdir = normalize_workspace_path(workdir)
+        end
+        return args
+    end
+
+    if name == "apply_patch" then
+        local patch = util.trim(args.patch or args.diff)
+        if patch ~= "" then
+            args.patch = patch
         end
         return args
     end
@@ -151,6 +151,9 @@ function M.supported_tools()
         read_lines = true,
         search_file = true,
         search_files = true,
+        write_file = true,
+        apply_patch = true,
+        exec_command = true,
     }
 end
 
@@ -164,7 +167,7 @@ function M.get_tool_schemas()
                 parameters = {
                     type = "object",
                     properties = {
-                        prefix = { type = "string", description = "Relative path prefix, e.g. download/" },
+                        prefix = { type = "string", description = "Workspace prefix, e.g. /mori/workspace/download" },
                         limit = { type = "integer", description = "Maximum number of files to return" },
                     },
                 },
@@ -174,11 +177,11 @@ function M.get_tool_schemas()
             type = "function",
             ["function"] = {
                 name = "read_file",
-                description = "Read file content from the agent workspace.",
+                description = "Read file content from /mori/workspace/*.",
                 parameters = {
                     type = "object",
                     properties = {
-                        path = { type = "string", description = "Relative path to file" },
+                        path = { type = "string", description = "Workspace path, e.g. /mori/workspace/download/a.txt" },
                         max_chars = { type = "integer", description = "Maximum characters to read" },
                     },
                     required = { "path" },
@@ -189,11 +192,11 @@ function M.get_tool_schemas()
             type = "function",
             ["function"] = {
                 name = "read_lines",
-                description = "Read a range of lines from a file in the agent workspace.",
+                description = "Read a range of lines from a file in /mori/workspace/*.",
                 parameters = {
                     type = "object",
                     properties = {
-                        path = { type = "string", description = "Relative path to file" },
+                        path = { type = "string", description = "Workspace path, e.g. /mori/workspace/app.lua" },
                         start_line = { type = "integer", description = "1-based start line" },
                         max_lines = { type = "integer", description = "Maximum number of lines" },
                     },
@@ -205,11 +208,11 @@ function M.get_tool_schemas()
             type = "function",
             ["function"] = {
                 name = "search_file",
-                description = "Search a file for a text pattern.",
+                description = "Search a /mori/workspace/* file for a text pattern.",
                 parameters = {
                     type = "object",
                     properties = {
-                        path = { type = "string", description = "Relative path to file" },
+                        path = { type = "string", description = "Workspace path" },
                         pattern = { type = "string", description = "Pattern to search for" },
                         max_hits = { type = "integer", description = "Maximum number of matches" },
                     },
@@ -221,11 +224,11 @@ function M.get_tool_schemas()
             type = "function",
             ["function"] = {
                 name = "search_files",
-                description = "Search files under a prefix for a text pattern. Returns matching lines with optional context (similar to grep -C). Use context_lines to get surrounding code for better understanding.",
+                description = "Search files under /mori/workspace/* for a text pattern. Returns matching lines with optional context.",
                 parameters = {
                     type = "object",
                     properties = {
-                        prefix = { type = "string", description = "Relative path prefix, e.g. module/graph/" },
+                        prefix = { type = "string", description = "Workspace prefix, e.g. /mori/workspace/module/graph" },
                         pattern = { type = "string", description = "Pattern to search for (text or regex)" },
                         context_lines = { type = "integer", description = "Lines of context before/after match (0-30, default 0)" },
                         max_hits = { type = "integer", description = "Maximum total hits (default 30)" },
@@ -235,6 +238,57 @@ function M.get_tool_schemas()
                         case_sensitive = { type = "boolean", description = "Case sensitive search (default false)" },
                     },
                     required = { "pattern" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "write_file",
+                description = "Write text content to a file under /mori/workspace/*. Use mode=overwrite or mode=append.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string", description = "Workspace path" },
+                        content = { type = "string", description = "Text content to write" },
+                        mode = { type = "string", description = "overwrite or append" },
+                    },
+                    required = { "path", "content" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "apply_patch",
+                description = "Apply a unified diff patch that only touches files under /mori/workspace/*.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        patch = { type = "string", description = "Unified diff patch text" },
+                    },
+                    required = { "patch" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "exec_command",
+                description = "Run a command inside /mori/workspace/* using argv plus workdir. Shell strings are not allowed.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        argv = {
+                            type = "array",
+                            items = { type = "string" },
+                            description = "Command and arguments"
+                        },
+                        workdir = { type = "string", description = "Workspace directory path" },
+                        timeout_ms = { type = "integer", description = "Timeout in milliseconds" },
+                        max_output_chars = { type = "integer", description = "Maximum output size" },
+                    },
+                    required = { "argv" },
                 },
             },
         },
@@ -292,6 +346,18 @@ function M.execute(call)
                 cfg.search_files_hard_per_file_hits or 20
             )
         )
+    end
+
+    if name == "write_file" then
+        return call_runtime({ "write_file", "write_agent_file" }, args_lua)
+    end
+
+    if name == "apply_patch" then
+        return call_runtime({ "apply_patch", "apply_agent_patch" }, args_lua)
+    end
+
+    if name == "exec_command" then
+        return call_runtime({ "exec_command", "exec_agent_command" }, args_lua)
     end
 
     return false, "unsupported_file_tool"

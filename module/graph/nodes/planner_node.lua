@@ -1,429 +1,270 @@
+local context_builder = require("module.graph.context_builder")
+local tool_registry = require("module.graph.tool_registry_v2")
+local control_tools = require("module.graph.control_tools")
 local util = require("module.graph.util")
 local config = require("module.config")
-local tool_registry = require("module.graph.tool_registry_v2")
 
 local M = {}
+
+local NEED_MORE_STEPS_TEXT = "Sorry, need more steps to process this request."
 
 local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
-local function lower_text(v)
-    return tostring(v or ""):lower()
-end
-
-local function has_uploads(state)
-    local rows = ((state or {}).uploads) or {}
-    return type(rows) == "table" and #rows > 0
-end
-
-local function should_force_upload_toolchain(state)
-    if not has_uploads(state) then
+local function has_method(runtime, method_name)
+    if runtime == nil then
         return false
     end
-    local executed_total = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0
-    return executed_total <= 0
+    local ok, attr = pcall(function()
+        return runtime[method_name]
+    end)
+    return ok and attr ~= nil
 end
 
-local function collect_history_rows(state)
-    local rows = ((((state or {}).messages or {}).conversation_history) or {})
-    if type(rows) ~= "table" then
-        return {}
+local function get_field(obj, key)
+    if obj == nil then
+        return nil
     end
-    return rows
+    if type(obj) == "table" then
+        local v = obj[key]
+        if v ~= nil then
+            return v
+        end
+        return obj[tostring(key)]
+    end
+    local ok, value = pcall(function()
+        return obj[key]
+    end)
+    if ok and value ~= nil then
+        return value
+    end
+    ok, value = pcall(function()
+        return obj[tostring(key)]
+    end)
+    if ok then
+        return value
+    end
+    return nil
 end
 
-local function has_history_tool_path(state)
-    local rows = collect_history_rows(state)
-    for i = #rows, 1, -1 do
-        local row = rows[i]
-        if type(row) == "table" then
-            local content = tostring(row.content or "")
-            if content:find("tool_path=download/", 1, true) or content:find("download/", 1, true) then
-                return true
+local function normalize_tool_calls(raw)
+    local out = {}
+    if type(raw) == "table" then
+        for idx, item in ipairs(raw) do
+            local name = util.trim(get_field(item, "name") or get_field(item, "tool"))
+            if name ~= "" then
+                out[#out + 1] = {
+                    tool = name,
+                    args = get_field(item, "args") or {},
+                    call_id = util.trim(get_field(item, "id") or get_field(item, "call_id") or ("planner_call_" .. tostring(idx))),
+                }
             end
         end
-    end
-    return false
-end
-
-local function should_force_history_toolchain(state, user_input)
-    local q = lower_text(user_input)
-    if q == "" then
-        return false
-    end
-    local likely_tool_intent = (
-        q:find("读取", 1, true) ~= nil
-        or q:find("查看", 1, true) ~= nil
-        or q:find("前几行", 1, true) ~= nil
-        or q:find("几行", 1, true) ~= nil
-        or q:find("执行", 1, true) ~= nil
-        or q:find("模型设置", 1, true) ~= nil
-        or q:find("配置", 1, true) ~= nil
-        or q:find("read", 1, true) ~= nil
-        or q:find("line", 1, true) ~= nil
-        or q:find("search", 1, true) ~= nil
-        or q:find("download/", 1, true) ~= nil
-    )
-    if not likely_tool_intent then
-        return false
+        return out
     end
 
-    local executed_total = tonumber((((state or {}).tool_exec or {}).executed_total) or 0) or 0
-    if executed_total > 0 then
-        return false
-    end
-    return has_history_tool_path(state)
-end
-
-local function build_supported_tool_list()
-    local supported = tool_registry.get_supported_tools()
-    local names = {}
-    for name, enabled in pairs(supported or {}) do
-        if enabled then
-            names[#names + 1] = name
-        end
-    end
-    table.sort(names)
-    return names
-end
-
-local function build_prompt(state)
-    local names = build_supported_tool_list()
-    local route = tostring((((state or {}).router_decision or {}).route) or "respond")
-    local user_input = tostring((((state or {}).input or {}).message) or "")
-    local memory_context = tostring((((state or {}).context or {}).memory_context) or "")
-    local tool_context = tostring((((state or {}).context or {}).tool_context) or "")
-
-    return table.concat({
-        "You are a strict tool planner.",
-        "Output exactly one Lua table on a single line.",
-        "Schema:",
-        "{tool_calls={",
-        "  {tool=\"list_files\", args={...}, call_id=\"optional\"},",
-        "  ...",
-        "}}",
-        "If no tool is needed, output {tool_calls={}}.",
-        "Do not output explanation.",
-        "",
-        "Allowed tools:",
-        table.concat(names, ", "),
-        "",
-        "[Route] " .. route,
-        "[UserInput]",
-        user_input,
-        "",
-        "[MemoryContext]",
-        memory_context,
-        "",
-        "[ToolContext]",
-        tool_context,
-        "",
-        "[ConversationTail]",
-        util.utf8_take(util.trim(table.concat((function()
-            local lines = {}
-            local rows = collect_history_rows(state)
-            for i = #rows, 1, -1 do
-                local row = rows[i]
-                if type(row) == "table" then
-                    local role = tostring(row.role or "")
-                    local content = util.trim(row.content or "")
-                    if content ~= "" then
-                        lines[#lines + 1] = string.format("[%s] %s", role, content)
-                    end
-                    if #lines >= 6 then
-                        break
-                    end
-                end
-            end
-            return lines
-        end)(), "\n")), 2200),
-    }, "\n")
-end
-
-local function normalize_upload_tool_path(item)
-    local raw = util.trim((item or {}).tool_path or (item or {}).path)
-    if raw == "" then
-        return ""
-    end
-    local path = raw:gsub("\\", "/")
-
-    while path:sub(1, 2) == "./" do
-        path = path:sub(3)
-    end
-    if path:sub(1, 10) == "workspace/" then
-        path = path:sub(11)
-    end
-
-    local idx = path:find("/workspace/", 1, true)
-    if idx then
-        path = path:sub(idx + 11)
-    end
-
-    path = path:gsub("^/+", "")
-    return util.trim(path)
-end
-
-local function build_forced_upload_calls(state, max_reads, read_max_chars)
-    local calls = {
-        {
-            tool = "list_files",
-            args = { prefix = "download" },
-            call_id = "forced_upload_list_1",
-        },
-    }
-
-    local upload_rows = ((state or {}).uploads) or {}
-    local seen = {}
-    local read_count = 0
-
-    for _, upload in ipairs(upload_rows) do
-        if read_count >= max_reads then
+    for i = 1, 32 do
+        local item = get_field(raw, i) or get_field(raw, i - 1)
+        if item == nil then
             break
         end
-        local tool_path = normalize_upload_tool_path(upload)
-        if tool_path ~= "" and not seen[tool_path] then
-            seen[tool_path] = true
-            read_count = read_count + 1
-            calls[#calls + 1] = {
-                tool = "read_file",
-                args = {
-                    path = tool_path,
-                    max_chars = read_max_chars,
-                },
-                call_id = string.format("forced_upload_read_%d", read_count),
+        local name = util.trim(get_field(item, "name") or get_field(item, "tool"))
+        if name ~= "" then
+            out[#out + 1] = {
+                tool = name,
+                args = get_field(item, "args") or {},
+                call_id = util.trim(get_field(item, "id") or get_field(item, "call_id") or ("planner_call_" .. tostring(i))),
             }
         end
     end
-
-    return calls
-end
-
-local function extract_tool_paths_from_text(text, out, seen)
-    local s = tostring(text or "")
-    if s == "" then
-        return
-    end
-
-    for path in s:gmatch("tool_path=([^,%s%)]+)") do
-        local p = normalize_upload_tool_path({ tool_path = path })
-        if p ~= "" and not seen[p] then
-            seen[p] = true
-            out[#out + 1] = p
-        end
-    end
-
-    for path in s:gmatch("download/[0-9A-Za-z%._%-%/]+") do
-        local p = normalize_upload_tool_path({ tool_path = path })
-        if p ~= "" and not seen[p] then
-            seen[p] = true
-            out[#out + 1] = p
-        end
-    end
-end
-
-local function collect_known_tool_paths(state)
-    local out = {}
-    local seen = {}
-
-    local uploads = ((state or {}).uploads) or {}
-    for _, item in ipairs(uploads) do
-        local p = normalize_upload_tool_path(item)
-        if p ~= "" and not seen[p] then
-            seen[p] = true
-            out[#out + 1] = p
-        end
-    end
-
-    local rows = collect_history_rows(state)
-    for i = #rows, 1, -1 do
-        local row = rows[i]
-        if type(row) == "table" then
-            extract_tool_paths_from_text(row.content or "", out, seen)
-        end
-    end
-
-    local user_input = tostring((((state or {}).input or {}).message) or "")
-    extract_tool_paths_from_text(user_input, out, seen)
     return out
 end
 
-local function build_forced_history_calls(state, known_paths, read_max_chars)
-    local q = lower_text((((state or {}).input or {}).message) or "")
-    local path = tostring((known_paths or {})[1] or "")
-    if path == "" then
-        return {}
+local function parse_model_output(raw)
+    local content = util.trim(get_field(raw, "content") or get_field(raw, "text") or "")
+    local tool_calls = normalize_tool_calls(get_field(raw, "tool_calls"))
+    local raw_text = util.trim(get_field(raw, "raw") or "")
+
+    if content == "" and #tool_calls == 0 and raw ~= nil then
+        raw_text = util.trim(tostring(raw))
     end
 
-    local calls = {
-        {
-            tool = "list_files",
-            args = { prefix = "download" },
-            call_id = "forced_history_list_1",
-        },
-    }
-
-    local wants_lines = (
-        q:find("前几行", 1, true) ~= nil
-        or q:find("几行", 1, true) ~= nil
-        or q:find("line", 1, true) ~= nil
-        or q:find("lines", 1, true) ~= nil
-    )
-
-    local mentions_config = (
-        q:find("模型设置", 1, true) ~= nil
-        or q:find("配置", 1, true) ~= nil
-        or q:find("model", 1, true) ~= nil
-        or q:find("config", 1, true) ~= nil
-    )
-
-    if wants_lines or mentions_config then
-        calls[#calls + 1] = {
-            tool = "read_lines",
-            args = {
-                path = path,
-                start_line = 1,
-                max_lines = mentions_config and 220 or 40,
-            },
-            call_id = "forced_history_read_lines_1",
-        }
-    else
-        calls[#calls + 1] = {
-            tool = "read_file",
-            args = {
-                path = path,
-                max_chars = read_max_chars,
-            },
-            call_id = "forced_history_read_file_1",
-        }
-    end
-
-    return calls
-end
-
-local function normalize_tool_call(item, idx)
-    if type(item) ~= "table" then
-        return nil, "tool_call_not_table"
-    end
-    local name = util.trim(item.tool or item.name)
-    if name == "" then
-        return nil, "missing_tool"
-    end
-    local args = item.args
-    if args == nil then
-        args = {}
-    end
-    if type(args) ~= "table" then
-        return nil, "args_not_table"
-    end
-    local call_id = util.trim(item.call_id)
-    if call_id == "" then
-        call_id = string.format("planner_call_%d", tonumber(idx) or 0)
-    end
     return {
-        tool = name,
-        args = args,
-        call_id = call_id,
+        content = content,
+        tool_calls = tool_calls,
+        raw = raw_text,
     }
 end
 
-local function parse_output(raw)
-    local parsed, err = util.parse_lua_table_literal(raw)
-    if not parsed then
-        return nil, err
-    end
-
-    local calls = parsed.tool_calls
-    if calls == nil then
-        return nil, "missing_tool_calls"
-    end
-    if type(calls) ~= "table" then
-        return nil, "tool_calls_not_table"
-    end
-
+local function ensure_contract_system_message(messages, state)
     local out = {}
-    for i, item in ipairs(calls) do
-        local norm, nerr = normalize_tool_call(item, i)
-        if not norm then
-            return nil, nerr
-        end
-        out[#out + 1] = norm
+    for i, row in ipairs(messages or {}) do
+        out[i] = {
+            role = tostring((row or {}).role or ""),
+            content = tostring((row or {}).content or ""),
+        }
     end
+    local profile = util.trim((((state or {}).context or {}).task_profile) or "general")
+    local contract = table.concat({
+        "You are the planner for a single-session tool agent.",
+        "Return tool calls when more work is needed.",
+        "If the turn is complete, call finish_turn.",
+        "Do not rely on plain assistant text to end the turn.",
+        "Never mix finish_turn with any other tool call in the same batch.",
+        "Available workspace root: " .. util.workspace_virtual_root(),
+        "Current task profile: " .. profile,
+    }, "\n")
 
+    if #out > 0 and tostring((out[1] or {}).role or "") == "system" then
+        out[1].content = table.concat({ tostring(out[1].content or ""), "", "[PlannerContract]", contract }, "\n")
+    else
+        table.insert(out, 1, { role = "system", content = contract })
+    end
     return out
+end
+
+local function set_terminal_failure(state, status, stop_reason, message)
+    state.termination = state.termination or {}
+    state.termination.finish_requested = true
+    state.termination.final_status = status
+    state.termination.stop_reason = stop_reason
+    state.termination.final_message = util.trim(message or "")
+    state.agent_loop = state.agent_loop or {}
+    state.agent_loop.stop_reason = stop_reason
+    state.agent_loop.pending_tool_calls = {}
+    state.planner = state.planner or {}
+    state.planner.tool_calls = {}
 end
 
 function M.run(state, _ctx)
-    local route = tostring((((state or {}).router_decision or {}).route) or "respond")
-    state.planner = state.planner or { tool_calls = {}, errors = {}, raw = "", force_reason = "" }
+    state.agent_loop = state.agent_loop or {}
+    state.planner = state.planner or {}
+    state.repair = state.repair or {}
+    state.termination = state.termination or {}
+    state.working_memory = state.working_memory or {}
+    state.messages = state.messages or {}
+    state.messages.runtime_messages = state.messages.runtime_messages or {}
 
-    if route ~= "tool_loop" then
-        state.planner.tool_calls = {}
-        state.planner.raw = ""
-        state.planner.force_reason = ""
+    state.planner.tool_calls = {}
+    state.planner.errors = {}
+    state.planner.raw = ""
+    state.planner.force_reason = ""
+    state.planner.missing_terminal_signal = false
+    state.repair.pending = false
+    state.repair.retry_requested = false
+
+    if state.termination.finish_requested == true then
+        return state
+    end
+
+    local tool_loop_max = math.max(1, math.floor(tonumber((graph_cfg() or {}).tool_loop_max) or 5))
+    local loop_count = tonumber((((state or {}).tool_exec or {}).loop_count) or 0) or 0
+    if loop_count >= tool_loop_max then
+        set_terminal_failure(state, "failed", "tool_loop_max_exceeded", NEED_MORE_STEPS_TEXT)
+        return state
+    end
+
+    local remaining_steps = tonumber(state.agent_loop.remaining_steps) or 0
+    if remaining_steps <= 0 then
+        set_terminal_failure(state, "failed", "remaining_steps_exhausted", NEED_MORE_STEPS_TEXT)
+        return state
+    end
+    state.agent_loop.remaining_steps = remaining_steps - 1
+    state.agent_loop.iteration = (tonumber(state.agent_loop.iteration) or 0) + 1
+
+    local runtime = _G.py_pipeline
+    if runtime == nil or not has_method(runtime, "generate_chat_with_tools_sync") then
+        state.planner.errors[#state.planner.errors + 1] = "planner_runtime_unavailable"
+        state.repair.pending = true
+        state.repair.last_error = "planner_runtime_unavailable"
         return state
     end
 
     local cfg = graph_cfg().planner or {}
-    local force_upload_toolchain = util.to_bool(cfg.force_upload_toolchain, true)
-    local force_upload = force_upload_toolchain and should_force_upload_toolchain(state)
-    local user_input = tostring((((state or {}).input or {}).message) or "")
-    local force_history_toolchain = util.to_bool(cfg.force_history_toolchain, true)
-    local force_history = force_history_toolchain and should_force_history_toolchain(state, user_input)
-    local max_upload_reads = math.max(1, math.floor(tonumber(cfg.force_upload_read_limit) or 2))
-    local upload_read_max_chars = math.max(256, math.floor(tonumber(cfg.force_upload_read_max_chars) or 2400))
-    local history_read_max_chars = math.max(256, math.floor(tonumber(cfg.force_history_read_max_chars) or upload_read_max_chars))
-    local max_calls = math.max(1, math.floor(tonumber(cfg.max_calls_per_loop) or 6))
-    local known_tool_paths = collect_known_tool_paths(state)
+    local params = {
+        max_tokens = math.max(64, math.floor(tonumber(cfg.max_tokens) or 768)),
+        temperature = tonumber(cfg.temperature) or 0.1,
+        seed = tonumber(cfg.seed) or 11,
+    }
 
-    local raw = py_pipeline:generate_chat_sync(
-        { { role = "user", content = build_prompt(state) } },
-        {
-            max_tokens = math.max(32, math.floor(tonumber(cfg.max_tokens) or 256)),
-            temperature = tonumber(cfg.temperature) or 0.1,
-            seed = tonumber(cfg.seed) or 11,
-        }
-    )
+    local messages = ensure_contract_system_message(context_builder.build_chat_messages(state), state)
+    local tools = tool_registry.get_tool_schemas(state)
 
-    local calls, err = parse_output(raw)
-    state.planner.raw = util.trim(raw)
-    state.planner.errors = state.planner.errors or {}
-    state.planner.force_reason = ""
-
-    if not calls then
-        state.planner.errors[#state.planner.errors + 1] = tostring(err or "planner_parse_failed")
-        if force_upload then
-            calls = build_forced_upload_calls(state, max_upload_reads, upload_read_max_chars)
-            state.planner.force_reason = "upload_toolchain_parse_fallback"
-        elseif force_history then
-            calls = build_forced_history_calls(state, known_tool_paths, history_read_max_chars)
-            state.planner.force_reason = "history_toolchain_parse_fallback"
-        else
-            state.planner.tool_calls = {}
-            return state
-        end
-    end
-
-    if #calls <= 0 and force_upload then
-        calls = build_forced_upload_calls(state, max_upload_reads, upload_read_max_chars)
-        state.planner.force_reason = "upload_toolchain_empty_fallback"
-    elseif #calls <= 0 and force_history then
-        calls = build_forced_history_calls(state, known_tool_paths, history_read_max_chars)
-        state.planner.force_reason = "history_toolchain_empty_fallback"
-    end
-
-    if #calls > max_calls then
-        for i = #calls, max_calls + 1, -1 do
-            table.remove(calls, i)
-        end
-    end
-
-    if #calls <= 0 then
-        state.planner.tool_calls = {}
+    local ok, result_or_err = pcall(function()
+        return runtime:generate_chat_with_tools_sync(
+            messages,
+            params,
+            tools,
+            "auto",
+            false
+        )
+    end)
+    if not ok then
+        state.planner.errors[#state.planner.errors + 1] = "planner_model_call_failed"
+        state.repair.pending = true
+        state.repair.last_error = tostring(result_or_err or "planner_model_call_failed")
         return state
     end
 
-    state.planner.tool_calls = calls
+    local parsed = parse_model_output(result_or_err)
+    state.planner.raw = parsed.raw ~= "" and parsed.raw or parsed.content
+
+    local finish_call = nil
+    local tool_calls = {}
+    for _, call in ipairs(parsed.tool_calls or {}) do
+        if util.trim(call.tool) == "finish_turn" then
+            finish_call = call
+        else
+            tool_calls[#tool_calls + 1] = call
+        end
+    end
+
+    if finish_call and #tool_calls > 0 then
+        state.planner.errors[#state.planner.errors + 1] = "invalid_mixed_terminal_batch"
+        state.repair.pending = true
+        state.repair.last_error = "invalid_mixed_terminal_batch"
+        state.working_memory.last_repair_error = "invalid_mixed_terminal_batch"
+        return state
+    end
+
+    if finish_call then
+        local ok_finish, _, control_info = control_tools.execute(finish_call)
+        if not ok_finish or not control_info then
+            state.planner.errors[#state.planner.errors + 1] = "finish_turn_invalid"
+            state.repair.pending = true
+            state.repair.last_error = "finish_turn_invalid"
+            return state
+        end
+
+        state.termination.finish_requested = true
+        state.termination.final_message = util.trim(control_info.message or parsed.content or "好的，已处理。")
+        state.termination.final_status = util.trim(control_info.status or "completed")
+        state.termination.stop_reason = "finish_turn_called"
+        state.agent_loop.stop_reason = "finish_turn_called"
+        state.agent_loop.pending_tool_calls = {}
+        state.working_memory.current_plan = "finish_turn"
+        return state
+    end
+
+    if #tool_calls == 0 then
+        state.planner.missing_terminal_signal = true
+        state.planner.errors[#state.planner.errors + 1] = "missing_terminal_signal"
+        state.repair.pending = true
+        state.repair.last_error = "missing_terminal_signal"
+        state.working_memory.last_repair_error = "missing_terminal_signal"
+        return state
+    end
+
+    state.planner.tool_calls = tool_calls
+    state.agent_loop.pending_tool_calls = tool_calls
+
+    local plan_names = {}
+    for _, call in ipairs(tool_calls) do
+        plan_names[#plan_names + 1] = call.tool
+    end
+    state.working_memory.current_plan = table.concat(plan_names, " -> ")
+    state.working_memory.plan_step_index = (tonumber(state.working_memory.plan_step_index) or 0) + 1
     return state
 end
 

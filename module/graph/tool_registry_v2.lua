@@ -4,24 +4,27 @@ local file_tools = require("module.graph.file_tools")
 local code_tools = require("module.graph.code_tools")
 local control_tools = require("module.graph.control_tools")
 local provider_registry = require("module.graph.providers.registry")
-local context_manager = require("module.graph.context_manager")
 
 local M = {}
 
-local NO_SIDE_EFFECT_TOOLS = {
+local READ_ONLY_TOOLS = {
     list_files = true,
     read_file = true,
     read_lines = true,
     search_file = true,
     search_files = true,
-    -- 代码分析工具（只读）
     code_outline = true,
     project_structure = true,
     code_symbols = true,
 }
 
--- 大文件提示阈值
-local LARGE_FILE_HINT_THRESHOLD = 10000
+local SIDE_EFFECT_TOOLS = {
+    write_file = true,
+    apply_patch = true,
+    exec_command = true,
+}
+
+local LARGE_RESULT_HINT_THRESHOLD = 10000
 
 local function graph_cfg()
     return ((config.settings or {}).graph or {})
@@ -37,25 +40,69 @@ end
 
 local function normalize_allowlist(raw)
     local out = {}
-    local set = {}
+    local seen = {}
     if type(raw) == "string" then
-        for name in raw:gmatch("[^,]+") do
-            local n = util.trim(name)
-            if n ~= "" and (not set[n]) then
-                set[n] = true
-                out[#out + 1] = n
+        for item in raw:gmatch("[^,]+") do
+            local name = util.trim(item)
+            if name ~= "" and not seen[name] then
+                seen[name] = true
+                out[#out + 1] = name
             end
         end
     elseif type(raw) == "table" then
         for _, item in ipairs(raw) do
-            local n = util.trim(item)
-            if n ~= "" and (not set[n]) then
-                set[n] = true
-                out[#out + 1] = n
+            local name = util.trim(item)
+            if name ~= "" and not seen[name] then
+                seen[name] = true
+                out[#out + 1] = name
             end
         end
     end
-    return out, set
+    return out, seen
+end
+
+local function create_provider_state()
+    local ext = external_cfg()
+    local enabled = util.to_bool(ext.enabled, false)
+    local allowlist, allowset = normalize_allowlist(ext.allowlist or ext.names)
+
+    local provider = nil
+    local provider_error = ""
+    if enabled and #allowlist > 0 then
+        provider, provider_error = provider_registry.create(ext.provider or "qwen", {
+            allowlist = allowlist,
+        })
+    elseif enabled and #allowlist == 0 then
+        provider_error = "external_allowlist_required"
+    end
+
+    return {
+        enabled = enabled,
+        allowlist = allowlist,
+        allowset = allowset,
+        provider = provider,
+        provider_error = provider_error,
+    }
+end
+
+local function get_task_profile(state)
+    local profile = util.trim((((state or {}).context or {}).task_profile) or "")
+    if profile ~= "" then
+        return profile
+    end
+    return util.trim((((((state or {}).session or {}).active_task) or {}).profile) or "")
+end
+
+local function build_capabilities(state)
+    local profile = get_task_profile(state)
+    local uploads = (((state or {}).uploads) or {})
+    local has_uploads = type(uploads) == "table" and #uploads > 0
+
+    return {
+        profile = profile ~= "" and profile or "general",
+        workspace = profile == "workspace" or profile == "code" or has_uploads,
+        code = profile == "code",
+    }
 end
 
 local function normalize_call(call, idx)
@@ -76,7 +123,7 @@ local function normalize_call(call, idx)
         return nil, "tool_call_args_not_table"
     end
 
-    local call_id = util.trim(call.call_id)
+    local call_id = util.trim(call.call_id or call.id)
     if call_id == "" then
         call_id = string.format("tool_call_%d", tonumber(idx) or 0)
     end
@@ -88,149 +135,132 @@ local function normalize_call(call, idx)
     }
 end
 
-local function create_provider_state()
-    local ext = external_cfg()
-    local enabled = util.to_bool(ext.enabled, false)
-    local allowlist, allowset = normalize_allowlist(ext.allowlist or ext.names)
-
-    local provider = nil
-    local provider_error = ""
-    if enabled and #allowlist > 0 then
-        provider, provider_error = provider_registry.create(
-            ext.provider or "qwen",
-            { allowlist = allowlist }
-        )
-    elseif enabled and #allowlist == 0 then
-        provider_error = "external_allowlist_required"
+local function append_schema_list(out, seen, schemas)
+    for _, schema in ipairs(schemas or {}) do
+        if type(schema) == "table" then
+            local fn = schema["function"] or {}
+            local name = util.trim(fn.name)
+            if name ~= "" and not seen[name] then
+                seen[name] = true
+                out[#out + 1] = schema
+            end
+        end
     end
-
-    return {
-        enabled = enabled,
-        allowlist = allowlist,
-        allowset = allowset,
-        provider = provider,
-        provider_error = provider_error,
-    }
 end
 
-function M.get_supported_tools()
-    local tools = file_tools.supported_tools()
-    -- 添加代码分析工具
-    for name, enabled in pairs(code_tools.supported_tools() or {}) do
-        if enabled then
-            tools[name] = true
+local function safe_trim_text(value)
+    return util.trim(tostring(value or ""))
+end
+
+local function build_result_summary_rows(call_results)
+    local lines = {}
+    for _, row in ipairs(call_results or {}) do
+        local tool_name = safe_trim_text((row or {}).tool)
+        if tool_name == "" then
+            tool_name = "unknown"
+        end
+        if row.ok == true then
+            local detail = util.utf8_take(safe_trim_text((row or {}).result), 240)
+            lines[#lines + 1] = string.format("- %s: ok%s", tool_name, detail ~= "" and (" | " .. detail) or "")
+        else
+            local err = util.utf8_take(safe_trim_text((row or {}).error), 180)
+            lines[#lines + 1] = string.format("- %s: failed%s", tool_name, err ~= "" and (" | " .. err) or "")
         end
     end
-    -- 添加控制工具
+    return table.concat(lines, "\n")
+end
+
+function M.get_supported_tools(state)
+    local capabilities = build_capabilities(state)
+    local out = {}
+
     for name, enabled in pairs(control_tools.supported_tools() or {}) do
         if enabled then
-            tools[name] = true
+            out[name] = true
         end
     end
+
+    if capabilities.workspace then
+        for name, enabled in pairs(file_tools.supported_tools() or {}) do
+            if enabled then
+                out[name] = true
+            end
+        end
+    end
+
+    if capabilities.code then
+        for name, enabled in pairs(code_tools.supported_tools() or {}) do
+            if enabled then
+                out[name] = true
+            end
+        end
+    end
+
     local provider_state = create_provider_state()
     if provider_state.enabled and provider_state.provider then
         for _, schema in ipairs(provider_state.provider:list_tools() or {}) do
             local fn = schema["function"] or {}
             local name = util.trim(fn.name)
             if name ~= "" then
-                tools[name] = true
+                out[name] = true
             end
         end
     end
-    return tools
+
+    return out
 end
 
-function M.get_tool_schemas()
+function M.get_tool_schemas(state)
     local out = {}
     local seen = {}
+    local capabilities = build_capabilities(state)
 
-    for _, schema in ipairs(file_tools.get_tool_schemas() or {}) do
-        if type(schema) == "table" then
-            local fn = schema["function"] or {}
-            local name = util.trim(fn.name)
-            if name ~= "" and (not seen[name]) then
-                seen[name] = true
-                out[#out + 1] = schema
-            end
-        end
+    append_schema_list(out, seen, control_tools.get_tool_schemas())
+    if capabilities.workspace then
+        append_schema_list(out, seen, file_tools.get_tool_schemas())
     end
-
-    -- 添加代码分析工具 schema
-    for _, schema in ipairs(code_tools.get_tool_schemas() or {}) do
-        if type(schema) == "table" then
-            local fn = schema["function"] or {}
-            local name = util.trim(fn.name)
-            if name ~= "" and (not seen[name]) then
-                seen[name] = true
-                out[#out + 1] = schema
-            end
-        end
-    end
-
-    -- 添加控制工具 schema
-    for _, schema in ipairs(control_tools.get_tool_schemas() or {}) do
-        if type(schema) == "table" then
-            local fn = schema["function"] or {}
-            local name = util.trim(fn.name)
-            if name ~= "" and (not seen[name]) then
-                seen[name] = true
-                out[#out + 1] = schema
-            end
-        end
+    if capabilities.code then
+        append_schema_list(out, seen, code_tools.get_tool_schemas())
     end
 
     local provider_state = create_provider_state()
     if provider_state.enabled and provider_state.provider then
-        for _, schema in ipairs(provider_state.provider:list_tools() or {}) do
-            if type(schema) == "table" then
-                local fn = schema["function"] or {}
-                local name = util.trim(fn.name)
-                if name ~= "" and (not seen[name]) then
-                    seen[name] = true
-                    out[#out + 1] = schema
-                end
-            end
-        end
+        append_schema_list(out, seen, provider_state.provider:list_tools())
     end
+
     return out
 end
 
--- 控制工具集合
-local CONTROL_TOOLS = {
-    finish_turn = true,
-    continue_task = true,
-}
-
-function M.execute_calls(calls)
+function M.execute_calls(calls, state)
     local out = {
         executed = 0,
         failed = 0,
         skipped = 0,
         call_results = {},
         context_fragments = {},
-        parallel_groups = 0,
         total_result_chars = 0,
-        large_results = {}, -- 记录大结果
-        -- 控制信号
-        control_action = nil,  -- "finish" | "continue"
-        control_data = nil,    -- 控制工具返回的数据
+        large_results = {},
+        control_action = nil,
+        control_data = nil,
+        protocol_error = "",
+        last_error = "",
+        summary = "",
     }
 
     if type(calls) ~= "table" or #calls == 0 then
         return out
     end
 
-    local supported = M.get_supported_tools()
+    local supported = M.get_supported_tools(state)
     local provider_state = create_provider_state()
     local ext_cfg = external_cfg()
     local inject_external_context = util.to_bool(ext_cfg.context_inject, true)
     local external_context_max_chars = math.max(120, math.floor(tonumber(ext_cfg.context_max_chars) or 1200))
-    local file_context_max_chars = math.max(120, math.floor(tonumber((tool_cfg().file_context_max_chars) or 4000)))
+    local local_context_max_chars = math.max(120, math.floor(tonumber((tool_cfg().file_context_max_chars) or 4000)))
+    local read_only = (((state or {}).input or {}).read_only) == true
 
-    local serial_calls = {}
-    local no_side_effect_count = 0
-    local control_call = nil  -- 存储第一个控制工具调用
-
+    local normalized = {}
+    local finish_calls = {}
     for i, raw in ipairs(calls) do
         local call, err = normalize_call(raw, i)
         if not call then
@@ -243,174 +273,134 @@ function M.execute_calls(calls)
                 error = err,
                 result = "",
             }
+        elseif not supported[call.tool] then
+            out.failed = out.failed + 1
+            out.call_results[#out.call_results + 1] = {
+                call_id = call.call_id,
+                tool = call.tool,
+                args = call.args,
+                ok = false,
+                error = "tool_not_supported",
+                result = "",
+            }
         else
-            if not supported[call.tool] then
-                out.failed = out.failed + 1
-                out.call_results[#out.call_results + 1] = {
-                    call_id = call.call_id,
-                    tool = call.tool,
-                    args = call.args,
-                    ok = false,
-                    error = "tool_not_supported",
-                    result = "",
-                }
-            else
-                -- 检查是否是控制工具
-                if CONTROL_TOOLS[call.tool] then
-                    -- 只处理第一个控制工具，忽略其他的
-                    if control_call == nil then
-                        control_call = call
-                    end
-                else
-                    if NO_SIDE_EFFECT_TOOLS[call.tool] then
-                        no_side_effect_count = no_side_effect_count + 1
-                    end
-                    serial_calls[#serial_calls + 1] = call
-                end
+            normalized[#normalized + 1] = call
+            if call.tool == "finish_turn" then
+                finish_calls[#finish_calls + 1] = call
             end
         end
     end
 
-    -- 优先处理控制工具
-    if control_call then
-        local ok, result_or_err, control_info = control_tools.execute(control_call)
+    if #finish_calls > 1 then
+        out.protocol_error = "multiple_finish_turn_calls"
+        out.last_error = out.protocol_error
+        out.summary = build_result_summary_rows(out.call_results)
+        return out
+    end
+
+    if #finish_calls == 1 and #normalized > 1 then
+        out.protocol_error = "invalid_mixed_terminal_batch"
+        out.last_error = out.protocol_error
+        out.summary = build_result_summary_rows(out.call_results)
+        return out
+    end
+
+    if #finish_calls == 1 then
+        local ok, result_or_err, control_info = control_tools.execute(finish_calls[1])
         if ok and control_info then
+            out.executed = 1
             out.control_action = control_info.action
             out.control_data = control_info
-            
-            -- 记录控制工具执行结果
-            out.executed = out.executed + 1
             out.call_results[#out.call_results + 1] = {
-                call_id = control_call.call_id,
-                tool = control_call.tool,
-                args = control_call.args,
+                call_id = finish_calls[1].call_id,
+                tool = finish_calls[1].tool,
+                args = finish_calls[1].args,
                 ok = true,
                 error = "",
-                result = tostring(result_or_err),
+                result = tostring(result_or_err or ""),
                 is_control = true,
             }
-            
-            -- 如果是 finish_turn，设置最终消息
-            if control_info.action == "finish" then
-                out.final_message = control_info.message
-            end
         else
             out.failed = out.failed + 1
+            out.last_error = tostring(result_or_err or "finish_turn_failed")
             out.call_results[#out.call_results + 1] = {
-                call_id = control_call.call_id,
-                tool = control_call.tool,
-                args = control_call.args,
+                call_id = finish_calls[1].call_id,
+                tool = finish_calls[1].tool,
+                args = finish_calls[1].args,
                 ok = false,
-                error = tostring(result_or_err or "control_tool_failed"),
+                error = out.last_error,
                 result = "",
                 is_control = true,
             }
         end
+        out.summary = build_result_summary_rows(out.call_results)
+        return out
     end
 
-    if no_side_effect_count > 1 then
-        out.parallel_groups = 1
-    end
-
-    for _, call in ipairs(serial_calls) do
+    for _, call in ipairs(normalized) do
         local ok = false
         local result_or_err = ""
 
-        -- 判断是代码分析工具还是普通文件工具
-        local is_code_tool = code_tools.supported_tools()[call.tool] == true
-        
-        if is_code_tool then
-            ok, result_or_err = code_tools.execute(call)
-        elseif NO_SIDE_EFFECT_TOOLS[call.tool] then
+        if read_only and SIDE_EFFECT_TOOLS[call.tool] then
+            ok = false
+            result_or_err = "read_only_mode_blocks_side_effect_tool"
+        elseif file_tools.supported_tools()[call.tool] == true then
             ok, result_or_err = file_tools.execute(call)
+        elseif code_tools.supported_tools()[call.tool] == true then
+            ok, result_or_err = code_tools.execute(call)
+        elseif provider_state.enabled and provider_state.provider then
+            ok, result_or_err = provider_state.provider:call(call.tool, call.args)
         else
-            if provider_state.enabled and provider_state.provider then
-                ok, result_or_err = provider_state.provider:call(call.tool, call.args)
-            else
-                ok = false
-                result_or_err = provider_state.provider_error ~= "" and provider_state.provider_error or "external_provider_disabled"
-            end
+            ok = false
+            result_or_err = provider_state.provider_error ~= "" and provider_state.provider_error or "external_provider_disabled"
         end
 
-        local result_text = util.trim(result_or_err)
-        local original_len = #result_text
-        out.total_result_chars = (out.total_result_chars or 0) + original_len
-
-        -- 记录大结果
-        if original_len > LARGE_FILE_HINT_THRESHOLD then
+        local result_text = safe_trim_text(result_or_err)
+        out.total_result_chars = out.total_result_chars + #result_text
+        if #result_text > LARGE_RESULT_HINT_THRESHOLD then
             out.large_results[#out.large_results + 1] = {
                 tool = call.tool,
-                chars = original_len,
+                chars = #result_text,
                 call_id = call.call_id,
             }
         end
 
-        if not ok then
-            out.failed = out.failed + 1
-            out.call_results[#out.call_results + 1] = {
-                call_id = call.call_id,
-                tool = call.tool,
-                args = call.args,
-                ok = false,
-                error = result_text ~= "" and result_text or "tool_exec_failed",
-                result = "",
-                original_chars = original_len,
-            }
-        else
+        if ok then
             out.executed = out.executed + 1
-
-            -- 对大结果添加智能提示
-            local final_result = result_text
-            if original_len > LARGE_FILE_HINT_THRESHOLD then
-                -- 添加大文件建议
-                local strategy_hint = ""
-                if call.tool == "read_file" then
-                    strategy_hint = string.format(
-                        "\n\n[System: Large file detected (%d chars). Consider using read_lines for specific sections.]",
-                        original_len
-                    )
-                elseif call.tool == "search_files" or call.tool == "search_file" then
-                    strategy_hint = string.format(
-                        "\n\n[System: Many results found (%d chars). Consider using more specific patterns.]",
-                        original_len
-                    )
-                end
-                final_result = result_text .. strategy_hint
-            end
-
             out.call_results[#out.call_results + 1] = {
                 call_id = call.call_id,
                 tool = call.tool,
                 args = call.args,
                 ok = true,
                 error = "",
-                result = final_result,
-                original_chars = original_len,
+                result = result_text,
             }
 
-            -- 生成context fragment时使用更大的限制
-            if NO_SIDE_EFFECT_TOOLS[call.tool] then
-                if result_text ~= "" then
-                    local clipped = util.utf8_take(result_text, file_context_max_chars)
-                    out.context_fragments[#out.context_fragments + 1] = string.format(
-                        "[Tool:%s]\n%s",
-                        call.tool,
-                        clipped
-                    )
-                end
-            else
-                if inject_external_context and result_text ~= "" then
-                    local clipped = util.utf8_take(result_text, external_context_max_chars)
-                    out.context_fragments[#out.context_fragments + 1] = string.format(
-                        "[External:%s]\n%s",
-                        call.tool,
-                        clipped
-                    )
-                end
+            local clip_limit = READ_ONLY_TOOLS[call.tool] and local_context_max_chars or external_context_max_chars
+            local prefix = (READ_ONLY_TOOLS[call.tool] or SIDE_EFFECT_TOOLS[call.tool]) and "[Tool:%s]\n%s" or "[External:%s]\n%s"
+            local should_inject = READ_ONLY_TOOLS[call.tool] or SIDE_EFFECT_TOOLS[call.tool] or inject_external_context
+            if should_inject and result_text ~= "" then
+                out.context_fragments[#out.context_fragments + 1] = string.format(
+                    prefix,
+                    call.tool,
+                    util.utf8_take(result_text, clip_limit)
+                )
             end
+        else
+            out.failed = out.failed + 1
+            out.last_error = result_text ~= "" and result_text or "tool_exec_failed"
+            out.call_results[#out.call_results + 1] = {
+                call_id = call.call_id,
+                tool = call.tool,
+                args = call.args,
+                ok = false,
+                error = out.last_error,
+                result = "",
+            }
         end
     end
 
+    out.summary = build_result_summary_rows(out.call_results)
     return out
 end
 

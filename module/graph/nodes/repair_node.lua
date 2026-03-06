@@ -7,82 +7,18 @@ local function graph_cfg()
     return ((config.settings or {}).graph or {})
 end
 
-local function normalize_tool_call(item, idx)
-    if type(item) ~= "table" then
-        return nil
-    end
-    local name = util.trim(item.tool or item.name)
-    if name == "" then
-        return nil
-    end
-    local args = item.args
-    if args == nil then
-        args = {}
-    end
-    if type(args) ~= "table" then
-        return nil
-    end
-    local call_id = util.trim(item.call_id)
-    if call_id == "" then
-        call_id = string.format("repair_call_%d", tonumber(idx) or 0)
-    end
-    return {
-        tool = name,
-        args = args,
-        call_id = call_id,
-    }
-end
-
-local function parse_output(raw)
-    local parsed = util.parse_lua_table_literal(raw)
-    if not parsed then
-        return nil
-    end
-    local calls = parsed.tool_calls
-    if type(calls) ~= "table" then
-        return nil
-    end
-    local out = {}
-    for i, item in ipairs(calls) do
-        local norm = normalize_tool_call(item, i)
-        if norm then
-            out[#out + 1] = norm
-        end
-    end
-    return out
-end
-
-local function build_prompt(state)
-    local failed = {}
-    for _, row in ipairs((((state or {}).tool_exec or {}).results) or {}) do
-        if row.ok ~= true then
-            failed[#failed + 1] = {
-                tool = row.tool,
-                call_id = row.call_id,
-                error = row.error,
-            }
-        end
-    end
-
-    return table.concat({
-        "You are a strict tool repair planner.",
-        "Given failed tool calls, return corrected tool calls.",
-        "Output exactly one Lua table: {tool_calls={...}}",
-        "If no retry should be made, output {tool_calls={}}",
-        "",
-        "[UserInput]",
-        tostring((((state or {}).input or {}).message) or ""),
-        "",
-        "[PreviousToolCalls]",
-        util.encode_lua_value((((state or {}).planner or {}).tool_calls) or {}, 0),
-        "",
-        "[FailedResults]",
-        util.encode_lua_value(failed, 0),
-    }, "\n")
-end
-
 function M.run(state, _ctx)
-    state.repair = state.repair or { attempts = 0, max_attempts = 2, last_error = "" }
+    state.repair = state.repair or {}
+    state.termination = state.termination or {}
+    state.context = state.context or {}
+    state.working_memory = state.working_memory or {}
+    state.planner = state.planner or {}
+
+    local pending = state.repair.pending == true or util.trim(state.repair.last_error or "") ~= ""
+    if not pending then
+        state.repair.retry_requested = false
+        return state
+    end
 
     local max_attempts = tonumber(state.repair.max_attempts)
     if not max_attempts then
@@ -90,38 +26,33 @@ function M.run(state, _ctx)
         state.repair.max_attempts = max_attempts
     end
 
-    if (tonumber((((state or {}).tool_exec or {}).failed)) or 0) <= 0 then
-        return state
-    end
+    state.repair.attempts = (tonumber(state.repair.attempts) or 0) + 1
+    local last_error = util.trim(state.repair.last_error or "repair_required")
+    state.working_memory.last_repair_error = last_error
 
-    local attempts = tonumber(state.repair.attempts) or 0
-    if attempts >= max_attempts then
-        return state
-    end
-
-    local cfg = graph_cfg().repair or {}
-    local raw = py_pipeline:generate_chat_sync(
-        { { role = "user", content = build_prompt(state) } },
-        {
-            max_tokens = math.max(32, math.floor(tonumber(cfg.max_tokens) or 256)),
-            temperature = tonumber(cfg.temperature) or 0,
-            seed = tonumber(cfg.seed) or 29,
-        }
-    )
-
-    local repaired_calls = parse_output(raw or "")
-    state.repair.attempts = attempts + 1
-    state.repair.last_error = ""
-
-    if type(repaired_calls) == "table" and #repaired_calls > 0 then
-        state.planner = state.planner or {}
-        state.planner.tool_calls = repaired_calls
-    else
-        state.repair.last_error = "repair_parse_failed_or_empty"
-        state.planner = state.planner or {}
+    if state.repair.attempts > max_attempts then
+        state.termination.finish_requested = true
+        state.termination.final_status = "failed"
+        state.termination.stop_reason = "repair_exhausted"
+        state.termination.final_message = "I could not complete the request after repeated tool/planner repair attempts."
+        state.context.planner_context = "Repair exhausted: stop and explain the failure."
+        state.repair.pending = false
+        state.repair.retry_requested = false
+        state.agent_loop = state.agent_loop or {}
+        state.agent_loop.stop_reason = "repair_exhausted"
         state.planner.tool_calls = {}
+        return state
     end
 
+    state.context.planner_context = table.concat({
+        "Repair the previous step.",
+        "Last error: " .. last_error,
+        "Do not repeat the same invalid tool batch.",
+        "If the task is complete, call finish_turn.",
+    }, "\n")
+    state.repair.pending = false
+    state.repair.retry_requested = true
+    state.planner.tool_calls = {}
     return state
 end
 

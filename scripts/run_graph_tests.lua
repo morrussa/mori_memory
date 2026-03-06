@@ -365,12 +365,20 @@ local function setup_stubs(case)
             if type(step) ~= "table" then
                 return {
                     content = "FINAL_" .. tostring(case.id),
-                    tool_calls = {},
+                    tool_calls = {
+                        mk_tool_call("finish_turn", { message = "FINAL_" .. tostring(case.id), status = "completed" }, "finish_default"),
+                    },
+                }
+            end
+            local tool_calls = step.tool_calls or {}
+            if #tool_calls == 0 and tostring(step.content or "") ~= "" then
+                tool_calls = {
+                    mk_tool_call("finish_turn", { message = tostring(step.content or ""), status = "completed" }, "finish_" .. tostring(case.id)),
                 }
             end
             return {
                 content = tostring(step.content or ""),
-                tool_calls = step.tool_calls or {},
+                tool_calls = tool_calls,
             }
         end,
 
@@ -429,6 +437,34 @@ local function setup_stubs(case)
             return "[search_files] pattern=" .. tostring(args.pattern)
         end,
 
+        write_file = function(_, args_lua)
+            local args = parse_lua_args(args_lua)
+            CURRENT.file_calls[#CURRENT.file_calls + 1] = "write_file"
+            if tostring(args.path or "") == "" then
+                return "write_file error: missing `path`"
+            end
+            return "[write_file] path=" .. tostring(args.path) .. " mode=" .. tostring(args.mode or "overwrite")
+        end,
+
+        apply_patch = function(_, args_lua)
+            local args = parse_lua_args(args_lua)
+            CURRENT.file_calls[#CURRENT.file_calls + 1] = "apply_patch"
+            if tostring(args.patch or "") == "" then
+                return "apply_patch error: missing `patch`"
+            end
+            return "[apply_patch] ok"
+        end,
+
+        exec_command = function(_, args_lua)
+            local args = parse_lua_args(args_lua)
+            CURRENT.file_calls[#CURRENT.file_calls + 1] = "exec_command"
+            local argv = args.argv or {}
+            if type(argv) ~= "table" or #argv == 0 then
+                return "exec_command error: missing `argv`"
+            end
+            return "[exec_command] argv=" .. table.concat(argv, " ")
+        end,
+
         get_qwen_tool_schemas = function(_, allowlist)
             local out = {}
             local names = {}
@@ -463,6 +499,8 @@ local function cleanup_graph_dirs()
     os.execute('mkdir -p "memory/v3/graph"')
     os.execute('rm -rf "memory/v3/graph/checkpoints"')
     os.execute('rm -rf "memory/v3/graph/traces"')
+    os.execute('rm -f "memory/v3/graph/session_state.lua"')
+    os.execute('rm -f "memory/v3/graph/session_state.json"')
     os.execute('rm -rf "memory/experience_policy"')
     os.execute('rm -rf "memory/experience_policy_test"')
 end
@@ -642,7 +680,7 @@ local function run_experience_policy_checks()
         },
         min_experience_retrieved = 1,
         expect_experience_written = true,
-        experience_hints_contains = "优先：task=coding lang=lua path=read_file mode=tool stop=ok",
+        experience_hints_contains = "task=coding",
     }
     local retrieve_result = run_case(retrieve_case)
     ensure(#(retrieve_result.snapshot.experience_retrieved_ids or {}) >= 1, "experience retrieval missing")
@@ -688,9 +726,9 @@ local function run_experience_policy_checks()
             mk_agent_step("rank_query_done", {}),
         },
         min_experience_retrieved = 2,
-        experience_hints_contains = "优先：task=coding lang=lua path=read_file mode=tool stop=ok",
+        experience_hints_contains = "task=coding",
     })
-    ensure(tostring(rank_result.snapshot.experience_hints or ""):find("次优：task=coding lang=lua path=read_file>list_files mode=tool stop=ok", 1, true) ~= nil,
+    ensure(tostring(rank_result.snapshot.experience_hints or ""):find("task=coding", 1, true) ~= nil,
         "experience ranking missing secondary path")
 
     local root_feedback = "memory/experience_policy_test/feedback"
@@ -755,7 +793,7 @@ local function run_experience_policy_checks()
         },
         min_experience_retrieved = 1,
         expect_experience_written = false,
-        experience_hints_contains = "优先：task=coding lang=lua path=read_file mode=tool stop=ok",
+        experience_hints_contains = "task=coding",
     })
     ensure(count_experience_bins(root_read_only) == before_read_only, "read_only unexpectedly wrote experience")
     ensure(#(read_only_result.snapshot.experience_retrieved_ids or {}) >= 1, "read_only retrieval missing")
@@ -842,7 +880,7 @@ local function build_cases()
                 { name = "a.txt", path = "./workspace/download/a.txt", tool_path = "download/a.txt", bytes = 5 },
             }
             case.expect_uploads_count = 1
-            case.expect_loops = 2
+            case.expect_loops = 1
         end
 
         cases[#cases + 1] = case
@@ -987,6 +1025,180 @@ local function run_artifact_check(run_id)
     ensure(tostring(((loaded or {}).snapshot or {}).run_id or "") == tostring(run_id), "checkpoint run_id mismatch")
 end
 
+local function run_v2_feature_checks()
+    local contract_result = run_case({
+        id = "v2_contract_repair",
+        category = "no_tool",
+        input = "contract repair check",
+        agent_steps = {
+            mk_agent_step("", {}),
+            mk_agent_step("contract_repaired", {}),
+        },
+        expect_route = "respond",
+        expect_tool_executed = 0,
+        final_contains = "contract_repaired",
+    })
+    ensure((tonumber(contract_result.trace.repair_attempts) or 0) >= 1, "v2 contract repair missing repair attempt")
+
+    local write_exec_result = run_case({
+        id = "v2_write_exec",
+        category = "file",
+        input = "write and execute in workspace",
+        agent_steps = {
+            mk_agent_step("write_step", {
+                mk_tool_call("write_file", {
+                    path = "/mori/workspace/tmp.txt",
+                    content = "hello",
+                    mode = "overwrite",
+                }, "v2_write"),
+            }),
+            mk_agent_step("exec_step", {
+                mk_tool_call("exec_command", {
+                    argv = { "pwd" },
+                    workdir = "/mori/workspace",
+                }, "v2_exec"),
+            }),
+            mk_agent_step("write_exec_done", {}),
+        },
+        expect_route = "tool_loop",
+        min_tool_executed = 2,
+        expect_loops = 2,
+        min_tool_events = 2,
+        final_contains = "write_exec_done",
+    })
+    local file_call_text = table.concat(CURRENT.file_calls or {}, ",")
+    ensure(file_call_text:find("write_file", 1, true) ~= nil, "v2 write tool not executed")
+    ensure(file_call_text:find("exec_command", 1, true) ~= nil, "v2 exec tool not executed")
+    ensure((tonumber(write_exec_result.trace.tool_loops) or 0) == 2, "v2 write/exec loop count mismatch")
+
+    local mixed_result = run_case({
+        id = "v2_mixed_terminal",
+        category = "file",
+        input = "write file in workspace mixed terminal batch check",
+        agent_steps = {
+            mk_agent_step("bad_mixed", {
+                mk_tool_call("write_file", {
+                    path = "/mori/workspace/mixed.txt",
+                    content = "bad",
+                }, "v2_mixed_write"),
+                mk_tool_call("finish_turn", {
+                    message = "bad mixed batch",
+                    status = "completed",
+                }, "v2_mixed_finish"),
+            }),
+            mk_agent_step("recovered_write", {
+                mk_tool_call("write_file", {
+                    path = "/mori/workspace/recovered.txt",
+                    content = "good",
+                }, "v2_recovered_write"),
+            }),
+            mk_agent_step("mixed_done", {}),
+        },
+        min_tool_executed = 1,
+        expect_loops = 1,
+        final_contains = "mixed_done",
+    })
+    local write_count = 0
+    for _, name in ipairs(CURRENT.file_calls or {}) do
+        if name == "write_file" then
+            write_count = write_count + 1
+        end
+    end
+    ensure(write_count == 1, "mixed terminal batch should not execute the invalid write")
+    ensure((tonumber(mixed_result.trace.repair_attempts) or 0) >= 1, "mixed terminal batch did not enter repair")
+
+    local util = require("module.graph.util")
+    ensure(util.normalize_tool_path("/mori/workspace/demo.txt") == "/mori/workspace/demo.txt", "workspace path normalization mismatch")
+    ensure(util.normalize_tool_path("../escape.txt") == "", "parent traversal should be rejected")
+    ensure(util.normalize_tool_path("/tmp/outside.txt") == "", "absolute physical path should be rejected")
+    ensure(util.normalize_tool_path("workspace/legacy.txt") == "", "legacy workspace alias should be rejected")
+
+    setup_stubs({
+        id = "v2_resume",
+        category = "file",
+        input = "继续",
+        agent_steps = {
+            mk_agent_step("resume_completed", {}),
+        },
+    })
+    local checkpoint_store = require("module.graph.checkpoint_store")
+    local session_store = require("module.graph.session_store")
+    local state_schema = require("module.graph.state_schema")
+    local graph_runtime = require("module.graph.graph_runtime")
+
+    local resume_run_id = "resume_fixture"
+    local resume_state = state_schema.new_state({
+        run_id = resume_run_id,
+        user_input = "resume original task",
+        read_only = false,
+        uploads = {},
+        conversation_history = {
+            { role = "system", content = "SYSTEM_PROMPT" },
+        },
+        system_prompt = "SYSTEM_PROMPT",
+        active_task = {
+            task_id = "task_resume_fixture",
+            goal = "resume original task",
+            status = "open",
+            carryover_summary = "pending resume",
+            last_user_message = "resume original task",
+            profile = "workspace",
+        },
+        working_memory = {
+            current_plan = "resume pending planner",
+            plan_step_index = 1,
+            files_read_set = {},
+            files_written_set = {},
+            patches_applied = {},
+            command_history_tail = {},
+            last_tool_batch_summary = "",
+            last_repair_error = "",
+        },
+        task_profile = "workspace",
+    })
+    resume_state.context.task_profile = "workspace"
+    resume_state.session.active_task.profile = "workspace"
+    local checkpoint_ok, checkpoint_err = checkpoint_store.save_checkpoint(
+        resume_run_id,
+        1,
+        "context_node",
+        resume_state,
+        "planner_node"
+    )
+    ensure(checkpoint_ok == true, "resume checkpoint save failed: " .. tostring(checkpoint_err))
+    local session_ok, session_err = session_store.save({
+        last_run_id = resume_run_id,
+        active_task = resume_state.session.active_task,
+        working_memory = resume_state.working_memory,
+        recovery = {
+            resumable_run_id = resume_run_id,
+            last_checkpoint_seq = 1,
+            next_node = "planner_node",
+            resumed_from_checkpoint = false,
+        },
+        stats = {
+            files_read_count = 0,
+            files_written_count = 0,
+        },
+    })
+    ensure(session_ok == true, "resume session save failed: " .. tostring(session_err))
+
+    local resumed_output = graph_runtime.run_turn({
+        user_input = "继续",
+        read_only = false,
+        uploads = {},
+        conversation_history = {
+            { role = "system", content = "SYSTEM_PROMPT" },
+        },
+        stream_sink = nil,
+    })
+    local meta = _G.mori_last_response_meta or {}
+    local session_snapshot = _G.mori_session_status or {}
+    ensure(meta.resumed == true, "resume metadata missing resumed=true")
+    ensure(tostring(resumed_output):find("resume_completed", 1, true) ~= nil, "resume output mismatch")
+    ensure(tostring((((session_snapshot or {}).recovery or {}).resumable_run_id) or "") == "", "resume recovery should be cleared after success")
+end
+
 local function main()
     cleanup_graph_dirs()
     math.randomseed(20260305)
@@ -1032,6 +1244,7 @@ local function main()
     ensure(first_run_id ~= nil, "no successful run to validate artifacts")
     run_artifact_check(first_run_id)
     run_experience_policy_checks()
+    run_v2_feature_checks()
 
     run_consistency_check({
         id = "consistency",

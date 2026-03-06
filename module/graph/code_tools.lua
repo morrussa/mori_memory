@@ -465,7 +465,7 @@ function M.get_tool_schemas()
                 parameters = {
                     type = "object",
                     properties = {
-                        path = { type = "string", description = "Relative path to code file" },
+                        path = { type = "string", description = "Workspace path to a code file under /mori/workspace/*" },
                         max_items = { type = "integer", description = "Maximum functions/items to extract (default 30)" },
                     },
                     required = { "path" },
@@ -480,7 +480,7 @@ function M.get_tool_schemas()
                 parameters = {
                     type = "object",
                     properties = {
-                        prefix = { type = "string", description = "Relative path prefix to analyze" },
+                        prefix = { type = "string", description = "Workspace prefix to analyze" },
                         max_files = { type = "integer", description = "Maximum files to scan (default 50)" },
                         show_files = { type = "boolean", description = "Include file list in output" },
                     },
@@ -496,7 +496,7 @@ function M.get_tool_schemas()
                     type = "object",
                     properties = {
                         pattern = { type = "string", description = "Symbol name pattern to search" },
-                        prefix = { type = "string", description = "Directory prefix to search in" },
+                        prefix = { type = "string", description = "Workspace prefix to search in" },
                         max_hits = { type = "integer", description = "Maximum hits (default 20)" },
                     },
                     required = { "pattern" },

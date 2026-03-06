@@ -25,6 +25,11 @@ local function pk_cfg()
     }
 end
 
+local function should_enable_for_state(state)
+    local profile = util.trim((((state or {}).context or {}).task_profile) or ((((state or {}).session or {}).active_task or {}).profile) or "")
+    return profile == "code"
+end
+
 -- 缓存
 local knowledge_cache = {
     overview = nil,
@@ -68,7 +73,7 @@ local function identify_core_modules()
         local runtime = _G.py_pipeline
         if runtime and runtime.list_files then
             local ok, result = pcall(function()
-                return runtime:list_files("module", 100)
+                return runtime:list_files(util.workspace_virtual_root(), 100)
             end)
             if ok then
                 local seen = {}
@@ -148,7 +153,7 @@ local function generate_project_overview()
     lines[#lines + 1] = ""
     
     -- 项目基本信息
-    lines[#lines + 1] = "Project: mori (Lua-based Agent Framework)"
+    lines[#lines + 1] = "Project: workspace code/task context"
     lines[#lines + 1] = ""
     
     -- 核心模块列表
@@ -165,18 +170,15 @@ local function generate_project_overview()
     local module_descriptions = {
         ["module.graph.graph_runtime"] = "Main graph execution runtime",
         ["module.graph.state_schema"] = "State definition and validation",
-        ["module.graph.context_builder"] = "Builds chat messages with budget control",
-        ["module.graph.context_manager"] = "Smart truncation, caching, context optimization",
-        ["module.graph.tool_registry_v2"] = "Tool registration and execution",
-        ["module.graph.file_tools"] = "File operation tools (read, search, list)",
-        ["module.graph.code_tools"] = "Code structure analysis tools",
-        ["module.graph.code_outline"] = "Code outline extraction",
-        ["module.graph.nodes.agent_node"] = "Agent decision loop with tool calling",
-        ["module.graph.nodes.planner_node"] = "Tool planning with forced toolchains",
-        ["module.graph.nodes.tools_node"] = "Tool execution and result merging",
-        ["module.graph.nodes.router_node"] = "Route decisions (tool_loop/respond)",
-        ["module.graph.memory_core"] = "Memory integration (recall/writeback)",
-        ["module.graph.util"] = "Utility functions (UTF-8, JSON, etc.)",
+        ["module.graph.context_builder"] = "Builds planner/responder chat context",
+        ["module.graph.tool_registry_v2"] = "Tool registry and execution policy",
+        ["module.graph.file_tools"] = "Workspace file tools",
+        ["module.graph.code_tools"] = "Workspace code analysis tools",
+        ["module.graph.nodes.planner_node"] = "Planner with strict finish_turn contract",
+        ["module.graph.nodes.tool_exec_node"] = "Tool execution and working-memory updates",
+        ["module.graph.nodes.repair_node"] = "Explicit repair stage",
+        ["module.graph.nodes.responder_node"] = "Final response generation stage",
+        ["module.graph.util"] = "Utility functions (UTF-8, JSON, paths)",
         ["module.config"] = "Configuration management",
     }
     
@@ -191,18 +193,18 @@ local function generate_project_overview()
     
     -- 工具列表
     lines[#lines + 1] = "Available Tools:"
-    lines[#lines + 1] = "  File: list_files, read_file, read_lines, search_file, search_files"
+    lines[#lines + 1] = "  File: list_files, read_file, read_lines, search_file, search_files, write_file, apply_patch, exec_command"
     lines[#lines + 1] = "  Code: code_outline, project_structure, code_symbols"
     lines[#lines + 1] = "  Control: finish_turn"
     lines[#lines + 1] = ""
     
     -- 工作流说明
     lines[#lines + 1] = "Agent Workflow:"
-    lines[#lines + 1] = "  1. Router decides: tool_loop or respond"
-    lines[#lines + 1] = "  2. If tool_loop: Planner generates tool calls"
-    lines[#lines + 1] = "  3. Tools executed, results merged to context"
-    lines[#lines + 1] = "  4. Agent decides: more tools or finish_turn"
-    lines[#lines + 1] = "  5. Context budget monitored throughout"
+    lines[#lines + 1] = "  1. Planner emits tools or finish_turn"
+    lines[#lines + 1] = "  2. Tools run serially inside /mori/workspace"
+    lines[#lines + 1] = "  3. Results update working memory"
+    lines[#lines + 1] = "  4. Repair or continue planning until finish_turn"
+    lines[#lines + 1] = "  5. Responder/finalize produce the user-visible reply"
     
     return table.concat(lines, "\n")
 end
@@ -210,9 +212,17 @@ end
 -- ==================== 知识注入 ====================
 
 -- 获取项目知识（带缓存）
-function M.get_project_knowledge(force_refresh)
+function M.get_project_knowledge(state, force_refresh)
+    if type(state) ~= "table" then
+        force_refresh = state
+        state = nil
+    end
+
     local cfg = pk_cfg()
     if not cfg.enabled then
+        return nil
+    end
+    if not should_enable_for_state(state) then
         return nil
     end
     
