@@ -162,7 +162,7 @@ local function ensure_contract_system_message(messages, state)
         policy_lines[#policy_lines + 1] = "Avoid these tools unless no alternative exists: " .. table.concat(avoid, ", ")
     end
     if (planner_policy or {}).force_read_before_write == true then
-        policy_lines[#policy_lines + 1] = "If any write-capable tool is needed, read relevant files or workspace context first."
+        policy_lines[#policy_lines + 1] = "Before using write-capable tools, read relevant files or workspace context first."
     end
     if util.trim((repair_policy or {}).mode or "normal") ~= "normal" then
         policy_lines[#policy_lines + 1] = "Repair mode: " .. tostring((repair_policy or {}).mode)

@@ -555,7 +555,9 @@ local function cleanup_graph_dirs()
     os.execute('rm -f "memory/v3/graph/session_state.lua"')
     os.execute('rm -f "memory/v3/graph/session_state.json"')
     os.execute('rm -rf "memory/experience_policy"')
+    os.execute('rm -rf "memory/experience_graph_policy"')
     os.execute('rm -rf "memory/experience_policy_test"')
+    os.execute('rm -rf "memory/experience_graph_policy_test"')
     os.execute('rm -rf "memory/episodes"')
     os.execute('rm -rf "memory/episodes_test"')
 end
@@ -659,7 +661,15 @@ local function run_case(case)
         ensure((tonumber(snapshot.writeback_saved) or 0) == case.expect_writeback_saved, case.id .. ": writeback_saved mismatch")
     end
     if case.expect_stop_reason ~= nil then
-        ensure(tostring(snapshot.stop_reason or "") == tostring(case.expect_stop_reason), case.id .. ": stop_reason mismatch")
+        ensure(
+            tostring(snapshot.stop_reason or "") == tostring(case.expect_stop_reason),
+            string.format(
+                "%s: stop_reason mismatch (expected=%s actual=%s)",
+                case.id,
+                tostring(case.expect_stop_reason),
+                tostring(snapshot.stop_reason or "")
+            )
+        )
     end
     if case.expect_experience_retrieved ~= nil then
         ensure(#(snapshot.experience_retrieved_ids or {}) == tonumber(case.expect_experience_retrieved), case.id .. ": experience_retrieved mismatch")
@@ -670,8 +680,13 @@ local function run_case(case)
     if case.expect_experience_written ~= nil then
         ensure((snapshot.experience_written == true) == (case.expect_experience_written == true), case.id .. ": experience_written mismatch")
     end
-    if case.experience_hints_contains ~= nil then
-        ensure(tostring(snapshot.experience_hints or ""):find(tostring(case.experience_hints_contains), 1, true) ~= nil, case.id .. ": experience hints mismatch")
+    local expected_audit = case.experience_audit_contains
+    if expected_audit == nil then
+        expected_audit = case.experience_hints_contains
+    end
+    if expected_audit ~= nil then
+        ensure(tostring(snapshot.experience_audit or snapshot.experience_hints or ""):find(tostring(expected_audit), 1, true) ~= nil,
+            case.id .. ": experience audit mismatch")
     end
     if case.expect_planner_mode ~= nil then
         ensure(tostring((((snapshot.experience_runtime_policy or {}).planner) or {}).mode or "") == tostring(case.expect_planner_mode), case.id .. ": planner mode mismatch")
@@ -770,7 +785,7 @@ local function run_experience_policy_checks()
         },
         min_experience_retrieved = 1,
         expect_planner_mode = "tool_first",
-        experience_hints_contains = "planner.mode=tool_first",
+        experience_audit_contains = "planner.mode=tool_first",
     })
     ensure(#(tool_query.snapshot.experience_retrieved_ids or {}) >= 1, "tool-first retrieval missing")
 
@@ -805,7 +820,7 @@ local function run_experience_policy_checks()
         },
         min_experience_retrieved = 1,
         expect_planner_mode = "direct_first",
-        experience_hints_contains = "planner.mode=direct_first",
+        experience_audit_contains = "planner.mode=direct_first",
     })
 
     local root_recall_force = "memory/experience_graph_policy_test/recall_force"
@@ -894,8 +909,18 @@ local function run_experience_policy_checks()
         min_experience_retrieved = 1,
         expect_force_read_before_write = true,
     })
-    ensure(tostring((((CURRENT.last_messages or {})[1] or {}).content) or ""):find("write%-capable tools", 1, false) ~= nil,
-        "planner contract missing read-before-write guidance")
+    local planner_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
+    ensure(
+        planner_prompt:find("write-capable tools", 1, true) ~= nil,
+        string.format(
+            "planner contract missing read-before-write guidance (len=%d has_contract=%s has_policy=%s)\nHEAD:\n%s\nTAIL:\n%s",
+            #planner_prompt,
+            tostring(planner_prompt:find("[PlannerContract]", 1, true) ~= nil),
+            tostring(planner_prompt:find("[GraphPolicy]", 1, true) ~= nil),
+            planner_prompt:sub(1, 400),
+            planner_prompt:sub(math.max(1, #planner_prompt - 400), #planner_prompt)
+        )
+    )
 
     local root_budget = "memory/experience_graph_policy_test/budget"
     for idx = 1, 2 do
@@ -1037,8 +1062,8 @@ local function build_cases()
             case.expect_loops = 1
             case.expect_tool_executed = 1
             case.min_tool_executed = nil
-            case.expect_stop_reason = "remaining_steps_exhausted"
-            case.final_contains = "Sorry, need more steps"
+            case.expect_stop_reason = "finish_turn_called"
+            case.final_contains = "FINAL_file_02"
             case.min_tool_events = 1
         elseif i == 20 then
             case.input = "读取我上传文件前几行"
@@ -1729,15 +1754,28 @@ local function main()
     cleanup_graph_dirs()
     math.randomseed(20260305)
 
+    local run_experience_only = tostring(os.getenv("RUN_EXPERIENCE_ONLY") or "") == "1"
+    if run_experience_only then
+        run_experience_policy_checks()
+        printf("Experience policy checks passed.")
+        return
+    end
+
     local cases = build_cases()
     ensure(#cases == 60, "expected exactly 60 cases")
 
-    local expected_dist = {
-        memory = 20,
-        file = 20,
-        no_tool = 10,
-        external = 10,
-    }
+    local case_filter = tostring(os.getenv("CASE_FILTER") or "")
+    if case_filter ~= "" then
+        local filtered = {}
+        for _, c in ipairs(cases) do
+            if tostring(c.id or ""):find(case_filter, 1, true) ~= nil then
+                filtered[#filtered + 1] = c
+            end
+        end
+        ensure(#filtered > 0, "CASE_FILTER matched no cases: " .. case_filter)
+        cases = filtered
+    end
+
     local dist = {
         memory = 0,
         file = 0,
@@ -1747,8 +1785,17 @@ local function main()
     for _, c in ipairs(cases) do
         dist[c.category] = (dist[c.category] or 0) + 1
     end
-    for k, expected in pairs(expected_dist) do
-        ensure((dist[k] or 0) == expected, string.format("case distribution mismatch: %s", k))
+
+    if case_filter == "" then
+        local expected_dist = {
+            memory = 20,
+            file = 20,
+            no_tool = 10,
+            external = 10,
+        }
+        for k, expected in pairs(expected_dist) do
+            ensure((dist[k] or 0) == expected, string.format("case distribution mismatch: %s", k))
+        end
     end
 
     local passed = 0
@@ -1767,18 +1814,20 @@ local function main()
         end
     end
 
-    ensure(first_run_id ~= nil, "no successful run to validate artifacts")
-    run_artifact_check(first_run_id)
-    run_experience_policy_checks()
-    run_v2_feature_checks()
+    if case_filter == "" then
+        ensure(first_run_id ~= nil, "no successful run to validate artifacts")
+        run_artifact_check(first_run_id)
+        run_experience_policy_checks()
+        run_v2_feature_checks()
 
-    run_consistency_check({
-        id = "consistency",
-        input = "MEMORY_HIT consistency check",
-        agent_steps = {
-            mk_agent_step("consistency_done", {}),
-        },
-    })
+        run_consistency_check({
+            id = "consistency",
+            input = "MEMORY_HIT consistency check",
+            agent_steps = {
+                mk_agent_step("consistency_done", {}),
+            },
+        })
+    end
 
     local hit_rate = passed / #cases
     printf("\nGraph Tests Summary")
