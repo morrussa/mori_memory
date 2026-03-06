@@ -327,6 +327,8 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
         target_task_id = "",
         updated_goal = "",
     }
+    state.task.decision.target_task_id = tostring(state.task.decision.target_task_id or "")
+    state.task.decision.updated_goal = tostring(state.task.decision.updated_goal or "")
     state.context = state.context or {
         task_context = "",
         memory_context = "",
@@ -395,6 +397,9 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
         state.session.active_task.contract,
         util.trim(state.session.active_task.goal or state.input.message or "")
     )
+    if util.trim(state.session.active_task.goal or "") == "" then
+        state.session.active_task.goal = tostring((state.session.active_task.contract or {}).goal or state.input.message or "")
+    end
     state.working_memory = state.working_memory or {
         current_plan = "",
         plan_step_index = 0,

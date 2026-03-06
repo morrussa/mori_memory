@@ -85,6 +85,22 @@ local function mk_agent_step(content, tool_calls)
     }
 end
 
+local function mk_task_decision(kind, extra)
+    local row = {
+        kind = tostring(kind or "hard_shift"),
+        confidence = 0.88,
+        reason = "stub_task_decision",
+        updated_goal = "",
+        deliverables = {},
+        acceptance_criteria = {},
+        non_goals = {},
+    }
+    for k, v in pairs(extra or {}) do
+        row[k] = v
+    end
+    return row
+end
+
 local CURRENT = nil
 
 local function setup_stubs(case)
@@ -95,6 +111,8 @@ local function setup_stubs(case)
         agent_steps = {},
         agent_default_step = case.agent_default_step,
         last_messages = {},
+        last_task_prompt = "",
+        task_decision = case.task_decision,
     }
 
     for _, step in ipairs(case.agent_steps or {}) do
@@ -391,6 +409,19 @@ local function setup_stubs(case)
         end,
 
         generate_chat_sync = function(_, _messages, _params)
+            local prompt = tostring((((_messages or {})[1] or {}).content) or "")
+            if prompt:find("[TaskDecisionRequest]", 1, true) ~= nil then
+                CURRENT.last_task_prompt = prompt
+                local decision = CURRENT.task_decision or mk_task_decision("hard_shift", {
+                    updated_goal = tostring(case.input or ""),
+                    deliverables = { tostring(case.input or "") },
+                    acceptance_criteria = {
+                        "Address goal: " .. tostring(case.input or ""),
+                        "Provide a result summary to the user",
+                    },
+                })
+                return encode_lua_value(decision)
+            end
             return "FALLBACK_" .. tostring(case.id)
         end,
 
@@ -1160,6 +1191,13 @@ local function run_v2_feature_checks()
         id = "v2_resume",
         category = "file",
         input = "把剩下的改完并跑一下测试",
+        task_decision = mk_task_decision("same_task_step", {
+            confidence = 0.97,
+            reason = "resume unfinished checkpoint task",
+            updated_goal = "resume original task",
+            deliverables = { "patched demo.lua", "test execution result" },
+            acceptance_criteria = { "unfinished task resumes from checkpoint", "tests are executed", "final reply summarizes result" },
+        }),
         agent_steps = {
             mk_agent_step("resume_completed", {}),
         },
@@ -1284,6 +1322,13 @@ local function run_v2_feature_checks()
         id = "v2_same_task_step",
         category = "file",
         input = "继续把剩下的改完",
+        task_decision = mk_task_decision("same_task_step", {
+            confidence = 0.96,
+            reason = "resume existing patch task",
+            updated_goal = "fix demo.lua and run tests",
+            deliverables = { "patched demo.lua", "test execution result" },
+            acceptance_criteria = { "demo.lua patch is complete", "tests are executed", "final reply summarizes result" },
+        }),
         agent_steps = {
             mk_agent_step("same_task_step_done", {}),
         },
@@ -1336,12 +1381,21 @@ local function run_v2_feature_checks()
     ensure(tostring(same_step_output):find("same_task_step_done", 1, true) ~= nil, "same task step output mismatch")
     local same_step_snapshot = _G.mori_session_status or {}
     ensure(tostring((((same_step_snapshot or {}).active_task or {}).task_id) or "") == "task_same_step_fixture", "same task step should keep the same task_id")
+    ensure(tostring((((((same_step_snapshot or {}).active_task or {}).contract) or {}).goal) or "") == "fix demo.lua and run tests", "same task step should preserve task contract goal")
     ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "same_task_step", "explicit continue should be classified as same_task_step")
 
     setup_stubs({
         id = "v2_followup_implicit",
         category = "file",
         input = "把 demo.lua 也顺手测一下",
+        task_decision = mk_task_decision("same_task_refine", {
+            confidence = 0.93,
+            reason = "add test execution to current task contract",
+            updated_goal = "fix demo.lua and run tests",
+            deliverables = { "patched demo.lua", "test execution result" },
+            acceptance_criteria = { "demo.lua patch is complete", "tests are executed", "final reply summarizes result" },
+            non_goals = { "switch to unrelated workspace task" },
+        }),
         agent_steps = {
             mk_agent_step("implicit_followup_done", {}),
         },
@@ -1394,15 +1448,25 @@ local function run_v2_feature_checks()
     ensure(tostring(followup_output):find("implicit_followup_done", 1, true) ~= nil, "implicit followup output mismatch")
     local followup_snapshot = _G.mori_session_status or {}
     ensure(tostring((((followup_snapshot or {}).active_task or {}).task_id) or "") == "task_followup_fixture", "implicit followup should keep the same task_id")
+    ensure(tostring((((((followup_snapshot or {}).active_task or {}).contract) or {}).goal) or "") == "fix demo.lua and run tests", "implicit followup should preserve contract goal")
     ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "same_task_refine", "implicit followup should be classified as same_task_refine")
     local followup_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
     ensure(followup_prompt:find("goal=fix demo.lua and run tests", 1, true) ~= nil, "implicit followup should keep previous goal")
+    ensure(followup_prompt:find("[TaskContract]", 1, true) ~= nil, "implicit followup should include task contract block")
     ensure(followup_prompt:find("current_plan=apply patch", 1, true) ~= nil, "implicit followup should keep previous working plan")
 
     setup_stubs({
         id = "v2_new_task_guard",
         category = "file",
         input = "file tool case 2",
+        task_decision = mk_task_decision("hard_shift", {
+            confidence = 0.94,
+            reason = "replace old completed memory task with a new file task",
+            updated_goal = "file tool case 2",
+            deliverables = { "file inspection result" },
+            acceptance_criteria = { "required file tool is executed", "final reply summarizes the file result" },
+            non_goals = { "resume completed memory task" },
+        }),
         agent_steps = {
             mk_agent_step("new_task_need_file", {
                 mk_tool_call("list_files", { prefix = "download" }, "v2_new_task_list"),
@@ -1458,6 +1522,7 @@ local function run_v2_feature_checks()
     local new_active_task = (new_task_snapshot or {}).active_task or {}
     ensure(tostring(new_active_task.task_id or "") ~= "task_memory_fixture", "new task should not keep stale task_id")
     ensure(tostring(new_active_task.goal or "") == "file tool case 2", "new task should replace stale goal")
+    ensure(tostring((((new_active_task or {}).contract) or {}).goal or "") == "file tool case 2", "new task should create a fresh task contract")
     ensure(tostring(new_active_task.profile or "") == "workspace", "new task should refresh task profile")
     ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "hard_shift", "new task should be classified as hard_shift")
     ensure((tonumber((((_G.mori_last_state_snapshot or {}).tool_executed) or 0)) or 0) >= 1, "new task guard should execute file tool")
@@ -1466,6 +1531,13 @@ local function run_v2_feature_checks()
         id = "v2_meta_turn",
         category = "no_tool",
         input = "现在进度怎样？",
+        task_decision = mk_task_decision("meta_turn", {
+            confidence = 0.95,
+            reason = "status question without contract change",
+            updated_goal = "fix demo.lua and run tests",
+            deliverables = { "patched demo.lua", "test execution result" },
+            acceptance_criteria = { "demo.lua patch is complete", "tests are executed", "final reply summarizes result" },
+        }),
         agent_steps = {
             mk_agent_step("meta_turn_done", {}),
         },
@@ -1519,10 +1591,12 @@ local function run_v2_feature_checks()
     local meta_snapshot = _G.mori_session_status or {}
     ensure(tostring((((meta_snapshot or {}).active_task or {}).task_id) or "") == "task_meta_fixture", "meta turn should keep the same task_id")
     ensure(tostring((((meta_snapshot or {}).active_task or {}).goal) or "") == "fix demo.lua and run tests", "meta turn should keep the same goal")
+    ensure(tostring((((((meta_snapshot or {}).active_task or {}).contract) or {}).goal) or "") == "fix demo.lua and run tests", "meta turn should preserve task contract goal")
     ensure(tostring((((meta_snapshot or {}).active_task or {}).status) or "") == "open", "meta turn should preserve task status")
     ensure(tostring((((_G.mori_last_state_snapshot or {}).task_decision_kind) or "")) == "meta_turn", "meta turn should be classified as meta_turn")
     local meta_prompt = tostring((((CURRENT.last_messages or {})[1] or {}).content) or "")
     ensure(meta_prompt:find("[TaskDecision]", 1, true) ~= nil, "meta turn should include task decision block")
+    ensure(meta_prompt:find("[TaskContract]", 1, true) ~= nil, "meta turn should include task contract block")
     ensure(meta_prompt:find("current_plan=apply patch", 1, true) ~= nil, "meta turn should keep current working plan")
 end
 
