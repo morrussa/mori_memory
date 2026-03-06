@@ -63,6 +63,30 @@ local function generate_id()
     return string.format("exp_%d_%d", os.time(), math.random(1000, 9999))
 end
 
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function copy_table(value, seen)
+    if type(value) ~= "table" then
+        return value
+    end
+
+    seen = seen or {}
+    if seen[value] then
+        return seen[value]
+    end
+
+    local out = {}
+    seen[value] = out
+    for k, v in pairs(value) do
+        out[copy_table(k, seen)] = copy_table(v, seen)
+    end
+    return out
+end
+
 local function serialize_context_signature(sig)
     if not sig or type(sig) ~= "table" then
         return ""
@@ -77,6 +101,39 @@ local function serialize_context_signature(sig)
     end
     table.sort(parts)
     return table.concat(parts, "|")
+end
+
+local function append_values(out, value)
+    if value == nil then
+        return
+    end
+
+    if type(value) ~= "table" then
+        out[#out + 1] = value
+        return
+    end
+
+    if #value > 0 then
+        for _, item in ipairs(value) do
+            if item ~= nil then
+                out[#out + 1] = item
+            end
+        end
+        return
+    end
+
+    for k, flag in pairs(value) do
+        if flag then
+            out[#out + 1] = k
+        end
+    end
+end
+
+local function sort_strings(values)
+    table.sort(values, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+    return values
 end
 
 -- ==================== 初始化 ====================
@@ -103,6 +160,9 @@ function M.add(experience)
     if not experience.created_at then
         experience.created_at = os.time()
     end
+
+    -- 补齐检索向量，避免后续检索退化成纯索引扫描
+    M.ensure_embedding(experience)
 
     -- 添加到存储
     M.experiences[experience.id] = experience
@@ -203,160 +263,296 @@ function M._add_to_index(index_type, key, experience_id)
     table.insert(ids, experience_id)
 end
 
+function M.build_retrieval_text(experience)
+    if not experience or type(experience) ~= "table" then
+        return ""
+    end
+
+    local parts = {}
+
+    if experience.description and experience.description ~= "" then
+        parts[#parts + 1] = tostring(experience.description)
+    end
+
+    if experience.type then
+        parts[#parts + 1] = string.format("type:%s", tostring(experience.type))
+    end
+
+    if experience.task_type then
+        parts[#parts + 1] = string.format("task:%s", tostring(experience.task_type))
+    end
+
+    if experience.domain then
+        parts[#parts + 1] = string.format("domain:%s", tostring(experience.domain))
+    end
+
+    if experience.language then
+        parts[#parts + 1] = string.format("language:%s", tostring(experience.language))
+    end
+
+    if experience.output_strategy then
+        parts[#parts + 1] = string.format("output:%s", tostring(experience.output_strategy))
+    end
+
+    if experience.context_signature then
+        local ctx_parts = {}
+        for k, v in pairs(experience.context_signature) do
+            ctx_parts[#ctx_parts + 1] = string.format("%s=%s", tostring(k), tostring(v))
+        end
+        if #ctx_parts > 0 then
+            parts[#parts + 1] = "context:" .. table.concat(sort_strings(ctx_parts), ",")
+        end
+    end
+
+    if experience.tools_used then
+        local tools = {}
+        for tool_name, count in pairs(experience.tools_used) do
+            tools[#tools + 1] = string.format("%s:%s", tostring(tool_name), tostring(count))
+        end
+        if #tools > 0 then
+            parts[#parts + 1] = "tools:" .. table.concat(sort_strings(tools), ",")
+        end
+    end
+
+    if experience.patterns then
+        for _, pattern in ipairs(experience.patterns) do
+            if pattern.key then
+                parts[#parts + 1] = "pattern:" .. tostring(pattern.key)
+            elseif pattern.pattern then
+                parts[#parts + 1] = "pattern:" .. tostring(pattern.pattern)
+            elseif pattern.type then
+                parts[#parts + 1] = "pattern_type:" .. tostring(pattern.type)
+            end
+        end
+    end
+
+    if experience.lessons then
+        for _, lesson in ipairs(experience.lessons) do
+            if type(lesson) == "table" and lesson.content ~= nil then
+                if type(lesson.content) == "table" then
+                    for _, item in ipairs(lesson.content) do
+                        parts[#parts + 1] = tostring(item)
+                    end
+                else
+                    parts[#parts + 1] = tostring(lesson.content)
+                end
+            elseif lesson ~= nil then
+                parts[#parts + 1] = tostring(lesson)
+            end
+        end
+    end
+
+    if experience.outcome and experience.outcome.reason then
+        parts[#parts + 1] = "outcome:" .. tostring(experience.outcome.reason)
+    end
+
+    return table.concat(parts, "\n")
+end
+
+function M.ensure_embedding(experience)
+    if not experience or type(experience) ~= "table" then
+        return nil
+    end
+
+    if type(experience.embedding) == "table" and #experience.embedding > 0 then
+        return experience.embedding
+    end
+
+    local retrieval_text = M.build_retrieval_text(experience)
+    if retrieval_text == "" then
+        return nil
+    end
+
+    local embedding = tool.get_embedding_passage(retrieval_text)
+    if type(embedding) == "table" and #embedding > 0 then
+        experience.embedding = embedding
+        M._dirty = true
+        return embedding
+    end
+
+    return nil
+end
+
 -- ==================== 经验检索 ====================
 
 function M.retrieve(options)
     options = options or {}
+    local limit = tonumber(options.limit) or 0
+    local context_threshold = tonumber(options.context_threshold) or 0.35
+    local semantic_threshold = tonumber(options.semantic_threshold)
+    if semantic_threshold == nil then
+        semantic_threshold = 0.12
+    end
+    local semantic_scan_limit = tonumber(options.semantic_scan_limit) or math.max(limit, 24)
+
+    local candidate_map = {}
+    local has_explicit_filters = false
+
+    local function get_record(id)
+        local exp = M.experiences[id]
+        if not exp then
+            return nil
+        end
+
+        local rec = candidate_map[id]
+        if rec then
+            return rec
+        end
+
+        rec = {
+            exp = exp,
+            index_score = 0.0,
+            query_similarity = nil,
+            context_similarity = nil,
+            matched_sources = {},
+            matched_source_count = 0,
+        }
+        candidate_map[id] = rec
+        return rec
+    end
+
+    local function add_candidate(id, source_name, weight)
+        local rec = get_record(id)
+        if not rec then
+            return
+        end
+
+        if source_name and not rec.matched_sources[source_name] then
+            rec.matched_sources[source_name] = true
+            rec.matched_source_count = rec.matched_source_count + 1
+        end
+
+        rec.index_score = rec.index_score + (tonumber(weight) or 0.0)
+    end
+
+    local function add_index_hits(index_type, option_value, source_name, weight)
+        local values = {}
+        append_values(values, option_value)
+        if #values <= 0 then
+            return
+        end
+
+        has_explicit_filters = true
+        for _, value in ipairs(values) do
+            local index_key = string.format("%s:%s", index_type, value)
+            local ids = M.experience_index[index_key] or {}
+            for _, id in ipairs(ids) do
+                add_candidate(id, source_name or index_type, weight or 1.0)
+            end
+        end
+    end
+
+    add_index_hits(INDEX_TYPES.TYPE, options.type, "type", 1.15)
+    add_index_hits(INDEX_TYPES.TASK, options.task_type, "task", 1.10)
+    add_index_hits(INDEX_TYPES.TOOL, options.tool_used or options.tools_used, "tool", 1.05)
+    add_index_hits(INDEX_TYPES.DOMAIN, options.domain, "domain", 1.00)
+    add_index_hits(INDEX_TYPES.LANGUAGE, options.language, "language", 1.00)
+    add_index_hits(INDEX_TYPES.OUTPUT_STRATEGY, options.output_strategy, "output_strategy", 0.90)
+    add_index_hits(INDEX_TYPES.PATTERN_KEY, options.pattern_key, "pattern", 0.95)
+    add_index_hits(INDEX_TYPES.ERROR_TYPE, options.error_type, "error", 0.95)
+    add_index_hits(INDEX_TYPES.SUCCESS_KEY, options.success_key, "success", 0.95)
+
+    if options.context_signature then
+        has_explicit_filters = true
+        for id, exp in pairs(M.experiences) do
+            local sim = M.compute_context_similarity(options.context_signature, exp.context_signature)
+            if sim >= context_threshold then
+                local rec = get_record(id)
+                rec.context_similarity = sim
+                add_candidate(id, "context", 1.20 + sim)
+            end
+        end
+    end
+
+    if type(options.query_embedding) == "table" and #options.query_embedding > 0 then
+        local semantic_hits = {}
+        for id, exp in pairs(M.experiences) do
+            local embedding = M.ensure_embedding(exp)
+            if embedding and #embedding > 0 then
+                local sim = tool.cosine_similarity(options.query_embedding, embedding)
+                semantic_hits[#semantic_hits + 1] = { id = id, sim = sim }
+            end
+        end
+
+        table.sort(semantic_hits, function(a, b)
+            return (a.sim or -1.0) > (b.sim or -1.0)
+        end)
+
+        local take_n = math.max(limit, math.max(semantic_scan_limit, 1))
+        for i = 1, math.min(take_n, #semantic_hits) do
+            local hit = semantic_hits[i]
+            if (hit.sim or -1.0) >= semantic_threshold then
+                local rec = get_record(hit.id)
+                rec.query_similarity = hit.sim
+                add_candidate(hit.id, "semantic", 1.35 + math.max(0.0, hit.sim))
+            end
+        end
+    end
+
+    if next(candidate_map) == nil then
+        for id, _ in pairs(M.experiences) do
+            add_candidate(id, has_explicit_filters and "backfill" or "fallback", 0.10)
+        end
+    end
+
+    local max_index_score = 0.0
+    for _, rec in pairs(candidate_map) do
+        max_index_score = math.max(max_index_score, tonumber(rec.index_score) or 0.0)
+    end
 
     local candidates = {}
-    local used_ids = {}
+    for id, rec in pairs(candidate_map) do
+        local item = copy_table(rec.exp)
 
-    -- 1. 按类型过滤
-    if options.type then
-        local index_key = string.format("%s:%s", INDEX_TYPES.TYPE, options.type)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
+        if options.context_signature and rec.context_similarity == nil then
+            rec.context_similarity = M.compute_context_similarity(options.context_signature, rec.exp.context_signature)
+        end
+
+        if type(options.query_embedding) == "table" and #options.query_embedding > 0 and rec.query_similarity == nil then
+            local embedding = M.ensure_embedding(rec.exp)
+            if embedding and #embedding > 0 then
+                rec.query_similarity = tool.cosine_similarity(options.query_embedding, embedding)
+            else
+                rec.query_similarity = 0.0
             end
         end
-    end
 
-    -- 2. 按任务类型过滤
-    if options.task_type then
-        local index_key = string.format("%s:%s", INDEX_TYPES.TASK, options.task_type)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
+        item.context_similarity = clamp(tonumber(rec.context_similarity) or 0.0, 0.0, 1.0)
+        item.query_similarity = tonumber(rec.query_similarity) or 0.0
+        item.vector_similarity = item.query_similarity
+        item.index_match_score = (max_index_score > 0.0)
+            and clamp((tonumber(rec.index_score) or 0.0) / max_index_score, 0.0, 1.0)
+            or 0.0
+        item.matched_source_count = tonumber(rec.matched_source_count) or 0
+        item.retrieval_sources = {}
+        for source_name in pairs(rec.matched_sources) do
+            item.retrieval_sources[#item.retrieval_sources + 1] = source_name
         end
+        sort_strings(item.retrieval_sources)
+
+        item.preliminary_score =
+            0.60 * math.max(0.0, item.query_similarity) +
+            0.25 * item.context_similarity +
+            0.15 * item.index_match_score
+
+        candidates[#candidates + 1] = item
     end
 
-    -- 3. 按上下文相似度过滤
-    if options.context_signature then
-        local sig_key = serialize_context_signature(options.context_signature)
-        local index_key = string.format("%s:%s", INDEX_TYPES.CONTEXT, sig_key)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                local exp = M.experiences[id]
-                if exp then
-                    local sim = M.compute_context_similarity(
-                        options.context_signature,
-                        exp.context_signature
-                    )
-                    if sim >= (options.context_threshold or 0.7) then
-                        exp.context_similarity = sim
-                        candidates[#candidates + 1] = exp
-                        used_ids[id] = true
-                    end
-                end
-            end
+    table.sort(candidates, function(a, b)
+        local score_a = tonumber(a.preliminary_score) or 0.0
+        local score_b = tonumber(b.preliminary_score) or 0.0
+        if score_a == score_b then
+            return (tonumber(a.created_at) or 0) > (tonumber(b.created_at) or 0)
         end
-    end
+        return score_a > score_b
+    end)
 
-    -- 4. 按工具使用过滤
-    if options.tool_used then
-        local index_key = string.format("%s:%s", INDEX_TYPES.TOOL, options.tool_used)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
-        end
-    end
-
-    -- [新增] 5. 按领域过滤
-    if options.domain then
-        local index_key = string.format("%s:%s", INDEX_TYPES.DOMAIN, options.domain)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
-        end
-    end
-
-    -- [新增] 6. 按编程语言过滤
-    if options.language then
-        local index_key = string.format("%s:%s", INDEX_TYPES.LANGUAGE, options.language)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
-        end
-    end
-
-    -- [新增] 7. 按输出策略过滤
-    if options.output_strategy then
-        local index_key = string.format("%s:%s", INDEX_TYPES.OUTPUT_STRATEGY, options.output_strategy)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
-        end
-    end
-
-    -- [新增] 8. 按模式特征过滤
-    if options.pattern_key then
-        local index_key = string.format("%s:%s", INDEX_TYPES.PATTERN_KEY, options.pattern_key)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
-        end
-    end
-
-    -- [新增] 9. 按错误类型过滤
-    if options.error_type then
-        local index_key = string.format("%s:%s", INDEX_TYPES.ERROR_TYPE, options.error_type)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
-        end
-    end
-
-    -- [新增] 10. 按成功模式键过滤
-    if options.success_key then
-        local index_key = string.format("%s:%s", INDEX_TYPES.SUCCESS_KEY, options.success_key)
-        local ids = M.experience_index[index_key] or {}
-        for _, id in ipairs(ids) do
-            if not used_ids[id] then
-                candidates[#candidates + 1] = M.experiences[id]
-                used_ids[id] = true
-            end
-        end
-    end
-
-    -- 11. 如果没有指定任何过滤条件，返回所有经验
-    if #candidates == 0 then
-        for id, exp in pairs(M.experiences) do
-            candidates[#candidates + 1] = exp
-        end
-    end
-
-    -- 12. 限制返回数量
-    local limit = options.limit or 5
-    if #candidates > limit then
-        local result = {}
+    if limit > 0 and #candidates > limit then
+        local trimmed = {}
         for i = 1, limit do
-            result[i] = candidates[i]
+            trimmed[i] = candidates[i]
         end
-        candidates = result
+        candidates = trimmed
     end
 
     return candidates

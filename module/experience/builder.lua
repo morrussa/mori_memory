@@ -32,6 +32,27 @@ local OUTPUT_STRATEGIES = {
 -- 活跃的topic上下文
 M.active_contexts = {}
 
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function count_tool_results(tool_calls)
+    local success_count = 0
+    local failure_count = 0
+
+    for _, call in ipairs(tool_calls or {}) do
+        if call.result and call.result.success == true then
+            success_count = success_count + 1
+        elseif call.result ~= nil then
+            failure_count = failure_count + 1
+        end
+    end
+
+    return success_count, failure_count
+end
+
 -- ==================== 初始化 ====================
 
 function M.init()
@@ -152,6 +173,14 @@ function M.build_experience(topic_data, context)
     -- [新增] 检测输出策略
     local output_strategy = M.detect_output_strategy(topic_data, context)
 
+    local success_rate = M.compute_success_rate(topic_data, context, outcome)
+    local utility_prior = M.compute_utility_prior(topic_data, context, outcome, success_rate)
+    local error_info = (#context.errors > 0) and {
+        type = (context.errors[1] and context.errors[1].type) or "unknown",
+        count = #context.errors,
+    } or nil
+    local success_key = outcome.success and M.build_success_key(context, output_strategy) or nil
+
     -- 构建经验对象
     local experience = {
         id = nil,  -- 由store分配
@@ -171,6 +200,8 @@ function M.build_experience(topic_data, context)
         -- 上下文特征
         context_signature = context.initial_context,
         task_type = context.task_type,
+        domain = context.initial_context and context.initial_context.domain or nil,
+        language = context.initial_context and context.initial_context.language or nil,
         tools_used = context.tools_used,
 
         -- [新增] 输出策略
@@ -183,11 +214,16 @@ function M.build_experience(topic_data, context)
 
         -- 结果
         outcome = outcome,
-        success_rate = M.compute_success_rate(topic_data, context),
+        success_rate = success_rate,
+        utility_prior = utility_prior,
+        error_info = error_info,
+        success_key = success_key,
 
         -- 向量（用于检索）
         embedding = nil  -- 可选：后续可以添加向量化
     }
+
+    experience.embedding = tool.get_embedding_passage(store.build_retrieval_text(experience))
 
     -- [新增] 记录输出策略结果到自适应系统
     adaptive.record_output_strategy(
@@ -364,26 +400,44 @@ end
 -- ==================== 结果分析 ====================
 
 function M.analyze_topic_outcome(topic_data, context)
+    local tool_success_count, tool_failure_count = count_tool_results(context.tool_calls)
+    local tool_calls = #context.tool_calls
+    local tool_success_rate = tool_calls > 0 and (tool_success_count / tool_calls) or nil
+    local explicit_success = topic_data.outcome and type(topic_data.outcome.success) == "boolean"
+        and topic_data.outcome.success
+        or nil
+
     local outcome = {
         success = false,
         reason = "",
         metrics = {}
     }
 
-    -- 检查是否有错误
-    if #context.errors > 0 then
+    if explicit_success ~= nil then
+        outcome.success = explicit_success
+        outcome.reason = explicit_success and "explicit_success" or "explicit_failure"
+    elseif #context.errors > 0 then
         outcome.success = false
         outcome.reason = "encountered_errors"
-        outcome.errors = context.errors
+    elseif tool_calls > 0 and tool_success_count == 0 then
+        outcome.success = false
+        outcome.reason = "tool_execution_failed"
     else
         outcome.success = true
         outcome.reason = "completed_successfully"
     end
 
+    if #context.errors > 0 then
+        outcome.errors = context.errors
+    end
+
     -- 提取指标
     outcome.metrics = {
         duration = (topic_data.end_turn or topic_data.turn) - context.start_turn,
-        tool_calls = #context.tool_calls,
+        tool_calls = tool_calls,
+        tool_success_count = tool_success_count,
+        tool_failure_count = tool_failure_count,
+        tool_success_rate = tool_success_rate,
         iterations = #context.intermediate_states,
         errors = #context.errors
     }
@@ -400,23 +454,28 @@ function M.extract_patterns(topic_data, context)
     for tool, count in pairs(context.tools_used) do
         patterns[#patterns + 1] = {
             type = "tool_usage",
+            key = tool,
             tool = tool,
             frequency = count
         }
     end
 
+    local task_pattern = M.detect_task_pattern(topic_data)
     -- 任务模式
     patterns[#patterns + 1] = {
         type = "task",
-        pattern = M.detect_task_pattern(topic_data),
+        key = task_pattern,
+        pattern = task_pattern,
         success = context.errors == nil or #context.errors == 0
     }
 
     -- 错误模式
     for _, error in ipairs(context.errors) do
+        local error_pattern = M.extract_error_pattern(error)
         patterns[#patterns + 1] = {
             type = "error",
-            pattern = M.extract_error_pattern(error),
+            key = error_pattern.type or "unknown",
+            pattern = error_pattern,
             context = error.context
         }
     end
@@ -567,19 +626,58 @@ end
 
 -- ==================== 成功率计算 ====================
 
-function M.compute_success_rate(topic_data, context)
-    if #context.tool_calls == 0 then
-        return 0.0
+function M.compute_success_rate(topic_data, context, outcome)
+    if type(outcome) ~= "table" then
+        outcome = M.analyze_topic_outcome(topic_data, context)
     end
 
-    local success_count = 0
-    for _, call in ipairs(context.tool_calls) do
-        if call.result and call.result.success then
-            success_count = success_count + 1
-        end
+    local success_count = count_tool_results(context.tool_calls)
+    local tool_calls = #context.tool_calls
+    local tool_success_rate = tool_calls > 0 and (success_count / tool_calls) or nil
+    local outcome_signal = outcome.success and 1.0 or 0.0
+
+    local base
+    if tool_success_rate ~= nil then
+        base = 0.75 * tool_success_rate + 0.25 * outcome_signal
+    else
+        base = outcome.success and 0.55 or 0.20
     end
 
-    return success_count / #context.tool_calls
+    local error_penalty = math.min(0.35, #context.errors * 0.12)
+    return clamp(base - error_penalty, 0.0, 1.0)
+end
+
+function M.compute_utility_prior(topic_data, context, outcome, success_rate)
+    local prior = tonumber(success_rate) or 0.5
+
+    if outcome.success then
+        prior = 0.55 + 0.45 * prior
+    else
+        local diagnostic_bonus = math.min(0.18, #context.errors * 0.05)
+        local solution_bonus = topic_data.solution and 0.12 or 0.0
+        prior = 0.30 + 0.30 * prior + diagnostic_bonus + solution_bonus
+    end
+
+    return clamp(prior, 0.0, 1.0)
+end
+
+function M.build_success_key(context, output_strategy)
+    local key_parts = {
+        tostring(context.task_type or "general"),
+        tostring(output_strategy or "default"),
+    }
+
+    local tools = {}
+    for tool_name in pairs(context.tools_used or {}) do
+        tools[#tools + 1] = tostring(tool_name)
+    end
+
+    if #tools > 0 then
+        table.sort(tools)
+        key_parts[#key_parts + 1] = table.concat(tools, "+")
+    end
+
+    return table.concat(key_parts, "|")
 end
 
 -- ==================== 手动触发 ====================

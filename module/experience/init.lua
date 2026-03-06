@@ -39,7 +39,7 @@ function M.add_experience(experience)
     return M.store.add(experience)
 end
 
--- 交集优先检索（核心检索方法）
+-- 相关性门控检索（核心检索方法）
 function M.retrieve(query, options)
     return M.retriever.retrieve_intersection_priority(query, options)
 end

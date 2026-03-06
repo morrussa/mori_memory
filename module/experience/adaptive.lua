@@ -668,6 +668,19 @@ function M.update_after_retrieval(event)
                     route_stats.by_task[sample.task_type] = stats
                 end
 
+                -- 按上下文统计
+                local context_key = sample.context_key
+                if (not context_key) and sample.context_signature then
+                    context_key = type(sample.context_signature) == "table"
+                        and serialize_context_signature(sample.context_signature)
+                        or tostring(sample.context_signature)
+                end
+                if context_key and context_key ~= "" then
+                    local stats = route_stats.by_context[context_key] or {pos=0, neg=0}
+                    if is_pos then stats.pos = stats.pos + 1 else stats.neg = stats.neg + 1 end
+                    route_stats.by_context[context_key] = stats
+                end
+
                 -- 按工具统计
                 if sample.tools_used then
                     for tool_name in pairs(sample.tools_used) do
@@ -824,6 +837,11 @@ end
 function M.get_experience_utility(experience_id)
     if not experience_id then return 0.5 end
     return tonumber(M.state.experience_utility_scores[experience_id]) or 0.5
+end
+
+function M.get_experience_utility_count(experience_id)
+    if not experience_id then return 0 end
+    return tonumber(M.state.experience_utility_counts[experience_id]) or 0
 end
 
 --- 批量获取经验效用评分
