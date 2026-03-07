@@ -261,7 +261,7 @@ local DEFAULT_SETTINGS = {
         soft_gate_enabled = true,
         soft_gate_margin = 0.10,
         expected_recall_enabled = true,
-        cluster_hit_rate_alpha = 0.10,
+        cluster_hit_rate_alpha = 0.2,
         route_score_bonus_scale = 0.15,
         empty_gate_decay = 0.98,
         empty_gate_decay_aggressive = 0.95,
@@ -303,7 +303,7 @@ local DEFAULT_SETTINGS = {
         refinement_merge_lr = 0.05, -- online_merge_limit 学习率（控制合并阈值收敛速度）。
         refinement_route_bias_scale = 0.08, -- route_score 参与簇排序时的偏置强度（0=不使用路由偏置）。
         refinement_probe_clusters_start = 8, -- 早期每query探测簇数（高探索）。
-        refinement_probe_clusters_end = 2, -- 后期每query探测簇数（高精度）。
+        refinement_probe_clusters_end = 3, -- 后期每query探测簇数（高精度）。
         refinement_probe_per_cluster_limit = 12, -- 单簇最多扫描候选 memory 数（限制大簇成本）。
 
         -- [实现方法] persistent explore：

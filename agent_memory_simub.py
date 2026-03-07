@@ -84,7 +84,7 @@ class SimParams:
     refinement_merge_lr: float = 0.05
     refinement_route_bias_scale: float = 0.08
     refinement_probe_clusters_start: int = 8
-    refinement_probe_clusters_end: int = 2
+    refinement_probe_clusters_end: int = 3
     refinement_probe_per_cluster_limit: int = 12
     persistent_explore_enabled: bool = True
     persistent_explore_epsilon: float = 0.01
@@ -126,7 +126,7 @@ class SimParams:
     
     # Expected recall estimation
     expected_recall_enabled: bool = True
-    cluster_hit_rate_alpha: float = 0.10  # EMA coefficient for cluster hit rate
+    cluster_hit_rate_alpha: float = 0.2  # EMA coefficient for cluster hit rate
     route_score_bonus_scale: float = 0.15  # Scale for route score bonus in cluster selection
     
     # Adaptive gate adjustment
@@ -335,7 +335,7 @@ class AgentMemorySim:
         # Cluster hit rate tracking for expected recall estimation
         self.cluster_visit_counts = np.zeros(self.max_memories, dtype=np.float64)
         self.cluster_hit_counts = np.zeros(self.max_memories, dtype=np.float64)
-        self.cluster_hit_rate_ema = np.full(self.max_memories, 0.5, dtype=np.float64)
+        self.cluster_hit_rate_ema = np.zeros(self.max_memories, dtype=np.float64)
         
         # Consecutive empty tracking for aggressive gate adjustment
         self.consecutive_empty_count = 0
@@ -923,11 +923,17 @@ class AgentMemorySim:
         best_id, best_sim, ops = self._find_best_cluster(vec, super_topn=self.p.supercluster_topn_add)
         self.sim_ops_add_total += ops
 
-        sim_results: List[Tuple[int, float]] = []
         if best_id is not None and best_sim >= self.p.cluster_sim:
             sim_results, ops2 = self._find_sim_in_cluster(
                 vec, best_id, only_hot=True, max_results=self.p.fast_scan_topk
             )
+            self.sim_ops_add_total += ops2
+            if not sim_results:
+                fallback, ops3 = self._find_sim_all_hot(vec, max_results=self.p.fast_scan_topk)
+                self.sim_ops_add_total += ops3
+                sim_results = fallback
+        else:
+            sim_results, ops2 = self._find_sim_all_hot(vec, max_results=self.p.fast_scan_topk)
             self.sim_ops_add_total += ops2
 
         if sim_results and sim_results[0][1] >= self.online_merge_limit:
@@ -957,6 +963,7 @@ class AgentMemorySim:
 
         self._attach_cluster(vec, new_idx)
         self._add_new_with_cluster_cap(new_idx)
+        self._neighbors_add_heat(vec, turn, new_idx)
         self.new_count += 1
 
     def _register_turn_topic(self, turn: int, topic_id: int) -> None:
@@ -1336,19 +1343,6 @@ class AgentMemorySim:
                     self.learned_min_gate * self.p.empty_gate_decay
                 )
             self.total_empty_queries += 1
-
-    def _post_retrieve_feedback(
-        self,
-        candidate_samples: List[Tuple[int, int, float, float]],
-        hit_flag: bool,
-    ) -> None:
-        clusters_seen = set()
-        for _mem_idx, cid, _sim, _effective in candidate_samples:
-            if cid < 0 or cid in clusters_seen:
-                continue
-            self._update_cluster_hit_rate(cid, hit_flag)
-            clusters_seen.add(cid)
-        self._adjust_gate_on_result(hit_flag)
     # ========================================================================
 
     def _top_probe_clusters(
@@ -1565,6 +1559,19 @@ class AgentMemorySim:
                     if not self._soft_gate_filter(sim, min_gate):
                         break
 
+            if not scanned_any:
+                fallback, ops2 = self._find_sim_all_hot(qv, max_results=max_memory * 2)
+                sim_ops += ops2
+                for mem_idx, sim in fallback:
+                    sim_pos = max(0.0, sim)
+                    cid = int(self.cluster_of[mem_idx])
+                    effective = (sim_pos ** power) * weight
+                    update_mem_best(mem_idx, sim, effective, cid, "hot")
+
+                    # EnhancedWeak: Use soft gate filter
+                    if not self._soft_gate_filter(sim, min_gate):
+                        break
+
             # Topic cache candidates do not participate in heat competition.
             if current_topic is not None and self.topic_cache_topic == current_topic and self.topic_cache_mem:
                 cache_idx = np.asarray(
@@ -1578,10 +1585,10 @@ class AgentMemorySim:
                     for oi in order:
                         sim = float(cache_sims[oi])
                         sim_pos = max(0.0, sim)
+                        if sim < min_gate:
+                            break
                         mem_idx = int(cache_idx[oi])
-                        effective = (sim_pos ** power) * weight
-                        if sim >= min_gate:
-                            effective *= self.p.topic_cache_weight
+                        effective = (sim ** power) * weight * self.p.topic_cache_weight
                         cid = int(self.cluster_of[mem_idx])
                         update_mem_best(mem_idx, sim, effective, cid, "cache")
 
@@ -1643,7 +1650,6 @@ class AgentMemorySim:
             candidate_samples = []
 
         if not turn_best:
-            self._post_retrieve_feedback(candidate_samples, False)
             return [], sim_ops, {
                 "candidate_samples": candidate_samples,
                 "selected_memories": [],
@@ -1690,10 +1696,6 @@ class AgentMemorySim:
                     for t in selected_turns
                     if t in turn_mem and self.turn_topics[t - 1] == target_topic
                 ]
-            hits_same_topics = 0
-            if current_topic is not None:
-                hits_same_topics = sum(1 for t in selected_turns if self.turn_topics[t - 1] == current_topic)
-            self._post_retrieve_feedback(candidate_samples, hits_same_topics > 0)
             return selected_turns, sim_ops, {
                 "candidate_samples": candidate_samples,
                 "selected_memories": selected_memories,
@@ -1761,10 +1763,6 @@ class AgentMemorySim:
                 for t in selected_turns
                 if t in turn_mem and self.turn_topics[t - 1] == target_topic
             ]
-        hits_same_topics = 0
-        if current_topic is not None:
-            hits_same_topics = sum(1 for t in selected_turns if self.turn_topics[t - 1] == current_topic)
-        self._post_retrieve_feedback(candidate_samples, hits_same_topics > 0)
         return selected_turns, sim_ops, {
             "candidate_samples": candidate_samples,
             "selected_memories": selected_memories,
@@ -1775,7 +1773,7 @@ class AgentMemorySim:
     def _apply_refinement(
         self,
         turn: int,
-        current_topic: Optional[int],
+        target_topic: Optional[int],
         hits_all: int,
         candidate_samples: List[Tuple[int, int, float, float]],
         selected_memories: List[int],
@@ -1790,91 +1788,39 @@ class AgentMemorySim:
         if rp <= 0.0:
             return
 
-        if current_topic is None or not candidate_samples:
-            return
-
         self.refinement_events += 1
+        hit = hits_all > 0
 
-        pos_set: Set[int] = set()
-        neg_set: Set[int] = set()
-        for mem_idx in selected_memories:
-            mem_topic = self._dominant_memory_topic(mem_idx)
-            if mem_topic is None:
-                continue
-            if mem_topic == current_topic:
-                pos_set.add(mem_idx)
-            elif self.topic.topic_similarity(mem_topic, current_topic) >= self.p.topic_sim_threshold:
-                neg_set.add(mem_idx)
+        # EnhancedWeak: Update cluster hit rates
+        clusters_seen = set()
+        for mem_idx, cid, sim, effective in candidate_samples:
+            if cid >= 0 and cid not in clusters_seen:
+                self._update_cluster_hit_rate(cid, hit)
+                clusters_seen.add(cid)
 
-        pos_sims: List[float] = []
-        neg_sims: List[float] = []
-        clu_pos: Dict[int, float] = {}
-        clu_neg: Dict[int, float] = {}
+        # EnhancedWeak: Adjust gate based on result
+        self._adjust_gate_on_result(hit)
 
         # Update route scores for clusters
-        route_lr = self.p.refinement_route_lr * (0.18 + 0.82 * rp)
-        gate_lr = self.p.refinement_gate_lr * (rp ** 1.6)
-        merge_lr = self.p.refinement_merge_lr * (0.12 + 0.88 * rp)
-        if route_lr <= 0.0 and gate_lr <= 0.0 and merge_lr <= 0.0:
-            return
+        route_lr = self.p.refinement_route_lr * rp
+        gate_lr = self.p.refinement_gate_lr * rp
 
         for mem_idx, cid, sim, effective in candidate_samples:
             if cid < 0 or cid >= len(self.clusters):
                 continue
-            score = max(1e-6, float(effective) if effective is not None else float(sim))
-            if mem_idx in pos_set:
-                pos_sims.append(float(sim))
-                clu_pos[cid] = clu_pos.get(cid, 0.0) + score
-            elif mem_idx in neg_set:
-                neg_sims.append(float(sim))
-                clu_neg[cid] = clu_neg.get(cid, 0.0) + score
-
-        route_decay = 1.0 - min(0.12, route_lr * 0.22)
-        for cid in set(clu_pos) | set(clu_neg):
-            pos_w = clu_pos.get(cid, 0.0)
-            neg_w = clu_neg.get(cid, 0.0)
-            total = pos_w + neg_w
-            if total <= 0.0:
+            
+            mem_topic = self._dominant_memory_topic(mem_idx)
+            if mem_topic is None:
                 continue
-            signal = (pos_w - neg_w) / total
+            
+            is_target = mem_topic == target_topic
+            delta = 1.0 if is_target else -0.3
+            
             old_score = float(self.cluster_route_score[cid])
-            self.cluster_route_score[cid] = float(np.clip(old_score * route_decay + route_lr * signal, -2.0, 2.0))
+            self.cluster_route_score[cid] = float(
+                np.clip(old_score + route_lr * delta, -1.0, 1.0)
+            )
             self.cluster_route_seen[cid] += 1
-
-        gate_target = float(self.learned_min_gate)
-        if pos_sims and neg_sims:
-            pos_floor = float(np.quantile(np.asarray(pos_sims, dtype=np.float64), 0.20))
-            neg_ceil = float(np.quantile(np.asarray(neg_sims, dtype=np.float64), 0.80))
-            gate_target = 0.5 * (pos_floor + neg_ceil)
-        elif neg_sims:
-            gate_target = gate_target + (0.035 if hits_all <= 0 else 0.018)
-        elif pos_sims:
-            gate_target = gate_target - (0.020 if hits_all <= 0 else 0.008)
-
-        start_gate = float(self.p.learning_min_sim_gate_start)
-        end_gate = float(self.p.min_sim_gate)
-        gate_lo = max(0.05, min(start_gate, end_gate) - 0.22)
-        gate_hi = min(0.90, end_gate + 0.08)
-        gate_target = min(gate_hi, max(gate_lo, gate_target))
-        self.learned_min_gate = float(self.learned_min_gate + gate_lr * (gate_target - self.learned_min_gate))
-
-        pos_n = len(pos_sims)
-        neg_n = len(neg_sims)
-        merge_target = float(self.p.merge_limit)
-        neg_ratio = neg_n / max(1, pos_n + neg_n)
-        if neg_ratio >= 0.66:
-            merge_target = self.p.merge_limit - 0.055
-        elif neg_ratio >= 0.52:
-            merge_target = self.p.merge_limit - 0.030
-        elif hits_all <= 0 and pos_n <= 0:
-            merge_target = self.p.merge_limit + 0.020
-        elif pos_n > neg_n * 1.4:
-            merge_target = self.p.merge_limit + 0.010
-
-        merge_lo = max(0.50, self.p.merge_limit - 0.10)
-        merge_hi = min(0.995, self.p.merge_limit + 0.03)
-        merge_target = min(merge_hi, max(merge_lo, merge_target))
-        self.online_merge_limit = float(self.online_merge_limit + merge_lr * (merge_target - self.online_merge_limit))
 
     def _eval_query(self, selected_turns: List[int], current_turn: int, target_topic: int) -> Tuple[int, int]:
         k = len(selected_turns)
@@ -2184,7 +2130,7 @@ class AgentMemorySim:
 
                 self._apply_refinement(
                     turn=turn,
-                    current_topic=current_topic,
+                    target_topic=target_topic,
                     hits_all=hits_all,
                     candidate_samples=debug.get("candidate_samples", []),
                     selected_memories=debug.get("selected_memories", []),
