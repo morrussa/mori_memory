@@ -84,80 +84,6 @@ local function sync_counts(c)
     c.cold_count = #(c.cold_members or {})
 end
 
-local function type_cfg()
-    return ((config.settings or {}).memory_types or {})
-end
-
-local function cluster_type_bonus()
-    return tonumber(type_cfg().cluster_type_bonus) or 0.0
-end
-
-local function memory_type_name(line)
-    local ok_mem, memory = pcall(require, "module.memory.store")
-    if ok_mem and memory and memory.get_type_name then
-        return memory.get_type_name(line)
-    end
-    return tostring(type_cfg().default or "Fact")
-end
-
-local function ensure_type_counts(c)
-    if not c then return end
-
-    local total_members = #(c.members or {})
-    local need_rebuild = (c.type_counts == nil)
-    if not need_rebuild then
-        local counted = 0
-        for _, n in pairs(c.type_counts) do
-            counted = counted + math.max(0, math.floor(tonumber(n) or 0))
-        end
-        need_rebuild = counted ~= total_members
-    end
-    if not need_rebuild then
-        return
-    end
-
-    c.type_counts = {}
-    for _, line in ipairs(c.members or {}) do
-        local type_name = memory_type_name(line)
-        if type_name and type_name ~= "" then
-            c.type_counts[type_name] = (c.type_counts[type_name] or 0) + 1
-        end
-    end
-end
-
-local function adjust_type_count(c, type_name, delta)
-    if not c then return end
-    local key = tostring(type_name or "")
-    if key == "" then return end
-
-    ensure_type_counts(c)
-    local next_value = (tonumber((c.type_counts or {})[key]) or 0) + math.floor(tonumber(delta) or 0)
-    if next_value > 0 then
-        c.type_counts[key] = next_value
-    else
-        c.type_counts[key] = nil
-    end
-end
-
-local function cluster_type_affinity_value(c, preferred_type)
-    local type_name = tostring(preferred_type or "")
-    if type_name == "" or not c then
-        return 0.0
-    end
-
-    ensure_type_counts(c)
-    local total = #(c.members or {})
-    if total <= 0 then
-        return 0.0
-    end
-
-    local count = tonumber((c.type_counts or {})[type_name]) or 0.0
-    if count <= 0 then
-        return 0.0
-    end
-    return count / total
-end
-
 local function set_member_hot_state(c, line, to_hot)
     ensure_member_tables(c)
     line = tonumber(line)
@@ -205,7 +131,6 @@ local function rebuild_cluster_member_views(c)
     c.cold_members = {}
     c._hot_pos = {}
     c._cold_pos = {}
-    c.type_counts = {}
 
     local dedup_members = {}
     local seen = {}
@@ -219,7 +144,6 @@ local function rebuild_cluster_member_views(c)
             else
                 add_member(c.cold_members, c._cold_pos, line)
             end
-            adjust_type_count(c, memory.get_type_name(line), 1)
         end
     end
     c.members = dedup_members
@@ -589,17 +513,8 @@ function M.super_candidate_clusters(vec, base_topn)
 end
 
 function M.find_best_cluster(vec, opts)
-    opts = opts or {}
     local cfg = (config.settings or {}).cluster or {}
-    local topn = tonumber(opts.super_topn) or tonumber(cfg.supercluster_topn_add) or 3
-    local strict_type = opts.strict_type == true
-    local preferred_type = tostring(opts.preferred_type or "")
-    if preferred_type ~= "" then
-        local ok_mem, memory = pcall(require, "module.memory.store")
-        if ok_mem and memory and memory.match_type_name then
-            preferred_type = memory.match_type_name(preferred_type) or preferred_type
-        end
-    end
+    local topn = tonumber((opts or {}).super_topn) or tonumber(cfg.supercluster_topn_add) or 3
 
     local candidates, ops0 = M.super_candidate_clusters(vec, topn)
     if #candidates <= 0 then
@@ -607,51 +522,37 @@ function M.find_best_cluster(vec, opts)
     end
 
     local best_id, best_sim = nil, -1
-    local best_rank = -math.huge
     local ops = ops0
     for _, id in ipairs(candidates) do
         local c = M.clusters[id]
         if c and c.centroid then
             local sim = tool.cosine_similarity(vec, c.centroid)
             ops = ops + 1
-            local affinity = cluster_type_affinity_value(c, preferred_type)
-            if (not strict_type) or preferred_type == "" or affinity > 0.0 then
-                local rank = sim + affinity * cluster_type_bonus()
-                if rank > best_rank or (rank == best_rank and sim > best_sim) then
-                    best_rank = rank
-                    best_sim = sim
-                    best_id = id
-                end
+            if sim > best_sim then
+                best_sim = sim
+                best_id = id
             end
         end
     end
     return best_id, best_sim, ops
 end
 
-function M.add(vec, mem_index, opts)
+function M.add(vec, mem_index)
     local saver = require("module.memory.saver")
     local memory = require("module.memory.store")
-    opts = opts or {}
     if #vec == 0 then
         print("[Cluster] Error: 收到空向量")
         return nil
     end
 
     local th = config.settings.cluster.cluster_sim or 0.75
-    local preferred_type = memory.match_type_name(opts.preferred_type) or memory.get_type_name(mem_index)
-    local strict_type = opts.strict_type == true
-    local best_id, sim = M.find_best_cluster(vec, {
-        super_topn = config.settings.cluster.supercluster_topn_add,
-        preferred_type = preferred_type,
-        strict_type = strict_type,
-    })
+    local best_id, sim = M.find_best_cluster(vec, { super_topn = config.settings.cluster.supercluster_topn_add })
 
     local assigned
     if best_id and sim >= th then
         local c = M.clusters[best_id]
         ensure_member_tables(c)
         table.insert(c.members, mem_index)
-        adjust_type_count(c, preferred_type, 1)
         set_member_hot_state(c, mem_index, true)
         M.line_to_cluster[mem_index] = best_id
         assigned = best_id
@@ -668,8 +569,7 @@ function M.add(vec, mem_index, opts)
             hot_count = 1,
             cold_count = 0,
             heat = 0,
-            is_hot_cluster = true,
-            type_counts = preferred_type ~= "" and { [preferred_type] = 1 } or {}
+            is_hot_cluster = true
         }
         refresh_hot_flag(id, M.clusters[id])
         M.line_to_cluster[mem_index] = id
@@ -729,26 +629,6 @@ function M.on_memory_heat_change(mem_line, old_heat, new_heat)
     return id, changed
 end
 
-function M.on_memory_type_change(mem_line, old_type, new_type)
-    local saver = require("module.memory.saver")
-    local id = M.line_to_cluster[mem_line]
-    local c = id and M.clusters[id] or nil
-    if not c then
-        return nil, false
-    end
-
-    local from = tostring(old_type or "")
-    local to = tostring(new_type or "")
-    if from == to then
-        return id, false
-    end
-
-    adjust_type_count(c, from, -1)
-    adjust_type_count(c, to, 1)
-    saver.mark_dirty()
-    return id, true
-end
-
 function M.get_hot_ratio(id)
     local c = M.clusters[id]
     if not c then return 0 end
@@ -780,8 +660,6 @@ function M.find_sim_in_cluster(vec, cluster_id, opts)
     opts = opts or {}
     local only_hot = opts.only_hot == true
     local only_cold = opts.only_cold == true
-    local allowed_types = opts.allowed_types
-    local blocked_types = opts.blocked_types
     local max_results = tonumber(opts.max_results)
     if max_results and max_results <= 0 then
         max_results = nil
@@ -813,34 +691,27 @@ function M.find_sim_in_cluster(vec, cluster_id, opts)
     local use_topk = max_results ~= nil
 
     for _, idx in ipairs(scan_members) do
-        local type_ok = true
-        if allowed_types or blocked_types then
-            type_ok = select(1, memory.type_matches(idx, allowed_types, blocked_types))
-        end
-
-        if type_ok then
         local mem_vec = shard.ptr_by_line and shard.ptr_by_line[idx] or nil
-            if mem_vec then
-                local sim = tool.cosine_similarity(qv, mem_vec)
-                if use_topk then
-                    if #topk < max_results then
-                        topk[#topk + 1] = { index = idx, similarity = sim }
-                        local j = #topk
-                        while j > 1 and topk[j].similarity < topk[j - 1].similarity do
-                            topk[j], topk[j - 1] = topk[j - 1], topk[j]
-                            j = j - 1
-                        end
-                    elseif sim > topk[1].similarity then
-                        topk[1] = { index = idx, similarity = sim }
-                        local j = 1
-                        while j < #topk and topk[j].similarity > topk[j + 1].similarity do
-                            topk[j], topk[j + 1] = topk[j + 1], topk[j]
-                            j = j + 1
-                        end
+        if mem_vec then
+            local sim = tool.cosine_similarity(qv, mem_vec)
+            if use_topk then
+                if #topk < max_results then
+                    topk[#topk + 1] = { index = idx, similarity = sim }
+                    local j = #topk
+                    while j > 1 and topk[j].similarity < topk[j - 1].similarity do
+                        topk[j], topk[j - 1] = topk[j - 1], topk[j]
+                        j = j - 1
                     end
-                else
-                    results[#results + 1] = { index = idx, similarity = sim }
+                elseif sim > topk[1].similarity then
+                    topk[1] = { index = idx, similarity = sim }
+                    local j = 1
+                    while j < #topk and topk[j].similarity > topk[j + 1].similarity do
+                        topk[j], topk[j + 1] = topk[j + 1], topk[j]
+                        j = j + 1
+                    end
                 end
+            else
+                results[#results + 1] = { index = idx, similarity = sim }
             end
         end
     end
@@ -858,24 +729,6 @@ end
 
 function M.get_cluster_id_for_line(mem_line)
     return M.line_to_cluster[mem_line]
-end
-
-function M.get_cluster_type_affinity(cluster_id, preferred_type)
-    local c = M.clusters[cluster_id]
-    if not c then
-        return 0.0
-    end
-
-    local type_name = tostring(preferred_type or "")
-    if type_name == "" then
-        return 0.0
-    end
-
-    local ok_mem, memory = pcall(require, "module.memory.store")
-    if ok_mem and memory and memory.match_type_name then
-        type_name = memory.match_type_name(type_name) or type_name
-    end
-    return cluster_type_affinity_value(c, type_name)
 end
 
 function M.rebuild_superclusters()

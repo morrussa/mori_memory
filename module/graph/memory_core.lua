@@ -35,120 +35,57 @@ local function run_chat(prompt, max_tokens, temperature, seed)
     return tostring(py_pipeline:generate_chat_sync(messages, params) or "")
 end
 
-local function normalize_fact_item(item, max_chars)
-    local fact = ""
-    local type_name = memory.get_default_type_name()
-
-    if type(item) == "string" then
-        fact = item
-    elseif type(item) == "table" then
-        fact = item.fact or item.text or item.value or item.content or ""
-        type_name = memory.normalize_type_name(item.type or item.kind or item.statement_type)
-    else
-        return nil
-    end
-
-    fact = sanitize_text(fact):gsub("%s+", " ")
-    fact = util.trim(fact)
-    if fact == "" or fact:lower() == "none" then
-        return nil
-    end
-    if #fact > max_chars then
-        fact = sanitize_text(fact:sub(1, max_chars))
-        fact = util.trim(fact)
-    end
-    if fact == "" then
-        return nil
-    end
-
-    return {
-        fact = fact,
-        type = type_name,
-    }
-end
-
 local function parse_fact_array(raw, max_items, max_chars)
-    local limit_items = math.max(1, math.floor(tonumber(max_items) or 8))
-    local limit_chars = math.max(8, math.floor(tonumber(max_chars) or 96))
+    local parsed, _err = tool.parse_lua_string_array_strict(raw or "", {
+        max_items = math.max(1, math.floor(tonumber(max_items) or 8)),
+        max_item_chars = math.max(8, math.floor(tonumber(max_chars) or 96)),
+        must_full = true,
+        extract_first_on_fail = true,
+    })
+    if not parsed then
+        return {}
+    end
+
     local out = {}
     local seen = {}
-
-    local function push_items(parsed)
-        if type(parsed) ~= "table" then
-            return
-        end
-        for i = 1, math.min(#parsed, limit_items) do
-            local normalized = normalize_fact_item(parsed[i], limit_chars)
-            if normalized then
-                local key = normalized.type .. "\0" .. normalized.fact
-                if not seen[key] then
-                    seen[key] = true
-                    out[#out + 1] = normalized
-                    if #out >= limit_items then
-                        break
-                    end
-                end
-            end
-        end
-    end
-
-    local parsed = select(1, util.parse_lua_table_literal(raw or ""))
-    push_items(parsed)
-
-    if #out <= 0 then
-        local legacy, _err = tool.parse_lua_string_array_strict(raw or "", {
-            max_items = limit_items,
-            max_item_chars = limit_chars,
-            must_full = true,
-            extract_first_on_fail = true,
-        })
-        push_items(legacy)
-    end
-
-    if #out > limit_items then
-        for i = #out, limit_items + 1, -1 do
-            table.remove(out, i)
+    for _, item in ipairs(parsed) do
+        local fact = util.trim(item)
+        if fact ~= "" and fact:lower() ~= "none" and (not seen[fact]) then
+            seen[fact] = true
+            out[#out + 1] = fact
         end
     end
     return out
-end
-
-local function allowed_type_list_literal()
-    return util.encode_lua_value(memory.get_allowed_type_names(), 0)
 end
 
 local function build_extract_prompt(user_input, assistant_text)
     return string.format([[
 你是长期记忆原子事实提取器。
 请从下面一轮对话提取“可复用且长期稳定”的事实。
-输出格式必须且只能是 Lua 数组，优先使用表项：
-{{fact="...",type="Constraint"},{fact="...",type="Preference"}} 或 {"none"}。
-`type` 只能从以下候选中选择：%s
+输出格式必须且只能是 Lua 字符串数组：{"fact1","fact2"} 或 {"none"}。
 禁止输出解释、markdown、代码块。
 
 用户输入：%s
 助手回复：%s
-]], allowed_type_list_literal(), user_input, assistant_text)
+]], user_input, assistant_text)
 end
 
 local function build_verify_prompt(user_input, assistant_text, facts)
     return string.format([[
 请校验下列原子事实是否得到当前轮对话支持，删除不可靠项。
-输出格式必须且只能是 Lua 数组，保留原有 `fact` 和 `type` 字段。
-`type` 只能从以下候选中选择：%s
+输出格式必须且只能是 Lua 字符串数组。
 
 用户输入：%s
 助手回复：%s
 候选事实：%s
-]], allowed_type_list_literal(), user_input, assistant_text, util.encode_lua_value(facts, 0))
+]], user_input, assistant_text, util.encode_lua_value(facts, 0))
 end
 
 local function build_repair_prompt(raw)
     return string.format([[
-把下面文本修复成合法 Lua 数组，仅输出数组本体。
-优先输出 {fact="...",type="..."} 的数组，`type` 只能从以下候选中选择：%s。
+把下面文本修复成合法 Lua 字符串数组，仅输出数组本体。
 文本：%s
-]], allowed_type_list_literal(), tostring(raw or ""))
+]], tostring(raw or ""))
 end
 
 function M.extract_atomic_items(user_input, assistant_text)
@@ -207,19 +144,14 @@ function M.save_ingest_items(items, mem_turn)
     end
 
     local saved = 0
-    for _, item in ipairs(items or {}) do
-        local normalized = normalize_fact_item(item, math.huge)
-        if normalized then
-            local fact_vec = tool.get_embedding_passage(normalized.fact)
-            local line, err = memory.add_memory(fact_vec, mem_turn, {
-                type_name = normalized.type,
-            })
-            if line then
-                heat.neighbors_add_heat(fact_vec, mem_turn, line)
-                saved = saved + 1
-            else
-                print(string.format("[GraphMemory][WARN] add memory failed (%s)", tostring(err)))
-            end
+    for _, fact in ipairs(items or {}) do
+        local fact_vec = tool.get_embedding_passage(fact)
+        local line, err = memory.add_memory(fact_vec, mem_turn)
+        if line then
+            heat.neighbors_add_heat(fact_vec, mem_turn, line)
+            saved = saved + 1
+        else
+            print(string.format("[GraphMemory][WARN] add memory failed (%s)", tostring(err)))
         end
     end
 

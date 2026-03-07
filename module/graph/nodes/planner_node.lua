@@ -219,19 +219,9 @@ end
 local function select_planner_messages(state)
     local runtime_messages = ((((state or {}).messages) or {}).runtime_messages) or {}
     if type(runtime_messages) == "table" and #runtime_messages > 0 then
-        local base_messages = context_builder.build_chat_messages(state) or {}
         local out = {}
-        if type(base_messages[1]) == "table" and tostring((base_messages[1] or {}).role or "") == "system" then
-            out[1] = copy_runtime_message(base_messages[1])
-        end
-        if #base_messages > 1 then
-            local last_base = base_messages[#base_messages]
-            if type(last_base) == "table" and tostring((last_base or {}).role or "") == "user" then
-                out[#out + 1] = copy_runtime_message(last_base)
-            end
-        end
-        for _, row in ipairs(runtime_messages) do
-            out[#out + 1] = copy_runtime_message(row)
+        for i, row in ipairs(runtime_messages) do
+            out[i] = copy_runtime_message(row)
         end
         return out
     end

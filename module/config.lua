@@ -58,17 +58,6 @@ local DEFAULT_SETTINGS = {
         },
         recall = {
             enable_on_respond = false,
-            legacy_trigger_enabled = false,
-            reentry = {
-                enabled = true,
-                max_per_turn = 1,
-                min_anchor_count = 3,
-            },
-            policy = {
-                max_tokens = 192,
-                temperature = 0.0,
-                seed = 23,
-            },
         },
         streaming = {
             token_chunk_chars = 24,
@@ -177,60 +166,6 @@ local DEFAULT_SETTINGS = {
             debug_trace = false,
         },
     },
-    memory_types = {
-        default = "Fact",
-        allowed = {
-            { name = "User", class = "stable", recent_weight = 0.00 },
-            { name = "Concept", class = "stable", recent_weight = 0.00 },
-            { name = "Constraint", class = "stable", recent_weight = 0.00, head_visible = true, head_bias = 0.18 },
-            { name = "Project", class = "rolling", recent_weight = 0.10 },
-            { name = "Preference", class = "rolling", recent_weight = 0.10 },
-            { name = "Decision", class = "rolling", recent_weight = 0.08, current_topic_boost = 0.12 },
-            { name = "Artifact", class = "mode_sensitive", recent_weight = 0.04, coding_recent_weight = 0.28, coding_frontier_bias = 0.18 },
-            { name = "Status", class = "frontier", recent_weight = 0.38, frontier_bias = 0.22 },
-            { name = "Blocker", class = "frontier", recent_weight = 0.46, frontier_bias = 0.30 },
-            { name = "Attempt", class = "frontier", recent_weight = 0.52, frontier_bias = 0.08, stale_penalty = 0.18 },
-            { name = "Verification", class = "frontier", recent_weight = 0.48, frontier_bias = 0.26 },
-            { name = "Fact", class = "stable", recent_weight = 0.02 },
-        },
-        aliases = {
-            You = "User",
-            you = "User",
-            Self = "User",
-            self = "User",
-            Person = "User",
-            person = "User",
-            People = "User",
-            people = "User",
-            File = "Artifact",
-            file = "Artifact",
-            Code = "Artifact",
-            code = "Artifact",
-            Document = "Artifact",
-            document = "Artifact",
-            Company = "Concept",
-            company = "Concept",
-            Org = "Concept",
-            org = "Concept",
-            Organization = "Concept",
-            organization = "Concept",
-            PreferenceFact = "Preference",
-            user = "User",
-            concept = "Concept",
-            project = "Project",
-            artifact = "Artifact",
-            preference = "Preference",
-            constraint = "Constraint",
-            decision = "Decision",
-            status = "Status",
-            blocker = "Blocker",
-            attempt = "Attempt",
-            verification = "Verification",
-            fact = "Fact",
-        },
-        cluster_type_bonus = 0.08,
-        merge_strict = true,
-    },
     api = {
         multipart_only = true,
         stream_event_mode = "sse_event",
@@ -300,9 +235,6 @@ local DEFAULT_SETTINGS = {
         topic_cross_penalty = 0.9,
         topic_sim_threshold = 0.7,
         topic_cross_quota_ratio = 0.25, -- topic 约束召回时，跨 topic 兜底配额比例（0~0.5）
-        topic_coverage_alpha = 0.45, -- topic_score = m1 + alpha * (1 - exp(-beta * coverage))
-        topic_coverage_beta = 1.0, -- coverage 奖励的饱和速度，越大越快饱和
-        topic_coverage_min_sim = 0.60, -- 子查询命中某 memory 的 sim 达到该值后，才会记入 topic coverage
         max_keywords = 4,
         keyword_weight = 0.55,    -- 关键词权重
         keyword_queries = 2,      -- 每轮 query 展开的检索向量数量（含主向量）
@@ -324,15 +256,6 @@ local DEFAULT_SETTINGS = {
         preload_heat_amount = 25000, -- 旧逻辑兼容字段（簇缓存模式不使用）
         preload_topic_confidence = 0.50,
         preload_use_vector_prediction = true,
-        topic_chain_preload_topn = 2, -- 当前 topic 的 chain 邻居里，最多再预取多少个历史 topic
-        topic_chain_preload_min_score = 0.42, -- chain 相似度低于该值时，不参与 preload
-        topic_chain_candidate_topn = 4, -- topic 聚合后，chain-aware 重排时参考多少个链邻居
-        topic_chain_candidate_min_score = 0.42, -- 低于该值的 topic_chain 边不参与候选聚合
-        topic_chain_recent_score_ratio = 0.88, -- 最近 topic 只有在分数接近最佳 topic 时才可前置
-        topic_chain_recent_score_margin = 0.12, -- 与 chain 最优分差在该范围内，也视为“质量足够接近”
-        topic_chain_rep_bonus = 0.08, -- 同一 chain 中最近代表 topic 的轻微加分
-        topic_chain_member_penalty = 0.04, -- 同一 chain 中旧但同质 topic 的轻微降权
-        topic_chain_current_bonus = 0.06, -- 落在当前 topic_chain 上的 topic 的额外加分
         preload_max_io_per_turn = 8, -- 每回合最多预加载簇数
         preload_low_hot_ratio_threshold = 0.15,
         soft_gate_enabled = true,
@@ -432,12 +355,6 @@ local DEFAULT_SETTINGS = {
         min_topic_length =2,--防止话题被切的太碎
         summary_max_tokens = 192, -- topic 摘要生成的最大输出长度（默认加大，减少截断）。
         rebuild = true,--当异常退出时，如果rebuild为true，那么就找到文件一开始写的current_turn上一个topic的末尾，然后自己根据history.txt的输出自动重建整个topic。这个过程会阻塞主pipeline，因为如果不阻塞就不安全。
-        fingerprint_topk = 6, -- topic fingerprint 只保留命中最多的 top-k cluster
-        chain_topn = 4, -- topic_chain 默认返回多少个相邻 topic
-        chain_min_score = 0.38, -- topic_chain 的最小相似度阈值
-        chain_centroid_weight = 0.55, -- chain score 里 centroid 相似度权重
-        chain_hist_weight = 0.45, -- chain score 里 cluster histogram overlap 权重
-        chain_dominant_bonus = 0.05, -- dominant cluster 相同的轻微加成
     },
     storage_v3 = {
         root = "memory/v3",

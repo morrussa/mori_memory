@@ -361,110 +361,12 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.context.policy_context = state.context.policy_context or ""
     state.context.applied_policy = state.context.applied_policy or ""
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
-    state.recall = state.recall or {
-        policy = {
-            mode = "",
-            confidence = 0,
-            force = false,
-            suppress = false,
-            preferred_type = "",
-            allowed_types = {},
-            blocked_types = {},
-            reason = "",
-            raw = "",
-            decided = false,
-        },
-        reentry = {
-            pending = false,
-            used = 0,
-            max_per_turn = 1,
-            kind = "",
-            phase = "",
-            reason = "",
-            source_error = "",
-            requested_by = "",
-            preferred_type = "",
-            allowed_types = {},
-            blocked_types = {},
-            anchors = {},
-            context = "",
-            last_kind = "",
-            last_phase = "",
-            last_source_error = "",
-            last_reason = "",
-            last_anchor_count = 0,
-        },
-        triggered = false,
-        context = "",
-        score = nil,
-    }
+    state.recall = state.recall or { triggered = false, context = "", score = nil }
     state.episode = state.episode or {
         current = { turn_index = 0, topic_anchor = "" },
         recent = { items = {}, summary = "", count = 0, latest_episode_id = "" },
         writeback = { written = false, episode_id = "" },
     }
-    state.recall.policy = state.recall.policy or {
-        mode = "",
-        confidence = 0,
-        force = false,
-        suppress = false,
-        preferred_type = "",
-        allowed_types = {},
-        blocked_types = {},
-        reason = "",
-        raw = "",
-        decided = false,
-    }
-    state.recall.policy.mode = tostring(state.recall.policy.mode or "")
-    state.recall.policy.confidence = tonumber(state.recall.policy.confidence) or 0
-    state.recall.policy.force = state.recall.policy.force == true
-    state.recall.policy.suppress = state.recall.policy.suppress == true
-    state.recall.policy.preferred_type = tostring(state.recall.policy.preferred_type or "")
-    state.recall.policy.allowed_types = state.recall.policy.allowed_types or {}
-    state.recall.policy.blocked_types = state.recall.policy.blocked_types or {}
-    state.recall.policy.reason = tostring(state.recall.policy.reason or "")
-    state.recall.policy.raw = tostring(state.recall.policy.raw or "")
-    state.recall.policy.decided = state.recall.policy.decided == true
-    state.recall.reentry = state.recall.reentry or {
-        pending = false,
-        used = 0,
-        max_per_turn = 1,
-        kind = "",
-        phase = "",
-        reason = "",
-        source_error = "",
-        requested_by = "",
-        preferred_type = "",
-        allowed_types = {},
-        blocked_types = {},
-        anchors = {},
-        context = "",
-        last_kind = "",
-        last_phase = "",
-        last_source_error = "",
-        last_reason = "",
-        last_anchor_count = 0,
-    }
-    state.recall.reentry.pending = state.recall.reentry.pending == true
-    state.recall.reentry.used = tonumber(state.recall.reentry.used) or 0
-    state.recall.reentry.max_per_turn = tonumber(state.recall.reentry.max_per_turn) or 1
-    state.recall.reentry.kind = tostring(state.recall.reentry.kind or "")
-    state.recall.reentry.phase = tostring(state.recall.reentry.phase or "")
-    state.recall.reentry.reason = tostring(state.recall.reentry.reason or "")
-    state.recall.reentry.source_error = tostring(state.recall.reentry.source_error or "")
-    state.recall.reentry.requested_by = tostring(state.recall.reentry.requested_by or "")
-    state.recall.reentry.preferred_type = tostring(state.recall.reentry.preferred_type or "")
-    state.recall.reentry.allowed_types = state.recall.reentry.allowed_types or {}
-    state.recall.reentry.blocked_types = state.recall.reentry.blocked_types or {}
-    state.recall.reentry.anchors = state.recall.reentry.anchors or {}
-    state.recall.reentry.context = tostring(state.recall.reentry.context or "")
-    state.recall.reentry.last_kind = tostring(state.recall.reentry.last_kind or "")
-    state.recall.reentry.last_phase = tostring(state.recall.reentry.last_phase or "")
-    state.recall.reentry.last_source_error = tostring(state.recall.reentry.last_source_error or "")
-    state.recall.reentry.last_reason = tostring(state.recall.reentry.last_reason or "")
-    state.recall.reentry.last_anchor_count = tonumber(state.recall.reentry.last_anchor_count) or 0
-    state.recall.triggered = state.recall.triggered == true
-    state.recall.context = tostring(state.recall.context or "")
     state.episode.current = state.episode.current or { turn_index = 0, topic_anchor = "" }
     state.episode.current.turn_index = tonumber(state.episode.current.turn_index) or 0
     state.episode.current.topic_anchor = tostring(state.episode.current.topic_anchor or "")

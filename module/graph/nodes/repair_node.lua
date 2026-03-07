@@ -1,6 +1,5 @@
 local util = require("module.graph.util")
 local config = require("module.config")
-local recall_reentry = require("module.graph.recall_reentry")
 
 local M = {}
 
@@ -65,7 +64,6 @@ function M.run(state, _ctx)
     state.repair.pending = false
     state.repair.retry_requested = true
     state.planner.tool_calls = {}
-    recall_reentry.request_from_repair(state)
     return state
 end
 
