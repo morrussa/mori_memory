@@ -16,6 +16,12 @@ local BREAK_LIMIT = T_CONF.break_limit or 0.45     -- 话语对断裂阈值 (论
 local CONFIRM_LIMIT = T_CONF.confirm_limit or 0.55 -- 话题无关确认阈值
 local MIN_TOPIC_LENGTH = T_CONF.min_topic_length or 2  -- 最小话题长度
 local SUMMARY_MAX_TOKENS = math.max(32, tonumber(T_CONF.summary_max_tokens) or 192)
+local FINGERPRINT_TOPK = math.max(1, tonumber(T_CONF.fingerprint_topk) or 6)
+local CHAIN_TOPN = math.max(1, tonumber(T_CONF.chain_topn) or 4)
+local CHAIN_MIN_SCORE = tonumber(T_CONF.chain_min_score) or 0.38
+local CHAIN_CENTROID_WEIGHT = math.max(0.0, tonumber(T_CONF.chain_centroid_weight) or 0.55)
+local CHAIN_HIST_WEIGHT = math.max(0.0, tonumber(T_CONF.chain_hist_weight) or 0.45)
+local CHAIN_DOMINANT_BONUS = math.max(0.0, tonumber(T_CONF.chain_dominant_bonus) or 0.05)
 
 local DO_REBUILD = T_CONF.rebuild
 local IDX_FILE = "memory/topic.bin"
@@ -26,17 +32,258 @@ local ACTIVE_LAST_MASK = 4
 
 -- ==================== 核心状态 ====================
 M.turn_vectors = {}       -- 缓存近期轮次的向量 (只保留必要的)
-M.topics = {}             -- 已完成的话题列表 {{start, end_, summary, centroid}, ...}
+M.topics = {}             -- 已完成的话题列表 {{start, end_, summary, centroid, fingerprint?}, ...}
 M.dialogues = {}          -- turn -> {user=, ai=}
 
+local function topic_start_key(start_turn)
+    local n = tonumber(start_turn)
+    if not n or n <= 0 then
+        return nil
+    end
+    return "S:" .. tostring(math.floor(n))
+end
+
+local function new_active_topic(start_turn)
+    local start_val = tonumber(start_turn)
+    if start_val and start_val > 0 then
+        start_val = math.floor(start_val)
+    else
+        start_val = nil
+    end
+    return {
+        start = start_val,      -- 起始轮次
+        head_centroid = nil,    -- 头质心
+        vectors = {},           -- 当前话题累积的向量 (用于最后生成 overall centroid)
+        tail_window = {},       -- 尾部滑动窗口
+        last_vec = nil,         -- 记录上一轮的向量，用于计算话语对相似度
+    }
+end
+
+local function empty_fingerprint()
+    return {
+        memory_count = 0,
+        cluster_count = 0,
+        dominant_cluster = nil,
+        top_clusters = {},
+    }
+end
+
+local function copy_fingerprint(fp)
+    local src = type(fp) == "table" and fp or empty_fingerprint()
+    local out = {
+        memory_count = math.max(0, math.floor(tonumber(src.memory_count) or 0)),
+        cluster_count = math.max(0, math.floor(tonumber(src.cluster_count) or 0)),
+        dominant_cluster = tonumber(src.dominant_cluster),
+        top_clusters = {},
+    }
+    for i, item in ipairs(src.top_clusters or {}) do
+        out.top_clusters[i] = {
+            cluster_id = math.floor(tonumber(item.cluster_id) or -1),
+            hits = math.max(0, math.floor(tonumber(item.hits) or 0)),
+            weight = math.max(0.0, tonumber(item.weight) or 0.0),
+        }
+    end
+    if not out.dominant_cluster and out.top_clusters[1] then
+        out.dominant_cluster = out.top_clusters[1].cluster_id
+    end
+    return out
+end
+
+local function memory_store()
+    local ok, memory = pcall(require, "module.memory.store")
+    if ok and memory then
+        return memory
+    end
+    return nil
+end
+
+local function turns_overlap_topic(turns, start_turn, end_turn)
+    if type(turns) ~= "table" then
+        return false
+    end
+    for _, raw_turn in ipairs(turns) do
+        local turn = tonumber(raw_turn)
+        if turn and turn >= start_turn and turn <= end_turn then
+            return true
+        end
+    end
+    return false
+end
+
+local function build_topic_fingerprint(topic_key, topk, start_turn, end_turn)
+    local memory = memory_store()
+    if not memory then
+        return empty_fingerprint()
+    end
+
+    local lines = nil
+    local start_num = tonumber(start_turn)
+    local end_num = tonumber(end_turn)
+    if start_num and end_num
+        and start_num > 0 and end_num >= start_num
+        and type(memory.iterate_all) == "function" then
+        lines = {}
+        local idx = 0
+        for mem in memory.iterate_all() do
+            idx = idx + 1
+            if mem and turns_overlap_topic(mem.turns, start_num, end_num) then
+                lines[#lines + 1] = idx
+            end
+        end
+    elseif type(memory.iter_topic_lines) == "function" then
+        lines = memory.iter_topic_lines(topic_key, false)
+    end
+
+    if type(lines) ~= "table" or #lines <= 0 then
+        return empty_fingerprint()
+    end
+
+    local cluster_counts = {}
+    local total = 0
+    for _, raw_line in ipairs(lines) do
+        local line = tonumber(raw_line)
+        if line and line > 0 then
+            local cid = nil
+            if memory.get_cluster_id then
+                cid = memory.get_cluster_id(line)
+            end
+            cid = math.floor(tonumber(cid) or -1)
+            if cid > 0 then
+                cluster_counts[cid] = (cluster_counts[cid] or 0) + 1
+                total = total + 1
+            end
+        end
+    end
+
+    if total <= 0 then
+        return empty_fingerprint()
+    end
+
+    local ranked = {}
+    local cluster_count = 0
+    for cid, hits in pairs(cluster_counts) do
+        cluster_count = cluster_count + 1
+        ranked[#ranked + 1] = { cluster_id = cid, hits = hits }
+    end
+    table.sort(ranked, function(a, b)
+        if a.hits == b.hits then
+            return a.cluster_id < b.cluster_id
+        end
+        return a.hits > b.hits
+    end)
+
+    local limit = math.min(math.max(1, math.floor(tonumber(topk) or FINGERPRINT_TOPK)), #ranked)
+    local top_clusters = {}
+    for i = 1, limit do
+        local item = ranked[i]
+        top_clusters[i] = {
+            cluster_id = item.cluster_id,
+            hits = item.hits,
+            weight = item.hits / total,
+        }
+    end
+
+    return {
+        memory_count = total,
+        cluster_count = cluster_count,
+        dominant_cluster = top_clusters[1] and top_clusters[1].cluster_id or nil,
+        top_clusters = top_clusters,
+    }
+end
+
+local function get_active_topic_centroid()
+    local cent = M.active_topic.head_centroid
+    if (not cent) and #M.active_topic.vectors > 0 then
+        cent = tool.average_vectors(M.active_topic.vectors)
+    end
+    return cent
+end
+
+local function ensure_topic_fingerprint(rec)
+    if type(rec) ~= "table" then
+        return empty_fingerprint()
+    end
+    if type(rec.fingerprint) == "table" then
+        return rec.fingerprint
+    end
+    rec.fingerprint = build_topic_fingerprint(
+        topic_start_key(rec.start),
+        FINGERPRINT_TOPK,
+        tonumber(rec.start),
+        tonumber(rec.end_) or tonumber(rec.start)
+    )
+    return rec.fingerprint
+end
+
+local function active_topic_fingerprint()
+    if not M.active_topic.start then
+        return empty_fingerprint()
+    end
+    return build_topic_fingerprint(topic_start_key(M.active_topic.start), FINGERPRINT_TOPK)
+end
+
+local function fingerprint_weight_map(fp)
+    local out = {}
+    local memory_count = math.max(1, math.floor(tonumber((fp or {}).memory_count) or 0))
+    for _, item in ipairs((fp or {}).top_clusters or {}) do
+        local cid = math.floor(tonumber(item.cluster_id) or -1)
+        if cid > 0 then
+            local weight = tonumber(item.weight)
+            if weight == nil then
+                weight = math.max(0.0, tonumber(item.hits) or 0.0) / memory_count
+            end
+            if weight > 0.0 then
+                out[cid] = weight
+            end
+        end
+    end
+    return out
+end
+
+local function fingerprint_overlap(fp_a, fp_b)
+    local a_map = fingerprint_weight_map(fp_a)
+    local b_map = fingerprint_weight_map(fp_b)
+    local overlap = 0.0
+    for cid, wa in pairs(a_map) do
+        local wb = b_map[cid]
+        if wb then
+            overlap = overlap + math.min(wa, wb)
+        end
+    end
+    return overlap
+end
+
+local function topic_chain_score(base_rec, cand_rec)
+    local centroid_sim = 0.0
+    if base_rec.centroid and cand_rec.centroid
+        and #base_rec.centroid > 0 and #cand_rec.centroid > 0 then
+        centroid_sim = math.max(0.0, tonumber(tool.cosine_similarity(base_rec.centroid, cand_rec.centroid)) or 0.0)
+    end
+
+    local base_fp = base_rec.fingerprint or empty_fingerprint()
+    local cand_fp = cand_rec.fingerprint or empty_fingerprint()
+    local hist_available = #(base_fp.top_clusters or {}) > 0 and #(cand_fp.top_clusters or {}) > 0
+    local hist_overlap = hist_available and fingerprint_overlap(base_fp, cand_fp) or 0.0
+
+    local centroid_weight = CHAIN_CENTROID_WEIGHT
+    local hist_weight = hist_available and CHAIN_HIST_WEIGHT or 0.0
+    local denom = centroid_weight + hist_weight
+    local score = 0.0
+    if denom > 0.0 then
+        score = (centroid_weight * centroid_sim + hist_weight * hist_overlap) / denom
+    end
+
+    if hist_available
+        and base_fp.dominant_cluster
+        and base_fp.dominant_cluster == cand_fp.dominant_cluster then
+        score = math.min(1.0, score + CHAIN_DOMINANT_BONUS)
+    end
+
+    return score, centroid_sim, hist_overlap
+end
+
 -- 当前活跃话题状态
-M.active_topic = {
-    start = nil,          -- 起始轮次
-    head_centroid = nil,  -- 头质心
-    vectors = {},         -- 当前话题累积的向量 (用于最后生成 overall centroid)
-    tail_window = {},     -- 尾部滑动窗口
-    last_vec = nil        -- [新增] 记录上一轮的向量，用于计算话语对相似度
-}
+M.active_topic = new_active_topic()
 
 M._last_processed_turn = 0
 
@@ -171,14 +418,14 @@ local function load_from_disk()
             offset = offset + last_len
         end
 
-        M.active_topic.start = active_start
+        M.active_topic = new_active_topic(active_start)
         M.active_topic.head_centroid = head_vec
         M.active_topic.tail_window = tail_vec and {tail_vec} or {}
         M.active_topic.last_vec = last_vec
         
         print(string.format("[Topic] 恢复活跃话题: %d - ?, LastVec=%s", active_start, last_vec and "Yes" or "No"))
     else
-        M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
+        M.active_topic = new_active_topic()
     end
     
     -- 清空旧 topics
@@ -213,7 +460,7 @@ local function rebuild_active_topic(current_turn, forced_start_turn)
     end
     
     -- 2. 重新嵌入并计算
-    M.active_topic = { start = start_turn, vectors = {}, tail_window = {}, last_vec = nil }
+    M.active_topic = new_active_topic(start_turn)
     
     print(string.format("[Topic] 正在从 history.txt 重建 Turn %d -> %d 的向量...", start_turn, current_turn))
     
@@ -300,7 +547,6 @@ local function close_current_topic(end_turn)
     local overall_centroid = tool.average_vectors(M.active_topic.vectors)
     
     -- 获取摘要
-    local key = M.active_topic.start .. "-" .. end_turn
     local summary = ""
     
     local dialog_texts = {}
@@ -321,13 +567,19 @@ local function close_current_topic(end_turn)
         start = M.active_topic.start,
         end_ = end_turn,
         summary = summary,
-        centroid = overall_centroid
+        centroid = overall_centroid,
+        fingerprint = build_topic_fingerprint(
+            topic_start_key(M.active_topic.start),
+            FINGERPRINT_TOPK,
+            tonumber(M.active_topic.start),
+            tonumber(end_turn)
+        ),
     })
     
     print(string.format("[Topic] 话题结束: %d-%d. 摘要: %s", M.active_topic.start, end_turn, summary))
     
     -- 重置状态
-    M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
+    M.active_topic = new_active_topic()
     local ok, err = save_to_disk()
     if not ok then
         print("[Topic][ERROR] 保存失败: " .. tostring(err))
@@ -344,11 +596,10 @@ function M.add_turn(turn, user_text, vector)
     -- 2. 初始化或延续话题
     if not M.active_topic.start then
         -- 开始新话题
-        M.active_topic.start = turn
+        M.active_topic = new_active_topic(turn)
         M.active_topic.vectors = {vector}
         M.active_topic.tail_window = {vector}
         M.active_topic.last_vec = vector
-        M.active_topic.head_centroid = nil 
         print("[Topic] 开启新话题: 第" .. turn .. "轮")
 
     else
@@ -429,11 +680,10 @@ function M.add_turn(turn, user_text, vector)
                 close_current_topic(turn - 1)
                 
                 -- 开启新话题，包含本轮向量
-                M.active_topic.start = turn
+                M.active_topic = new_active_topic(turn)
                 M.active_topic.vectors = {vector}
                 M.active_topic.tail_window = {vector}
                 M.active_topic.last_vec = vector
-                M.active_topic.head_centroid = nil
             end
         end
         
@@ -536,5 +786,164 @@ function M.get_topic_anchor(turn)
     end
     return nil
 end
+
+local function resolved_current_turn(turn)
+    local n = tonumber(turn)
+    if n and n > 0 then
+        return math.floor(n)
+    end
+    local last_turn = math.floor(tonumber(M._last_processed_turn) or 0)
+    if M.active_topic.start then
+        return math.max(last_turn, math.floor(tonumber(M.active_topic.start) or 0))
+    end
+    return last_turn
+end
+
+local function wrap_completed_topic(rec)
+    if type(rec) ~= "table" or not rec.start then
+        return nil
+    end
+    return {
+        key = topic_start_key(rec.start),
+        start = tonumber(rec.start) or 0,
+        end_ = tonumber(rec.end_) or tonumber(rec.start) or 0,
+        summary = tostring(rec.summary or ""),
+        centroid = rec.centroid,
+        fingerprint = ensure_topic_fingerprint(rec),
+        is_active = false,
+    }
+end
+
+local function wrap_active_topic(current_turn)
+    if not M.active_topic.start then
+        return nil
+    end
+    local start_turn = math.floor(tonumber(M.active_topic.start) or 0)
+    return {
+        key = topic_start_key(start_turn),
+        start = start_turn,
+        end_ = math.max(start_turn, resolved_current_turn(current_turn)),
+        summary = "",
+        centroid = get_active_topic_centroid(),
+        fingerprint = active_topic_fingerprint(),
+        is_active = true,
+    }
+end
+
+local function resolve_topic_record(ref, current_turn)
+    local ref_type = type(ref)
+    if ref_type == "number" then
+        local turn = math.floor(tonumber(ref) or 0)
+        if turn <= 0 then
+            return nil
+        end
+        if M.active_topic.start and turn >= M.active_topic.start then
+            return wrap_active_topic(current_turn or turn)
+        end
+        for _, rec in ipairs(M.topics) do
+            if rec.start <= turn and (not rec.end_ or turn <= rec.end_) then
+                return wrap_completed_topic(rec)
+            end
+        end
+        return nil
+    end
+
+    local key = tostring(ref or "")
+    if key == "" then
+        return nil
+    end
+
+    local start_turn = key:match("^S:(%d+)$")
+    if start_turn then
+        local start_num = math.floor(tonumber(start_turn) or 0)
+        if M.active_topic.start and start_num == math.floor(tonumber(M.active_topic.start) or -1) then
+            return wrap_active_topic(current_turn)
+        end
+        for _, rec in ipairs(M.topics) do
+            if math.floor(tonumber(rec.start) or -1) == start_num then
+                return wrap_completed_topic(rec)
+            end
+        end
+        return nil
+    end
+
+    local active_key = key:match("^A:(%d+)$")
+    if active_key then
+        return resolve_topic_record("S:" .. tostring(active_key), current_turn)
+    end
+
+    local idx = tonumber(key:match("^C:(%d+)$"))
+    if idx and M.topics[idx] then
+        return wrap_completed_topic(M.topics[idx])
+    end
+
+    return nil
+end
+
+function M.get_topic_fingerprint(ref, opts)
+    opts = opts or {}
+    local rec = resolve_topic_record(ref, opts.current_turn)
+    if not rec then
+        return empty_fingerprint()
+    end
+    return copy_fingerprint(rec.fingerprint)
+end
+
+function M.get_topic_chain(ref, opts)
+    opts = opts or {}
+    local current_turn = resolved_current_turn(opts.current_turn)
+    local base = resolve_topic_record(ref, current_turn)
+    if not base then
+        return {}
+    end
+
+    local out = {}
+    local seen = {}
+    local min_score = tonumber(opts.min_score) or CHAIN_MIN_SCORE
+
+    local function consider(rec)
+        if not rec or not rec.key or rec.key == base.key or seen[rec.key] then
+            return
+        end
+        seen[rec.key] = true
+
+        local score, centroid_sim, hist_overlap = topic_chain_score(base, rec)
+        if score < min_score then
+            return
+        end
+
+        out[#out + 1] = {
+            key = rec.key,
+            start = rec.start,
+            end_ = rec.end_,
+            summary = rec.summary,
+            is_active = rec.is_active == true,
+            score = score,
+            centroid_sim = centroid_sim,
+            fingerprint_overlap = hist_overlap,
+            dominant_cluster = tonumber((rec.fingerprint or {}).dominant_cluster),
+        }
+    end
+
+    for _, rec in ipairs(M.topics) do
+        consider(wrap_completed_topic(rec))
+    end
+    consider(wrap_active_topic(current_turn))
+
+    table.sort(out, function(a, b)
+        if a.score == b.score then
+            return (a.start or 0) > (b.start or 0)
+        end
+        return a.score > b.score
+    end)
+
+    local topn = math.max(1, math.floor(tonumber(opts.topn) or CHAIN_TOPN))
+    while #out > topn do
+        out[#out] = nil
+    end
+    return out
+end
+
+M.find_related_topics = M.get_topic_chain
 
 return M

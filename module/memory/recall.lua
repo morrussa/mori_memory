@@ -1088,6 +1088,18 @@ local function smart_preload_cold_memories(query_vec, current_turn, current_key,
 
     try_add_topic(current_key)
 
+    local chain_topn = math.max(0, math.floor(tonumber(cfg.topic_chain_preload_topn) or 2))
+    if current_key and chain_topn > 0 and topic.find_related_topics then
+        local chain_items = topic.find_related_topics(current_key, {
+            current_turn = current_turn,
+            topn = chain_topn,
+            min_score = tonumber(cfg.topic_chain_preload_min_score) or 0.42,
+        }) or {}
+        for _, item in ipairs(chain_items) do
+            try_add_topic(item.key)
+        end
+    end
+
     if cfg.preload_use_vector_prediction ~= false then
         local pred_key, conf = predict_topic_key(query_vec, current_turn, current_key, current_info)
         if pred_key and conf >= conf_th then
@@ -1736,7 +1748,210 @@ local function rank_topic_turns(turn_best, turn_mem, bucket, current_turn, order
     return out
 end
 
-local function build_topic_candidates(kept_memories, mem_best_effective, mem_best_source, mem_topic_query_best, current_info, current_turn, sim_th, cfg, order_ctx)
+local function compare_topic_bucket(a, b)
+    local aselection = tonumber(a.selection_score) or tonumber(a.score) or 0.0
+    local bselection = tonumber(b.selection_score) or tonumber(b.score) or 0.0
+    if aselection == bselection then
+        if a.score == b.score then
+            if a.coverage_count == b.coverage_count then
+                if a.best_memory_score == b.best_memory_score then
+                    if a.best_turn_score == b.best_turn_score then
+                        local a_end = tonumber(a.end_turn) or tonumber(a.start_turn) or 0
+                        local b_end = tonumber(b.end_turn) or tonumber(b.start_turn) or 0
+                        if a_end == b_end then
+                            return tostring(a.key) < tostring(b.key)
+                        end
+                        return a_end > b_end
+                    end
+                    return a.best_turn_score > b.best_turn_score
+                end
+                return a.best_memory_score > b.best_memory_score
+            end
+            return a.coverage_count > b.coverage_count
+        end
+        return a.score > b.score
+    end
+    return aselection > bselection
+end
+
+local function annotate_topic_chain_candidates(topic_order, current_topic_key, current_turn, cfg)
+    if #(topic_order or {}) <= 0 then
+        return
+    end
+
+    local candidate_by_key = {}
+    for _, bucket in ipairs(topic_order) do
+        local meta = topic_meta_for_key(bucket.key, current_turn) or {}
+        bucket.start_turn = math.floor(tonumber(meta.start_turn) or 0)
+        bucket.end_turn = math.floor(tonumber(meta.end_turn) or bucket.start_turn)
+        bucket.chain_id = tostring(bucket.key or "")
+        bucket.chain_size = 1
+        bucket.chain_rank_index = 1
+        bucket.chain_rep_key = tostring(bucket.key or "")
+        bucket.chain_bonus = 0.0
+        bucket.current_chain_score = 0.0
+        bucket.selection_score = tonumber(bucket.score) or 0.0
+        candidate_by_key[tostring(bucket.key or "")] = bucket
+    end
+
+    local chain_topn = math.max(1, math.floor(tonumber((cfg or {}).topic_chain_candidate_topn) or 4))
+    local chain_min_score = tonumber((cfg or {}).topic_chain_candidate_min_score) or 0.42
+    local recent_ratio = clamp(tonumber((cfg or {}).topic_chain_recent_score_ratio) or 0.88, 0.0, 1.0)
+    local recent_margin = math.max(0.0, tonumber((cfg or {}).topic_chain_recent_score_margin) or 0.12)
+    local rep_bonus = math.max(0.0, tonumber((cfg or {}).topic_chain_rep_bonus) or 0.08)
+    local member_penalty = math.max(0.0, tonumber((cfg or {}).topic_chain_member_penalty) or 0.04)
+    local current_bonus = math.max(0.0, tonumber((cfg or {}).topic_chain_current_bonus) or 0.06)
+
+    local adjacency = {}
+    local function ensure_node(key)
+        local norm = tostring(key or "")
+        if norm == "" then
+            return nil
+        end
+        adjacency[norm] = adjacency[norm] or {}
+        return norm
+    end
+
+    local function link_nodes(a_key, b_key, score)
+        local left = ensure_node(a_key)
+        local right = ensure_node(b_key)
+        if not left or not right or left == right then
+            return
+        end
+        local edge_score = math.max(0.0, tonumber(score) or 0.0)
+        adjacency[left][right] = math.max(tonumber(adjacency[left][right]) or 0.0, edge_score)
+        adjacency[right][left] = math.max(tonumber(adjacency[right][left]) or 0.0, edge_score)
+    end
+
+    for key, _ in pairs(candidate_by_key) do
+        ensure_node(key)
+    end
+
+    if topic.find_related_topics then
+        for key, _ in pairs(candidate_by_key) do
+            local related = topic.find_related_topics(key, {
+                current_turn = current_turn,
+                topn = chain_topn,
+                min_score = chain_min_score,
+            }) or {}
+            for _, item in ipairs(related) do
+                local other_key = tostring((item or {}).key or "")
+                if other_key ~= "" and candidate_by_key[other_key] then
+                    link_nodes(key, other_key, item.score)
+                end
+            end
+        end
+
+        if current_topic_key and current_topic_key ~= "" then
+            local current_related = topic.find_related_topics(current_topic_key, {
+                current_turn = current_turn,
+                topn = chain_topn,
+                min_score = chain_min_score,
+            }) or {}
+            if candidate_by_key[current_topic_key] then
+                candidate_by_key[current_topic_key].current_chain_score = 1.0
+            end
+            for _, item in ipairs(current_related) do
+                local other_key = tostring((item or {}).key or "")
+                local bucket = candidate_by_key[other_key]
+                if bucket then
+                    bucket.current_chain_score = math.max(
+                        tonumber(bucket.current_chain_score) or 0.0,
+                        math.max(0.0, tonumber(item.score) or 0.0)
+                    )
+                end
+            end
+        end
+    elseif current_topic_key and current_topic_key ~= "" and candidate_by_key[current_topic_key] then
+        candidate_by_key[current_topic_key].current_chain_score = 1.0
+    end
+
+    local visited = {}
+    local chain_seq = 0
+    for _, bucket in ipairs(topic_order) do
+        local root_key = tostring(bucket.key or "")
+        if root_key ~= "" and not visited[root_key] then
+            chain_seq = chain_seq + 1
+            local stack = { root_key }
+            local members = {}
+            visited[root_key] = true
+
+            while #stack > 0 do
+                local key = table.remove(stack)
+                local member = candidate_by_key[key]
+                if member then
+                    members[#members + 1] = member
+                end
+                for next_key, _ in pairs(adjacency[key] or {}) do
+                    if not visited[next_key] then
+                        visited[next_key] = true
+                        stack[#stack + 1] = next_key
+                    end
+                end
+            end
+
+            local chain_best_score = 0.0
+            for _, member in ipairs(members) do
+                chain_best_score = math.max(chain_best_score, tonumber(member.score) or 0.0)
+            end
+            local eligible_floor = math.max(chain_best_score * recent_ratio, chain_best_score - recent_margin)
+
+            local eligible_recent = {}
+            for _, member in ipairs(members) do
+                local member_score = tonumber(member.score) or 0.0
+                if member_score >= eligible_floor then
+                    eligible_recent[#eligible_recent + 1] = member
+                end
+            end
+            if #eligible_recent <= 0 and #members > 0 then
+                eligible_recent[1] = members[1]
+            end
+
+            table.sort(eligible_recent, function(a, b)
+                local a_end = tonumber(a.end_turn) or tonumber(a.start_turn) or 0
+                local b_end = tonumber(b.end_turn) or tonumber(b.start_turn) or 0
+                if a_end == b_end then
+                    if a.score == b.score then
+                        return tostring(a.key) < tostring(b.key)
+                    end
+                    return (tonumber(a.score) or 0.0) > (tonumber(b.score) or 0.0)
+                end
+                return a_end > b_end
+            end)
+
+            local representative = eligible_recent[1]
+            for _, member in ipairs(members) do
+                local bonus = current_bonus * (tonumber(member.current_chain_score) or 0.0)
+                if #members > 1 then
+                    if representative and tostring(member.key or "") == tostring(representative.key or "") then
+                        bonus = bonus + rep_bonus
+                    elseif (tonumber(member.score) or 0.0) >= eligible_floor then
+                        bonus = bonus - member_penalty
+                    end
+                end
+                member.chain_id = string.format("chain:%d", chain_seq)
+                member.chain_size = #members
+                member.chain_rep_key = tostring((representative or {}).key or member.key or "")
+                member.chain_bonus = bonus
+                member.selection_score = (tonumber(member.score) or 0.0) + bonus
+            end
+
+            table.sort(members, function(a, b)
+                local a_rep = tostring(a.key or "") == tostring((representative or {}).key or "")
+                local b_rep = tostring(b.key or "") == tostring((representative or {}).key or "")
+                if a_rep ~= b_rep then
+                    return a_rep
+                end
+                return compare_topic_bucket(a, b)
+            end)
+            for idx, member in ipairs(members) do
+                member.chain_rank_index = idx
+            end
+        end
+    end
+end
+
+local function build_topic_candidates(kept_memories, mem_best_effective, mem_best_source, mem_topic_query_best, current_info, current_turn, current_topic_key, sim_th, cfg, order_ctx)
     local topic_groups = {}
     local topic_order = {}
 
@@ -1824,21 +2039,9 @@ local function build_topic_candidates(kept_memories, mem_best_effective, mem_bes
         end
     end
 
-    table.sort(topic_order, function(a, b)
-        if a.score == b.score then
-            if a.coverage_count == b.coverage_count then
-                if a.best_memory_score == b.best_memory_score then
-                    if a.best_turn_score == b.best_turn_score then
-                        return tostring(a.key) < tostring(b.key)
-                    end
-                    return a.best_turn_score > b.best_turn_score
-                end
-                return a.best_memory_score > b.best_memory_score
-            end
-            return a.coverage_count > b.coverage_count
-        end
-        return a.score > b.score
-    end)
+    annotate_topic_chain_candidates(topic_order, current_topic_key, current_turn, cfg)
+
+    table.sort(topic_order, compare_topic_bucket)
 
     return topic_order
 end
@@ -1889,6 +2092,7 @@ local function select_topic_landings(selected_topics, max_turns, cfg)
             type_name = item.type_name,
             topic_key = key,
             topic_score = tonumber(bucket.score) or tonumber(item.score) or 0.0,
+            topic_selection_score = tonumber(bucket.selection_score) or tonumber(bucket.score) or tonumber(item.score) or 0.0,
             topic_type_counts = bucket.type_counts,
             topic_rank_index = tonumber(item.topic_rank_index) or 0,
             topic_order_index = tonumber(bucket.topic_order_index) or 0,
@@ -1961,6 +2165,7 @@ local function build_compiled_memory_context(selected, current_turn, cfg)
             bucket = {
                 key = topic_key,
                 score = tonumber(item.topic_score) or tonumber(item.score) or 0.0,
+                selection_score = tonumber(item.topic_selection_score) or tonumber(item.topic_score) or tonumber(item.score) or 0.0,
                 turns = {},
                 type_counts = {},
             }
@@ -1968,6 +2173,10 @@ local function build_compiled_memory_context(selected, current_turn, cfg)
             topic_order[#topic_order + 1] = bucket
         else
             bucket.score = math.max(bucket.score, tonumber(item.topic_score) or tonumber(item.score) or 0.0)
+            bucket.selection_score = math.max(
+                tonumber(bucket.selection_score) or 0.0,
+                tonumber(item.topic_selection_score) or tonumber(item.topic_score) or tonumber(item.score) or 0.0
+            )
         end
         bucket.turns[#bucket.turns + 1] = item.turn
         local has_topic_type_counts = (type(item.topic_type_counts) == "table")
@@ -1986,10 +2195,15 @@ local function build_compiled_memory_context(selected, current_turn, cfg)
     end
 
     table.sort(topic_order, function(a, b)
-        if a.score == b.score then
-            return tostring(a.key) < tostring(b.key)
+        local aselection = tonumber(a.selection_score) or tonumber(a.score) or 0.0
+        local bselection = tonumber(b.selection_score) or tonumber(b.score) or 0.0
+        if aselection == bselection then
+            if a.score == b.score then
+                return tostring(a.key) < tostring(b.key)
+            end
+            return a.score > b.score
         end
-        return a.score > b.score
+        return aselection > bselection
     end)
 
     local max_topics = math.max(1, math.floor(tonumber((cfg or {}).compiled_context_max_topics) or 3))
@@ -2446,6 +2660,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         mem_topic_query_best,
         current_info,
         current_turn,
+        current_topic_key,
         sim_th,
         cfg,
         type_order_ctx
@@ -2493,12 +2708,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                     selected_topics = {}
                     for _, it in ipairs(core) do selected_topics[#selected_topics + 1] = it end
                     for i = 1, choose_n do selected_topics[#selected_topics + 1] = pool[i] end
-                    table.sort(selected_topics, function(a, b)
-                        if a.score == b.score then
-                            return tostring(a.key) < tostring(b.key)
-                        end
-                        return a.score > b.score
-                    end)
+                    table.sort(selected_topics, compare_topic_bucket)
                     while #selected_topics > max_topics do
                         table.remove(selected_topics)
                     end
@@ -2545,12 +2755,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             append_until(cross, max_topics)
         end
 
-        table.sort(selected_topics, function(a, b)
-            if a.score == b.score then
-                return tostring(a.key) < tostring(b.key)
-            end
-            return a.score > b.score
-        end)
+        table.sort(selected_topics, compare_topic_bucket)
         while #selected_topics > max_topics do
             table.remove(selected_topics)
         end
