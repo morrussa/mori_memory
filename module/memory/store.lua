@@ -57,6 +57,14 @@ local function shallow_copy_array(src)
     return out
 end
 
+local function shallow_copy_map(src)
+    local out = {}
+    for k, v in pairs(src or {}) do
+        out[k] = v
+    end
+    return out
+end
+
 local function trim_str(s)
     return tostring(s or ""):gsub("^%s*(.-)%s*$", "%1")
 end
@@ -70,23 +78,56 @@ local function allowed_type_maps()
     local ordered = {}
     local exact = {}
     local folded = {}
+    local meta_by_name = {}
 
-    for _, raw in ipairs(cfg.allowed or {}) do
-        local name = trim_str(raw)
-        if name ~= "" and not exact[name] then
+    local function add_type(raw_name, raw_meta)
+        local name = trim_str(raw_name)
+        if name == "" then
+            return
+        end
+
+        if not exact[name] then
             ordered[#ordered + 1] = name
             exact[name] = true
             folded[name:lower()] = name
         end
+
+        local meta = meta_by_name[name] or {}
+        if type(raw_meta) == "table" then
+            for k, v in pairs(raw_meta) do
+                if k ~= "name" and k ~= "type" and k ~= "id" then
+                    meta[k] = v
+                end
+            end
+        end
+        meta.name = name
+        meta_by_name[name] = meta
+    end
+
+    local allowed = cfg.allowed or {}
+    for _, raw in ipairs(allowed) do
+        if type(raw) == "table" then
+            add_type(raw.name or raw.type or raw.id, raw)
+        else
+            add_type(raw, nil)
+        end
+    end
+
+    for raw_name, raw_meta in pairs(allowed) do
+        if type(raw_name) == "string" then
+            if type(raw_meta) == "table" then
+                add_type(raw_name, raw_meta)
+            elseif raw_meta == true then
+                add_type(raw_name, nil)
+            end
+        end
     end
 
     if #ordered <= 0 then
-        ordered[1] = "Fact"
-        exact.Fact = true
-        folded.fact = "Fact"
+        add_type("Fact", { class = "stable", recent_weight = 0.0 })
     end
 
-    return ordered, exact, folded
+    return ordered, exact, folded, meta_by_name
 end
 
 local function default_type_name()
@@ -136,6 +177,14 @@ end
 
 function M.get_default_type_name()
     return default_type_name()
+end
+
+function M.get_type_meta(raw)
+    local canonical = resolve_type_name(raw, true)
+    local _, _, _, meta_by_name = allowed_type_maps()
+    local meta = shallow_copy_map(meta_by_name[canonical] or {})
+    meta.name = canonical
+    return meta
 end
 
 function M.normalize_type_name(raw)

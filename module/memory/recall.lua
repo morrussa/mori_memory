@@ -72,6 +72,11 @@ local TECH_KEYWORDS = {
     "代码", "函数", "api", "算法", "编程", "python", "lua", "配置", "参数"
 }
 
+local ARTIFACT_FRONTIER_KEYWORDS = {
+    "debug", "调试", "bug", "报错", "错误", "error", "trace", "stack", "日志", "log",
+    "测试", "test", "fix", "修复", "编译", "build", "文件", "file", "路径", "path", "patch"
+}
+
 local function ai_cfg()
     return ((config.settings or {}).ai_query or {})
 end
@@ -1319,26 +1324,21 @@ local function count_map_entries(rows)
     return n
 end
 
-local function compute_topic_evidence_score(scores)
-    local items = {}
-    for _, score in ipairs(scores or {}) do
-        items[#items + 1] = tonumber(score) or 0.0
+local function compute_topic_evidence_score(m1, coverage, cfg)
+    local base = tonumber(m1) or 0.0
+    if base <= 0.0 then
+        return 0.0
     end
-    table.sort(items, function(a, b) return a > b end)
 
-    local total = 0.0
-    for idx, score in ipairs(items) do
-        local weight = 1.0
-        if idx == 2 then
-            weight = 0.72
-        elseif idx == 3 then
-            weight = 0.50
-        elseif idx >= 4 then
-            weight = 0.35 / math.sqrt(idx - 2)
-        end
-        total = total + score * weight
+    local covered = math.max(0, math.floor(tonumber(coverage) or 0))
+    local extra_coverage = math.max(0, covered - 1)
+    local alpha = math.max(0.0, tonumber((cfg or {}).topic_coverage_alpha) or 0.45)
+    local beta = math.max(0.0, tonumber((cfg or {}).topic_coverage_beta) or 1.0)
+    local bonus = 0.0
+    if extra_coverage > 0 and alpha > 0.0 and beta > 0.0 then
+        bonus = alpha * (1.0 - math.exp(-beta * extra_coverage))
     end
-    return total
+    return base + bonus
 end
 
 local function collect_candidate_samples(mem_best_sim, mem_best_cluster, mem_best_effective, limit)
@@ -1640,7 +1640,103 @@ local function format_type_summary(type_counts)
     return table.concat(parts, ", ")
 end
 
-local function build_topic_candidates(kept_memories, mem_best_effective, mem_best_source, current_info, current_turn, sim_th)
+local function build_type_order_context(user_input, preferred_type, current_topic_key)
+    local text = tostring(user_input or "")
+    local text_lower = text:lower()
+    local coding_mode = false
+
+    if tostring(preferred_type or "") == "Artifact" then
+        coding_mode = true
+    else
+        coding_mode = select(1, contains_any_keyword(text, text_lower, TECH_KEYWORDS))
+            or select(1, contains_any_keyword(text, text_lower, ARTIFACT_FRONTIER_KEYWORDS))
+    end
+
+    return {
+        coding_mode = coding_mode == true,
+        current_topic_key = tostring(current_topic_key or ""),
+    }
+end
+
+local function topic_local_recency(turn_value, topic_key, current_turn)
+    local meta = topic_meta_for_key(topic_key, current_turn)
+    local turn_n = math.floor(tonumber(turn_value) or 0)
+    if not meta then
+        return 1.0, 0.0
+    end
+
+    local start_turn = math.floor(tonumber(meta.start_turn) or turn_n)
+    local end_turn = math.floor(tonumber(meta.end_turn) or turn_n)
+    if end_turn <= start_turn then
+        return 1.0, 1.0
+    end
+
+    local recent01 = clamp((turn_n - start_turn) / math.max(1, end_turn - start_turn), 0.0, 1.0)
+    return recent01, 1.0 - recent01
+end
+
+local function compute_topic_turn_rank_score(item, bucket, current_turn, order_ctx)
+    local semantic = tonumber(item.score) or 0.0
+    local type_name = item.mem_idx and memory.get_type_name(item.mem_idx) or memory.get_default_type_name()
+    local type_meta = (memory.get_type_meta and memory.get_type_meta(type_name)) or { name = type_name }
+    local recent01, head01 = topic_local_recency(item.turn, bucket.key, current_turn)
+
+    local recent_weight = tonumber(type_meta.recent_weight) or 0.0
+    local frontier_bias = tonumber(type_meta.frontier_bias) or 0.0
+    if tostring(type_meta.class or "") == "mode_sensitive" and order_ctx and order_ctx.coding_mode == true then
+        recent_weight = tonumber(type_meta.coding_recent_weight) or recent_weight
+        frontier_bias = tonumber(type_meta.coding_frontier_bias) or frontier_bias
+    end
+
+    local head_bonus = 0.0
+    if type_meta.head_visible == true then
+        head_bonus = (tonumber(type_meta.head_bias) or 0.0) * head01
+    end
+
+    local current_topic_boost = 0.0
+    if order_ctx and tostring(order_ctx.current_topic_key or "") ~= "" then
+        if tostring(bucket.key or "") == tostring(order_ctx.current_topic_key or "")
+            or tostring(bucket.relation or "") == "same" then
+            current_topic_boost = tonumber(type_meta.current_topic_boost) or 0.0
+        end
+    end
+
+    local stale_penalty = (tonumber(type_meta.stale_penalty) or 0.0) * head01
+    local rank_score = semantic
+        + frontier_bias
+        + (recent_weight * recent01)
+        + head_bonus
+        + current_topic_boost
+        - stale_penalty
+
+    return rank_score, type_name
+end
+
+local function rank_topic_turns(turn_best, turn_mem, bucket, current_turn, order_ctx)
+    local out = to_sorted_pairs(turn_best, turn_mem)
+    for _, item in ipairs(out) do
+        item.rank_score, item.type_name = compute_topic_turn_rank_score(item, bucket, current_turn, order_ctx)
+    end
+
+    table.sort(out, function(a, b)
+        local ar = tonumber(a.rank_score) or tonumber(a.score) or 0.0
+        local br = tonumber(b.rank_score) or tonumber(b.score) or 0.0
+        if ar == br then
+            if a.score == b.score then
+                return (tonumber(a.turn) or 0) > (tonumber(b.turn) or 0)
+            end
+            return (tonumber(a.score) or 0.0) > (tonumber(b.score) or 0.0)
+        end
+        return ar > br
+    end)
+
+    for idx, item in ipairs(out) do
+        item.topic_rank_index = idx
+    end
+    return out
+end
+
+local function build_topic_candidates(kept_memories, mem_best_effective, mem_best_source, mem_topic_query_best, current_info, current_turn, sim_th, cfg, order_ctx)
     local topic_groups = {}
     local topic_order = {}
 
@@ -1660,9 +1756,13 @@ local function build_topic_candidates(kept_memories, mem_best_effective, mem_bes
                         turn_mem = {},
                         turn_src = {},
                         mem_scores = {},
+                        query_hits = {},
                         type_counts = {},
                         ranked_turns = {},
                         score = 0.0,
+                        best_memory_score = 0.0,
+                        best_turn_score = 0.0,
+                        coverage_count = 0,
                         relation = "cross",
                         mem_count = 0,
                         turn_count = 0,
@@ -1675,6 +1775,7 @@ local function build_topic_candidates(kept_memories, mem_best_effective, mem_bes
                     bucket.turn_mem[turn_value] = mem_idx
                     bucket.turn_src[turn_value] = source
                 end
+                bucket.best_turn_score = math.max(tonumber(bucket.best_turn_score) or 0.0, effective)
                 seen_topics[topic_key] = true
             end
 
@@ -1683,6 +1784,23 @@ local function build_topic_candidates(kept_memories, mem_best_effective, mem_bes
                 local prev_mem = bucket.mem_scores[mem_idx]
                 if (not prev_mem) or effective > prev_mem then
                     bucket.mem_scores[mem_idx] = effective
+                end
+                bucket.best_memory_score = math.max(tonumber(bucket.best_memory_score) or 0.0, effective)
+                local query_scores = nil
+                if mem_topic_query_best and mem_topic_query_best[mem_idx] then
+                    query_scores = mem_topic_query_best[mem_idx][topic_key]
+                end
+                if query_scores then
+                    for q_idx, q_score in pairs(query_scores) do
+                        local qn = math.floor(tonumber(q_idx) or 0)
+                        if qn > 0 then
+                            local prev_q = tonumber(bucket.query_hits[qn]) or 0.0
+                            local next_q = tonumber(q_score) or 0.0
+                            if next_q > prev_q then
+                                bucket.query_hits[qn] = next_q
+                            end
+                        end
+                    end
                 end
                 local type_name = memory.get_type_name(mem_idx)
                 if type_name and type_name ~= "" then
@@ -1693,30 +1811,31 @@ local function build_topic_candidates(kept_memories, mem_best_effective, mem_bes
     end
 
     for _, bucket in ipairs(topic_order) do
-        local evidence = {}
-        for _, score in pairs(bucket.mem_scores) do
-            evidence[#evidence + 1] = tonumber(score) or 0.0
-        end
-        bucket.score = compute_topic_evidence_score(evidence)
+        bucket.coverage_count = count_map_entries(bucket.query_hits)
+        bucket.score = compute_topic_evidence_score(bucket.best_memory_score, bucket.coverage_count, cfg)
         bucket.mem_count = count_map_entries(bucket.mem_scores)
         bucket.turn_count = count_map_entries(bucket.turn_best)
-        bucket.ranked_turns = to_sorted_pairs(bucket.turn_best, bucket.turn_mem)
+        local semantic_turns = to_sorted_pairs(bucket.turn_best, bucket.turn_mem)
+        local best_turn = semantic_turns[1] and semantic_turns[1].turn or nil
+        bucket.relation = topic_relation_for_key(bucket.key, current_info, sim_th, current_turn, best_turn)
+        bucket.ranked_turns = rank_topic_turns(bucket.turn_best, bucket.turn_mem, bucket, current_turn, order_ctx)
         for _, item in ipairs(bucket.ranked_turns) do
             item.src = bucket.turn_src[item.turn]
         end
-        local best_turn = bucket.ranked_turns[1] and bucket.ranked_turns[1].turn or nil
-        bucket.relation = topic_relation_for_key(bucket.key, current_info, sim_th, current_turn, best_turn)
     end
 
     table.sort(topic_order, function(a, b)
         if a.score == b.score then
-            if a.mem_count == b.mem_count then
-                if a.turn_count == b.turn_count then
-                    return tostring(a.key) < tostring(b.key)
+            if a.coverage_count == b.coverage_count then
+                if a.best_memory_score == b.best_memory_score then
+                    if a.best_turn_score == b.best_turn_score then
+                        return tostring(a.key) < tostring(b.key)
+                    end
+                    return a.best_turn_score > b.best_turn_score
                 end
-                return a.turn_count > b.turn_count
+                return a.best_memory_score > b.best_memory_score
             end
-            return a.mem_count > b.mem_count
+            return a.coverage_count > b.coverage_count
         end
         return a.score > b.score
     end)
@@ -1745,6 +1864,7 @@ local function select_topic_landings(selected_topics, max_turns, cfg)
     local selected = {}
     local used_turns = {}
     local landing_counts = {}
+    local topic_cursor = {}
 
     local function push_item(bucket, item)
         if not bucket or not item then
@@ -1763,72 +1883,68 @@ local function select_topic_landings(selected_topics, max_turns, cfg)
         selected[#selected + 1] = {
             turn = turn_value,
             score = tonumber(item.score) or 0.0,
+            rank_score = tonumber(item.rank_score) or tonumber(item.score) or 0.0,
             mem_idx = item.mem_idx,
             src = item.src,
+            type_name = item.type_name,
             topic_key = key,
             topic_score = tonumber(bucket.score) or tonumber(item.score) or 0.0,
             topic_type_counts = bucket.type_counts,
+            topic_rank_index = tonumber(item.topic_rank_index) or 0,
+            topic_order_index = tonumber(bucket.topic_order_index) or 0,
         }
         return true
     end
 
-    for _, bucket in ipairs(selected_topics or {}) do
+    local function push_next_from_bucket(bucket)
+        if not bucket then
+            return false
+        end
+        local key = tostring(bucket.key or "")
+        local start_idx = (tonumber(topic_cursor[key]) or 0) + 1
+        for idx = start_idx, #(bucket.ranked_turns or {}) do
+            topic_cursor[key] = idx
+            if push_item(bucket, bucket.ranked_turns[idx]) then
+                return true
+            end
+        end
+        topic_cursor[key] = #(bucket.ranked_turns or {})
+        return false
+    end
+
+    for idx, bucket in ipairs(selected_topics or {}) do
+        bucket.topic_order_index = idx
         landing_counts[tostring(bucket.key or "")] = 0
-        for _, item in ipairs(bucket.ranked_turns or {}) do
-            if push_item(bucket, item) then
+        topic_cursor[tostring(bucket.key or "")] = 0
+        push_next_from_bucket(bucket)
+        if #selected >= max_turns then
+            break
+        end
+    end
+
+    while #selected < max_turns do
+        local advanced = false
+        for _, bucket in ipairs(selected_topics or {}) do
+            if #selected >= max_turns then
                 break
             end
-        end
-        if #selected >= max_turns then
-            break
-        end
-    end
-
-    local extra_pool = {}
-    for _, bucket in ipairs(selected_topics or {}) do
-        for _, item in ipairs(bucket.ranked_turns or {}) do
-            local turn_value = math.floor(tonumber(item.turn) or -1)
-            if turn_value >= 1 and not used_turns[turn_value] then
-                extra_pool[#extra_pool + 1] = {
-                    bucket = bucket,
-                    turn = turn_value,
-                    score = tonumber(item.score) or 0.0,
-                    mem_idx = item.mem_idx,
-                    src = item.src,
-                }
+            if push_next_from_bucket(bucket) then
+                advanced = true
             end
         end
-    end
-
-    table.sort(extra_pool, function(a, b)
-        if a.score == b.score then
-            local a_topic = tonumber(((a.bucket or {}).score)) or 0.0
-            local b_topic = tonumber(((b.bucket or {}).score)) or 0.0
-            if a_topic == b_topic then
-                return (tonumber(a.turn) or 0) > (tonumber(b.turn) or 0)
-            end
-            return a_topic > b_topic
-        end
-        return a.score > b.score
-    end)
-
-    for _, item in ipairs(extra_pool) do
-        if #selected >= max_turns then
+        if not advanced then
             break
         end
-        push_item(item.bucket, item)
     end
 
     table.sort(selected, function(a, b)
-        local a_topic = tonumber(a.topic_score) or 0.0
-        local b_topic = tonumber(b.topic_score) or 0.0
-        if a_topic == b_topic then
-            if a.score == b.score then
+        if tostring(a.topic_key or "") == tostring(b.topic_key or "") then
+            if a.topic_rank_index == b.topic_rank_index then
                 return (tonumber(a.turn) or 0) > (tonumber(b.turn) or 0)
             end
-            return a.score > b.score
+            return (tonumber(a.topic_rank_index) or 0) < (tonumber(b.topic_rank_index) or 0)
         end
-        return a_topic > b_topic
+        return (tonumber(a.topic_order_index) or 0) < (tonumber(b.topic_order_index) or 0)
     end)
 
     return selected
@@ -1944,6 +2060,11 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local cross_quota_ratio = clamp(tonumber(knobs.topic_cross_quota_ratio) or 0.25, 0.0, 0.5)
     local memory_drop_sim = tonumber(cfg.memory_drop_sim)
     if memory_drop_sim == nil then memory_drop_sim = 0.60 end
+    local coverage_min_sim = tonumber(cfg.topic_coverage_min_sim)
+    if coverage_min_sim == nil then
+        coverage_min_sim = memory_drop_sim
+    end
+    coverage_min_sim = math.max(0.0, coverage_min_sim)
     local sim_th = tonumber(cfg.topic_sim_threshold) or 0.70
 
     local per_cluster_limit = math.max(2, tonumber(cfg.refinement_probe_per_cluster_limit) or 12)
@@ -1952,11 +2073,13 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local allowed_types, blocked_types, preferred_type = derive_type_filters(opts)
 
     local current_topic_key = topic_key_for_current(current_turn, current_info)
+    local type_order_ctx = build_type_order_context(user_input, preferred_type, current_topic_key)
 
     local mem_best_sim = {}
     local mem_best_cluster = {}
     local mem_best_effective = {}
     local mem_best_source = {}
+    local mem_topic_query_best = {}
     local persistent_probe_clusters_query = {}
     local keyword_perf_mode = tostring(cfg.keyword_perf_mode or "lossless")
     if keyword_perf_mode ~= "near_lossless" then
@@ -1971,6 +2094,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     local mem_vec_cache = {}
     local mem_cluster_cache = {}
+    local mem_topic_key_cache = {}
     local q_sim_cache = {}
     local primary_candidates = nil
 
@@ -1998,6 +2122,35 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             mem_cluster_cache[mem_idx] = cid
         end
         return cid
+    end
+
+    local function get_mem_owner_topic_key(mem_idx)
+        local cached = mem_topic_key_cache[mem_idx]
+        if cached ~= nil then
+            if cached == false then
+                return nil
+            end
+            return cached
+        end
+
+        local topic_key = nil
+        local turns = memory.get_turns(mem_idx)
+        local owner_turn = math.floor(tonumber((turns or {})[1]) or 0)
+        if owner_turn > 0 then
+            topic_key = topic_key_for_turn(owner_turn) or ("turn:" .. tostring(owner_turn))
+        end
+        if not topic_key or topic_key == "" then
+            if memory.get_topic_anchor then
+                topic_key = tostring(memory.get_topic_anchor(mem_idx) or "")
+            end
+        end
+
+        if topic_key and topic_key ~= "" then
+            mem_topic_key_cache[mem_idx] = topic_key
+            return topic_key
+        end
+        mem_topic_key_cache[mem_idx] = false
+        return nil
     end
 
     local function get_sim_cached(q_idx, qptr, mem_idx)
@@ -2062,6 +2215,35 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
+    local function update_mem_query_hit(mem_idx, q_idx, sim, effective)
+        if (tonumber(sim) or 0.0) < coverage_min_sim then
+            return
+        end
+        local qn = math.floor(tonumber(q_idx) or 0)
+        if qn <= 0 then
+            return
+        end
+        local topic_key = get_mem_owner_topic_key(mem_idx)
+        if not topic_key or topic_key == "" then
+            return
+        end
+        local mem_bucket = mem_topic_query_best[mem_idx]
+        if not mem_bucket then
+            mem_bucket = {}
+            mem_topic_query_best[mem_idx] = mem_bucket
+        end
+        local bucket = mem_bucket[topic_key]
+        if not bucket then
+            bucket = {}
+            mem_bucket[topic_key] = bucket
+        end
+        local prev = tonumber(bucket[qn]) or 0.0
+        local next_score = tonumber(effective) or 0.0
+        if next_score > prev then
+            bucket[qn] = next_score
+        end
+    end
+
     local function type_filter_pass(mem_idx)
         if not allowed_types and not blocked_types then
             return true
@@ -2115,6 +2297,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                     local cid = mem_best_cluster[mem_idx] or get_mem_cluster_cached(mem_idx)
                     local src = mem_best_source[mem_idx] or "hot"
                     update_mem_best(mem_idx, sim, effective, cid, src)
+                    update_mem_query_hit(mem_idx, q_idx, sim, effective)
                 end
             end
         else
@@ -2176,8 +2359,12 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                     local sim_pos = math.max(0.0, sim)
                     local effective = (sim_pos ^ power) * weight
                     update_mem_best(mem_idx, sim, effective, cid, src_label)
+                    local passed_gate = soft_gate_filter(sim, min_gate, opts)
+                    if passed_gate then
+                        update_mem_query_hit(mem_idx, q_idx, sim, effective)
+                    end
 
-                    if not soft_gate_filter(sim, min_gate, opts) then
+                    if not passed_gate then
                         break
                     end
                 end
@@ -2195,6 +2382,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                         effective = effective * (tonumber(cfg.topic_cache_weight) or 1.02)
                     end
                     update_mem_best(mem_idx, sim, effective, get_mem_cluster_cached(mem_idx), "cache")
+                    update_mem_query_hit(mem_idx, q_idx, sim, effective)
                     end
                 end
             end
@@ -2220,6 +2408,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 local sim_pos = math.max(0.0, sim)
                 local effective = (sim_pos ^ power) * weight
                 update_mem_best(mem_idx, sim, effective, get_mem_cluster_cached(mem_idx), "preload_cluster")
+                update_mem_query_hit(mem_idx, q_idx, sim, effective)
             end
         end
 
@@ -2254,9 +2443,12 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         kept_memories,
         kept_best_effective,
         mem_best_source,
+        mem_topic_query_best,
         current_info,
         current_turn,
-        sim_th
+        sim_th,
+        cfg,
+        type_order_ctx
     )
     if #topic_candidates <= 0 then
         print(string.format(
