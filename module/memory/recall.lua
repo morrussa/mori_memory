@@ -11,6 +11,7 @@ local cluster = require("module.memory.cluster")
 local topic = require("module.memory.topic")
 local adaptive = require("module.memory.adaptive")
 local heat = require("module.memory.heat")
+local memtypes = require("module.memory.types")
 
 local ANXIETY_SENTENCES = {
     "我很焦虑", "我急死了", "快点", "急急急", "我现在很着急"
@@ -74,6 +75,10 @@ local TECH_KEYWORDS = {
 
 local function ai_cfg()
     return ((config.settings or {}).ai_query or {})
+end
+
+local function type_route_cfg()
+    return (((ai_cfg() or {}).memory_type_routing) or {})
 end
 
 local function is_read_only(opts)
@@ -1263,22 +1268,319 @@ local function to_sorted_pairs(turn_best)
     return out
 end
 
-local function collect_candidate_samples(mem_best_sim, mem_best_cluster, mem_best_effective, limit)
-    local items = {}
-    for mem_idx, sim in pairs(mem_best_sim) do
-        items[#items + 1] = { mem_idx = mem_idx, sim = sim }
+local function turn_source_bonus(source)
+    local cfg = ai_cfg()
+    if source == "cache" then
+        return tonumber(cfg.turn_source_bonus_cache) or 0.08
     end
-    table.sort(items, function(a, b) return a.sim > b.sim end)
+    if source == "preload_cluster" then
+        return tonumber(cfg.turn_source_bonus_preload) or 0.05
+    end
+    if source == "hot" then
+        return tonumber(cfg.turn_source_bonus_hot) or 0.02
+    end
+    return 0.0
+end
 
-    local out = {}
-    for i = 1, math.min(limit, #items) do
-        local mem_idx = items[i].mem_idx
-        out[#out + 1] = {
+local function stage_a_evidence_shortlist(mem_best_sim, mem_best_effective, mem_best_cluster, mem_best_source, sample_limit, memory_drop_sim)
+    local cfg = ai_cfg()
+    local mem_items = {}
+    for mem_idx, sim in pairs(mem_best_sim) do
+        if (tonumber(sim) or -1.0) >= (tonumber(memory_drop_sim) or 0.60) then
+            local effective = tonumber(mem_best_effective[mem_idx]) or 0.0
+            if effective > 0.0 then
+                local source = mem_best_source[mem_idx] or "hot"
+                mem_items[#mem_items + 1] = {
+                    mem_idx = mem_idx,
+                    sim = tonumber(sim) or 0.0,
+                    effective = effective,
+                    source_bonus = turn_source_bonus(source),
+                }
+            end
+        end
+    end
+
+    table.sort(mem_items, function(a, b)
+        if a.effective == b.effective then
+            if a.sim == b.sim then
+                return a.source_bonus > b.source_bonus
+            end
+            return a.sim > b.sim
+        end
+        return a.effective > b.effective
+    end)
+
+    local kept_memories = {}
+    for _, item in ipairs(mem_items) do
+        kept_memories[#kept_memories + 1] = item.mem_idx
+    end
+
+    local evidence_memories = kept_memories
+    if cfg.two_stage_turn_rerank_enabled ~= false then
+        local shortlist_cap = math.max(1, math.floor(tonumber(cfg.turn_rerank_memory_shortlist) or 16))
+        evidence_memories = {}
+        for i = 1, math.min(shortlist_cap, #kept_memories) do
+            evidence_memories[#evidence_memories + 1] = kept_memories[i]
+        end
+    end
+
+    local candidate_samples = {}
+    for i = 1, math.min(sample_limit, #mem_items) do
+        local item = mem_items[i]
+        local mem_idx = item.mem_idx
+        candidate_samples[#candidate_samples + 1] = {
             mem_idx = mem_idx,
             cid = tonumber(mem_best_cluster[mem_idx]) or -1,
-            sim = tonumber(items[i].sim) or 0.0,
-            effective = tonumber(mem_best_effective[mem_idx]) or tonumber(items[i].sim) or 0.0,
+            sim = tonumber(item.sim) or 0.0,
+            effective = tonumber(item.effective) or tonumber(item.sim) or 0.0,
         }
+    end
+
+    return kept_memories, evidence_memories, candidate_samples
+end
+
+local function score_turn_candidate(turn, evidence_score, source, current_info, current_turn, recency_scale, sim_th)
+    local cfg = ai_cfg()
+    local score = math.max(0.0, tonumber(evidence_score) or 0.0)
+    if score <= 0.0 then
+        return 0.0
+    end
+
+    local age = math.max(0, (tonumber(current_turn) or 0) - (tonumber(turn) or 0))
+    local recency = clamp(tonumber(recency_scale) or 0.0, 0.0, 1.0)
+    local freshness_scale = 0.20 + 0.80 * recency
+    local half_life = math.max(1.0, tonumber(cfg.turn_age_decay_half_life) or 72.0)
+    local age_decay = math.exp(-math.log(2.0) * (age / half_life))
+    score = score * (1.0 + (tonumber(cfg.turn_age_decay_weight) or 0.18) * age_decay * freshness_scale)
+
+    if current_info then
+        local rel = topic_relation_for_turn(turn, current_info, sim_th)
+        if rel == "same" then
+            score = score * (1.0 + (tonumber(cfg.turn_same_topic_bonus) or 0.08) * recency)
+
+            if current_info.is_active then
+                local active_start = topic.active_topic and tonumber(topic.active_topic.start) or nil
+                if active_start and (tonumber(turn) or 0) >= active_start then
+                    score = score * (1.0 + (tonumber(cfg.turn_same_session_bonus) or 0.10) * recency)
+                end
+            end
+
+            local continuation_window = math.max(0, math.floor(tonumber(cfg.turn_recent_continuation_window) or 18))
+            if age <= continuation_window then
+                score = score * (1.0 + (tonumber(cfg.turn_recent_continuation_bonus) or 0.08) * recency)
+            end
+        end
+    end
+
+    score = score * (1.0 + turn_source_bonus(source))
+    return score
+end
+
+local function stage_b_turn_rerank(evidence_memories, mem_best_effective, mem_best_source, current_info, current_turn, recency_scale, sim_th)
+    local cfg = ai_cfg()
+    local turn_best = {}
+    local turn_src = {}
+    local turn_mem = {}
+    local full_turn_pool = 0
+    local per_memory_limit = math.max(1, math.floor(tonumber(cfg.turn_rerank_per_memory_limit) or 8))
+    local global_shortlist = math.max(per_memory_limit, math.floor(tonumber(cfg.turn_rerank_global_shortlist) or 48))
+
+    for _, mem_idx in ipairs(evidence_memories or {}) do
+        local evidence_score = tonumber(mem_best_effective[mem_idx]) or 0.0
+        if evidence_score > 0.0 then
+            local source = mem_best_source[mem_idx] or "hot"
+            local turns = memory.get_turns(mem_idx)
+            full_turn_pool = full_turn_pool + #turns
+
+            local local_ranked = {}
+            for _, turn in ipairs(turns) do
+                local turn_score = score_turn_candidate(
+                    turn,
+                    evidence_score,
+                    source,
+                    current_info,
+                    current_turn,
+                    recency_scale,
+                    sim_th
+                )
+                if turn_score > 0.0 then
+                    local_ranked[#local_ranked + 1] = { turn = turn, score = turn_score }
+                end
+            end
+
+            table.sort(local_ranked, function(a, b) return a.score > b.score end)
+            while #local_ranked > per_memory_limit do
+                table.remove(local_ranked)
+            end
+
+            for _, item in ipairs(local_ranked) do
+                local prev = tonumber(turn_best[item.turn]) or nil
+                if (not prev) or item.score > prev then
+                    turn_best[item.turn] = item.score
+                    turn_src[item.turn] = source
+                    turn_mem[item.turn] = mem_idx
+                end
+            end
+        end
+    end
+
+    local ranked = to_sorted_pairs(turn_best)
+    while #ranked > global_shortlist do
+        table.remove(ranked)
+    end
+    return ranked, turn_src, turn_mem, full_turn_pool
+end
+
+local function memory_coverage_turns(turns, limit)
+    if limit <= 0 or type(turns) ~= "table" or #turns <= 0 then
+        return {}
+    end
+    if #turns <= limit then
+        local out = {}
+        for i = 1, #turns do
+            out[#out + 1] = tonumber(turns[i]) or 0
+        end
+        return out
+    end
+
+    local out = {}
+    local seen = {}
+    for i = 0, limit - 1 do
+        local pos = math.min(#turns, math.floor((#turns * i) / math.max(1, limit)) + 1)
+        local turn = tonumber(turns[pos]) or 0
+        if turn > 0 and not seen[turn] then
+            seen[turn] = true
+            out[#out + 1] = turn
+        end
+    end
+    return out
+end
+
+local function stage_b_turn_coverage(evidence_memories, mem_best_effective, mem_best_source)
+    local cfg = ai_cfg()
+    local per_memory_coverage = math.max(0, math.floor(tonumber(cfg.turn_rerank_per_memory_coverage) or 2))
+    if per_memory_coverage <= 0 then
+        return {}, {}, {}
+    end
+
+    local coverage_best = {}
+    local coverage_src = {}
+    local coverage_mem = {}
+    for _, mem_idx in ipairs(evidence_memories or {}) do
+        local evidence_score = tonumber(mem_best_effective[mem_idx]) or 0.0
+        if evidence_score > 0.0 then
+            local source = mem_best_source[mem_idx] or "hot"
+            local score = evidence_score * (1.0 + 0.5 * math.max(0.0, turn_source_bonus(source)))
+            local turns = memory_coverage_turns(memory.get_turns(mem_idx), per_memory_coverage)
+            for _, turn in ipairs(turns) do
+                local prev = tonumber(coverage_best[turn]) or nil
+                if (not prev) or score > prev then
+                    coverage_best[turn] = score
+                    coverage_src[turn] = source
+                    coverage_mem[turn] = mem_idx
+                end
+            end
+        end
+    end
+
+    local ranked = to_sorted_pairs(coverage_best)
+    return ranked, coverage_src, coverage_mem
+end
+
+local function select_turns_from_ranked(ranked, max_turns, current_info, cross_quota_ratio, query_turn, sim_th, opts)
+    local cfg = ai_cfg()
+    if type(ranked) ~= "table" or #ranked <= 0 or max_turns <= 0 then
+        return {}
+    end
+
+    if cfg.use_topic_buckets ~= true or not current_info then
+        local selected = {}
+        for i = 1, math.min(max_turns, #ranked) do
+            selected[#selected + 1] = ranked[i]
+        end
+
+        if (not is_read_only(opts)) and cfg.refinement_enabled == true and #ranked > max_turns then
+            local rp = refinement_progress(query_turn)
+            local explore_slots = math.floor(max_turns * 0.55 * (1.0 - rp) + 0.5)
+            if explore_slots > 0 then
+                local core_n = math.max(1, max_turns - explore_slots)
+                local core = {}
+                for i = 1, math.min(core_n, #ranked) do
+                    core[#core + 1] = ranked[i]
+                end
+                local pool = {}
+                for i = core_n + 1, math.min(#ranked, max_turns * 6) do
+                    pool[#pool + 1] = ranked[i]
+                end
+                if #pool > 0 then
+                    shuffle_inplace(pool)
+                    selected = {}
+                    for _, item in ipairs(core) do
+                        selected[#selected + 1] = item
+                    end
+                    for i = 1, math.min(explore_slots, #pool) do
+                        selected[#selected + 1] = pool[i]
+                    end
+                    table.sort(selected, function(a, b) return a.score > b.score end)
+                    while #selected > max_turns do
+                        table.remove(selected)
+                    end
+                end
+            end
+        end
+
+        local out = {}
+        for _, item in ipairs(selected) do
+            out[#out + 1] = item.turn
+        end
+        return out
+    end
+
+    local same, near, cross = {}, {}, {}
+    for _, item in ipairs(ranked) do
+        local rel = topic_relation_for_turn(item.turn, current_info, sim_th)
+        if rel == "same" then
+            same[#same + 1] = item
+        elseif rel == "near" then
+            near[#near + 1] = item
+        else
+            cross[#cross + 1] = item
+        end
+    end
+
+    local reserved_cross = math.min(#cross, math.floor(max_turns * cross_quota_ratio))
+    local in_topic_budget = max_turns - reserved_cross
+    local selected = {}
+    local used = {}
+
+    local function append_until(src, limit)
+        for _, item in ipairs(src) do
+            if #selected >= limit then break end
+            if not used[item.turn] then
+                used[item.turn] = true
+                selected[#selected + 1] = item
+            end
+        end
+    end
+
+    append_until(same, in_topic_budget)
+    append_until(near, in_topic_budget)
+    append_until(cross, max_turns)
+
+    if #selected < max_turns then
+        append_until(near, max_turns)
+        append_until(same, max_turns)
+        append_until(cross, max_turns)
+    end
+
+    table.sort(selected, function(a, b) return a.score > b.score end)
+    while #selected > max_turns do
+        table.remove(selected)
+    end
+
+    local out = {}
+    for _, item in ipairs(selected) do
+        out[#out + 1] = item.turn
     end
     return out
 end
@@ -1359,9 +1661,6 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     local current_topic_key = topic_key_for_current(current_turn, current_info)
 
-    local turn_best = {}
-    local turn_src = {}
-    local turn_mem = {}
     local mem_best_sim = {}
     local mem_best_cluster = {}
     local mem_best_effective = {}
@@ -1380,6 +1679,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     local mem_vec_cache = {}
     local mem_cluster_cache = {}
+    local mem_kind_cache = {}
     local q_sim_cache = {}
     local primary_candidates = nil
 
@@ -1407,6 +1707,16 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             mem_cluster_cache[mem_idx] = cid
         end
         return cid
+    end
+
+    local function get_mem_kind_cached(mem_idx)
+        local kind = mem_kind_cache[mem_idx]
+        if kind == nil then
+            kind = memory.get_memory_type and memory.get_memory_type(mem_idx) or memtypes.DEFAULT_KIND
+            kind = memtypes.normalize(kind, memtypes.DEFAULT_KIND)
+            mem_kind_cache[mem_idx] = kind
+        end
+        return kind
     end
 
     local function get_sim_cached(q_idx, qptr, mem_idx)
@@ -1440,6 +1750,15 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         return ""
     end
     local primary_qptr = tool.to_ptr_vec(primary.vec) or primary.vec
+    local query_type_profile = memtypes.predict_query_profile(user_input, primary.vec, type_route_cfg())
+
+    local function apply_memory_type_bonus(mem_idx, effective)
+        local bonus = memtypes.match_bonus(get_mem_kind_cached(mem_idx), query_type_profile)
+        if bonus <= 0.0 then
+            return effective
+        end
+        return effective * (1.0 + bonus)
+    end
 
     local persistent_extra_budget = 0
     if (not read_only) and cfg.persistent_explore_enabled == true and cluster.cluster_count() > 1 then
@@ -1511,7 +1830,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 local sim = get_sim_cached(q_idx, qptr, mem_idx)
                 if sim then
                     local sim_pos = math.max(0.0, sim)
-                    local effective = (sim_pos ^ power) * weight
+                    local effective = apply_memory_type_bonus(mem_idx, (sim_pos ^ power) * weight)
                     local cid = mem_best_cluster[mem_idx] or get_mem_cluster_cached(mem_idx)
                     local src = mem_best_source[mem_idx] or "hot"
                     update_mem_best(mem_idx, sim, effective, cid, src)
@@ -1570,7 +1889,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                     end
 
                     local sim_pos = math.max(0.0, sim)
-                    local effective = (sim_pos ^ power) * weight
+                    local effective = apply_memory_type_bonus(mem_idx, (sim_pos ^ power) * weight)
                     update_mem_best(mem_idx, sim, effective, cid, src_label)
 
                     if not soft_gate_filter(sim, min_gate, opts) then
@@ -1585,7 +1904,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 local sim = get_sim_cached(q_idx, qptr, mem_idx)
                 if sim then
                     local sim_pos = math.max(0.0, sim)
-                    local effective = (sim_pos ^ power) * weight
+                    local effective = apply_memory_type_bonus(mem_idx, (sim_pos ^ power) * weight)
                     if sim >= min_gate then
                         effective = effective * (tonumber(cfg.topic_cache_weight) or 1.02)
                     end
@@ -1610,7 +1929,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                 end
                 local mem_idx = item.mem_idx
                 local sim_pos = math.max(0.0, sim)
-                local effective = (sim_pos ^ power) * weight
+                local effective = apply_memory_type_bonus(mem_idx, (sim_pos ^ power) * weight)
                 update_mem_best(mem_idx, sim, effective, get_mem_cluster_cached(mem_idx), "preload_cluster")
             end
         end
@@ -1620,11 +1939,62 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
-    local kept_memories = {}
     local dropped_by_memory_gate = 0
     for mem_idx, sim in pairs(mem_best_sim) do
-        if sim >= memory_drop_sim then
-            kept_memories[#kept_memories + 1] = mem_idx
+        if sim < memory_drop_sim then
+            dropped_by_memory_gate = dropped_by_memory_gate + 1
+        end
+    end
+
+    local sample_limit = math.max(1, tonumber(cfg.refinement_sample_mem_topk) or 48)
+    local kept_memories, evidence_memories, candidate_samples = stage_a_evidence_shortlist(
+        mem_best_sim,
+        mem_best_effective,
+        mem_best_cluster,
+        mem_best_source,
+        sample_limit,
+        memory_drop_sim
+    )
+
+    local recency_scale = 0.0
+    if current_info and current_info.centroid then
+        recency_scale = math.max(0.0, tonumber(tool.cosine_similarity(primary_qptr, current_info.centroid)) or 0.0)
+    end
+
+    local ranked = {}
+    local turn_src = {}
+    local turn_mem = {}
+    local coverage_ranked = {}
+    if cfg.two_stage_turn_rerank_enabled ~= false then
+        local coverage_src, coverage_mem
+        local _full_turn_pool
+        ranked, turn_src, turn_mem, _full_turn_pool = stage_b_turn_rerank(
+            evidence_memories,
+            mem_best_effective,
+            mem_best_source,
+            current_info,
+            current_turn,
+            recency_scale,
+            sim_th
+        )
+        coverage_ranked, coverage_src, coverage_mem = stage_b_turn_coverage(
+            evidence_memories,
+            mem_best_effective,
+            mem_best_source
+        )
+        for turn, source in pairs(coverage_src) do
+            if not turn_src[turn] then
+                turn_src[turn] = source
+            end
+        end
+        for turn, mem_idx in pairs(coverage_mem) do
+            if not turn_mem[turn] then
+                turn_mem[turn] = mem_idx
+            end
+        end
+    else
+        local turn_best = {}
+        for _, mem_idx in ipairs(kept_memories) do
             local effective = tonumber(mem_best_effective[mem_idx]) or 0.0
             if effective > 0.0 then
                 local src_label = mem_best_source[mem_idx] or "hot"
@@ -1637,25 +2007,10 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
                     end
                 end
             end
-        else
-            dropped_by_memory_gate = dropped_by_memory_gate + 1
         end
+        ranked = to_sorted_pairs(turn_best)
     end
 
-    local kept_best_sim = {}
-    local kept_best_cluster = {}
-    local kept_best_effective = {}
-    for _, mem_idx in ipairs(kept_memories) do
-        kept_best_sim[mem_idx] = mem_best_sim[mem_idx]
-        kept_best_cluster[mem_idx] = mem_best_cluster[mem_idx]
-        kept_best_effective[mem_idx] = mem_best_effective[mem_idx]
-    end
-
-    local sample_limit = math.max(1, tonumber(cfg.refinement_sample_mem_topk) or 48)
-    local candidate_samples = collect_candidate_samples(kept_best_sim, kept_best_cluster, kept_best_effective, sample_limit)
-
-    local selected = {}
-    local ranked = to_sorted_pairs(turn_best)
     if #ranked <= 0 then
         print(string.format(
             "[Recall] 空召回（preloaded_clusters=%d, kept_memories=%d, dropped_by_memory_gate=%d, keyword_mode=%s）",
@@ -1669,88 +2024,70 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         return ""
     end
 
-    if cfg.use_topic_buckets ~= true or not current_info then
-        for i = 1, math.min(max_turns, #ranked) do
-            selected[#selected + 1] = ranked[i]
-        end
+    local selected_turns = {}
+    local used_turns = {}
+    local coverage_slots = 0
+    if cfg.two_stage_turn_rerank_enabled ~= false and #coverage_ranked > 0 then
+        coverage_slots = math.min(
+            math.max(0, max_turns - 1),
+            math.max(0, math.floor(tonumber(cfg.turn_rerank_coverage_slots) or 1)),
+            #coverage_ranked
+        )
+    end
 
-        if (not read_only) and cfg.refinement_enabled == true then
-            local rp = refinement_progress(current_turn)
-            local explore_slots = math.floor(max_turns * 0.55 * (1.0 - rp) + 0.5)
-            if explore_slots > 0 and #ranked > max_turns then
-                local core_n = math.max(1, max_turns - explore_slots)
-                local core = {}
-                for i = 1, math.min(core_n, #ranked) do
-                    core[#core + 1] = ranked[i]
-                end
-                local pool = {}
-                for i = core_n + 1, math.min(#ranked, max_turns * 6) do
-                    pool[#pool + 1] = ranked[i]
-                end
-                if #pool > 0 then
-                    shuffle_inplace(pool)
-                    local choose_n = math.min(explore_slots, #pool)
-                    selected = {}
-                    for _, it in ipairs(core) do selected[#selected + 1] = it end
-                    for i = 1, choose_n do selected[#selected + 1] = pool[i] end
-                    table.sort(selected, function(a, b) return a.score > b.score end)
-                    while #selected > max_turns do
-                        table.remove(selected)
-                    end
-                end
+    local primary_turns = select_turns_from_ranked(
+        ranked,
+        (max_turns > 0) and math.max(1, max_turns - coverage_slots) or 0,
+        current_info,
+        cross_quota_ratio,
+        current_turn,
+        sim_th,
+        opts
+    )
+    for _, turn in ipairs(primary_turns) do
+        if not used_turns[turn] and #selected_turns < max_turns then
+            used_turns[turn] = true
+            selected_turns[#selected_turns + 1] = turn
+        end
+    end
+    if coverage_slots > 0 then
+        for _, item in ipairs(coverage_ranked) do
+            if #selected_turns >= max_turns then break end
+            if not used_turns[item.turn] then
+                used_turns[item.turn] = true
+                selected_turns[#selected_turns + 1] = item.turn
             end
         end
-    else
-        local same, near, cross = {}, {}, {}
+    end
+    if #selected_turns < max_turns then
         for _, item in ipairs(ranked) do
-            local rel = topic_relation_for_turn(item.turn, current_info, sim_th)
-            if rel == "same" then
-                same[#same + 1] = item
-            elseif rel == "near" then
-                near[#near + 1] = item
-            else
-                cross[#cross + 1] = item
+            if #selected_turns >= max_turns then break end
+            if not used_turns[item.turn] then
+                used_turns[item.turn] = true
+                selected_turns[#selected_turns + 1] = item.turn
             end
-        end
-
-        local reserved_cross = math.min(#cross, math.floor(max_turns * cross_quota_ratio))
-        local in_topic_budget = max_turns - reserved_cross
-        local used = {}
-
-        local function append_until(src, limit)
-            for _, item in ipairs(src) do
-                if #selected >= limit then break end
-                if not used[item.turn] then
-                    used[item.turn] = true
-                    selected[#selected + 1] = item
-                end
-            end
-        end
-
-        append_until(same, in_topic_budget)
-        append_until(near, in_topic_budget)
-        append_until(cross, max_turns)
-
-        if #selected < max_turns then
-            append_until(near, max_turns)
-            append_until(same, max_turns)
-            append_until(cross, max_turns)
-        end
-
-        table.sort(selected, function(a, b) return a.score > b.score end)
-        while #selected > max_turns do
-            table.remove(selected)
         end
     end
 
-    local selected_turns = {}
+    local score_lookup = {}
+    for _, item in ipairs(ranked) do
+        score_lookup[item.turn] = tonumber(item.score) or 0.0
+    end
+    for _, item in ipairs(coverage_ranked) do
+        local prev = tonumber(score_lookup[item.turn]) or -1.0
+        if item.score > prev then
+            score_lookup[item.turn] = tonumber(item.score) or 0.0
+        end
+    end
+
+    local selected = {}
     local selected_memories = {}
     local cache_contrib = 0
-    for _, item in ipairs(selected) do
-        selected_turns[#selected_turns + 1] = item.turn
-        local mem_idx = turn_mem[item.turn]
+    for _, turn in ipairs(selected_turns) do
+        selected[#selected + 1] = { turn = turn, score = tonumber(score_lookup[turn]) or 0.0 }
+        local mem_idx = turn_mem[turn]
         if mem_idx then selected_memories[#selected_memories + 1] = mem_idx end
-        if turn_src[item.turn] == "cache" then
+        if turn_src[turn] == "cache" then
             cache_contrib = cache_contrib + 1
         end
     end

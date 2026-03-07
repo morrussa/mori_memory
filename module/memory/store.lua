@@ -6,6 +6,7 @@ local tool = require("module.tool")
 local config = require("module.config")
 local cluster = require("module.memory.cluster")
 local adaptive = require("module.memory.adaptive")
+local memtypes = require("module.memory.types")
 local ffi = require("ffi")
 local saver = require("module.memory.saver")
 local persistence = require("module.persistence")
@@ -17,7 +18,7 @@ local MANIFEST_PATH = ROOT_DIR .. "/manifest.txt"
 local INDEX_PATH = ROOT_DIR .. "/memory_index.bin"
 
 local INDEX_MAGIC = "MID3"
-local INDEX_VERSION = 1
+local INDEX_VERSION = 2
 local SHARD_MAGIC = "SHD3"
 local SHARD_VERSION = 1
 
@@ -191,9 +192,10 @@ end
 local function build_index_record(line, mem)
     local topic_anchor = tostring(mem.topic_anchor or "")
     local turns = mem.turns or {}
+    local kind_code = memtypes.code_for(mem.type or mem.kind)
     local topic_len = #topic_anchor
     local turn_count = #turns
-    local record_size = 4 + 4 + 4 + 4 + 2 + topic_len + 2 + (turn_count * 4)
+    local record_size = 4 + 4 + 4 + 4 + 2 + 2 + topic_len + 2 + (turn_count * 4)
 
     local buf = ffi.new("uint8_t[?]", record_size)
     local base = 0
@@ -209,6 +211,9 @@ local function build_index_record(line, mem)
 
     ffi.cast("int32_t*", buf + base)[0] = math.floor(tonumber(mem.cluster_id) or -1)
     base = base + 4
+
+    ffi.cast("uint16_t*", buf + base)[0] = math.floor(tonumber(kind_code) or 0)
+    base = base + 2
 
     ffi.cast("uint16_t*", buf + base)[0] = topic_len
     base = base + 2
@@ -281,7 +286,7 @@ local function load_index_binary()
     local dim = tonumber(header[2]) or VECTOR_DIM
     local next_line_header = tonumber(header[3]) or (count + 1)
 
-    if version ~= INDEX_VERSION then
+    if version ~= 1 and version ~= INDEX_VERSION then
         return false, "index_version_mismatch"
     end
 
@@ -306,6 +311,13 @@ local function load_index_binary()
 
         local cluster_id = tonumber(ffi.cast("const int32_t*", p + base)[0]) or -1
         base = base + 4
+
+        local kind_code = 0
+        if version >= 2 then
+            if base + 2 > offset + rec_len then break end
+            kind_code = tonumber(ffi.cast("const uint16_t*", p + base)[0]) or 0
+            base = base + 2
+        end
 
         local topic_len = tonumber(ffi.cast("const uint16_t*", p + base)[0]) or 0
         base = base + 2
@@ -336,6 +348,7 @@ local function load_index_binary()
                 turns = turns,
                 heat = heat,
                 cluster_id = cluster_id,
+                type = memtypes.kind_for_code(kind_code, memtypes.DEFAULT_KIND),
                 topic_anchor = topic_anchor,
             }
             topic_index_add(topic_anchor, line)
@@ -544,6 +557,30 @@ function M.get_topic_anchor(line)
     return mem.topic_anchor
 end
 
+function M.get_memory_type(line)
+    local idx = normalize_line(line)
+    if not idx then return memtypes.DEFAULT_KIND end
+    local mem = M.memories[idx]
+    if not mem then return memtypes.DEFAULT_KIND end
+    return memtypes.normalize(mem.type or mem.kind, memtypes.DEFAULT_KIND)
+end
+
+function M.set_memory_type(line, kind)
+    local idx = normalize_line(line)
+    if not idx then return false end
+    local mem = M.memories[idx]
+    if not mem then return false end
+
+    local normalized = memtypes.normalize(kind, memtypes.DEFAULT_KIND)
+    if mem.type == normalized then
+        return true
+    end
+
+    mem.type = normalized
+    record_dirty_index()
+    return true
+end
+
 function M.iter_topic_lines(topic_anchor, only_cold)
     local out = {}
     local bucket = M.topic_index[tostring(topic_anchor or "")]
@@ -703,6 +740,7 @@ function M.iterate_all()
         return {
             heat = tonumber(mem.heat) or 0,
             turns = shallow_copy_array(mem.turns),
+            type = memtypes.normalize(mem.type or mem.kind, memtypes.DEFAULT_KIND),
             topic_anchor = mem.topic_anchor,
             vec = M.return_mem_vec(i),
         }
@@ -794,12 +832,15 @@ function M.save_to_disk()
     return true
 end
 
-function M.add_memory(vec, turn)
+function M.add_memory(vec, turn, opts)
     local heat_mod = require("module.memory.heat")
+    opts = type(opts) == "table" and opts or {}
 
     if type(vec) ~= "table" or #vec <= 0 then
         return nil, "invalid_vector"
     end
+
+    local mem_kind = memtypes.normalize(opts.type or opts.kind, memtypes.DEFAULT_KIND)
 
     local new_heat = tonumber((config.settings.heat or {}).new_memory_heat) or 43000
     local merge_limit = adaptive.get_merge_limit((config.settings or {}).merge_limit or 0.95)
@@ -828,6 +869,7 @@ function M.add_memory(vec, turn)
                     if merged_topic_key then
                         M.update_topic_anchor(target, merged_topic_key)
                     end
+                    M.set_memory_type(target, mem_kind)
                     M.set_heat(target, M.get_heat_by_index(target) + new_heat)
                     heat_mod.sync_line(target)
                     heat_mod.normalize_heat()
@@ -850,6 +892,7 @@ function M.add_memory(vec, turn)
         turns = { math.max(0, math.floor(tonumber(turn) or 0)) },
         heat = 0,
         cluster_id = -1,
+        type = mem_kind,
         topic_anchor = topic_anchor,
     }
     topic_index_add(topic_anchor, new_line)

@@ -332,6 +332,33 @@ local DEFAULT_SETTINGS = {
         topic_random_lift_only_cold = true, -- true=只从冷记忆里挑 lift 候选，避免热区重复。
         topic_cache_weight = 1.02, -- cache 命中的分数增益系数（用于轻微偏置同topic记忆）。
 
+        -- [实现方法] two-stage turn rerank：
+        -- 先按 memory shortlist，再对 turn 做二阶段重排，降低“一个 memory 带很多历史 turn 全挤进来”的问题。
+        two_stage_turn_rerank_enabled = true,
+        turn_rerank_memory_shortlist = 16,
+        turn_rerank_per_memory_limit = 8,
+        turn_rerank_global_shortlist = 48,
+        turn_rerank_coverage_slots = 1,
+        turn_rerank_per_memory_coverage = 2,
+        turn_age_decay_half_life = 72.0,
+        turn_age_decay_weight = 0.18,
+        turn_same_session_bonus = 0.10,
+        turn_recent_continuation_bonus = 0.08,
+        turn_recent_continuation_window = 18,
+        turn_same_topic_bonus = 0.08,
+        turn_source_bonus_cache = 0.08,
+        turn_source_bonus_preload = 0.05,
+        turn_source_bonus_hot = 0.02,
+
+        -- [实现方法] memory type routing：
+        -- query 只对 memory type 做轻量加权，不做过滤，也不参与 cluster 粗路由。
+        memory_type_routing = {
+            enabled = true,
+            topk = 2,
+            min_query_sim = 0.18,
+            max_bonus = 0.16,
+        },
+
         -- [实现方法] 查询驱动冷救援（delayed rescue queue）：
         -- 召回 miss/弱命中时入队冷记忆，按延迟到期后在 maintenance tick 执行唤醒 + 邻居加热。
         cold_rescue_delay_min = 24, -- 入队后最小延迟轮数（防止即时抖动）。
