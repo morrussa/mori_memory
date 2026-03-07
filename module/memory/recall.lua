@@ -1299,10 +1299,46 @@ local function to_sorted_pairs(turn_best, turn_mem)
             turn = turn,
             score = score,
             mem_idx = turn_mem and turn_mem[turn] or nil,
+            src = nil,
         }
     end
-    table.sort(out, function(a, b) return a.score > b.score end)
+    table.sort(out, function(a, b)
+        if a.score == b.score then
+            return (tonumber(a.turn) or 0) > (tonumber(b.turn) or 0)
+        end
+        return a.score > b.score
+    end)
     return out
+end
+
+local function count_map_entries(rows)
+    local n = 0
+    for _, _ in pairs(rows or {}) do
+        n = n + 1
+    end
+    return n
+end
+
+local function compute_topic_evidence_score(scores)
+    local items = {}
+    for _, score in ipairs(scores or {}) do
+        items[#items + 1] = tonumber(score) or 0.0
+    end
+    table.sort(items, function(a, b) return a > b end)
+
+    local total = 0.0
+    for idx, score in ipairs(items) do
+        local weight = 1.0
+        if idx == 2 then
+            weight = 0.72
+        elseif idx == 3 then
+            weight = 0.50
+        elseif idx >= 4 then
+            weight = 0.35 / math.sqrt(idx - 2)
+        end
+        total = total + score * weight
+    end
+    return total
 end
 
 local function collect_candidate_samples(mem_best_sim, mem_best_cluster, mem_best_effective, limit)
@@ -1468,6 +1504,18 @@ local function topic_meta_for_key(topic_key, current_turn)
     }
 end
 
+local function topic_relation_for_key(topic_key, current_info, sim_th, current_turn, fallback_turn)
+    local turn_value = tonumber(fallback_turn)
+    if not turn_value then
+        local meta = topic_meta_for_key(topic_key, current_turn)
+        turn_value = tonumber(meta and meta.start_turn)
+    end
+    if not turn_value then
+        return "cross"
+    end
+    return topic_relation_for_turn(turn_value, current_info, sim_th)
+end
+
 local function nearest_selected_distance(turn_value, selected_turns)
     local best = math.huge
     for _, selected_turn in ipairs(selected_turns or {}) do
@@ -1592,27 +1640,230 @@ local function format_type_summary(type_counts)
     return table.concat(parts, ", ")
 end
 
+local function build_topic_candidates(kept_memories, mem_best_effective, mem_best_source, current_info, current_turn, sim_th)
+    local topic_groups = {}
+    local topic_order = {}
+
+    for _, mem_idx in ipairs(kept_memories or {}) do
+        local effective = tonumber(mem_best_effective[mem_idx]) or 0.0
+        if effective > 0.0 then
+            local turns = sorted_unique_numbers(memory.get_turns(mem_idx))
+            local source = mem_best_source[mem_idx] or "hot"
+            local seen_topics = {}
+            for _, turn_value in ipairs(turns) do
+                local topic_key = topic_key_for_turn(turn_value) or ("turn:" .. tostring(turn_value))
+                local bucket = topic_groups[topic_key]
+                if not bucket then
+                    bucket = {
+                        key = topic_key,
+                        turn_best = {},
+                        turn_mem = {},
+                        turn_src = {},
+                        mem_scores = {},
+                        type_counts = {},
+                        ranked_turns = {},
+                        score = 0.0,
+                        relation = "cross",
+                        mem_count = 0,
+                        turn_count = 0,
+                    }
+                    topic_groups[topic_key] = bucket
+                    topic_order[#topic_order + 1] = bucket
+                end
+                if (not bucket.turn_best[turn_value]) or effective > bucket.turn_best[turn_value] then
+                    bucket.turn_best[turn_value] = effective
+                    bucket.turn_mem[turn_value] = mem_idx
+                    bucket.turn_src[turn_value] = source
+                end
+                seen_topics[topic_key] = true
+            end
+
+            for topic_key, _ in pairs(seen_topics) do
+                local bucket = topic_groups[topic_key]
+                local prev_mem = bucket.mem_scores[mem_idx]
+                if (not prev_mem) or effective > prev_mem then
+                    bucket.mem_scores[mem_idx] = effective
+                end
+                local type_name = memory.get_type_name(mem_idx)
+                if type_name and type_name ~= "" then
+                    bucket.type_counts[type_name] = (bucket.type_counts[type_name] or 0) + 1
+                end
+            end
+        end
+    end
+
+    for _, bucket in ipairs(topic_order) do
+        local evidence = {}
+        for _, score in pairs(bucket.mem_scores) do
+            evidence[#evidence + 1] = tonumber(score) or 0.0
+        end
+        bucket.score = compute_topic_evidence_score(evidence)
+        bucket.mem_count = count_map_entries(bucket.mem_scores)
+        bucket.turn_count = count_map_entries(bucket.turn_best)
+        bucket.ranked_turns = to_sorted_pairs(bucket.turn_best, bucket.turn_mem)
+        for _, item in ipairs(bucket.ranked_turns) do
+            item.src = bucket.turn_src[item.turn]
+        end
+        local best_turn = bucket.ranked_turns[1] and bucket.ranked_turns[1].turn or nil
+        bucket.relation = topic_relation_for_key(bucket.key, current_info, sim_th, current_turn, best_turn)
+    end
+
+    table.sort(topic_order, function(a, b)
+        if a.score == b.score then
+            if a.mem_count == b.mem_count then
+                if a.turn_count == b.turn_count then
+                    return tostring(a.key) < tostring(b.key)
+                end
+                return a.turn_count > b.turn_count
+            end
+            return a.mem_count > b.mem_count
+        end
+        return a.score > b.score
+    end)
+
+    return topic_order
+end
+
+local function collect_selected_topic_memories(selected_topics)
+    local out = {}
+    local seen = {}
+    for _, bucket in ipairs(selected_topics or {}) do
+        for mem_idx, _ in pairs(bucket.mem_scores or {}) do
+            local idx = tonumber(mem_idx)
+            if idx and not seen[idx] then
+                seen[idx] = true
+                out[#out + 1] = idx
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function select_topic_landings(selected_topics, max_turns, cfg)
+    local per_topic_limit = math.max(1, math.floor(tonumber((cfg or {}).compiled_context_max_turns_per_topic) or 4))
+    local selected = {}
+    local used_turns = {}
+    local landing_counts = {}
+
+    local function push_item(bucket, item)
+        if not bucket or not item then
+            return false
+        end
+        local turn_value = math.floor(tonumber(item.turn) or -1)
+        if turn_value < 1 or used_turns[turn_value] or #selected >= max_turns then
+            return false
+        end
+        local key = tostring(bucket.key or ("turn:" .. tostring(turn_value)))
+        if (landing_counts[key] or 0) >= per_topic_limit then
+            return false
+        end
+        used_turns[turn_value] = true
+        landing_counts[key] = (landing_counts[key] or 0) + 1
+        selected[#selected + 1] = {
+            turn = turn_value,
+            score = tonumber(item.score) or 0.0,
+            mem_idx = item.mem_idx,
+            src = item.src,
+            topic_key = key,
+            topic_score = tonumber(bucket.score) or tonumber(item.score) or 0.0,
+            topic_type_counts = bucket.type_counts,
+        }
+        return true
+    end
+
+    for _, bucket in ipairs(selected_topics or {}) do
+        landing_counts[tostring(bucket.key or "")] = 0
+        for _, item in ipairs(bucket.ranked_turns or {}) do
+            if push_item(bucket, item) then
+                break
+            end
+        end
+        if #selected >= max_turns then
+            break
+        end
+    end
+
+    local extra_pool = {}
+    for _, bucket in ipairs(selected_topics or {}) do
+        for _, item in ipairs(bucket.ranked_turns or {}) do
+            local turn_value = math.floor(tonumber(item.turn) or -1)
+            if turn_value >= 1 and not used_turns[turn_value] then
+                extra_pool[#extra_pool + 1] = {
+                    bucket = bucket,
+                    turn = turn_value,
+                    score = tonumber(item.score) or 0.0,
+                    mem_idx = item.mem_idx,
+                    src = item.src,
+                }
+            end
+        end
+    end
+
+    table.sort(extra_pool, function(a, b)
+        if a.score == b.score then
+            local a_topic = tonumber(((a.bucket or {}).score)) or 0.0
+            local b_topic = tonumber(((b.bucket or {}).score)) or 0.0
+            if a_topic == b_topic then
+                return (tonumber(a.turn) or 0) > (tonumber(b.turn) or 0)
+            end
+            return a_topic > b_topic
+        end
+        return a.score > b.score
+    end)
+
+    for _, item in ipairs(extra_pool) do
+        if #selected >= max_turns then
+            break
+        end
+        push_item(item.bucket, item)
+    end
+
+    table.sort(selected, function(a, b)
+        local a_topic = tonumber(a.topic_score) or 0.0
+        local b_topic = tonumber(b.topic_score) or 0.0
+        if a_topic == b_topic then
+            if a.score == b.score then
+                return (tonumber(a.turn) or 0) > (tonumber(b.turn) or 0)
+            end
+            return a.score > b.score
+        end
+        return a_topic > b_topic
+    end)
+
+    return selected
+end
+
 local function build_compiled_memory_context(selected, current_turn, cfg)
     local topic_groups = {}
     local topic_order = {}
 
     for _, item in ipairs(selected or {}) do
-        local topic_key = topic_key_for_turn(item.turn) or ("turn:" .. tostring(item.turn))
+        local topic_key = tostring(item.topic_key or topic_key_for_turn(item.turn) or ("turn:" .. tostring(item.turn)))
         local bucket = topic_groups[topic_key]
         if not bucket then
             bucket = {
                 key = topic_key,
-                score = tonumber(item.score) or 0.0,
+                score = tonumber(item.topic_score) or tonumber(item.score) or 0.0,
                 turns = {},
                 type_counts = {},
             }
             topic_groups[topic_key] = bucket
             topic_order[#topic_order + 1] = bucket
         else
-            bucket.score = math.max(bucket.score, tonumber(item.score) or 0.0)
+            bucket.score = math.max(bucket.score, tonumber(item.topic_score) or tonumber(item.score) or 0.0)
         end
         bucket.turns[#bucket.turns + 1] = item.turn
-        if item.mem_idx then
+        local has_topic_type_counts = (type(item.topic_type_counts) == "table")
+        if has_topic_type_counts then
+            for type_name, count in pairs(item.topic_type_counts) do
+                local n = math.max(0, math.floor(tonumber(count) or 0))
+                if n > 0 then
+                    bucket.type_counts[type_name] = math.max(bucket.type_counts[type_name] or 0, n)
+                end
+            end
+        end
+        if (not has_topic_type_counts) and item.mem_idx then
             local type_name = memory.get_type_name(item.mem_idx)
             bucket.type_counts[type_name] = (bucket.type_counts[type_name] or 0) + 1
         end
@@ -1702,9 +1953,6 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     local current_topic_key = topic_key_for_current(current_turn, current_info)
 
-    local turn_best = {}
-    local turn_src = {}
-    local turn_mem = {}
     local mem_best_sim = {}
     local mem_best_cluster = {}
     local mem_best_effective = {}
@@ -1985,18 +2233,6 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     for mem_idx, sim in pairs(mem_best_sim) do
         if sim >= memory_drop_sim then
             kept_memories[#kept_memories + 1] = mem_idx
-            local effective = tonumber(mem_best_effective[mem_idx]) or 0.0
-            if effective > 0.0 then
-                local src_label = mem_best_source[mem_idx] or "hot"
-                local turns = memory.get_turns(mem_idx)
-                for _, t in ipairs(turns) do
-                    if (not turn_best[t]) or effective > turn_best[t] then
-                        turn_best[t] = effective
-                        turn_src[t] = src_label
-                        turn_mem[t] = mem_idx
-                    end
-                end
-            end
         else
             dropped_by_memory_gate = dropped_by_memory_gate + 1
         end
@@ -2014,9 +2250,15 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local sample_limit = math.max(1, tonumber(cfg.refinement_sample_mem_topk) or 48)
     local candidate_samples = collect_candidate_samples(kept_best_sim, kept_best_cluster, kept_best_effective, sample_limit)
 
-    local selected = {}
-    local ranked = to_sorted_pairs(turn_best, turn_mem)
-    if #ranked <= 0 then
+    local topic_candidates = build_topic_candidates(
+        kept_memories,
+        kept_best_effective,
+        mem_best_source,
+        current_info,
+        current_turn,
+        sim_th
+    )
+    if #topic_candidates <= 0 then
         print(string.format(
             "[Recall] 空召回（preloaded_clusters=%d, kept_memories=%d, dropped_by_memory_gate=%d, keyword_mode=%s）",
             preloaded_clusters, #kept_memories, dropped_by_memory_gate,
@@ -2029,41 +2271,52 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         return ""
     end
 
+    local selected_topics = {}
+    local max_topics = math.max(1, math.min(
+        max_turns,
+        math.floor(tonumber(cfg.compiled_context_max_topics) or 3)
+    ))
+
     if cfg.use_topic_buckets ~= true or not current_info then
-        for i = 1, math.min(max_turns, #ranked) do
-            selected[#selected + 1] = ranked[i]
+        for i = 1, math.min(max_topics, #topic_candidates) do
+            selected_topics[#selected_topics + 1] = topic_candidates[i]
         end
 
         if (not read_only) and cfg.refinement_enabled == true then
             local rp = refinement_progress(current_turn)
-            local explore_slots = math.floor(max_turns * 0.55 * (1.0 - rp) + 0.5)
-            if explore_slots > 0 and #ranked > max_turns then
-                local core_n = math.max(1, max_turns - explore_slots)
+            local explore_slots = math.floor(max_topics * 0.55 * (1.0 - rp) + 0.5)
+            if explore_slots > 0 and #topic_candidates > max_topics then
+                local core_n = math.max(1, max_topics - explore_slots)
                 local core = {}
-                for i = 1, math.min(core_n, #ranked) do
-                    core[#core + 1] = ranked[i]
+                for i = 1, math.min(core_n, #topic_candidates) do
+                    core[#core + 1] = topic_candidates[i]
                 end
                 local pool = {}
-                for i = core_n + 1, math.min(#ranked, max_turns * 6) do
-                    pool[#pool + 1] = ranked[i]
+                for i = core_n + 1, math.min(#topic_candidates, max_topics * 6) do
+                    pool[#pool + 1] = topic_candidates[i]
                 end
                 if #pool > 0 then
                     shuffle_inplace(pool)
                     local choose_n = math.min(explore_slots, #pool)
-                    selected = {}
-                    for _, it in ipairs(core) do selected[#selected + 1] = it end
-                    for i = 1, choose_n do selected[#selected + 1] = pool[i] end
-                    table.sort(selected, function(a, b) return a.score > b.score end)
-                    while #selected > max_turns do
-                        table.remove(selected)
+                    selected_topics = {}
+                    for _, it in ipairs(core) do selected_topics[#selected_topics + 1] = it end
+                    for i = 1, choose_n do selected_topics[#selected_topics + 1] = pool[i] end
+                    table.sort(selected_topics, function(a, b)
+                        if a.score == b.score then
+                            return tostring(a.key) < tostring(b.key)
+                        end
+                        return a.score > b.score
+                    end)
+                    while #selected_topics > max_topics do
+                        table.remove(selected_topics)
                     end
                 end
             end
         end
     else
         local same, near, cross = {}, {}, {}
-        for _, item in ipairs(ranked) do
-            local rel = topic_relation_for_turn(item.turn, current_info, sim_th)
+        for _, item in ipairs(topic_candidates) do
+            local rel = item.relation or "cross"
             if rel == "same" then
                 same[#same + 1] = item
             elseif rel == "near" then
@@ -2073,44 +2326,51 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             end
         end
 
-        local reserved_cross = math.min(#cross, math.floor(max_turns * cross_quota_ratio))
-        local in_topic_budget = max_turns - reserved_cross
+        local reserved_cross = math.min(#cross, math.floor(max_topics * cross_quota_ratio))
+        local in_topic_budget = max_topics - reserved_cross
         local used = {}
 
         local function append_until(src, limit)
             for _, item in ipairs(src) do
-                if #selected >= limit then break end
-                if not used[item.turn] then
-                    used[item.turn] = true
-                    selected[#selected + 1] = item
+                if #selected_topics >= limit then break end
+                local key = tostring(item.key or "")
+                if not used[key] then
+                    used[key] = true
+                    selected_topics[#selected_topics + 1] = item
                 end
             end
         end
 
         append_until(same, in_topic_budget)
-        append_until(near, in_topic_budget)
-        append_until(cross, max_turns)
+        if #selected_topics < in_topic_budget then
+            append_until(near, in_topic_budget)
+        end
+        append_until(cross, max_topics)
 
-        if #selected < max_turns then
-            append_until(near, max_turns)
-            append_until(same, max_turns)
-            append_until(cross, max_turns)
+        if #selected_topics < max_topics then
+            append_until(near, max_topics)
+            append_until(same, max_topics)
+            append_until(cross, max_topics)
         end
 
-        table.sort(selected, function(a, b) return a.score > b.score end)
-        while #selected > max_turns do
-            table.remove(selected)
+        table.sort(selected_topics, function(a, b)
+            if a.score == b.score then
+                return tostring(a.key) < tostring(b.key)
+            end
+            return a.score > b.score
+        end)
+        while #selected_topics > max_topics do
+            table.remove(selected_topics)
         end
     end
 
+    local selected = select_topic_landings(selected_topics, max_turns, cfg)
     local selected_turns = {}
-    local selected_memories = {}
+    local selected_memories = collect_selected_topic_memories(selected_topics)
     local cache_contrib = 0
     for _, item in ipairs(selected) do
         selected_turns[#selected_turns + 1] = item.turn
-        local mem_idx = turn_mem[item.turn]
-        if mem_idx then selected_memories[#selected_memories + 1] = mem_idx end
-        if turn_src[item.turn] == "cache" then
+        if item.src == "cache" then
             cache_contrib = cache_contrib + 1
         end
     end
@@ -2128,8 +2388,8 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             end
         end
     else
-        for _, t in ipairs(selected_turns) do
-            if turn_src[t] == "explore" then
+        for _, item in ipairs(selected) do
+            if item.src == "explore" then
                 persistent_hits = persistent_hits + 1
             end
         end
@@ -2138,16 +2398,16 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         adaptive.add_counter("persistent_explore_turn_hits", persistent_hits)
     end
 
-    local hits_all = 0
+    local hits_same_topics = 0
     if current_info then
-        for _, t in ipairs(selected_turns) do
-            if topic_relation_for_turn(t, current_info, sim_th) == "same" then
-                hits_all = hits_all + 1
+        for _, bucket in ipairs(selected_topics) do
+            if (bucket.relation or "cross") == "same" then
+                hits_same_topics = hits_same_topics + 1
             end
         end
     end
 
-    local hit_flag = hits_all > 0
+    local hit_flag = hits_same_topics > 0
     local clusters_seen = {}
     for _, sample in ipairs(candidate_samples) do
         local cid = tonumber(sample.cid)
@@ -2161,10 +2421,10 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     adjust_gate_on_result(hit_flag, opts)
 
-    apply_refinement(current_turn, hits_all, candidate_samples, selected_memories, current_info, sim_th, opts)
+    apply_refinement(current_turn, hits_same_topics, candidate_samples, selected_memories, current_info, sim_th, opts)
 
     local need_rescue = (#selected_turns == 0)
-    if not need_rescue and (cfg.cold_rescue_on_empty_only ~= true) and hits_all <= 0 then
+    if not need_rescue and (cfg.cold_rescue_on_empty_only ~= true) and hits_same_topics <= 0 then
         need_rescue = true
     end
     if need_rescue and (not read_only) then
@@ -2172,8 +2432,8 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     end
 
     print(string.format(
-        "[Recall] 选中 %d 条 turn（hits_same=%d, gate=%.3f, max_turns=%d, preloaded_clusters=%d, kept_memories=%d, dropped_by_memory_gate=%d, keyword_mode=%s）",
-        #selected_turns, hits_all, min_gate, max_turns, preloaded_clusters, #kept_memories, dropped_by_memory_gate,
+        "[Recall] 选中 %d 个 topic / %d 条 turn（same_topics=%d, gate=%.3f, max_turns=%d, preloaded_clusters=%d, kept_memories=%d, dropped_by_memory_gate=%d, keyword_mode=%s）",
+        #selected_topics, #selected_turns, hits_same_topics, min_gate, max_turns, preloaded_clusters, #kept_memories, dropped_by_memory_gate,
         secondary_near_mode_used and "near_lossless" or keyword_perf_mode
     ))
 
