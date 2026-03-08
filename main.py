@@ -2122,10 +2122,22 @@ class AIPipeline:
 
     def unpack_state(self):
         zst_path = "memory/state.zst"
-        if os.path.exists(zst_path):
-            print("[Python] 检测到旧 state.zst，Graph V1 启动策略为忽略旧执行态，不做解压迁移。")
+        v3_manifest = "memory/v3/manifest.txt"
         os.makedirs("memory/v3/graph/checkpoints", exist_ok=True)
         os.makedirs("memory/v3/graph/traces", exist_ok=True)
+
+        if os.path.exists(v3_manifest):
+            print("[Python] 检测到 V3 raw state，直接使用")
+            return
+
+        if not os.path.exists(zst_path):
+            print("[Python] 未找到 state.zst，使用现有 raw 或全新启动")
+            return
+
+        print("[Python] 检测到归档状态，正在解压 state.zst...")
+        self._do_decompress(zst_path)
+        if not os.path.exists(v3_manifest):
+            print("[Python][WARN] state.zst 解压后仍无 V3 manifest，memory 将以空 V3 状态启动")
 
     def _ensure_v3_state(self, zst_path):
         v3_manifest = "memory/v3/manifest.txt"
@@ -2176,6 +2188,8 @@ class AIPipeline:
         tar_bytes = io.BytesIO()
         with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
             for name in [
+                "memory.bin",
+                "clusters.bin",
                 "history.txt",
                 "topic.bin",
                 "pending_cold.txt",
@@ -2243,14 +2257,8 @@ class AIPipeline:
                 except Exception as e:
                     print(f"   删除 {name} 失败: {e}")
 
-        v3_root = "memory/v3"
-        if os.path.isdir(v3_root):
-            try:
-                shutil.rmtree(v3_root)
-                print("   已删除 v3/")
-            except Exception as e:
-                print(f"   删除 v3/ 失败: {e}")
-        print("[Python] 归档完成！仅保留 state.zst")
+        print("[Python] V3 storage 与 Graph 状态目录已保留")
+        print("[Python] 归档完成！保留 state.zst、memory/v3 与 graph 状态")
 
     def get_similarity(self, text1: str, text2: str) -> float:
         emb1 = self.get_embedding(text1)

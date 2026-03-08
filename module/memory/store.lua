@@ -717,10 +717,62 @@ function M.append_turn(line, turn)
     return true
 end
 
-function M.find_similar_all_fast(_query_vec_table, _max_results)
-    adaptive.add_counter("full_scan_guard_violations", 1)
-    print("[Guard] find_similar_all_fast 被禁用（V3 禁止全量扫描）")
-    return {}
+function M.find_similar_all_fast(query_vec_table, max_results)
+    local use_full_sort = false
+    if max_results == nil then
+        max_results = FAST_SCAN_TOPK
+    end
+    max_results = tonumber(max_results) or FAST_SCAN_TOPK
+    if max_results <= 0 then
+        use_full_sort = true
+    end
+
+    local results = {}
+    local topk = {}
+    local total = next_line - 1
+
+    for i = 1, total do
+        local h = M.get_heat_by_index(i)
+        if h > 0 then
+            local mem_vec = M.return_mem_vec(i)
+            if mem_vec and #mem_vec > 0 then
+                local score = tonumber(tool.cosine_similarity(query_vec_table, mem_vec)) or 0.0
+                if score > 0.5 then
+                    if use_full_sort then
+                        table.insert(results, { index = i, similarity = score })
+                    else
+                        if #topk < max_results then
+                            table.insert(topk, { index = i, similarity = score })
+                            local j = #topk
+                            while j > 1 and topk[j].similarity < topk[j - 1].similarity do
+                                topk[j], topk[j - 1] = topk[j - 1], topk[j]
+                                j = j - 1
+                            end
+                        elseif score > topk[1].similarity then
+                            topk[1] = { index = i, similarity = score }
+                            local j = 1
+                            while j < #topk and topk[j].similarity > topk[j + 1].similarity do
+                                topk[j], topk[j + 1] = topk[j + 1], topk[j]
+                                j = j + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if not use_full_sort then
+        for i = #topk, 1, -1 do
+            results[#results + 1] = topk[i]
+        end
+        return results
+    end
+
+    table.sort(results, function(a, b)
+        return a.similarity > b.similarity
+    end)
+    return results
 end
 
 function M.iterate_all()
@@ -753,8 +805,14 @@ function M.load()
 
     local manifest = parse_manifest()
     if not manifest or tostring(manifest.version or "") ~= "V3" then
-        cleanup_legacy_files()
-        print("[Memory] V3 manifest 不存在，初始化空记忆池")
+        local has_legacy_raw = tool.file_exists("memory/memory.bin")
+            or tool.file_exists("memory/clusters.bin")
+            or tool.file_exists("memory/history.txt")
+        if has_legacy_raw then
+            print("[Memory] 未检测到 V3 manifest，保留 legacy raw 文件；当前以内存空状态启动")
+        else
+            print("[Memory] V3 manifest 不存在，初始化空记忆池")
+        end
         M._loaded_v3 = false
         return
     end

@@ -14,9 +14,9 @@ function M.run(state, _ctx)
 
     local user_input = tostring((((state or {}).input or {}).message) or "")
     local final_text = tostring((((state or {}).final_response or {}).message) or "")
-    local items = memory_core.extract_atomic_items(user_input, final_text)
+    local items = memory_core.extract_atomic_facts(user_input, final_text)
     state.writeback.items = items or {}
-    state.writeback.ingest_strategy = "atomic_fact"
+    state.writeback.ingest_strategy = "main_atomic_fact"
     state.writeback.saved_count = 0
     return state
 end

@@ -2,212 +2,200 @@ local tool = require("module.tool")
 local memory = require("module.memory.store")
 local heat = require("module.memory.heat")
 local history = require("module.memory.history")
-local memtypes = require("module.memory.types")
-local config = require("module.config")
-local util = require("module.graph.util")
 
 local M = {}
 
-local function graph_cfg()
-    return ((config.settings or {}).graph or {})
+local function trim(s)
+    if not s then return "" end
+    return (tostring(s):gsub("^%s*(.-)%s*$", "%1"))
 end
 
-local function fact_cfg()
-    return (graph_cfg().fact_extractor or {})
+local function strip_cot_safe(text)
+    text = tostring(text or "")
+    local cleaned = tool.remove_cot(text)
+    if cleaned == "" and text ~= "" and not text:find("</think>", 1, true) then
+        cleaned = text
+    end
+    return cleaned
 end
 
-local function sanitize_text(s)
-    local text = tostring(s or "")
-    if tool.utf8_sanitize_lossy then
-        text = tool.utf8_sanitize_lossy(text)
-    end
-    return text
+local function build_fact_prompt(user_input, assistant_clean)
+    return string.format([[
+你是记忆系统的“原子事实提取器”。
+任务：从下面一轮对话提取可长期存储的事实，输出 Lua 字符串数组。
+
+硬性输出格式（只能二选一）：
+1) {"事实1","事实2"}
+2) {"无"}
+
+硬性规则：
+- 只能输出一个 Lua table，禁止任何解释、前后缀、代码块标记、标签。
+- 每条事实 6~28 字，必须是可独立复用的陈述句。
+- 优先提取：偏好、约束、身份、长期计划、持续需求；忽略寒暄/一次性上下文。
+- 不要输出“用户说/助手说/这轮对话”等元话术。
+- 没有可存事实时只能输出 {"无"}。
+
+输入：
+用户：%s
+助手：%s
+
+请使用 /no_think 模式推理；但输出中只能包含 Lua table 本体
+]], user_input, assistant_clean)
 end
 
-local function run_chat(prompt, max_tokens, temperature, seed)
-    local messages = {
-        { role = "user", content = prompt },
-    }
-    local params = {
-        max_tokens = math.max(64, math.floor(tonumber(max_tokens) or 256)),
-        temperature = tonumber(temperature) or 0,
-        seed = tonumber(seed) or 42,
-    }
-    return tostring(py_pipeline:generate_chat_sync(messages, params) or "")
+local function build_fact_repair_prompt(raw_output)
+    return string.format([[
+把下面文本修复为**仅一个** Lua 字符串数组：
+允许输出：
+{"事实1","事实2"} 或 {"无"}
+禁止任何其他字符。
+原始文本：
+%s
+
+请使用 /no_think 模式推理；但输出中只能包含修复后的 Lua table 本体
+]], tostring(raw_output or ""))
 end
 
-local function normalize_item_row(item, max_chars)
-    local text = ""
-    local kind = nil
-
-    if type(item) == "string" then
-        text = util.trim(item)
-    elseif type(item) == "table" then
-        text = util.trim(item.text or item.content or item.fact or "")
-        kind = item.type or item.kind or item.label
-    end
-
-    if text == "" then
-        return nil
-    end
-
-    text = util.utf8_take(text, math.max(16, math.floor(tonumber(max_chars) or 96)))
-    if text == "" or text:lower() == "none" then
-        return nil
-    end
-
-    kind = memtypes.normalize(kind, memtypes.infer_text_type(text, "passage"))
-    return {
-        text = text,
-        type = kind,
-    }
+local function normalize_fact(fact)
+    fact = trim(tostring(fact or ""))
+    fact = fact:gsub("[%c]+", " ")
+    fact = fact:gsub("%s+", " ")
+    fact = trim(fact)
+    fact = fact:gsub("^用户[:：]?", "")
+    fact = fact:gsub("^助手[:：]?", "")
+    fact = trim(fact)
+    return fact
 end
 
-local function parse_typed_item_array(raw, max_items, max_chars)
-    local parsed, _err = util.parse_lua_table_literal(raw or "")
-    if type(parsed) ~= "table" then
-        local fallback, _fallback_err = tool.parse_lua_string_array_strict(raw or "", {
-            max_items = math.max(1, math.floor(tonumber(max_items) or 8)),
-            max_item_chars = math.max(8, math.floor(tonumber(max_chars) or 96)),
-            must_full = true,
-            extract_first_on_fail = true,
-        })
-        parsed = fallback or {}
-    end
+local function is_bad_fact(fact)
+    local n = #fact
+    if n < 6 or n > 64 then return true end
+    if fact == "无" then return true end
+    if fact:find("[{}]") then return true end
+    local low = fact:lower()
+    if low:find("lua table", 1, true) then return true end
+    if low:find("analysis", 1, true) then return true end
+    if fact:find("用户说", 1, true) or fact:find("助手说", 1, true) then return true end
+    return false
+end
 
+local function sanitize_facts(candidates, max_items)
     local out = {}
     local seen = {}
-    for _, item in ipairs(parsed or {}) do
-        local row = normalize_item_row(item, max_chars)
-        if row then
-            local dedup_key = row.type .. "\31" .. row.text
-            if not seen[dedup_key] then
-                seen[dedup_key] = true
-                out[#out + 1] = row
-                if #out >= math.max(1, math.floor(tonumber(max_items) or 8)) then
-                    break
-                end
-            end
+    max_items = tonumber(max_items) or 8
+    for _, item in ipairs(candidates or {}) do
+        local fact = normalize_fact(item)
+        if fact ~= "" and (not is_bad_fact(fact)) and (not seen[fact]) then
+            seen[fact] = true
+            out[#out + 1] = fact
+            if #out >= max_items then break end
         end
     end
     return out
 end
 
-local function build_extract_prompt(user_input, assistant_text)
-    return string.format([[
-你是长期记忆条目提取器。
-请从下面一轮对话提取“未来轮次仍可复用”的记忆条目，并为每条标注唯一类型。
-类型只能是：
-- identity: 用户本人、他人身份、角色、稳定属性
-- preference: 偏好、风格、习惯、常用选择
-- state: 当前进展、阶段、上下文、临时约束、正在做的事
-- decision: 已确定方案、冻结结论、采用或不采用什么
-- fact: 客观结果、指标、数值、观察结论
-- concept: 方法、机制、术语、抽象知识
-
-输出格式必须且只能是 Lua table 数组：
-{{text="...",type="state"},{text="...",type="decision"}}
-如果没有可写入内容，输出：
-{{text="none",type="none"}}
-禁止输出解释、markdown、代码块。
-
-用户输入：%s
-助手回复：%s
-]], user_input, assistant_text)
+local function parse_quoted_candidates(text, max_items)
+    local out = {}
+    max_items = tonumber(max_items) or 12
+    text = tostring(text or "")
+    for q in text:gmatch('"(.-)"') do
+        out[#out + 1] = q
+        if #out >= max_items then return out end
+    end
+    for q in text:gmatch("'(.-)'") do
+        out[#out + 1] = q
+        if #out >= max_items then return out end
+    end
+    return out
 end
 
-local function build_verify_prompt(user_input, assistant_text, items)
-    return string.format([[
-请校验下列记忆条目及其类型是否得到当前轮对话支持，删除不可靠项，必要时修正类型。
-输出格式必须且只能是 Lua table 数组，字段只允许 text/type。
+local function parse_facts_from_llm(raw_facts_str)
+    local facts_str = strip_cot_safe(raw_facts_str or "")
+    facts_str = trim(facts_str)
 
-用户输入：%s
-助手回复：%s
-候选条目：%s
-]], user_input, assistant_text, util.encode_lua_value(items, 0))
+    local parsed, err = tool.parse_lua_string_array_strict(facts_str, {
+        max_items = 12,
+        max_item_chars = 64,
+        must_full = true,
+        extract_first_on_fail = true,
+    })
+    if not parsed then
+        local quoted = parse_quoted_candidates(facts_str, 12)
+        local recovered = sanitize_facts(quoted, 8)
+        if #recovered > 0 then
+            print(string.format("[Lua Fact Extract] strict 解析失败(%s)，已从引号内容恢复 %d 条", tostring(err), #recovered))
+            return recovered
+        end
+        print(string.format("[Lua Fact Extract] LLM 输出格式非法，已丢弃: %s", tostring(err)))
+        return {}
+    end
+
+    local facts = sanitize_facts(parsed, 8)
+    print(string.format("[Lua Fact Extract] 成功提取 %d 条原子事实", #facts))
+    return facts
 end
 
-local function build_repair_prompt(raw)
-    return string.format([[
-把下面文本修复成合法 Lua table 数组，仅输出数组本体。
-每个元素必须是 {text="...",type="identity|preference|state|decision|fact|concept"}。
-文本：%s
-]], tostring(raw or ""))
-end
+function M.extract_atomic_facts(user_input, assistant_text)
+    local assistant_clean = tool.replace(assistant_text or "", "\n", " ")
+    local fact_prompt = build_fact_prompt(user_input, assistant_clean)
 
-function M.extract_atomic_items(user_input, assistant_text)
-    local cfg = fact_cfg()
-    local max_facts = math.max(1, math.floor(tonumber(cfg.max_facts) or 8))
-    local max_parse_items = math.max(max_facts, math.floor(tonumber(cfg.max_parse_items) or 12))
-    local max_item_chars = math.max(16, math.floor(tonumber(cfg.max_item_chars) or 96))
+    local fact_messages = {
+        { role = "system", content = fact_prompt }
+    }
+    local fact_params = {
+        max_tokens = 256,
+        temperature = 0.15,
+        seed = 42,
+    }
 
-    local user = sanitize_text(user_input)
-    local assistant = sanitize_text(assistant_text):gsub("\n", " ")
+    local facts_str = py_pipeline:generate_chat_sync(fact_messages, fact_params)
+    local facts = parse_facts_from_llm(facts_str)
 
-    local raw = run_chat(
-        build_extract_prompt(user, assistant),
-        cfg.extract_max_tokens or 320,
-        cfg.extract_temperature or 0.15,
-        cfg.extract_seed or 42
-    )
-
-    local items = parse_typed_item_array(raw, max_parse_items, max_item_chars)
-
-    if #items > 0 and util.to_bool(cfg.verify_pass, true) then
-        local checked_raw = run_chat(
-            build_verify_prompt(user, assistant, items),
-            cfg.verify_max_tokens or 192,
-            cfg.verify_temperature or 0,
-            cfg.verify_seed or 46
-        )
-        local checked = parse_typed_item_array(checked_raw, max_parse_items, max_item_chars)
-        if #checked > 0 then
-            items = checked
+    if #facts == 0 then
+        local repair_prompt = build_fact_repair_prompt(facts_str)
+        local repair_messages = {
+            { role = "system", content = repair_prompt }
+        }
+        local repair_params = {
+            max_tokens = 192,
+            temperature = 0.0,
+            seed = 43,
+        }
+        local repaired = py_pipeline:generate_chat_sync(repair_messages, repair_params)
+        facts = parse_facts_from_llm(repaired)
+        if #facts > 0 then
+            print(string.format("[Lua Fact Extract] repair 模式恢复成功：%d 条", #facts))
         end
     end
 
-    if #items == 0 then
-        local repaired_raw = run_chat(
-            build_repair_prompt(raw),
-            cfg.repair_max_tokens or 192,
-            cfg.repair_temperature or 0,
-            cfg.repair_seed or 43
-        )
-        items = parse_typed_item_array(repaired_raw, max_parse_items, max_item_chars)
-    end
-
-    if #items > max_facts then
-        for i = #items, max_facts + 1, -1 do
-            table.remove(items, i)
+    if #facts == 0 then
+        print("[Lua Fact Extract] 未提取到事实，使用原始用户输入兜底")
+        facts = sanitize_facts({ user_input }, 1)
+        if #facts == 0 then
+            facts = { "用户本轮提出需求" }
         end
     end
-
-    return items
+    return facts
 end
 
-function M.save_ingest_items(items, mem_turn)
+function M.save_ingest_items(facts, mem_turn)
     if history.get_turn() ~= mem_turn then
         print(string.format("[GraphMemory][WARN] history turn mismatch: history=%d current=%d", history.get_turn(), mem_turn))
     end
 
     local saved = 0
-    for _, item in ipairs(items or {}) do
-        local row = normalize_item_row(item, 160)
-        if row then
-            local fact_vec = tool.get_embedding_passage(row.text)
-            local line, err = memory.add_memory(fact_vec, mem_turn, {
-                type = row.type,
-            })
-            if line then
-                heat.neighbors_add_heat(fact_vec, mem_turn, line)
-                saved = saved + 1
-            else
-                print(string.format("[GraphMemory][WARN] add memory failed (%s)", tostring(err)))
-            end
+    for _, fact in ipairs(facts or {}) do
+        local fact_vec = tool.get_embedding_passage(fact)
+        local line, err = memory.add_memory(fact_vec, mem_turn)
+        if line then
+            heat.neighbors_add_heat(fact_vec, mem_turn, line)
+            saved = saved + 1
+        else
+            print(string.format("[GraphMemory][WARN] add memory failed (%s): %s", tostring(err), tostring(fact):sub(1, 60)))
         end
     end
 
-    local maintenance_every = tonumber(((config.settings or {}).time or {}).maintenance_task) or 75
+    local maintenance_every = tonumber((((require("module.config").settings or {}).time) or {}).maintenance_task) or 75
     if maintenance_every > 0 and mem_turn % maintenance_every == 0 then
         heat.perform_cold_exchange()
     end
@@ -215,7 +203,7 @@ function M.save_ingest_items(items, mem_turn)
     return saved
 end
 
-M.extract_atomic_facts = M.extract_atomic_items
+M.extract_atomic_items = M.extract_atomic_facts
 M.save_turn_memory = M.save_ingest_items
 
 return M
