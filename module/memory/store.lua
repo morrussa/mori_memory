@@ -4,9 +4,8 @@ local M = {}
 
 local tool = require("module.tool")
 local config = require("module.config")
-local cluster = require("module.memory.cluster")
+local ghsom = require("module.memory.ghsom")
 local adaptive = require("module.memory.adaptive")
-local memtypes = require("module.memory.types")
 local ffi = require("ffi")
 local saver = require("module.memory.saver")
 local persistence = require("module.persistence")
@@ -63,31 +62,10 @@ local function topic_key_for_turn(turn)
     if not ok_topic or not topic then
         return nil
     end
-
-    local ti = topic.get_topic_for_turn and topic.get_topic_for_turn(turn) or nil
-    if not ti then
-        local anchor = topic.get_topic_anchor and topic.get_topic_anchor(turn) or nil
-        return anchor
+    if topic.get_stable_anchor then
+        return topic.get_stable_anchor(turn)
     end
-
-    if ti.is_active then
-        local start_turn = topic.active_topic and topic.active_topic.start
-        if start_turn then
-            return "S:" .. tostring(start_turn)
-        end
-        local anchor = topic.get_topic_anchor and topic.get_topic_anchor(turn) or nil
-        return anchor
-    end
-
-    if ti.topic_idx and topic.topics and topic.topics[ti.topic_idx] then
-        local rec = topic.topics[ti.topic_idx]
-        if rec and rec.start then
-            return "S:" .. tostring(rec.start)
-        end
-    end
-
-    local anchor = topic.get_topic_anchor and topic.get_topic_anchor(turn) or nil
-    return anchor
+    return topic.get_topic_anchor and topic.get_topic_anchor(turn) or nil
 end
 
 local function get_cache_cap()
@@ -192,7 +170,7 @@ end
 local function build_index_record(line, mem)
     local topic_anchor = tostring(mem.topic_anchor or "")
     local turns = mem.turns or {}
-    local kind_code = memtypes.code_for(mem.type or mem.kind)
+    local kind_code = 0  -- 类型系统已移除，默认为0
     local topic_len = #topic_anchor
     local turn_count = #turns
     local record_size = 4 + 4 + 4 + 4 + 2 + 2 + topic_len + 2 + (turn_count * 4)
@@ -348,7 +326,7 @@ local function load_index_binary()
                 turns = turns,
                 heat = heat,
                 cluster_id = cluster_id,
-                type = memtypes.kind_for_code(kind_code, memtypes.DEFAULT_KIND),
+                type = "fact",  -- 类型系统已移除，默认为"fact"
                 topic_anchor = topic_anchor,
             }
             topic_index_add(topic_anchor, line)
@@ -424,24 +402,7 @@ local function save_cluster_shard(cid)
 end
 
 local function enforce_lru_capacity()
-    if not lru_enabled() then return end
-    local cap = get_cache_cap()
-    local order = M._cluster_cache_order
-
-    while #order > cap do
-        local evict_cid = table.remove(order, 1)
-        if evict_cid then
-            if M._dirty_shards[evict_cid] then
-                local ok, err = save_cluster_shard(evict_cid)
-                if not ok then
-                    print(string.format("[Memory][WARN] shard %d eviction save failed: %s", evict_cid, tostring(err)))
-                    order[#order + 1] = evict_cid
-                    break
-                end
-            end
-            M._cluster_cache[evict_cid] = nil
-        end
-    end
+    return
 end
 
 local function load_cluster_shard(cid)
@@ -559,10 +520,10 @@ end
 
 function M.get_memory_type(line)
     local idx = normalize_line(line)
-    if not idx then return memtypes.DEFAULT_KIND end
+    if not idx then return "fact" end  -- 类型系统已移除，默认为"fact"
     local mem = M.memories[idx]
-    if not mem then return memtypes.DEFAULT_KIND end
-    return memtypes.normalize(mem.type or mem.kind, memtypes.DEFAULT_KIND)
+    if not mem then return "fact" end
+    return mem.type or "fact"
 end
 
 function M.set_memory_type(line, kind)
@@ -571,7 +532,7 @@ function M.set_memory_type(line, kind)
     local mem = M.memories[idx]
     if not mem then return false end
 
-    local normalized = memtypes.normalize(kind, memtypes.DEFAULT_KIND)
+    local normalized = kind or "fact"
     if mem.type == normalized then
         return true
     end
@@ -699,9 +660,7 @@ function M.set_heat(line, new_heat)
     end
 
     mem.heat = val
-    if cluster and cluster.on_memory_heat_change then
-        cluster.on_memory_heat_change(idx, old_val, val)
-    end
+    ghsom.on_memory_heat_change(idx, old_val, val)
     record_dirty_index()
     return true
 end
@@ -717,7 +676,8 @@ function M.append_turn(line, turn)
     return true
 end
 
-function M.find_similar_all_fast(query_vec_table, max_results)
+function M.find_similar_all_fast(query_vec_table, max_results, opts)
+    opts = type(opts) == "table" and opts or {}
     local use_full_sort = false
     if max_results == nil then
         max_results = FAST_SCAN_TOPK
@@ -726,16 +686,16 @@ function M.find_similar_all_fast(query_vec_table, max_results)
     if max_results <= 0 then
         use_full_sort = true
     end
+    local only_active = opts.only_active == true
 
     local results = {}
     local topk = {}
     local total = next_line - 1
 
     for i = 1, total do
-        local h = M.get_heat_by_index(i)
-        if h > 0 then
+        if (not only_active) or ghsom.is_hot(i) then
             local mem_vec = M.return_mem_vec(i)
-            if mem_vec and #mem_vec > 0 then
+            if mem_vec then
                 local score = tonumber(tool.cosine_similarity(query_vec_table, mem_vec)) or 0.0
                 if score > 0.5 then
                     if use_full_sort then
@@ -792,7 +752,7 @@ function M.iterate_all()
         return {
             heat = tonumber(mem.heat) or 0,
             turns = shallow_copy_array(mem.turns),
-            type = memtypes.normalize(mem.type or mem.kind, memtypes.DEFAULT_KIND),
+            type = mem.type or "fact",  -- 类型系统已移除
             topic_anchor = mem.topic_anchor,
             vec = M.return_mem_vec(i),
         }
@@ -891,66 +851,87 @@ function M.save_to_disk()
 end
 
 function M.add_memory(vec, turn, opts)
-    local heat_mod = require("module.memory.heat")
     opts = type(opts) == "table" and opts or {}
 
     if type(vec) ~= "table" or #vec <= 0 then
         return nil, "invalid_vector"
     end
 
-    local mem_kind = memtypes.normalize(opts.type or opts.kind, memtypes.DEFAULT_KIND)
-
     local new_heat = tonumber((config.settings.heat or {}).new_memory_heat) or 43000
     local merge_limit = adaptive.get_merge_limit((config.settings or {}).merge_limit or 0.95)
-    local cluster_sim_th = tonumber((((config.settings or {}).cluster or {}).cluster_sim)) or 0.72
-
-    local best_id, best_sim = cluster.find_best_cluster(vec, {
-        super_topn = (((config.settings or {}).cluster or {}).supercluster_topn_add),
-    })
+    local strict_merge_limit = math.min(0.995, merge_limit + 0.02)
+    local merge_gap = tonumber((((config.settings or {}).ghsom) or {}).merge_gap) or 0.015
+    local allow_merge = opts.allow_merge ~= false
 
     local sim_results = {}
-    if best_id and best_sim and best_sim >= cluster_sim_th then
-        sim_results = cluster.find_sim_in_cluster(vec, best_id, {
-            only_hot = true,
-            max_results = FAST_SCAN_TOPK,
-        })
-    end
-
-    if #sim_results > 0 then
-        local top = sim_results[1]
-        if top and (tonumber(top.similarity) or 0) >= merge_limit then
-            local target = tonumber(top.index)
-            if target and M.get_heat_by_index(target) > 0 then
-                local ok_turn = M.append_turn(target, turn)
-                if ok_turn then
-                    local merged_topic_key = topic_key_for_turn(turn)
-                    if merged_topic_key then
-                        M.update_topic_anchor(target, merged_topic_key)
-                    end
-                    M.set_memory_type(target, mem_kind)
-                    M.set_heat(target, M.get_heat_by_index(target) + new_heat)
-                    heat_mod.sync_line(target)
-                    heat_mod.normalize_heat()
-                    saver.mark_dirty()
-                    print(string.format("[Memory] 合并 -> 行 %d (sim=%.4f)", target, tonumber(top.similarity) or 0))
-                    return target
+    local seen = {}
+    if allow_merge then
+        local probe_nodes = ghsom.probe_nodes(vec, 3, { only_hot = false })
+        for _, node_item in ipairs(probe_nodes) do
+            local node_results = ghsom.find_similar_in_node(vec, node_item.id, {
+                only_hot = false,
+                max_results = FAST_SCAN_TOPK,
+            })
+            for _, item in ipairs(node_results) do
+                local target = tonumber(item.index)
+                if target and not seen[target] then
+                    seen[target] = true
+                    sim_results[#sim_results + 1] = item
                 end
+            end
+        end
+        table.sort(sim_results, function(a, b)
+            return (tonumber(a.similarity) or -1) > (tonumber(b.similarity) or -1)
+        end)
+
+        -- 尝试合并到现有记忆
+        if #sim_results > 0 then
+            local top = sim_results[1]
+            local top_sim = tonumber(top and top.similarity) or 0
+            local second_sim = tonumber(sim_results[2] and sim_results[2].similarity) or -1
+            local confident_merge = top_sim >= strict_merge_limit
+                or (top_sim >= merge_limit and (top_sim - second_sim) >= merge_gap)
+
+            if top and confident_merge then
+                local target = tonumber(top.index)
+                if target then
+                    local ok_turn = M.append_turn(target, turn)
+                    if ok_turn then
+                        local merged_topic_key = topic_key_for_turn(turn)
+                        if merged_topic_key then
+                            M.update_topic_anchor(target, merged_topic_key)
+                        end
+                        ghsom.activate_lines({ target }, { mode = "append" })
+                        saver.mark_dirty()
+                        print(string.format("[Memory] 合并 -> 行 %d (sim=%.4f)", target, tonumber(top.similarity) or 0))
+                        return target
+                    end
+                end
+            elseif top and top_sim >= merge_limit then
+                adaptive.add_counter("merge_deferred", 1)
+                print(string.format(
+                    "[Memory] merge deferred -> top sim %.4f, gap %.4f",
+                    top_sim,
+                    top_sim - math.max(0, second_sim)
+                ))
             end
         end
     end
 
+    -- 检查容量
     if next_line > MAX_MEMORY then
         print(string.format("[Memory][WARN] 记忆池已满（MAX_MEMORY=%d），跳过写入", MAX_MEMORY))
         return nil, "capacity_reached"
     end
 
+    -- 创建新记忆
     local new_line = next_line
     local topic_anchor = topic_key_for_turn(turn)
     M.memories[new_line] = {
         turns = { math.max(0, math.floor(tonumber(turn) or 0)) },
         heat = 0,
         cluster_id = -1,
-        type = mem_kind,
+        type = "fact",  -- 类型系统已移除
         topic_anchor = topic_anchor,
     }
     topic_index_add(topic_anchor, new_line)
@@ -958,18 +939,16 @@ function M.add_memory(vec, turn, opts)
     next_line = next_line + 1
     record_dirty_index()
 
-    local cid = cluster.add(vec, new_line)
-    if cid then
-        M.set_cluster_id(new_line, cid)
-        M.store_vector(new_line, cid, vec)
+    -- 使用GHSOM添加记忆
+    local node_id = ghsom.add(vec, new_line)
+    local shard_id = tonumber(node_id) or new_line
+    if shard_id > 0 then
+        M.store_vector(new_line, shard_id, vec)
     end
 
-    heat_mod.add_new_with_cluster_cap(new_line, vec)
-    if M.get_heat_by_index(new_line) <= 0 then
-        cluster.mark_cold(new_line)
-    end
+    ghsom.activate_lines({ new_line }, { mode = "append" })
 
-    print(string.format("[Memory] 新建 -> 行 %d", new_line))
+    print(string.format("[Memory] 新建 -> 行 %d (GHSOM节点 %d)", new_line, node_id or -1))
     return new_line
 end
 

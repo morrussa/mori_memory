@@ -1,6 +1,6 @@
 {
-    "git.enabled": true,
-    "Lua.diagnostics.globals": [
-        "py_pipeline"
-    ]
+"http.proxy": "http://127.0.0.1:7897",
+"https.proxy": "http://127.0.0.1:7897",
+"http.proxyStrictSSL": false,
+"http.noProxy": "127.0.0.1,localhost,::1"
 }

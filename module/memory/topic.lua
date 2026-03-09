@@ -16,6 +16,12 @@ local BREAK_LIMIT = T_CONF.break_limit or 0.45     -- 话语对断裂阈值 (论
 local CONFIRM_LIMIT = T_CONF.confirm_limit or 0.55 -- 话题无关确认阈值
 local MIN_TOPIC_LENGTH = T_CONF.min_topic_length or 2  -- 最小话题长度
 local SUMMARY_MAX_TOKENS = math.max(32, tonumber(T_CONF.summary_max_tokens) or 192)
+local FINGERPRINT_TOPK = math.max(1, tonumber(T_CONF.fingerprint_topk) or 3)
+local CHAIN_TOPN = math.max(1, tonumber(T_CONF.chain_topn) or 3)
+local CHAIN_MIN_SCORE = tonumber(T_CONF.chain_min_score) or 0.20
+local CHAIN_CENTROID_WEIGHT = tonumber(T_CONF.chain_centroid_weight) or 0.55
+local CHAIN_HIST_WEIGHT = tonumber(T_CONF.chain_hist_weight) or 0.45
+local CHAIN_DOMINANT_BONUS = tonumber(T_CONF.chain_dominant_bonus) or 0.05
 
 local DO_REBUILD = T_CONF.rebuild
 local IDX_FILE = "memory/topic.bin"
@@ -44,6 +50,105 @@ M._last_processed_turn = 0
 
 local function has_flag(mask, flag)
     return (mask % (flag * 2)) >= flag
+end
+
+local function shallow_copy_array(src)
+    local out = {}
+    for i = 1, #(src or {}) do
+        out[i] = src[i]
+    end
+    return out
+end
+
+local function stable_topic_key_from_record(rec)
+    local start = tonumber((rec or {}).start)
+    if not start or start <= 0 then
+        return nil
+    end
+    return "S:" .. tostring(math.floor(start))
+end
+
+local function normalize_topic_key(topic_key)
+    local key = tostring(topic_key or ""):match("^%s*(.-)%s*$")
+    if key == "" then
+        return nil
+    end
+
+    local prefix, value = key:match("^([ASC]):(%d+)$")
+    if not prefix or not value then
+        return key
+    end
+
+    local n = tonumber(value)
+    if not n or n <= 0 then
+        return nil
+    end
+
+    if prefix == "S" then
+        return "S:" .. tostring(math.floor(n))
+    end
+
+    if prefix == "A" then
+        return "S:" .. tostring(math.floor(n))
+    end
+
+    if prefix == "C" then
+        local rec = M.topics[math.floor(n)]
+        return stable_topic_key_from_record(rec)
+    end
+
+    return key
+end
+
+local function resolve_topic_key(topic_key)
+    local stable_key = normalize_topic_key(topic_key)
+    if not stable_key then
+        return nil
+    end
+
+    local start_turn = tonumber(stable_key:match("^S:(%d+)$"))
+    if not start_turn then
+        return stable_key
+    end
+
+    if M.active_topic.start and tonumber(M.active_topic.start) == start_turn then
+        return stable_key, {
+            key = stable_key,
+            start = start_turn,
+            end_ = nil,
+            summary = "",
+            centroid = M.active_topic.head_centroid or tool.average_vectors(M.active_topic.vectors),
+            is_active = true,
+            topic_idx = nil,
+        }
+    end
+
+    for idx, rec in ipairs(M.topics) do
+        if tonumber(rec.start) == start_turn then
+            return stable_key, {
+                key = stable_key,
+                start = tonumber(rec.start),
+                end_ = tonumber(rec.end_),
+                summary = tostring(rec.summary or ""),
+                centroid = rec.centroid,
+                is_active = false,
+                topic_idx = idx,
+            }
+        end
+    end
+
+    return stable_key
+end
+
+local function histogram_overlap(a, b)
+    local total = 0.0
+    local weights_a = ((a or {}).weights) or {}
+    local weights_b = ((b or {}).weights) or {}
+    for cid, wa in pairs(weights_a) do
+        local wb = tonumber(weights_b[cid]) or 0.0
+        total = total + math.min(tonumber(wa) or 0.0, wb)
+    end
+    return total
 end
 
 local function save_to_disk()
@@ -532,6 +637,177 @@ function M.get_topic_anchor(turn)
         end
     end
     return nil
+end
+
+function M.get_stable_anchor(turn)
+    local t = turn or M._last_processed_turn
+    if M.active_topic.start and t >= M.active_topic.start then
+        return "S:" .. tostring(M.active_topic.start)
+    end
+    for _, rec in ipairs(M.topics) do
+        if rec.start <= t and (not rec.end_ or t <= rec.end_) then
+            return stable_topic_key_from_record(rec)
+        end
+    end
+    return nil
+end
+
+function M.get_topic_fingerprint(topic_key)
+    local stable_key, rec = resolve_topic_key(topic_key)
+    if not stable_key then
+        return {
+            key = nil,
+            memory_count = 0,
+            cluster_count = 0,
+            dominant_cluster = nil,
+            top_clusters = {},
+            histogram = {},
+            weights = {},
+            centroid = nil,
+            summary = "",
+            start = nil,
+            topic_idx = nil,
+            is_active = false,
+        }
+    end
+
+    local ok_store, store = pcall(require, "module.memory.store")
+    local lines = {}
+    if ok_store and store and store.iter_topic_lines then
+        lines = store.iter_topic_lines(stable_key) or {}
+    end
+
+    local histogram = {}
+    local memory_count = 0
+    if ok_store and store and store.get_cluster_id then
+        for _, line in ipairs(lines) do
+            local cid = tonumber(store.get_cluster_id(line))
+            memory_count = memory_count + 1
+            if cid then
+                histogram[cid] = (histogram[cid] or 0) + 1
+            end
+        end
+    else
+        memory_count = #lines
+    end
+
+    local cluster_items = {}
+    for cid, hits in pairs(histogram) do
+        cluster_items[#cluster_items + 1] = {
+            cluster_id = tonumber(cid),
+            hits = tonumber(hits) or 0,
+            weight = memory_count > 0 and ((tonumber(hits) or 0) / memory_count) or 0.0,
+        }
+    end
+    table.sort(cluster_items, function(a, b)
+        if (a.hits or 0) ~= (b.hits or 0) then
+            return (a.hits or 0) > (b.hits or 0)
+        end
+        return (a.cluster_id or 0) < (b.cluster_id or 0)
+    end)
+
+    local top_clusters = {}
+    local weights = {}
+    for cid, hits in pairs(histogram) do
+        weights[cid] = memory_count > 0 and ((tonumber(hits) or 0) / memory_count) or 0.0
+    end
+    for i = 1, math.min(FINGERPRINT_TOPK, #cluster_items) do
+        top_clusters[#top_clusters + 1] = {
+            cluster_id = cluster_items[i].cluster_id,
+            hits = cluster_items[i].hits,
+            weight = cluster_items[i].weight,
+        }
+    end
+
+    return {
+        key = stable_key,
+        memory_count = memory_count,
+        cluster_count = #cluster_items,
+        dominant_cluster = top_clusters[1] and top_clusters[1].cluster_id or nil,
+        top_clusters = top_clusters,
+        histogram = histogram,
+        weights = weights,
+        centroid = rec and rec.centroid or nil,
+        summary = rec and tostring(rec.summary or "") or "",
+        start = rec and rec.start or nil,
+        topic_idx = rec and rec.topic_idx or nil,
+        is_active = rec and (rec.is_active == true) or false,
+        lines = shallow_copy_array(lines),
+    }
+end
+
+function M.get_topic_chain(topic_key, opts)
+    opts = type(opts) == "table" and opts or {}
+    local base_fp = M.get_topic_fingerprint(topic_key)
+    if not base_fp.key then
+        return {}
+    end
+
+    local centroid_weight = tonumber(opts.centroid_weight) or CHAIN_CENTROID_WEIGHT
+    local hist_weight = tonumber(opts.hist_weight) or CHAIN_HIST_WEIGHT
+    local dominant_bonus = tonumber(opts.dominant_bonus) or CHAIN_DOMINANT_BONUS
+    local topn = math.max(1, tonumber(opts.topn) or CHAIN_TOPN)
+    local min_score = tonumber(opts.min_score) or CHAIN_MIN_SCORE
+
+    local candidates = {}
+    for _, rec in ipairs(M.topics) do
+        local key = stable_topic_key_from_record(rec)
+        if key and key ~= base_fp.key then
+            candidates[#candidates + 1] = key
+        end
+    end
+    if M.active_topic.start then
+        local active_key = "S:" .. tostring(M.active_topic.start)
+        if active_key ~= base_fp.key then
+            candidates[#candidates + 1] = active_key
+        end
+    end
+
+    local seen = {}
+    local scored = {}
+    for _, key in ipairs(candidates) do
+        if not seen[key] then
+            seen[key] = true
+            local cand_fp = M.get_topic_fingerprint(key)
+            local centroid_sim = 0.0
+            if base_fp.centroid and cand_fp.centroid then
+                centroid_sim = tonumber(tool.cosine_similarity(base_fp.centroid, cand_fp.centroid)) or 0.0
+            end
+            local overlap = histogram_overlap(base_fp, cand_fp)
+            local same_dominant = base_fp.dominant_cluster
+                and cand_fp.dominant_cluster
+                and base_fp.dominant_cluster == cand_fp.dominant_cluster
+            local score = centroid_weight * math.max(0.0, centroid_sim)
+                + hist_weight * overlap
+                + (same_dominant and dominant_bonus or 0.0)
+
+            if score >= min_score then
+                scored[#scored + 1] = {
+                    key = cand_fp.key,
+                    score = score,
+                    centroid_similarity = centroid_sim,
+                    fingerprint_overlap = overlap,
+                    dominant_cluster = cand_fp.dominant_cluster,
+                    memory_count = cand_fp.memory_count,
+                    topic_idx = cand_fp.topic_idx,
+                    is_active = cand_fp.is_active,
+                    summary = cand_fp.summary,
+                }
+            end
+        end
+    end
+
+    table.sort(scored, function(a, b)
+        if (a.score or 0.0) ~= (b.score or 0.0) then
+            return (a.score or 0.0) > (b.score or 0.0)
+        end
+        return tostring(a.key or "") < tostring(b.key or "")
+    end)
+
+    while #scored > topn do
+        table.remove(scored)
+    end
+    return scored
 end
 
 return M

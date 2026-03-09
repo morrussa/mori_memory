@@ -11,10 +11,10 @@ function M.flush_all(force)
     if not M.dirty and not force then return true end
 
     local memory = require("module.memory.store")
-    local cluster = require("module.memory.cluster")
+    local ghsom = require("module.memory.ghsom")
     local history = require("module.memory.history")
-    local heat = require("module.memory.heat")
     local adaptive = require("module.memory.adaptive")
+    local topic_predictor = require("module.memory.topic_predictor")
     local checkpoint_store = require("module.graph.checkpoint_store")
 
     print("[Saver] === 开始原子保存 memory/v3 + graph 状态 ===")
@@ -30,11 +30,10 @@ function M.flush_all(force)
     end
 
     if not run_save("memory_v3", memory.save_to_disk) then return false end
-    if not run_save("cluster_v3_index", cluster.save_to_disk) then return false end
+    if not run_save("ghsom_index", ghsom.save_to_disk) then return false end
     if not run_save("history.txt", history.save_to_disk) then return false end
     if not run_save("adaptive_state.txt", adaptive.save_to_disk) then return false end
-
-    if not run_save("pending_cold.txt", heat.save_pending) then return false end
+    if not run_save("topic_predictor.txt", topic_predictor.save_to_disk) then return false end
 
     if not run_save("graph_checkpoint", function()
         return checkpoint_store.flush(force)

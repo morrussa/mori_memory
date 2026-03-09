@@ -7,10 +7,10 @@ local tool = require("module.tool")
 local memory = require("module.memory.store")
 local history = require("module.memory.history")
 local config = require("module.config")
-local cluster = require("module.memory.cluster")
+local ghsom = require("module.memory.ghsom")
 local topic = require("module.memory.topic")
 local adaptive = require("module.memory.adaptive")
-local heat = require("module.memory.heat")
+local predictor = require("module.memory.topic_predictor")
 
 local ANXIETY_SENTENCES = {
     "我很焦虑", "我急死了", "快点", "急急急", "我现在很着急"
@@ -27,14 +27,6 @@ local PAST_TALK_SENTENCES = {
 local anxiety_vec = nil
 local help_cry_vec = nil
 local past_talk_vec = nil
-
-M._last_topic_anchor = nil
-M._prev_query_vec = nil
-M._same_topic_streak = 0
-M._streak_sim_sum = 0.0
-M._streak_sim_count = 0
-M._topic_cache_anchor = nil
-M._topic_cache_mem = {}
 
 local function ai_cfg()
     return ((config.settings or {}).ai_query or {})
@@ -341,150 +333,32 @@ local function effective_retrieval_knobs(turn)
     }
 end
 
-local function top_probe_clusters(vec, probe_clusters, super_topn, turn)
-    local cfg = ai_cfg()
-    local cand, ops0 = cluster.super_candidate_clusters(vec, super_topn)
-    if #cand <= 0 then
-        return {}, ops0
-    end
-
-    local route_scale = 0.0
-    if cfg.refinement_enabled == true and (tonumber(turn) or 0) >= (tonumber(cfg.refinement_start_turn) or 200) then
-        route_scale = (tonumber(cfg.refinement_route_bias_scale) or 0.08) * refinement_progress(turn)
-    end
-
-    local scored = {}
-    local ops = ops0
-    for _, cid in ipairs(cand) do
-        local clu = cluster.clusters[cid]
-        if clu and clu.centroid then
-            local sim = tool.cosine_similarity(vec, clu.centroid)
-            ops = ops + 1
-            local adjusted = sim
-            if route_scale > 0 then
-                adjusted = adjusted + route_scale * adaptive.get_route_score(cid)
-            end
-            scored[#scored + 1] = { cid = cid, adjusted = adjusted }
+local function merge_unique_results(dst, src, limit)
+    local merged = {}
+    local seen = {}
+    for _, item in ipairs(dst or {}) do
+        local idx = tonumber(item.index)
+        if idx and not seen[idx] then
+            seen[idx] = true
+            merged[#merged + 1] = item
         end
     end
-
-    if #scored <= 0 then
-        return {}, ops
-    end
-
-    table.sort(scored, function(a, b) return a.adjusted > b.adjusted end)
-    local k = math.max(1, math.min(tonumber(probe_clusters) or 1, #scored))
-    local out = {}
-    for i = 1, k do
-        out[#out + 1] = scored[i].cid
-    end
-
-    if cfg.refinement_enabled == true and #scored > k then
-        local rp = refinement_progress(turn)
-        local explore_n = math.floor((1.0 - rp) * k * 0.75 + 0.5)
-        if explore_n > 0 then
-            local remain = {}
-            for i = k + 1, #scored do
-                remain[#remain + 1] = scored[i].cid
-            end
-            shuffle_inplace(remain)
-            for i = 1, math.min(explore_n, #remain) do
-                out[#out + 1] = remain[i]
-            end
+    for _, item in ipairs(src or {}) do
+        local idx = tonumber(item.index)
+        if idx and not seen[idx] then
+            seen[idx] = true
+            merged[#merged + 1] = item
         end
     end
-
-    return out, ops
-end
-
-local function unload_topic_cache()
-    if next(M._topic_cache_mem) ~= nil then
-        adaptive.add_counter("topic_cache_unload_count", 1)
-    end
-    M._topic_cache_mem = {}
-    M._topic_cache_anchor = nil
-end
-
-local function update_topic_stability(current_anchor, query_vec)
-    local cfg = ai_cfg()
-    local stable_warm = math.max(1, tonumber(cfg.stable_warmup_turns) or 6)
-    local stable_sim = clamp(tonumber(cfg.stable_min_pair_sim) or 0.72, 0.0, 1.0)
-
-    if current_anchor and current_anchor == M._last_topic_anchor then
-        M._same_topic_streak = M._same_topic_streak + 1
-        if M._prev_query_vec and #M._prev_query_vec > 0 and query_vec and #query_vec > 0 then
-            local sim = tool.cosine_similarity(M._prev_query_vec, query_vec)
-            M._streak_sim_sum = M._streak_sim_sum + sim
-            M._streak_sim_count = M._streak_sim_count + 1
-        end
-    else
-        M._same_topic_streak = 1
-        M._streak_sim_sum = 0.0
-        M._streak_sim_count = 0
-    end
-
-    M._last_topic_anchor = current_anchor
-    M._prev_query_vec = shallow_copy_array(query_vec or {})
-
-    local avg_pair = 1.0
-    if M._streak_sim_count > 0 then
-        avg_pair = M._streak_sim_sum / M._streak_sim_count
-    end
-
-    return (M._same_topic_streak >= stable_warm) and (avg_pair >= stable_sim)
-end
-
-local function memory_matches_current_topic(mem_idx, current_info, sim_th)
-    local mem = memory.memories[mem_idx]
-    if not mem or not mem.turns then return false end
-    for _, t in ipairs(mem.turns) do
-        if topic_relation_for_turn(t, current_info, sim_th) == "same" then
-            return true
+    table.sort(merged, function(a, b)
+        return (tonumber(a.similarity) or -1.0) > (tonumber(b.similarity) or -1.0)
+    end)
+    if limit and limit > 0 then
+        while #merged > limit do
+            table.remove(merged)
         end
     end
-    return false
-end
-
-local function topic_random_lift(turn, current_anchor, current_info, stable_ready)
-    local cfg = ai_cfg()
-    if not current_anchor or not current_info then return end
-    if not stable_ready then return end
-
-    local interval = math.max(1, tonumber(cfg.topic_random_lift_interval) or 3)
-    if interval > 1 and (turn % interval) ~= 0 then return end
-
-    local prob = clamp(tonumber(cfg.topic_random_lift_prob) or 0.85, 0.0, 1.0)
-    if math.random() > prob then return end
-
-    local sim_th = tonumber(cfg.topic_sim_threshold) or 0.70
-    local only_cold = cfg.topic_random_lift_only_cold ~= false
-
-    local candidates = {}
-    for idx = 1, memory.get_total_lines() do
-        if memory_matches_current_topic(idx, current_info, sim_th) then
-            if (not only_cold) or (not heat.is_hot(idx)) then
-                candidates[#candidates + 1] = idx
-            end
-        end
-    end
-    if #candidates <= 0 then return end
-
-    adaptive.add_counter("topic_lift_attempted", 1)
-    shuffle_inplace(candidates)
-
-    local take_n = math.max(1, tonumber(cfg.topic_random_lift_count) or 2)
-    local picked = {}
-    for i = 1, math.min(take_n, #candidates) do
-        picked[#picked + 1] = candidates[i]
-    end
-    if #picked <= 0 then return end
-
-    M._topic_cache_anchor = current_anchor
-    M._topic_cache_mem = {}
-    for _, idx in ipairs(picked) do
-        M._topic_cache_mem[idx] = true
-    end
-    adaptive.add_counter("topic_lift_executed", #picked)
+    return merged
 end
 
 local function build_query_vectors(user_input, user_vec, keyword_weight)
@@ -610,7 +484,7 @@ local function apply_refinement(turn, hits_all, candidate_samples, selected_memo
     })
 end
 
-local function retrieve(user_input, user_vec, current_turn, current_info, current_anchor)
+local function retrieve(user_input, user_vec, current_turn, current_info, current_anchor, prediction)
     if memory.get_total_lines() <= 0 then
         return ""
     end
@@ -621,7 +495,6 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local power = tonumber(knobs.power_suppress) or (cfg.power_suppress or 1.80)
     local max_memory = math.max(1, tonumber(knobs.max_memory) or 5)
     local max_turns = math.max(1, tonumber(knobs.max_turns) or 10)
-    local query_topn = math.max(1, tonumber(knobs.supercluster_topn_query) or 4)
     local probe_clusters = math.max(1, tonumber(knobs.probe_clusters) or 2)
     local cross_quota_ratio = clamp(tonumber(knobs.topic_cross_quota_ratio) or 0.25, 0.0, 0.5)
     local keyword_weight = math.max(0.0, tonumber(knobs.keyword_weight) or 0.55)
@@ -629,10 +502,9 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     local per_cluster_limit = math.max(2, tonumber(cfg.refinement_probe_per_cluster_limit) or 12)
     local base_scan_limit = math.max(per_cluster_limit, max_memory)
-    local persistent_cap = math.max(1, tonumber(cfg.persistent_explore_candidate_cap) or 32)
 
     local persistent_extra_budget = 0
-    if cfg.persistent_explore_enabled == true and cluster.cluster_count() > 1 then
+    if cfg.persistent_explore_enabled == true and ghsom.node_count() > 1 then
         local eps = clamp(tonumber(cfg.persistent_explore_epsilon) or 0.01, 0.0, 1.0)
         local periodic = math.max(0, tonumber(cfg.persistent_explore_period_turns) or 0)
         local trigger = false
@@ -650,11 +522,12 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local mem_best_sim = {}
     local mem_best_cluster = {}
     local mem_best_effective = {}
-    local persistent_probe_clusters_query = {}
     local candidate_mem_set = {}
     local candidate_mem_src = {}
     local candidate_mem_cluster = {}
     local candidate_mem_list = {}
+    local predicted_node_scores = type((prediction or {}).node_scores) == "table" and prediction.node_scores or {}
+    local predicted_lines = type((prediction or {}).lines) == "table" and prediction.lines or {}
 
     local query_vectors = build_query_vectors(user_input, user_vec, keyword_weight)
     local primary = query_vectors[1]
@@ -669,11 +542,11 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             candidate_mem_set[mem_idx] = true
             candidate_mem_list[#candidate_mem_list + 1] = mem_idx
             candidate_mem_src[mem_idx] = src_label or "hot"
-            candidate_mem_cluster[mem_idx] = tonumber(cid) or (cluster.get_cluster_id_for_line(mem_idx) or -1)
+            candidate_mem_cluster[mem_idx] = tonumber(cid) or (ghsom.get_node_for_line(mem_idx) or -1)
         elseif src_label == "explore" then
             candidate_mem_src[mem_idx] = "explore"
-        elseif src_label == "cache" and candidate_mem_src[mem_idx] ~= "explore" then
-            candidate_mem_src[mem_idx] = "cache"
+        elseif src_label == "predict" and candidate_mem_src[mem_idx] ~= "explore" then
+            candidate_mem_src[mem_idx] = "predict"
         end
     end
 
@@ -694,53 +567,49 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         local prev_sim = mem_best_sim[mem_idx]
         if (not prev_sim) or sim > prev_sim then
             mem_best_sim[mem_idx] = sim
-            mem_best_cluster[mem_idx] = tonumber(cid) or (cluster.get_cluster_id_for_line(mem_idx) or -1)
+            mem_best_cluster[mem_idx] = tonumber(cid) or (ghsom.get_node_for_line(mem_idx) or -1)
             mem_best_effective[mem_idx] = (sim_pos ^ power) * weight
         end
     end
 
-    -- Stage A: 只用主 query 召回候选池（降低关键词数量对检索耗时的线性放大）
+    -- Stage A: topic 预测先分配 GHSOM 节点预算，再做 active-first 扫描。
     do
         local qv = primary.vec
         local weight = primary.weight or 1.0
-        local cluster_ids, _ = top_probe_clusters(qv, probe_clusters, query_topn, current_turn)
-        local persistent_probe_clusters_vec = {}
-
-        if persistent_extra_budget > 0 and #cluster_ids > 0 then
-            local picked = {}
-            for _, cid in ipairs(cluster_ids) do picked[cid] = true end
-            local pool = {}
-            for _, cid in ipairs(cluster.get_cluster_ids()) do
-                if not picked[cid] then
-                    pool[#pool + 1] = cid
-                end
-            end
-            if #pool > 0 then
-                shuffle_inplace(pool)
-                local take = math.min(persistent_extra_budget, #pool)
-                for i = 1, take do
-                    local cid = pool[i]
-                    cluster_ids[#cluster_ids + 1] = cid
-                    persistent_probe_clusters_vec[cid] = true
-                    persistent_probe_clusters_query[cid] = true
-                end
-                adaptive.add_counter("persistent_explore_cluster_probes", take)
-            end
-        end
-
+        local total_scan_budget = math.max(base_scan_limit * math.max(1, probe_clusters), max_memory * 3)
+        local per_node_floor = math.max(2, math.floor(base_scan_limit / math.max(1, probe_clusters)))
+        local node_plan = ghsom.plan_probe_budget(qv, {
+            max_nodes = probe_clusters + persistent_extra_budget,
+            total_scan_budget = total_scan_budget,
+            per_node_floor = per_node_floor,
+            predicted_nodes = predicted_node_scores,
+            prior_scale = tonumber(cfg.topic_activation_node_prior_scale) or 0.78,
+            activation_bonus = tonumber(cfg.topic_activation_node_active_bonus) or 0.18,
+        })
         local scanned_any = false
-        for _, cid in ipairs(cluster_ids) do
-            local scan_limit = base_scan_limit
-            local src_label = "hot"
-            if persistent_probe_clusters_vec[cid] then
-                scan_limit = math.min(scan_limit, persistent_cap)
-                src_label = "explore"
+        for _, plan_item in ipairs(node_plan) do
+            local cid = tonumber(plan_item.id)
+            local scan_limit = math.max(1, tonumber(plan_item.scan_limit) or base_scan_limit)
+            local src_label = ((tonumber(plan_item.prior) or 0.0) > 0.0) and "predict" or "hot"
+            local sim_results = {}
+            if plan_item.prefer_active == true then
+                sim_results = ghsom.find_sim_in_node(qv, cid, {
+                    only_hot = true,
+                    max_results = scan_limit,
+                })
+                if #sim_results < scan_limit then
+                    local fallback_results = ghsom.find_sim_in_node(qv, cid, {
+                        only_hot = false,
+                        max_results = scan_limit,
+                    })
+                    sim_results = merge_unique_results(sim_results, fallback_results, scan_limit)
+                end
+            else
+                sim_results = ghsom.find_sim_in_node(qv, cid, {
+                    only_hot = false,
+                    max_results = scan_limit,
+                })
             end
-
-            local sim_results = cluster.find_sim_in_cluster(qv, cid, {
-                only_hot = true,
-                max_results = scan_limit,
-            })
             if #sim_results > 0 then
                 scanned_any = true
             end
@@ -762,8 +631,8 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             for _, mem in ipairs(fallback) do
                 local mem_idx = mem.index
                 local sim = mem.similarity
-                mark_candidate(mem_idx, "hot", cluster.get_cluster_id_for_line(mem_idx) or -1)
-                update_mem_best(mem_idx, sim, weight, cluster.get_cluster_id_for_line(mem_idx) or -1)
+                mark_candidate(mem_idx, "hot", ghsom.get_node_for_line(mem_idx) or -1)
+                update_mem_best(mem_idx, sim, weight, ghsom.get_node_for_line(mem_idx) or -1)
                 if sim >= min_gate then
                     local effective = (sim ^ power) * weight
                     push_turn_score(mem_idx, effective, "hot")
@@ -771,24 +640,19 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             end
         end
 
-        if current_anchor and M._topic_cache_anchor == current_anchor and next(M._topic_cache_mem) ~= nil then
-            local cache_scored = {}
-            for mem_idx, _ in pairs(M._topic_cache_mem) do
+        if #predicted_lines > 0 then
+            local predict_gain = tonumber(cfg.topic_activation_predict_gain) or 1.06
+            for _, mem_idx in ipairs(predicted_lines) do
                 local mem_vec = memory.return_mem_vec(mem_idx)
                 if mem_vec then
                     local sim = tool.cosine_similarity(qv, mem_vec)
-                    cache_scored[#cache_scored + 1] = { mem_idx = mem_idx, sim = sim }
-                end
-            end
-            table.sort(cache_scored, function(a, b) return a.sim > b.sim end)
-            for _, item in ipairs(cache_scored) do
-                local sim = item.sim
-                local mem_idx = item.mem_idx
-                mark_candidate(mem_idx, "cache", cluster.get_cluster_id_for_line(mem_idx) or -1)
-                update_mem_best(mem_idx, sim, weight, cluster.get_cluster_id_for_line(mem_idx) or -1)
-                if sim >= min_gate then
-                    local effective = (sim ^ power) * weight * (tonumber(cfg.topic_cache_weight) or 1.02)
-                    push_turn_score(mem_idx, effective, "cache")
+                    local cid = ghsom.get_node_for_line(mem_idx) or -1
+                    mark_candidate(mem_idx, "predict", cid)
+                    update_mem_best(mem_idx, sim, weight, cid)
+                    if sim >= min_gate then
+                        local effective = (sim ^ power) * weight * predict_gain
+                        push_turn_score(mem_idx, effective, "predict")
+                    end
                 end
             end
         end
@@ -877,7 +741,6 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local selected = {}
     local ranked = to_sorted_pairs(turn_best)
     if #ranked <= 0 then
-        heat.enqueue_cold_rescue(user_vec, current_turn, current_info, min_gate)
         return ""
     end
 
@@ -957,36 +820,17 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     local selected_turns = {}
     local selected_memories = {}
-    local cache_contrib = 0
+    local predict_contrib = 0
     for _, item in ipairs(selected) do
         selected_turns[#selected_turns + 1] = item.turn
         local mem_idx = turn_mem[item.turn]
         if mem_idx then selected_memories[#selected_memories + 1] = mem_idx end
-        if turn_src[item.turn] == "cache" then
-            cache_contrib = cache_contrib + 1
+        if turn_src[item.turn] == "predict" then
+            predict_contrib = predict_contrib + 1
         end
     end
-    if cache_contrib > 0 then
-        adaptive.add_counter("topic_cache_selected_turns_total", cache_contrib)
-    end
-
-    local persistent_hits = 0
-    if next(persistent_probe_clusters_query) ~= nil then
-        for _, mem_idx in ipairs(selected_memories) do
-            local cid = cluster.get_cluster_id_for_line(mem_idx)
-            if cid and persistent_probe_clusters_query[cid] then
-                persistent_hits = persistent_hits + 1
-            end
-        end
-    else
-        for _, t in ipairs(selected_turns) do
-            if turn_src[t] == "explore" then
-                persistent_hits = persistent_hits + 1
-            end
-        end
-    end
-    if persistent_hits > 0 then
-        adaptive.add_counter("persistent_explore_turn_hits", persistent_hits)
+    if predict_contrib > 0 then
+        adaptive.add_counter("topic_cache_selected_turns_total", predict_contrib)
     end
 
     local hits_all = 0
@@ -999,14 +843,10 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     end
 
     apply_refinement(current_turn, hits_all, candidate_samples, selected_memories, current_info, sim_th)
-
-    local need_rescue = (#selected_turns == 0)
-    if not need_rescue and (cfg.cold_rescue_on_empty_only ~= true) and hits_all <= 0 then
-        need_rescue = true
+    if #selected_memories > 0 then
+        ghsom.activate_lines(selected_memories, { mode = "append" })
     end
-    if need_rescue then
-        heat.enqueue_cold_rescue(user_vec, current_turn, current_info, min_gate)
-    end
+    predictor.observe(current_anchor, selected_memories)
 
     print(string.format(
         "[Recall] 选中 %d 条 turn（hits_same=%d, gate=%.3f, max_turns=%d）",
@@ -1035,18 +875,15 @@ function M.check_and_retrieve(user_input, user_vec)
     user_vec = user_vec or tool.get_embedding_query(user_input)
 
     local current_turn = history.get_turn() + 1
-    local current_anchor = topic.get_topic_anchor and topic.get_topic_anchor(current_turn) or nil
+    local current_anchor = topic.get_stable_anchor and topic.get_stable_anchor(current_turn) or nil
     local current_info = topic.get_topic_for_turn and topic.get_topic_for_turn(current_turn) or nil
-
-    if M._last_topic_anchor and current_anchor ~= M._last_topic_anchor then
-        unload_topic_cache()
-    end
-
-    local stable_ready = update_topic_stability(current_anchor, user_vec)
-    topic_random_lift(current_turn, current_anchor, current_info, stable_ready)
+    local prediction = predictor.predict(current_anchor, {
+        query_vec = user_vec,
+    })
+    ghsom.activate_lines((prediction or {}).lines or {}, { mode = "replace" })
 
     if need_recall(user_input, user_vec, current_turn) then
-        return retrieve(user_input, user_vec, current_turn, current_info, current_anchor)
+        return retrieve(user_input, user_vec, current_turn, current_info, current_anchor, prediction)
     end
 
     return ""

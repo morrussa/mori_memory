@@ -1,6 +1,6 @@
 local tool = require("module.tool")
 local memory = require("module.memory.store")
-local heat = require("module.memory.heat")
+local ghsom = require("module.memory.ghsom")
 local history = require("module.memory.history")
 
 local M = {}
@@ -188,16 +188,10 @@ function M.save_ingest_items(facts, mem_turn)
         local fact_vec = tool.get_embedding_passage(fact)
         local line, err = memory.add_memory(fact_vec, mem_turn)
         if line then
-            heat.neighbors_add_heat(fact_vec, mem_turn, line)
             saved = saved + 1
         else
             print(string.format("[GraphMemory][WARN] add memory failed (%s): %s", tostring(err), tostring(fact):sub(1, 60)))
         end
-    end
-
-    local maintenance_every = tonumber((((require("module.config").settings or {}).time) or {}).maintenance_task) or 75
-    if maintenance_every > 0 and mem_turn % maintenance_every == 0 then
-        heat.perform_cold_exchange()
     end
 
     return saved

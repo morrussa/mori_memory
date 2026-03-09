@@ -322,15 +322,24 @@ local DEFAULT_SETTINGS = {
         uncertain_recency_pool_cap = 32,
 
         -- [实现方法] topic 分桶与预加载：
-        -- recall 先按 same/near/cross 进行桶内选取；当 topic 稳定时可随机预热少量同topic memory 进入 cache 通道。
+        -- recall 先按 topic 预测激活 memory / 节点，再把 GHSOM probe budget 分配到更可能命中的图上。
         use_topic_buckets = false, -- true=按 same/near/cross 分桶再配额；false=全局分数直接截断。
-        stable_warmup_turns = 6, -- topic 连续稳定轮数阈值（达到后才允许 random lift）。
-        stable_min_pair_sim = 0.72, -- 连续轮 query 向量平均相似度阈值（稳定性判断）。
-        topic_random_lift_interval = 3, -- 每隔多少轮尝试一次随机 lift（>1 时做取模触发）。
-        topic_random_lift_count = 2, -- 每次 lift 放入 cache 的 memory 数量。
-        topic_random_lift_prob = 0.85, -- 满足稳定条件后，本轮实际执行 lift 的概率。
-        topic_random_lift_only_cold = true, -- true=只从冷记忆里挑 lift 候选，避免热区重复。
-        topic_cache_weight = 1.02, -- cache 命中的分数增益系数（用于轻微偏置同topic记忆）。
+        topic_activation_memory_topn = 12, -- 每轮最多显式激活多少条 memory。
+        topic_activation_chain_topn = 2, -- 当前 topic 的近邻 topic 数量，用于冷启动补充候选。
+        topic_activation_chain_min_score = 0.18, -- topic chain 最低接受分数。
+        topic_activation_topic_weight = 1.00, -- 同 topic 历史命中统计的基准权重。
+        topic_activation_chain_weight = 0.65, -- 相邻 topic 迁移过来的记忆先验权重。
+        topic_activation_resident_weight = 0.28, -- 同 topic 原生 memory 的基础激活权重。
+        topic_activation_recent_weight = 0.55, -- 最近一次已选记忆的“后继记忆”先验权重。
+        topic_activation_query_weight = 0.30, -- 预测候选再与当前 query 对齐时的语义增益。
+        topic_activation_min_score = 0.08, -- 低于该值的预测候选不进入激活集。
+        topic_activation_predict_gain = 1.06, -- 显式激活 memory 被命中时的轻微分数增益。
+        topic_activation_node_prior_scale = 0.78, -- topic 节点先验参与 GHSOM 节点排序的权重。
+        topic_activation_node_active_bonus = 0.18, -- 节点里已有激活 memory 时的预算倾斜增益。
+        topic_activation_topic_cap = 64, -- 每个 topic 最多保留多少条自监督 memory 统计。
+        topic_activation_next_cap = 32, -- 每条 memory 最多保留多少条“后继激活”统计。
+        topic_activation_transition_cap = 12, -- 每个 topic 最多保留多少个 topic 转移统计。
+        topic_activation_cross_topic_next_weight = 0.45, -- 跨 topic 时，记忆后继统计的衰减权重。
 
         -- [实现方法] two-stage turn rerank：
         -- 先按 memory shortlist，再对 turn 做二阶段重排，降低“一个 memory 带很多历史 turn 全挤进来”的问题。

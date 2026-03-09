@@ -184,6 +184,42 @@ class SimParams:
     supercluster_topn_scale: float = 0.20
     supercluster_rebuild_every: int = 600
 
+    # ========================================================================
+    # GHSOM Parameters (NEW)
+    # ========================================================================
+    # Enable GHSOM clustering instead of traditional K-means style
+    ghsom_enabled: bool = False
+    
+    # Global quantization error target (τ1)
+    ghsom_tau1: float = 0.10
+    
+    # Local quantization error target for each node (τ2)
+    ghsom_tau2: float = 0.05
+    
+    # Initial SOM grid size (width x height)
+    ghsom_initial_width: int = 2
+    ghsom_initial_height: int = 2
+    
+    # Maximum grid size expansion
+    ghsom_max_width: int = 8
+    ghsom_max_height: int = 8
+    
+    # Learning rate parameters
+    ghsom_learning_rate_initial: float = 0.3
+    ghsom_learning_rate_decay: float = 0.95
+    ghsom_neighborhood_radius_initial: float = 1.5
+    ghsom_neighborhood_radius_decay: float = 0.95
+    
+    # Minimum number of samples before expanding
+    ghsom_min_samples_for_expansion: int = 10
+    
+    # Maximum hierarchy depth
+    ghsom_max_depth: int = 3
+    
+    # Use hierarchical retrieval (if disabled, only top-level nodes used as clusters)
+    ghsom_hierarchical_retrieval: bool = True
+    # ========================================================================
+
     # Cold-memory rescue simulation (delayed salvage)
     maintenance_task: int = 75
     cold_rescue_delay_min: int = 24
