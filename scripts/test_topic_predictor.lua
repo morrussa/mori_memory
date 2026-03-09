@@ -14,6 +14,8 @@ package.loaded["module.config"] = {
             topic_activation_recent_weight = 0.8,
             topic_activation_query_weight = 0.3,
             topic_activation_min_score = 0.0,
+            topic_activation_recall_weight = 0.4,
+            topic_activation_adopted_weight = 1.6,
             topic_activation_topic_cap = 16,
             topic_activation_next_cap = 8,
             topic_activation_transition_cap = 4,
@@ -106,7 +108,10 @@ package.loaded["module.memory.ghsom"] = {
 local predictor = require("module.memory.topic_predictor")
 predictor.reset_defaults()
 
-predictor.observe("S:1", { 11, 12 })
+predictor.observe("S:1", nil, {
+    retrieved_memories = { 11, 12 },
+    adopted_memories = { 12 },
+})
 predictor.observe("S:1", { 12, 13 })
 
 local pred = predictor.predict("S:1", {
@@ -115,7 +120,8 @@ local pred = predictor.predict("S:1", {
 
 assert(type(pred) == "table", "predict should return a table")
 assert(#(pred.lines or {}) >= 2, "predict should return activated memories")
-assert(pred.lines[1] == 12, "topic predictor should rank repeated topic memory first")
+assert(pred.lines[1] == 12, "adopted memory should outrank recall-only memory")
+assert((pred.memory_scores or {})[12] > (pred.memory_scores or {})[11], "assistant adoption feedback should strengthen the target memory")
 assert((pred.memory_scores or {})[13] ~= nil, "recent transition memory should be preserved")
 assert(((pred.node_scores or {})[1] or 0.0) > ((pred.node_scores or {})[3] or 0.0), "same-topic node should outrank chain-only node")
 

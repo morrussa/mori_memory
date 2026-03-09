@@ -10,9 +10,8 @@ local ROOT_DIR = STORAGE_CFG.root or "memory/v3"
 local GHSOM_PATH = ROOT_DIR .. "/ghsom_index.bin"
 
 local MAGIC = "GHSM"
-local VERSION = 2
+local VERSION = 3
 
-local HEAT_CFG = (config.settings or {}).heat or {}
 local GHSOM_CFG = (config.settings or {}).ghsom or {}
 
 local MAP_WIDTH = math.max(2, math.floor(tonumber(GHSOM_CFG.map_width) or 2))
@@ -22,28 +21,8 @@ local MIN_SPLIT_MEMBERS = math.max(4, math.floor(tonumber(GHSOM_CFG.min_split_me
 local SPLIT_SIM_THRESHOLD = tonumber(GHSOM_CFG.split_similarity_threshold) or 0.78
 local LEARNING_RATE = tonumber(GHSOM_CFG.learning_rate) or 0.18
 local NEIGHBOR_RADIUS = math.max(0, tonumber(GHSOM_CFG.neighbor_radius) or 1)
-
-local NEW_HEAT = math.max(1, math.floor(tonumber(HEAT_CFG.new_memory_heat) or 43000))
-local MAX_NEIGHBORS = math.max(1, math.floor(tonumber(HEAT_CFG.max_neighbors) or 5))
-local NEIGHBOR_HEAT = math.max(1, math.floor(tonumber(HEAT_CFG.neighbors_heat) or 26000))
-local ACTIVITY_DECAY = tonumber(GHSOM_CFG.activity_decay_rate)
-    or tonumber(HEAT_CFG.activity_decay_rate)
-    or 0.985
-local SUPPRESSION_THRESHOLD = math.max(
-    1,
-    math.floor(
-        tonumber(GHSOM_CFG.activity_threshold)
-            or tonumber(HEAT_CFG.suppression_threshold)
-            or math.max(2000, math.floor(NEW_HEAT * 0.18))
-    )
-)
-local REACTIVATE_TOPN = math.max(1, math.floor(tonumber(GHSOM_CFG.reactivate_topn) or 2))
-local REACTIVATE_BOOST = math.max(
-    NEW_HEAT,
-    math.floor(tonumber(GHSOM_CFG.reactivate_boost) or (NEW_HEAT + NEIGHBOR_HEAT))
-)
 local REACTIVATE_SCAN_NODES = math.max(2, math.floor(tonumber(GHSOM_CFG.reactivate_scan_nodes) or 6))
-local REACTIVATE_SCAN_LIMIT = math.max(REACTIVATE_TOPN * 4, math.floor(tonumber(GHSOM_CFG.reactivate_scan_limit) or 24))
+local REACTIVATE_SCAN_LIMIT = math.max(4, math.floor(tonumber(GHSOM_CFG.reactivate_scan_limit) or 24))
 
 local function get_memory()
     return require("module.memory.store")
@@ -211,10 +190,6 @@ local function new_node(id, parent_id, parent_slot, level, seed_vec)
         children = {},
         members = {},
         member_pos = {},
-        hot_members = {},
-        hot_pos = {},
-        cold_members = {},
-        cold_pos = {},
         slot_members = {},
         slot_pos = {},
         line_to_slot = {},
@@ -223,7 +198,6 @@ local function new_node(id, parent_id, parent_slot, level, seed_vec)
         slot_sim_sum = {},
         centroid = {},
         member_subtree_count = 0,
-        hot_subtree_count = 0,
         initialized = false,
     }
 
@@ -307,50 +281,15 @@ local function update_neurons(node, vec, bmu_slot)
     refresh_node_centroid(node)
 end
 
-local function add_line_to_activity_set(line)
-    if M.active_pos[line] then return end
-    M.active_lines[#M.active_lines + 1] = line
-    M.active_pos[line] = #M.active_lines
-end
-
-local function remove_line_from_activity_set(line)
-    local pos = M.active_pos[line]
-    if not pos then return end
-
-    local last = #M.active_lines
-    if pos ~= last then
-        local moved = M.active_lines[last]
-        M.active_lines[pos] = moved
-        M.active_pos[moved] = pos
-    end
-    M.active_lines[last] = nil
-    M.active_pos[line] = nil
-end
-
-local function sync_node_hot_state(node, line, is_hot)
-    if is_hot then
-        remove_member(node.cold_members, node.cold_pos, line)
-        add_member(node.hot_members, node.hot_pos, line)
-        add_line_to_activity_set(line)
-    else
-        remove_member(node.hot_members, node.hot_pos, line)
-        add_member(node.cold_members, node.cold_pos, line)
-        remove_line_from_activity_set(line)
-    end
-end
-
 local function recompute_subtree_counts(node)
     local total_members = #(node.members or {})
-    local total_hot = #(node.hot_members or {})
     for slot = 1, node_cell_count(node) do
         local child = M.nodes[tonumber(node.children[slot]) or 0]
         if child then
             total_members = total_members + (tonumber(child.member_subtree_count) or 0)
-            total_hot = total_hot + (tonumber(child.hot_subtree_count) or 0)
         end
     end
     node.member_subtree_count = total_members
-    node.hot_subtree_count = total_hot
 end
 
 local function bubble_subtree_counts(node)
@@ -369,8 +308,6 @@ local function detach_line(node, line)
 
     remove_member(node.members, node.member_pos, line)
     remove_member(node.slot_members[slot], node.slot_pos[slot], line)
-    remove_member(node.hot_members, node.hot_pos, line)
-    remove_member(node.cold_members, node.cold_pos, line)
 
     local sim = tonumber(node.line_similarity[line]) or 0.0
     node.slot_count[slot] = math.max(0, (tonumber(node.slot_count[slot]) or 0) - 1)
@@ -394,8 +331,6 @@ local function attach_line(node, line, slot, similarity)
     node.slot_count[slot] = (node.slot_count[slot] or 0) + 1
     node.slot_sim_sum[slot] = (node.slot_sim_sum[slot] or 0.0) + (tonumber(similarity) or 0.0)
     M.line_to_node[line] = node.id
-
-    sync_node_hot_state(node, line, M.active_pos[line] ~= nil)
 end
 
 local function sorted_node_ids()
@@ -422,10 +357,7 @@ local function reset_state()
     M.root_id = nil
     M.nodes = {}
     M.line_to_node = {}
-    M.active_lines = {}
-    M.active_pos = {}
     M.next_node_id = 1
-    M.last_decay_turn = 0
     M.state_dirty = false
 end
 
@@ -571,17 +503,11 @@ end
 
 local function rebuild_runtime_views()
     M.line_to_node = {}
-    M.active_lines = {}
-    M.active_pos = {}
 
     local memory = get_memory()
     for _, node_id in ipairs(sorted_node_ids()) do
         local node = M.nodes[node_id]
         node.member_pos = {}
-        node.hot_members = {}
-        node.hot_pos = {}
-        node.cold_members = {}
-        node.cold_pos = {}
         node.line_similarity = {}
 
         local cells = node_cell_count(node)
@@ -607,13 +533,6 @@ local function rebuild_runtime_views()
             node.line_similarity[line] = sim
             node.slot_count[slot] = (node.slot_count[slot] or 0) + 1
             node.slot_sim_sum[slot] = (node.slot_sim_sum[slot] or 0.0) + sim
-
-            if M.active_pos[line] then
-                add_member(node.hot_members, node.hot_pos, line)
-                add_line_to_activity_set(line)
-            else
-                add_member(node.cold_members, node.cold_pos, line)
-            end
         end
 
         refresh_node_centroid(node)
@@ -732,7 +651,7 @@ local function load_state_from_disk()
     local p = ffi.cast("const uint8_t*", data)
     local header = ffi.cast("const uint32_t*", p + 4)
     local version = tonumber(header[0]) or 0
-    if version ~= VERSION then
+    if version ~= 2 and version ~= VERSION then
         return false, "version"
     end
 
@@ -740,7 +659,6 @@ local function load_state_from_disk()
     M.next_node_id = math.max(1, tonumber(header[1]) or 1)
     M.root_id = tonumber(header[2]) or 0
     local node_count = tonumber(header[3]) or 0
-    M.last_decay_turn = math.max(0, tonumber(header[4]) or 0)
 
     local offset = 24
     for _ = 1, node_count do
@@ -850,10 +768,8 @@ function M.load()
 
     ensure_root()
     print(string.format(
-        "[GHSOM] ready: nodes=%d active=%d last_decay_turn=%d",
-        #scannable_node_ids(),
-        #M.active_lines,
-        M.last_decay_turn
+        "[GHSOM] ready: nodes=%d",
+        #scannable_node_ids()
     ))
 end
 
@@ -862,7 +778,7 @@ function M.save_to_disk()
 
     local ids = sorted_node_ids()
     local ok, err = persistence.write_atomic(GHSOM_PATH, "wb", function(f)
-        local header = ffi.new("uint32_t[5]", VERSION, M.next_node_id, M.root_id or 0, #ids, M.last_decay_turn or 0)
+        local header = ffi.new("uint32_t[5]", VERSION, M.next_node_id, M.root_id or 0, #ids, 0)
 
         local ok0, err0 = f:write(MAGIC)
         if not ok0 then return false, err0 end
@@ -938,7 +854,6 @@ end
 function M.probe_nodes(vec, max_results, opts)
     opts = opts or {}
     local limit = math.max(1, tonumber(max_results) or 4)
-    local only_hot = opts.only_hot == true
     local include_empty = opts.include_empty == true
     local beam_width = math.max(limit, tonumber(opts.beam_width) or math.max(3, limit * 2))
 
@@ -963,16 +878,12 @@ function M.probe_nodes(vec, max_results, opts)
         for _, state in ipairs(frontier) do
             local node = state.node
             local members_n = #(node.members or {})
-            local hot_n = #(node.hot_members or {})
-            local subtree_members = tonumber(node.member_subtree_count) or members_n
-            local subtree_hot = tonumber(node.hot_subtree_count) or hot_n
 
-            if members_n > 0 and (include_empty or members_n > 0) and ((not only_hot) or hot_n > 0) and not seen[node.id] then
+            if members_n > 0 and (include_empty or members_n > 0) and not seen[node.id] then
                 seen[node.id] = true
                 topk_push(collected, {
                     id = node.id,
                     similarity = tonumber(state.similarity) or safe_similarity(v, node.centroid),
-                    hot = hot_n,
                     size = members_n,
                 }, limit)
             end
@@ -982,8 +893,7 @@ function M.probe_nodes(vec, max_results, opts)
                 local child = child_id > 0 and M.nodes[child_id] or nil
                 if child then
                     local child_members = tonumber(child.member_subtree_count) or #(child.members or {})
-                    local child_hot = tonumber(child.hot_subtree_count) or #(child.hot_members or {})
-                    if child_members > 0 and (include_empty or child_members > 0) and ((not only_hot) or child_hot > 0) then
+                    if child_members > 0 and (include_empty or child_members > 0) then
                         topk_push(next_frontier, {
                             node = child,
                             similarity = safe_similarity(v, child.centroid),
@@ -1008,18 +918,7 @@ function M.find_sim_in_node(vec, node_id, opts)
     local v = normalize_vector(vector_to_table(vec))
     if #v <= 0 then return {} end
 
-    local only_hot = opts.only_hot == true
-    local only_cold = opts.only_cold == true
-    if only_hot and only_cold then
-        return {}
-    end
-
     local members = node.members or {}
-    if only_hot then
-        members = node.hot_members or {}
-    elseif only_cold then
-        members = node.cold_members or {}
-    end
 
     local topk = {}
     local limit = tonumber(opts.max_results)
@@ -1051,88 +950,20 @@ end
 
 M.find_similar_in_node = M.find_sim_in_node
 
-function M.on_memory_heat_change(mem_line, old_heat, new_heat)
+function M.on_memory_heat_change(mem_line, _old_heat, _new_heat)
     return tonumber(M.line_to_node[mem_line]), false
 end
 
-function M.is_hot(line)
-    return M.active_pos[line] ~= nil
-end
-
-local function set_line_activation(mem_line, is_active)
-    local idx = tonumber(mem_line)
-    if not idx or idx <= 0 then
-        return false
-    end
-
-    local node_id = M.line_to_node[idx]
-    if not node_id or not M.nodes[node_id] then
-        if is_active then
-            add_line_to_activity_set(idx)
-        else
-            remove_line_from_activity_set(idx)
-        end
-        return true
-    end
-
-    local node = M.nodes[node_id]
-    local was_active = node.hot_pos[idx] ~= nil
-    if was_active == is_active then
-        return false
-    end
-
-    sync_node_hot_state(node, idx, is_active)
-    bubble_subtree_counts(node)
-    return true
+function M.is_hot(_line)
+    return false
 end
 
 function M.get_active_lines()
-    return shallow_copy(M.active_lines)
+    return {}
 end
 
-function M.activate_lines(lines, opts)
-    opts = opts or {}
-    local mode = tostring(opts.mode or "replace")
-    local target = {}
-    for _, mem_line in ipairs(lines or {}) do
-        local idx = tonumber(mem_line)
-        if idx and idx > 0 then
-            target[idx] = true
-        end
-    end
-
-    local changed = 0
-    if mode == "replace" then
-        local snapshot = shallow_copy(M.active_lines)
-        for _, mem_line in ipairs(snapshot) do
-            if not target[mem_line] and set_line_activation(mem_line, false) then
-                changed = changed + 1
-            end
-        end
-    elseif mode == "remove" then
-        for mem_line in pairs(target) do
-            if set_line_activation(mem_line, false) then
-                changed = changed + 1
-            end
-        end
-        if changed > 0 then
-            M.state_dirty = true
-        end
-        return changed
-    elseif mode ~= "append" then
-        mode = "replace"
-    end
-
-    for mem_line in pairs(target) do
-        if set_line_activation(mem_line, true) then
-            changed = changed + 1
-        end
-    end
-
-    if changed > 0 then
-        M.state_dirty = true
-    end
-    return changed
+function M.activate_lines(_lines, _opts)
+    return 0
 end
 
 local function normalize_score_map(src)
@@ -1161,11 +992,12 @@ function M.plan_probe_budget(vec, opts)
     local total_scan_budget = math.max(max_nodes, math.floor(tonumber(opts.total_scan_budget) or max_nodes * 8))
     local per_node_floor = math.max(1, math.floor(tonumber(opts.per_node_floor) or 2))
     local prior_scale = math.max(0.0, tonumber(opts.prior_scale) or 0.75)
-    local activation_bonus = math.max(0.0, tonumber(opts.activation_bonus) or 0.18)
+    local resident_bonus = math.max(0.0, tonumber(opts.resident_bonus) or 0.08)
     local semantic_limit = math.max(max_nodes, math.floor(tonumber(opts.semantic_limit) or (max_nodes * 4)))
     local predicted_nodes = normalize_score_map(opts.predicted_nodes or {})
+    local memory = get_memory()
 
-    local semantic_nodes = M.probe_nodes(vec, semantic_limit, { only_hot = false, include_empty = false })
+    local semantic_nodes = M.probe_nodes(vec, semantic_limit, { include_empty = false })
     local scored = {}
     local seen = {}
 
@@ -1184,8 +1016,8 @@ function M.plan_probe_budget(vec, opts)
                 id = cid,
                 similarity = 0.0,
                 prior = 0.0,
-                active_members = #(node.hot_members or {}),
                 member_count = #(node.members or {}),
+                resident = memory.is_cluster_cached and memory.is_cluster_cached(cid) or false,
             }
             scored[cid] = entry
             seen[#seen + 1] = cid
@@ -1212,7 +1044,7 @@ function M.plan_probe_budget(vec, opts)
         if entry then
             local combined = math.max(0.0, entry.similarity)
                 + prior_scale * math.max(0.0, entry.prior)
-                + ((entry.active_members or 0) > 0 and activation_bonus or 0.0)
+                + (entry.resident == true and resident_bonus or 0.0)
             entry.score = combined
             ranked[#ranked + 1] = entry
         end
@@ -1245,72 +1077,12 @@ function M.plan_probe_budget(vec, opts)
             extra = math.floor(remaining * (math.max(1e-6, tonumber(entry.score) or 0.0) / total_score) + 0.5)
         end
         entry.scan_limit = per_node_floor + extra
-        entry.prefer_active = (tonumber(entry.prior) or 0.0) > 0.0 or (tonumber(entry.active_members) or 0) > 0
     end
 
     return ranked
 end
 
-function M.maintain_activity(current_turn)
-    local turn = math.max(0, math.floor(tonumber(current_turn) or M.last_decay_turn or 0))
-    if turn > M.last_decay_turn then
-        M.last_decay_turn = turn
-        M.state_dirty = true
-    end
-    return 0
-end
-
-function M.touch_line(mem_line, boost, current_turn)
-    M.maintain_activity(current_turn)
-    local idx = tonumber(mem_line)
-    if not idx or idx <= 0 then
-        return false
-    end
-    M.activate_lines({ idx }, { mode = "append" })
-    return true
-end
-
-function M.add_new_memory(mem_line, vec, current_turn)
-    return M.touch_line(mem_line, NEW_HEAT, current_turn)
-end
-
-local function collect_neighbor_candidates(node, slot, target_line)
-    local candidates = {}
-    local seen = {}
-    if not node then return candidates end
-
-    for other_slot = 1, node_cell_count(node) do
-        if cell_distance(node, slot, other_slot) <= math.max(1, NEIGHBOR_RADIUS) then
-            for _, line in ipairs(node.slot_members[other_slot] or {}) do
-                if line ~= target_line and not seen[line] then
-                    seen[line] = true
-                    candidates[#candidates + 1] = line
-                end
-            end
-        end
-    end
-
-    if #candidates <= 0 and (tonumber(node.parent_id) or 0) > 0 then
-        local parent = M.nodes[node.parent_id]
-        local parent_slot = tonumber(node.parent_slot) or 1
-        if parent then
-            for other_slot = 1, node_cell_count(parent) do
-                if cell_distance(parent, parent_slot, other_slot) <= math.max(1, NEIGHBOR_RADIUS) then
-                    for _, line in ipairs(parent.slot_members[other_slot] or {}) do
-                        if line ~= target_line and not seen[line] then
-                            seen[line] = true
-                            candidates[#candidates + 1] = line
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return candidates
-end
-
-function M.neighbors_add_heat(vec, current_turn, target_mem_line)
+function M.neighbors_add_heat(_vec, _current_turn, _target_mem_line)
     return 0
 end
 
@@ -1318,12 +1090,11 @@ function M.find_cold_candidates(vec, opts)
     opts = opts or {}
     local probe_limit = math.max(1, tonumber(opts.max_nodes) or REACTIVATE_SCAN_NODES)
     local result_limit = math.max(1, tonumber(opts.max_results) or REACTIVATE_SCAN_LIMIT)
-    local probe = M.probe_nodes(vec, probe_limit, { only_hot = false, include_empty = false })
+    local probe = M.probe_nodes(vec, probe_limit, { include_empty = false })
 
     local topk = {}
     for _, node_item in ipairs(probe) do
         local results = M.find_sim_in_node(vec, node_item.id, {
-            only_cold = true,
             max_results = result_limit,
         })
         for _, item in ipairs(results) do
@@ -1334,7 +1105,7 @@ function M.find_cold_candidates(vec, opts)
     return topk_to_desc(topk)
 end
 
-function M.reactivate_cold_candidates(vec, current_turn, opts)
+function M.reactivate_cold_candidates(_vec, _current_turn, _opts)
     return 0, {}
 end
 
@@ -1344,12 +1115,11 @@ function M.print_tree()
         if not node then return end
 
         print(string.format(
-            "%snode=%d level=%d members=%d hot=%d",
+            "%snode=%d level=%d members=%d",
             string.rep("  ", indent),
             node.id,
             node.level,
-            #(node.members or {}),
-            #(node.hot_members or {})
+            #(node.members or {})
         ))
 
         for slot = 1, node_cell_count(node) do

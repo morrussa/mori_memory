@@ -14,17 +14,29 @@ function M.run(state, _ctx)
     local read_only = (((state or {}).input or {}).read_only) == true
 
     local user_vec_q = tool.get_embedding_query(user_input)
-    local memory_context = recall.check_and_retrieve(user_input, user_vec_q, {
+    local recall_result = recall.check_and_retrieve(user_input, user_vec_q, {
         read_only = read_only,
         force = false,
         suppress = false,
     })
+    if type(recall_result) ~= "table" then
+        recall_result = {
+            context = tostring(recall_result or ""),
+        }
+    end
+    local memory_context = util.trim(recall_result.context or "")
 
-    memory_context = util.trim(memory_context)
     state.recall = {
         triggered = memory_context ~= "",
         context = memory_context,
         score = nil,
+        topic_anchor = tostring(recall_result.topic_anchor or ""),
+        predicted_memories = (recall_result.predicted_memories or {}),
+        predicted_nodes = (recall_result.predicted_nodes or {}),
+        selected_turns = (recall_result.selected_turns or {}),
+        selected_memories = (recall_result.selected_memories or {}),
+        fragments = (recall_result.fragments or {}),
+        adopted_memories = (recall_result.adopted_memories or {}),
     }
 
     state.context = state.context or {}

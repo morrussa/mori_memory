@@ -267,6 +267,13 @@ function M.new_state(args)
             triggered = false,
             context = "",
             score = nil,
+            topic_anchor = "",
+            predicted_memories = {},
+            predicted_nodes = {},
+            selected_turns = {},
+            selected_memories = {},
+            fragments = {},
+            adopted_memories = {},
         },
         episode = {
             current = {

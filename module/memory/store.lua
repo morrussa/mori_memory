@@ -17,7 +17,7 @@ local MANIFEST_PATH = ROOT_DIR .. "/manifest.txt"
 local INDEX_PATH = ROOT_DIR .. "/memory_index.bin"
 
 local INDEX_MAGIC = "MID3"
-local INDEX_VERSION = 2
+local INDEX_VERSION = 3
 local SHARD_MAGIC = "SHD3"
 local SHARD_VERSION = 1
 
@@ -53,6 +53,19 @@ local function shallow_copy_array(src)
     local out = {}
     for i = 1, #(src or {}) do
         out[i] = src[i]
+    end
+    return out
+end
+
+local function unique_number_list(items)
+    local seen = {}
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        local n = tonumber(item)
+        if n and n > 0 and not seen[n] then
+            seen[n] = true
+            out[#out + 1] = n
+        end
     end
     return out
 end
@@ -173,7 +186,7 @@ local function build_index_record(line, mem)
     local kind_code = 0  -- 类型系统已移除，默认为0
     local topic_len = #topic_anchor
     local turn_count = #turns
-    local record_size = 4 + 4 + 4 + 4 + 2 + 2 + topic_len + 2 + (turn_count * 4)
+    local record_size = 4 + 4 + 4 + 2 + 2 + topic_len + 2 + (turn_count * 4)
 
     local buf = ffi.new("uint8_t[?]", record_size)
     local base = 0
@@ -182,9 +195,6 @@ local function build_index_record(line, mem)
     base = base + 4
 
     ffi.cast("uint32_t*", buf + base)[0] = line
-    base = base + 4
-
-    ffi.cast("uint32_t*", buf + base)[0] = math.max(0, math.floor(tonumber(mem.heat) or 0))
     base = base + 4
 
     ffi.cast("int32_t*", buf + base)[0] = math.floor(tonumber(mem.cluster_id) or -1)
@@ -213,6 +223,8 @@ local function build_index_record(line, mem)
 
     return ffi.string(buf, record_size)
 end
+
+local enforce_lru_capacity
 
 local function save_index_binary()
     return persistence.write_atomic(INDEX_PATH, "wb", function(f)
@@ -264,7 +276,7 @@ local function load_index_binary()
     local dim = tonumber(header[2]) or VECTOR_DIM
     local next_line_header = tonumber(header[3]) or (count + 1)
 
-    if version ~= 1 and version ~= INDEX_VERSION then
+    if version ~= 1 and version ~= 2 and version ~= INDEX_VERSION then
         return false, "index_version_mismatch"
     end
 
@@ -276,7 +288,7 @@ local function load_index_binary()
     local loaded = 0
     while offset + 4 <= #data and loaded < count do
         local rec_len = tonumber(ffi.cast("const uint32_t*", p + offset)[0]) or 0
-        if rec_len < 20 or (offset + rec_len) > #data then
+        if rec_len < 18 or (offset + rec_len) > #data then
             break
         end
 
@@ -284,9 +296,12 @@ local function load_index_binary()
         local line = tonumber(ffi.cast("const uint32_t*", p + base)[0]) or 0
         base = base + 4
 
-        local heat = tonumber(ffi.cast("const uint32_t*", p + base)[0]) or 0
-        base = base + 4
+        if version <= 2 then
+            if base + 4 > offset + rec_len then break end
+            base = base + 4
+        end
 
+        if base + 4 > offset + rec_len then break end
         local cluster_id = tonumber(ffi.cast("const int32_t*", p + base)[0]) or -1
         base = base + 4
 
@@ -324,7 +339,6 @@ local function load_index_binary()
         if line > 0 then
             M.memories[line] = {
                 turns = turns,
-                heat = heat,
                 cluster_id = cluster_id,
                 type = "fact",  -- 类型系统已移除，默认为"fact"
                 topic_anchor = topic_anchor,
@@ -398,11 +412,36 @@ local function save_cluster_shard(cid)
     end
 
     M._dirty_shards[cid] = nil
+    enforce_lru_capacity()
     return true
 end
 
-local function enforce_lru_capacity()
-    return
+enforce_lru_capacity = function()
+    if not lru_enabled() then
+        return
+    end
+
+    local cap = get_cache_cap()
+    local order = M._cluster_cache_order
+    local dirty_passes = 0
+
+    while #order > cap do
+        local cid = tonumber(order[1])
+        if not cid then
+            table.remove(order, 1)
+        elseif M._dirty_shards[cid] then
+            table.remove(order, 1)
+            order[#order + 1] = cid
+            dirty_passes = dirty_passes + 1
+            if dirty_passes >= #order then
+                break
+            end
+        else
+            table.remove(order, 1)
+            M._cluster_cache[cid] = nil
+            dirty_passes = 0
+        end
+    end
 end
 
 local function load_cluster_shard(cid)
@@ -498,6 +537,103 @@ function M.reserve_preload_io(requested, max_per_turn)
     return granted
 end
 
+function M.is_cluster_cached(cluster_id)
+    local cid = tonumber(cluster_id)
+    return cid ~= nil and cid > 0 and M._cluster_cache[cid] ~= nil
+end
+
+function M.get_cached_cluster_ids()
+    return shallow_copy_array(M._cluster_cache_order)
+end
+
+function M.preload_clusters(cluster_ids, opts)
+    opts = type(opts) == "table" and opts or {}
+    local pending = {}
+    local loaded = {}
+    for _, cid in ipairs(unique_number_list(cluster_ids)) do
+        if M.is_cluster_cached(cid) then
+            touch_cache_order(cid)
+            loaded[#loaded + 1] = cid
+        else
+            pending[#pending + 1] = cid
+        end
+    end
+
+    local max_clusters = math.max(0, math.floor(tonumber(opts.max_clusters) or (#pending + #loaded)))
+    local max_io = math.max(0, math.floor(tonumber(opts.max_io) or max_clusters))
+    local preload_n = math.max(0, math.min(max_clusters - #loaded, #pending))
+    local granted = M.reserve_preload_io(preload_n, max_io)
+
+    for i = 1, math.min(granted, #pending) do
+        local cid = pending[i]
+        if cid and cid > 0 then
+            load_cluster_shard(cid)
+            loaded[#loaded + 1] = cid
+        end
+    end
+
+    return loaded
+end
+
+function M.preload_lines(lines, opts)
+    opts = type(opts) == "table" and opts or {}
+    local cluster_ids = {}
+    for _, line in ipairs(unique_number_list(lines)) do
+        local cid = M.get_cluster_id(line)
+        if cid and cid > 0 then
+            cluster_ids[#cluster_ids + 1] = cid
+        end
+    end
+    return M.preload_clusters(cluster_ids, {
+        max_clusters = tonumber(opts.max_clusters) or #cluster_ids,
+        max_io = tonumber(opts.max_io) or tonumber(opts.max_clusters) or #cluster_ids,
+    })
+end
+
+function M.preload_prediction(prediction, opts)
+    opts = type(opts) == "table" and opts or {}
+    prediction = type(prediction) == "table" and prediction or {}
+
+    local ranked_nodes = {}
+    for _, item in ipairs(prediction.ranked_nodes or {}) do
+        local cid = tonumber((item or {}).id)
+        if cid and cid > 0 then
+            ranked_nodes[#ranked_nodes + 1] = cid
+        end
+    end
+
+    local loaded = {}
+    local seen = {}
+    local max_nodes = math.max(0, math.floor(tonumber(opts.max_nodes) or #ranked_nodes))
+    local max_memories = math.max(0, math.floor(tonumber(opts.max_memories) or #((prediction.lines) or {})))
+    local max_io = math.max(0, math.floor(tonumber(opts.max_io) or (max_nodes + max_memories)))
+
+    for _, cid in ipairs(M.preload_clusters(ranked_nodes, {
+        max_clusters = max_nodes,
+        max_io = max_io,
+    })) do
+        if not seen[cid] then
+            seen[cid] = true
+            loaded[#loaded + 1] = cid
+        end
+    end
+
+    local remaining_io = math.max(0, max_io - preload_io_count)
+    if remaining_io > 0 and max_memories > 0 then
+        for _, cid in ipairs(M.preload_lines(prediction.lines or {}, {
+            max_clusters = max_memories,
+            max_io = remaining_io,
+        })) do
+            if not seen[cid] then
+                seen[cid] = true
+                loaded[#loaded + 1] = cid
+            end
+        end
+    end
+
+    return loaded
+end
+
 function M.get_total_lines()
     return next_line - 1
 end
@@ -542,22 +678,20 @@ function M.set_memory_type(line, kind)
     return true
 end
 
-function M.iter_topic_lines(topic_anchor, only_cold)
+function M.iter_topic_lines(topic_anchor)
     local out = {}
     local bucket = M.topic_index[tostring(topic_anchor or "")]
     if not bucket then
         return out
     end
 
-    local need_cold = only_cold == true
     for line, _ in pairs(bucket) do
         local idx = normalize_line(line)
         if idx then
-            if (not need_cold) or (M.get_heat_by_index(idx) <= 0) then
-                out[#out + 1] = idx
-            end
+            out[#out + 1] = idx
         end
     end
+    table.sort(out)
     return out
 end
 
@@ -638,33 +772,6 @@ function M.return_mem_vec(line)
     return vec
 end
 
-function M.get_heat_by_index(line)
-    local idx = normalize_line(line)
-    if not idx then return 0 end
-    local mem = M.memories[idx]
-    if not mem then return 0 end
-    return math.max(0, tonumber(mem.heat) or 0)
-end
-
-function M.set_heat(line, new_heat)
-    local idx = normalize_line(line)
-    if not idx then return false end
-
-    local mem = M.memories[idx]
-    if not mem then return false end
-
-    local old_val = math.max(0, math.floor(tonumber(mem.heat) or 0))
-    local val = math.max(0, math.floor(tonumber(new_heat) or 0))
-    if old_val == val then
-        return true
-    end
-
-    mem.heat = val
-    ghsom.on_memory_heat_change(idx, old_val, val)
-    record_dirty_index()
-    return true
-end
-
 function M.append_turn(line, turn)
     local idx = normalize_line(line)
     if not idx then return false end
@@ -686,35 +793,31 @@ function M.find_similar_all_fast(query_vec_table, max_results, opts)
     if max_results <= 0 then
         use_full_sort = true
     end
-    local only_active = opts.only_active == true
-
     local results = {}
     local topk = {}
     local total = next_line - 1
 
     for i = 1, total do
-        if (not only_active) or ghsom.is_hot(i) then
-            local mem_vec = M.return_mem_vec(i)
-            if mem_vec then
-                local score = tonumber(tool.cosine_similarity(query_vec_table, mem_vec)) or 0.0
-                if score > 0.5 then
-                    if use_full_sort then
-                        table.insert(results, { index = i, similarity = score })
-                    else
-                        if #topk < max_results then
-                            table.insert(topk, { index = i, similarity = score })
-                            local j = #topk
-                            while j > 1 and topk[j].similarity < topk[j - 1].similarity do
-                                topk[j], topk[j - 1] = topk[j - 1], topk[j]
-                                j = j - 1
-                            end
-                        elseif score > topk[1].similarity then
-                            topk[1] = { index = i, similarity = score }
-                            local j = 1
-                            while j < #topk and topk[j].similarity > topk[j + 1].similarity do
-                                topk[j], topk[j + 1] = topk[j + 1], topk[j]
-                                j = j + 1
-                            end
+        local mem_vec = M.return_mem_vec(i)
+        if mem_vec then
+            local score = tonumber(tool.cosine_similarity(query_vec_table, mem_vec)) or 0.0
+            if score > 0.5 then
+                if use_full_sort then
+                    table.insert(results, { index = i, similarity = score })
+                else
+                    if #topk < max_results then
+                        table.insert(topk, { index = i, similarity = score })
+                        local j = #topk
+                        while j > 1 and topk[j].similarity < topk[j - 1].similarity do
+                            topk[j], topk[j - 1] = topk[j - 1], topk[j]
+                            j = j - 1
+                        end
+                    elseif score > topk[1].similarity then
+                        topk[1] = { index = i, similarity = score }
+                        local j = 1
+                        while j < #topk and topk[j].similarity > topk[j + 1].similarity do
+                            topk[j], topk[j + 1] = topk[j + 1], topk[j]
+                            j = j + 1
                         end
                     end
                 end
@@ -743,14 +846,12 @@ function M.iterate_all()
         local mem = M.memories[i]
         if not mem then
             return {
-                heat = 0,
                 turns = {},
                 topic_anchor = nil,
                 vec = nil,
             }
         end
         return {
-            heat = tonumber(mem.heat) or 0,
             turns = shallow_copy_array(mem.turns),
             type = mem.type or "fact",  -- 类型系统已移除
             topic_anchor = mem.topic_anchor,
@@ -839,6 +940,7 @@ function M.save_dirty_shards()
         end
     end
 
+    enforce_lru_capacity()
     return true
 end
 
@@ -857,7 +959,6 @@ function M.add_memory(vec, turn, opts)
         return nil, "invalid_vector"
     end
 
-    local new_heat = tonumber((config.settings.heat or {}).new_memory_heat) or 43000
     local merge_limit = adaptive.get_merge_limit((config.settings or {}).merge_limit or 0.95)
     local strict_merge_limit = math.min(0.995, merge_limit + 0.02)
     local merge_gap = tonumber((((config.settings or {}).ghsom) or {}).merge_gap) or 0.015
@@ -866,10 +967,9 @@ function M.add_memory(vec, turn, opts)
     local sim_results = {}
     local seen = {}
     if allow_merge then
-        local probe_nodes = ghsom.probe_nodes(vec, 3, { only_hot = false })
+        local probe_nodes = ghsom.probe_nodes(vec, 3)
         for _, node_item in ipairs(probe_nodes) do
             local node_results = ghsom.find_similar_in_node(vec, node_item.id, {
-                only_hot = false,
                 max_results = FAST_SCAN_TOPK,
             })
             for _, item in ipairs(node_results) do
@@ -901,7 +1001,6 @@ function M.add_memory(vec, turn, opts)
                         if merged_topic_key then
                             M.update_topic_anchor(target, merged_topic_key)
                         end
-                        ghsom.activate_lines({ target }, { mode = "append" })
                         saver.mark_dirty()
                         print(string.format("[Memory] 合并 -> 行 %d (sim=%.4f)", target, tonumber(top.similarity) or 0))
                         return target
@@ -929,7 +1028,6 @@ function M.add_memory(vec, turn, opts)
     local topic_anchor = topic_key_for_turn(turn)
     M.memories[new_line] = {
         turns = { math.max(0, math.floor(tonumber(turn) or 0)) },
-        heat = 0,
         cluster_id = -1,
         type = "fact",  -- 类型系统已移除
         topic_anchor = topic_anchor,
@@ -945,8 +1043,6 @@ function M.add_memory(vec, turn, opts)
     if shard_id > 0 then
         M.store_vector(new_line, shard_id, vec)
     end
-
-    ghsom.activate_lines({ new_line }, { mode = "append" })
 
     print(string.format("[Memory] 新建 -> 行 %d (GHSOM节点 %d)", new_line, node_id or -1))
     return new_line

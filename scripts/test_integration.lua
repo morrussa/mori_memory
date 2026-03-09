@@ -24,6 +24,7 @@ local config = require("module.config")
 config.settings.storage_v3 = config.settings.storage_v3 or {}
 config.settings.storage_v3.root = root
 config.settings.storage_v3.max_memory = 128
+config.settings.storage_v3.cluster_cache_cap = 2
 
 local store = require("module.memory.store")
 local ghsom = require("module.memory.ghsom")
@@ -52,8 +53,12 @@ assert(store.get_total_lines() == 3, "merge should not create a new line")
 local fast_hits = store.find_similar_all_fast(vectors[1], 2)
 assert(#fast_hits >= 1, "expected hot fast search hits")
 
-local node_hits = ghsom.probe_nodes(vectors[1], 2, { only_hot = true })
-assert(#node_hits >= 1, "expected reachable hot nodes")
+local node_hits = ghsom.probe_nodes(vectors[1], 2)
+assert(#node_hits >= 1, "expected reachable nodes")
+
+assert(store.store_vector(1, 101, vectors[1]), "should rewrite line 1 into a dedicated shard")
+assert(store.store_vector(2, 102, vectors[2]), "should rewrite line 2 into a dedicated shard")
+assert(store.store_vector(3, 103, vectors[3]), "should rewrite line 3 into a dedicated shard")
 
 local ok1, err1 = store.save_to_disk()
 assert(ok1, err1)
@@ -61,6 +66,15 @@ local ok2, err2 = ghsom.save_to_disk()
 assert(ok2, err2)
 
 store.load()
+local preloaded = store.preload_clusters({ 101, 102, 103 }, {
+    max_clusters = 3,
+    max_io = 3,
+})
+assert(#preloaded == 3, "preload should touch all requested shards before LRU trimming")
+local cached = store.get_cached_cluster_ids()
+assert(#cached <= 2, "LRU should cap resident shard count")
+assert(cached[1] == 102 and cached[2] == 103, "LRU should keep the most recently touched shards")
+
 ghsom.load()
 assert(store.get_total_lines() == 3, "reload total mismatch")
 

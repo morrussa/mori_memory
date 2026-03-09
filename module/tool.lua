@@ -631,7 +631,7 @@ function M.find_sim_all_heat(vec)
 
     for mem in iter do
         lineno = lineno + 1
-        if mem and mem.vec and (tonumber(mem.heat) or 0) > 0 then
+        if mem and mem.vec then
             local sim = M.cosine_similarity(v1, mem.vec)
 
             table.insert(results, {
@@ -655,7 +655,7 @@ end
 
 -- ==================== 二进制记录构造/解析（全面改为 float 存储向量） ====================
 
-function M.create_memory_record(heat, turns, vec)
+function M.create_memory_record(_legacy_heat, turns, vec)
     turns = (type(turns) == "table") and turns or {}
     vec = (type(vec) == "table") and vec or {}
     local dim = #vec
@@ -663,15 +663,12 @@ function M.create_memory_record(heat, turns, vec)
 
     local turns_size = num_turns * 4          -- uint32_t 数组
     local vector_size = dim * 4                -- float 数组（每个 4 字节）
-    local record_size = 4 + 4 + 2 + turns_size + 2 + vector_size
+    local record_size = 4 + 2 + turns_size + 2 + vector_size
 
     local buf = ffi.new("uint8_t[?]", record_size)
     local offset = 0
 
     ffi.cast("uint32_t*", buf + offset)[0] = record_size
-    offset = offset + 4
-
-    ffi.cast("uint32_t*", buf + offset)[0] = math.floor(heat or 0)
     offset = offset + 4
 
     ffi.cast("uint16_t*", buf + offset)[0] = num_turns
@@ -710,9 +707,7 @@ function M.parse_memory_record(data, offset)
     end
 
     local base = 4
-    if base + 4 + 2 > record_len then return nil, 0 end
-    local heat = ffi.cast("const uint32_t*", p + base)[0]
-    base = base + 4
+    if base + 2 > record_len then return nil, 0 end
 
     local num_turns = ffi.cast("const uint16_t*", p + base)[0]
     base = base + 2
@@ -741,7 +736,7 @@ function M.parse_memory_record(data, offset)
         vec[i + 1] = ffi.cast("const float*", p + base)[i]
     end
 
-    return { heat = heat, turns = turns, vec = vec }, record_len
+    return { turns = turns, vec = vec }, record_len
 end
 
 function M.create_cluster_record(id, centroid, members, heat, hot_count, cold_count, is_hot)

@@ -170,19 +170,6 @@ local DEFAULT_SETTINGS = {
         multipart_only = true,
         stream_event_mode = "sse_event",
     },
-    heat = {
-        total_heat = 10000000,--总热力池大小
-        new_memory_heat = 43000,--新记忆的热力
-        max_neighbors = 5,--新记忆存入时，最多平分给几个邻居
-        neighbors_heat = 26000,--邻居分配的热力，是平分的
-        softmax = true,--当softmax = true时，自动禁用热力池设定，每一句话和它的邻居更新都触发全局归一化
-        tolerance = 500,--softmax的热力归一化以后的容差
-        cold_cluster = {
-            neighbor_multiplier = 2.2,   -- 冷簇时邻居热力倍数（1.8~2.5 都行）
-            wake_multiplier     = 1.8,   -- 冷簇唤醒热力倍数
-            extra_neighbor_heat = 18000, -- 额外给邻居的热力（冷簇专用）
-        },
-    },
     cluster = {
         cluster_sim = 0.72,--新记忆首先计算与其他簇的质心的相似度，如果>cluster_sim，那么就进入簇内。如果没有，那么就将这个向量本身作为质心。
         hot_cluster_ratio = 0.65,--热簇占比超过hot_cluster_ratio则为热簇，反之为冷簇。
@@ -335,7 +322,15 @@ local DEFAULT_SETTINGS = {
         topic_activation_min_score = 0.08, -- 低于该值的预测候选不进入激活集。
         topic_activation_predict_gain = 1.06, -- 显式激活 memory 被命中时的轻微分数增益。
         topic_activation_node_prior_scale = 0.78, -- topic 节点先验参与 GHSOM 节点排序的权重。
-        topic_activation_node_active_bonus = 0.18, -- 节点里已有激活 memory 时的预算倾斜增益。
+        topic_activation_node_resident_bonus = 0.08, -- shard 已经驻留在 LRU 缓存时的轻微预算倾斜。
+        topic_activation_recall_weight = 0.45, -- recall 选中 memory 的弱监督权重。
+        topic_activation_adopted_weight = 1.35, -- assistant 最终采用 memory 片段的强监督权重。
+        topic_activation_feedback_topn = 3, -- 最多保留多少条 assistant 最终采用的 memory 反馈。
+        topic_activation_feedback_min_sim = 0.58, -- final reply 与 recall 片段对齐的最低相似度。
+        topic_activation_feedback_margin = 0.05, -- 与最佳 recall 片段的允许回退 margin。
+        topic_activation_preload_node_topn = 4, -- 每轮 topic 预测最多预拉起多少个 node shard。
+        topic_activation_preload_memory_topn = 12, -- 每轮 topic 预测最多按 memory 补拉起多少个 shard。
+        topic_activation_preload_io_budget = 6, -- 单轮 topic 预测最多消耗多少次 shard preload I/O。
         topic_activation_topic_cap = 64, -- 每个 topic 最多保留多少条自监督 memory 统计。
         topic_activation_next_cap = 32, -- 每条 memory 最多保留多少条“后继激活”统计。
         topic_activation_transition_cap = 12, -- 每个 topic 最多保留多少个 topic 转移统计。

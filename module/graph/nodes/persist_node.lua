@@ -1,5 +1,7 @@
 local history = require("module.memory.history")
+local recall = require("module.memory.recall")
 local topic = require("module.memory.topic")
+local predictor = require("module.memory.topic_predictor")
 local tool = require("module.tool")
 local memory_core = require("module.graph.memory_core")
 local episode = require("module.episode")
@@ -21,6 +23,19 @@ function M.run(state, _ctx)
 
     history.add_history(user_input, final_text)
     topic.update_assistant(current_turn, final_text)
+
+    local recall_state = ((state or {}).recall) or {}
+    local adopted_memories = recall.infer_adopted_memories(final_text, recall_state)
+    local current_anchor = topic.get_stable_anchor and topic.get_stable_anchor(current_turn) or topic.get_topic_anchor(current_turn)
+    state.recall = state.recall or {}
+    state.recall.topic_anchor = tostring(current_anchor or "")
+    state.recall.adopted_memories = adopted_memories
+    if #((recall_state.selected_memories) or {}) > 0 or #adopted_memories > 0 then
+        predictor.observe(current_anchor, nil, {
+            retrieved_memories = (recall_state.selected_memories or {}),
+            adopted_memories = adopted_memories,
+        })
+    end
 
     local items = (((state or {}).writeback or {}).items) or {}
     local saved = memory_core.save_ingest_items(items, current_turn)

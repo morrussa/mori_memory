@@ -361,7 +361,25 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
     state.context.policy_context = state.context.policy_context or ""
     state.context.applied_policy = state.context.applied_policy or ""
     state.router_decision = state.router_decision or { route = "respond", raw = "", reason = "" }
-    state.recall = state.recall or { triggered = false, context = "", score = nil }
+    state.recall = state.recall or {
+        triggered = false,
+        context = "",
+        score = nil,
+        topic_anchor = "",
+        predicted_memories = {},
+        predicted_nodes = {},
+        selected_turns = {},
+        selected_memories = {},
+        fragments = {},
+        adopted_memories = {},
+    }
+    state.recall.topic_anchor = tostring(state.recall.topic_anchor or "")
+    state.recall.predicted_memories = state.recall.predicted_memories or {}
+    state.recall.predicted_nodes = state.recall.predicted_nodes or {}
+    state.recall.selected_turns = state.recall.selected_turns or {}
+    state.recall.selected_memories = state.recall.selected_memories or {}
+    state.recall.fragments = state.recall.fragments or {}
+    state.recall.adopted_memories = state.recall.adopted_memories or {}
     state.episode = state.episode or {
         current = { turn_index = 0, topic_anchor = "" },
         recent = { items = {}, summary = "", count = 0, latest_episode_id = "" },

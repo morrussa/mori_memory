@@ -4,7 +4,7 @@ local config = require("module.config")
 local persistence = require("module.persistence")
 
 local STATE_FILE = "memory/topic_predictor.txt"
-local VERSION = "TPR1"
+local VERSION = "TPR2"
 
 M.state = nil
 M.runtime = nil
@@ -103,6 +103,23 @@ local function unique_sorted_memories(memories)
         if idx and idx > 0 and not seen[idx] then
             seen[idx] = true
             out[#out + 1] = idx
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function merge_memory_lists(...)
+    local seen = {}
+    local out = {}
+    for i = 1, select("#", ...) do
+        local arr = select(i, ...)
+        for _, mem_idx in ipairs(arr or {}) do
+            local idx = tonumber(mem_idx)
+            if idx and idx > 0 and not seen[idx] then
+                seen[idx] = true
+                out[#out + 1] = idx
+            end
         end
     end
     table.sort(out)
@@ -262,17 +279,24 @@ function M.observe(topic_anchor, selected_memories, opts)
     opts = type(opts) == "table" and opts or {}
 
     local anchor = normalize_anchor(topic_anchor)
-    local selected = unique_sorted_memories(selected_memories)
+    local retrieved = unique_sorted_memories(opts.retrieved_memories or selected_memories)
+    local adopted = unique_sorted_memories(opts.adopted_memories)
+    local observed = merge_memory_lists(adopted, retrieved)
     local cfg = ai_cfg()
     local topic_cap = math.max(8, math.floor(tonumber(cfg.topic_activation_topic_cap) or 64))
     local next_cap = math.max(8, math.floor(tonumber(cfg.topic_activation_next_cap) or 32))
     local trans_cap = math.max(4, math.floor(tonumber(cfg.topic_activation_transition_cap) or 12))
     local cross_weight = clamp(tonumber(cfg.topic_activation_cross_topic_next_weight) or 0.45, 0.0, 1.0)
+    local recall_weight = math.max(0.0, tonumber(cfg.topic_activation_recall_weight) or 0.45)
+    local adopted_weight = math.max(recall_weight, tonumber(cfg.topic_activation_adopted_weight) or 1.35)
 
-    if anchor and #selected > 0 then
+    if anchor and (#retrieved > 0 or #adopted > 0) then
         local topic_bucket = M.state.topic_memory[anchor] or {}
-        for _, mem_idx in ipairs(selected) do
-            add_weight(topic_bucket, mem_idx, 1.0)
+        for _, mem_idx in ipairs(retrieved) do
+            add_weight(topic_bucket, mem_idx, recall_weight)
+        end
+        for _, mem_idx in ipairs(adopted) do
+            add_weight(topic_bucket, mem_idx, adopted_weight)
         end
         prune_bucket(topic_bucket, topic_cap)
         M.state.topic_memory[anchor] = topic_bucket
@@ -280,13 +304,18 @@ function M.observe(topic_anchor, selected_memories, opts)
 
     local prev_anchor = normalize_anchor(opts.previous_anchor or M.runtime.last_anchor)
     local prev_selected = unique_sorted_memories(opts.previous_selected or M.runtime.last_selected)
-    if #prev_selected > 0 and #selected > 0 then
+    if #prev_selected > 0 and #observed > 0 then
         local pair_weight = (prev_anchor and anchor and prev_anchor ~= anchor) and cross_weight or 1.0
         for _, src in ipairs(prev_selected) do
             local bucket = M.state.memory_next[src] or {}
-            for _, dst in ipairs(selected) do
+            for _, dst in ipairs(retrieved) do
                 if src ~= dst then
-                    add_weight(bucket, dst, pair_weight)
+                    add_weight(bucket, dst, pair_weight * recall_weight)
+                end
+            end
+            for _, dst in ipairs(adopted) do
+                if src ~= dst then
+                    add_weight(bucket, dst, pair_weight * adopted_weight)
                 end
             end
             prune_bucket(bucket, next_cap)
@@ -304,8 +333,8 @@ function M.observe(topic_anchor, selected_memories, opts)
     if anchor then
         M.runtime.last_anchor = anchor
     end
-    if #selected > 0 then
-        M.runtime.last_selected = selected
+    if #observed > 0 then
+        M.runtime.last_selected = observed
     end
 
     M.state.observe_count = (tonumber(M.state.observe_count) or 0) + 1
@@ -422,11 +451,22 @@ function M.predict(topic_anchor, opts)
             node_max = score
         end
     end
+    local ranked_nodes = {}
     if node_max > 0 then
         for cid, score in pairs(node_scores) do
             node_scores[cid] = score / node_max
+            ranked_nodes[#ranked_nodes + 1] = {
+                id = tonumber(cid),
+                score = tonumber(node_scores[cid]) or 0.0,
+            }
         end
     end
+    table.sort(ranked_nodes, function(a, b)
+        if (a.score or 0.0) ~= (b.score or 0.0) then
+            return (a.score or 0.0) > (b.score or 0.0)
+        end
+        return (a.id or 0) < (b.id or 0)
+    end)
 
     M.state.predict_count = (tonumber(M.state.predict_count) or 0) + 1
     mark_dirty()
@@ -436,6 +476,7 @@ function M.predict(topic_anchor, opts)
         lines = lines,
         memory_scores = memory_scores,
         node_scores = node_scores,
+        ranked_nodes = ranked_nodes,
         recent_selected = shallow_copy_array(recent_selected),
     }
 end

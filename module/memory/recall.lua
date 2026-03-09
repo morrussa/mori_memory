@@ -46,6 +46,48 @@ local function shallow_copy_array(src)
     return out
 end
 
+local function trim(text)
+    return tostring(text or ""):match("^%s*(.-)%s*$")
+end
+
+local function unique_sorted_memories(memories)
+    local seen = {}
+    local out = {}
+    for _, mem_idx in ipairs(memories or {}) do
+        local idx = tonumber(mem_idx)
+        if idx and idx > 0 and not seen[idx] then
+            seen[idx] = true
+            out[#out + 1] = idx
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function ranked_prediction_nodes(prediction)
+    local out = {}
+    for _, item in ipairs(((prediction or {}).ranked_nodes) or {}) do
+        local cid = tonumber((item or {}).id)
+        if cid and cid > 0 then
+            out[#out + 1] = cid
+        end
+    end
+    return out
+end
+
+local function empty_recall_result(current_anchor, prediction)
+    return {
+        context = "",
+        topic_anchor = tostring(current_anchor or ""),
+        predicted_memories = shallow_copy_array(((prediction or {}).lines) or {}),
+        predicted_nodes = ranked_prediction_nodes(prediction),
+        selected_turns = {},
+        selected_memories = {},
+        fragments = {},
+        adopted_memories = {},
+    }
+end
+
 local function shuffle_inplace(arr)
     for i = #arr, 2, -1 do
         local j = math.random(i)
@@ -333,34 +375,6 @@ local function effective_retrieval_knobs(turn)
     }
 end
 
-local function merge_unique_results(dst, src, limit)
-    local merged = {}
-    local seen = {}
-    for _, item in ipairs(dst or {}) do
-        local idx = tonumber(item.index)
-        if idx and not seen[idx] then
-            seen[idx] = true
-            merged[#merged + 1] = item
-        end
-    end
-    for _, item in ipairs(src or {}) do
-        local idx = tonumber(item.index)
-        if idx and not seen[idx] then
-            seen[idx] = true
-            merged[#merged + 1] = item
-        end
-    end
-    table.sort(merged, function(a, b)
-        return (tonumber(a.similarity) or -1.0) > (tonumber(b.similarity) or -1.0)
-    end)
-    if limit and limit > 0 then
-        while #merged > limit do
-            table.remove(merged)
-        end
-    end
-    return merged
-end
-
 local function build_query_vectors(user_input, user_vec, keyword_weight)
     local out = {
         { vec = user_vec, weight = 1.0, is_primary = true }
@@ -486,7 +500,7 @@ end
 
 local function retrieve(user_input, user_vec, current_turn, current_info, current_anchor, prediction)
     if memory.get_total_lines() <= 0 then
-        return ""
+        return empty_recall_result(current_anchor, prediction)
     end
 
     local cfg = ai_cfg()
@@ -532,7 +546,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local query_vectors = build_query_vectors(user_input, user_vec, keyword_weight)
     local primary = query_vectors[1]
     if (not primary) or type(primary.vec) ~= "table" or #primary.vec == 0 then
-        return ""
+        return empty_recall_result(current_anchor, prediction)
     end
 
     local function mark_candidate(mem_idx, src_label, cid)
@@ -572,7 +586,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         end
     end
 
-    -- Stage A: topic 预测先分配 GHSOM 节点预算，再做 active-first 扫描。
+    -- Stage A: topic 预测先分配 GHSOM 节点预算，并优先拉起更可能命中的 shard。
     do
         local qv = primary.vec
         local weight = primary.weight or 1.0
@@ -584,32 +598,16 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             per_node_floor = per_node_floor,
             predicted_nodes = predicted_node_scores,
             prior_scale = tonumber(cfg.topic_activation_node_prior_scale) or 0.78,
-            activation_bonus = tonumber(cfg.topic_activation_node_active_bonus) or 0.18,
+            resident_bonus = tonumber(cfg.topic_activation_node_resident_bonus) or 0.08,
         })
         local scanned_any = false
         for _, plan_item in ipairs(node_plan) do
             local cid = tonumber(plan_item.id)
             local scan_limit = math.max(1, tonumber(plan_item.scan_limit) or base_scan_limit)
-            local src_label = ((tonumber(plan_item.prior) or 0.0) > 0.0) and "predict" or "hot"
-            local sim_results = {}
-            if plan_item.prefer_active == true then
-                sim_results = ghsom.find_sim_in_node(qv, cid, {
-                    only_hot = true,
-                    max_results = scan_limit,
-                })
-                if #sim_results < scan_limit then
-                    local fallback_results = ghsom.find_sim_in_node(qv, cid, {
-                        only_hot = false,
-                        max_results = scan_limit,
-                    })
-                    sim_results = merge_unique_results(sim_results, fallback_results, scan_limit)
-                end
-            else
-                sim_results = ghsom.find_sim_in_node(qv, cid, {
-                    only_hot = false,
-                    max_results = scan_limit,
-                })
-            end
+            local src_label = ((tonumber(plan_item.prior) or 0.0) > 0.0) and "predict" or ((plan_item.resident == true) and "resident" or "semantic")
+            local sim_results = ghsom.find_sim_in_node(qv, cid, {
+                max_results = scan_limit,
+            })
             if #sim_results > 0 then
                 scanned_any = true
             end
@@ -631,11 +629,11 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
             for _, mem in ipairs(fallback) do
                 local mem_idx = mem.index
                 local sim = mem.similarity
-                mark_candidate(mem_idx, "hot", ghsom.get_node_for_line(mem_idx) or -1)
+                mark_candidate(mem_idx, "semantic", ghsom.get_node_for_line(mem_idx) or -1)
                 update_mem_best(mem_idx, sim, weight, ghsom.get_node_for_line(mem_idx) or -1)
                 if sim >= min_gate then
                     local effective = (sim ^ power) * weight
-                    push_turn_score(mem_idx, effective, "hot")
+                    push_turn_score(mem_idx, effective, "semantic")
                 end
             end
         end
@@ -741,7 +739,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     local selected = {}
     local ranked = to_sorted_pairs(turn_best)
     if #ranked <= 0 then
-        return ""
+        return empty_recall_result(current_anchor, prediction)
     end
 
     if cfg.use_topic_buckets ~= true or not current_info then
@@ -820,6 +818,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
 
     local selected_turns = {}
     local selected_memories = {}
+    local selected_fragments = {}
     local predict_contrib = 0
     for _, item in ipairs(selected) do
         selected_turns[#selected_turns + 1] = item.turn
@@ -843,10 +842,7 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
     end
 
     apply_refinement(current_turn, hits_all, candidate_samples, selected_memories, current_info, sim_th)
-    if #selected_memories > 0 then
-        ghsom.activate_lines(selected_memories, { mode = "append" })
-    end
-    predictor.observe(current_anchor, selected_memories)
+    selected_memories = unique_sorted_memories(selected_memories)
 
     print(string.format(
         "[Recall] 选中 %d 条 turn（hits_same=%d, gate=%.3f, max_turns=%d）",
@@ -859,34 +855,133 @@ local function retrieve(user_input, user_vec, current_turn, current_info, curren
         if entry then
             local user_part, ai_part = history.parse_entry(entry)
             if user_part then
+                local mem_idx = tonumber(turn_mem[item.turn])
+                local fragment_text = string.format("第%d轮 用户：%s\n助手：%s", item.turn, user_part, ai_part)
+                selected_fragments[#selected_fragments + 1] = {
+                    turn = item.turn,
+                    mem_idx = mem_idx,
+                    user = tostring(user_part or ""),
+                    assistant = tostring(ai_part or ""),
+                    text = fragment_text,
+                    source = tostring(turn_src[item.turn] or ""),
+                    score = tonumber(item.score) or 0.0,
+                }
                 memory_text_lines[#memory_text_lines + 1] =
-                    string.format("第%d轮 用户：%s\n助手：%s", item.turn, user_part, ai_part)
+                    fragment_text
             end
         end
     end
 
+    local context = ""
     if #memory_text_lines > 0 then
-        return "【相关记忆】\n" .. table.concat(memory_text_lines, "\n\n")
+        context = "【相关记忆】\n" .. table.concat(memory_text_lines, "\n\n")
     end
-    return ""
+
+    return {
+        context = context,
+        topic_anchor = tostring(current_anchor or ""),
+        predicted_memories = shallow_copy_array(predicted_lines),
+        predicted_nodes = ranked_prediction_nodes(prediction),
+        selected_turns = shallow_copy_array(selected_turns),
+        selected_memories = selected_memories,
+        fragments = selected_fragments,
+        adopted_memories = {},
+    }
 end
 
-function M.check_and_retrieve(user_input, user_vec)
+function M.check_and_retrieve(user_input, user_vec, _opts)
     user_vec = user_vec or tool.get_embedding_query(user_input)
 
     local current_turn = history.get_turn() + 1
     local current_anchor = topic.get_stable_anchor and topic.get_stable_anchor(current_turn) or nil
     local current_info = topic.get_topic_for_turn and topic.get_topic_for_turn(current_turn) or nil
+    memory.begin_turn(current_turn)
     local prediction = predictor.predict(current_anchor, {
         query_vec = user_vec,
     })
-    ghsom.activate_lines((prediction or {}).lines or {}, { mode = "replace" })
 
     if need_recall(user_input, user_vec, current_turn) then
+        if memory.preload_prediction then
+            memory.preload_prediction(prediction, {
+                max_io = tonumber(ai_cfg().topic_activation_preload_io_budget) or 6,
+                max_nodes = tonumber(ai_cfg().topic_activation_preload_node_topn) or 4,
+                max_memories = tonumber(ai_cfg().topic_activation_preload_memory_topn) or tonumber(ai_cfg().topic_activation_memory_topn) or 12,
+            })
+        end
         return retrieve(user_input, user_vec, current_turn, current_info, current_anchor, prediction)
     end
 
-    return ""
+    return empty_recall_result(current_anchor, prediction)
+end
+
+function M.infer_adopted_memories(final_text, recall_state)
+    final_text = trim(final_text)
+    recall_state = type(recall_state) == "table" and recall_state or {}
+
+    local fragments = type(recall_state.fragments) == "table" and recall_state.fragments or {}
+    if final_text == "" or #fragments <= 0 then
+        return {}
+    end
+
+    local embed = tool.get_embedding_passage or tool.get_embedding
+    local final_vec = embed and embed(final_text) or nil
+    if type(final_vec) ~= "table" or #final_vec <= 0 then
+        return {}
+    end
+
+    local cfg = ai_cfg()
+    local min_sim = tonumber(cfg.topic_activation_feedback_min_sim) or 0.58
+    local topn = math.max(1, math.floor(tonumber(cfg.topic_activation_feedback_topn) or 3))
+    local margin = math.max(0.0, tonumber(cfg.topic_activation_feedback_margin) or 0.05)
+    local ranked = {}
+
+    for _, fragment in ipairs(fragments) do
+        local mem_idx = tonumber((fragment or {}).mem_idx)
+        local assistant_text = trim((fragment or {}).assistant)
+        local full_text = trim((fragment or {}).text)
+        local base_text = assistant_text ~= "" and assistant_text or full_text
+        if mem_idx and base_text ~= "" then
+            local base_vec = embed and embed(base_text) or nil
+            if type(base_vec) == "table" and #base_vec > 0 then
+                local sim = tonumber(tool.cosine_similarity(final_vec, base_vec)) or 0.0
+                if full_text ~= "" and full_text ~= base_text then
+                    local full_vec = embed(full_text)
+                    if type(full_vec) == "table" and #full_vec > 0 then
+                        sim = math.max(sim, (tonumber(tool.cosine_similarity(final_vec, full_vec)) or 0.0) * 0.97)
+                    end
+                end
+                ranked[#ranked + 1] = {
+                    mem_idx = mem_idx,
+                    similarity = sim,
+                }
+            end
+        end
+    end
+
+    table.sort(ranked, function(a, b)
+        if (a.similarity or 0.0) ~= (b.similarity or 0.0) then
+            return (a.similarity or 0.0) > (b.similarity or 0.0)
+        end
+        return (a.mem_idx or 0) < (b.mem_idx or 0)
+    end)
+
+    local out = {}
+    local seen = {}
+    local best = ranked[1] and (tonumber(ranked[1].similarity) or 0.0) or 0.0
+    for i = 1, math.min(topn, #ranked) do
+        local item = ranked[i]
+        local sim = tonumber(item.similarity) or 0.0
+        if sim >= min_sim or (best > 0 and sim >= math.max(min_sim - 0.04, best - margin)) then
+            local mem_idx = tonumber(item.mem_idx)
+            if mem_idx and not seen[mem_idx] then
+                seen[mem_idx] = true
+                out[#out + 1] = mem_idx
+            end
+        end
+    end
+
+    table.sort(out)
+    return out
 end
 
 return M
