@@ -35,6 +35,11 @@ from typing import Dict, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 
+try:
+    from mori_hnsw import HNSWIndex
+except Exception:
+    HNSWIndex = None
+
 
 def unit(v: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(v))
@@ -243,6 +248,13 @@ class SimParams:
     topic_graph_bridge_weight: float = 0.55
     topic_graph_resident_bonus: float = 0.08
     topic_graph_current_topic_bonus: float = 0.12
+    topic_graph_local_hnsw_enabled: bool = False
+    topic_graph_local_hnsw_threshold: int = 96
+    topic_graph_local_hnsw_candidate_threshold: int = 6
+    topic_graph_local_hnsw_m: int = 16
+    topic_graph_local_hnsw_ef_construction: int = 80
+    topic_graph_local_hnsw_ef_search: int = 32
+    topic_graph_local_hnsw_k_mult: int = 4
     # ========================================================================
 
     # Cold-memory rescue simulation (delayed salvage)
@@ -313,6 +325,8 @@ class TopicShardState:
     loaded: bool = False
     last_loaded_turn: int = 0
     ghsom_root: Optional["GHSOMNodeState"] = None
+    hnsw_index: Optional["HNSWIndex"] = None
+    hnsw_capacity: int = 0
 
 
 class TopicStream:
@@ -2938,6 +2952,10 @@ class TopicGraphSim:
         self.ghsom_probe_count = 0
         self.ghsom_probe_candidates_total = 0
         self.ghsom_probe_depth_total = 0
+        self.local_hnsw_build_events = 0
+        self.local_hnsw_rebuild_events = 0
+        self.local_hnsw_query_events = 0
+        self.local_hnsw_failure_events = 0
 
         self.snapshots: List[Dict[str, float]] = []
 
@@ -3155,6 +3173,98 @@ class TopicGraphSim:
             return shard.centroid
         return self.topic.topic_vectors[tid]
 
+    def _local_hnsw_ready(self) -> bool:
+        return bool(self.p.topic_graph_local_hnsw_enabled and HNSWIndex is not None)
+
+    def _close_topic_hnsw(self, shard: TopicShardState) -> None:
+        if shard.hnsw_index is not None:
+            try:
+                shard.hnsw_index.close()
+            except Exception:
+                pass
+        shard.hnsw_index = None
+        shard.hnsw_capacity = 0
+
+    def _build_topic_hnsw(self, tid: int, force_rebuild: bool) -> Optional["HNSWIndex"]:
+        if not self._local_hnsw_ready():
+            return None
+        if tid < 0 or tid >= self.topic_count:
+            return None
+        shard = self.topic_shards[tid]
+        if not shard.loaded:
+            return None
+        members = shard.members
+        threshold = max(2, int(self.p.topic_graph_local_hnsw_threshold))
+        if len(members) < threshold:
+            self._close_topic_hnsw(shard)
+            return None
+
+        need_rebuild = force_rebuild or shard.hnsw_index is None
+        if not need_rebuild and shard.hnsw_index is not None:
+            if shard.hnsw_index.count != len(members) or shard.hnsw_capacity < len(members):
+                need_rebuild = True
+        if not need_rebuild:
+            return shard.hnsw_index
+
+        self._close_topic_hnsw(shard)
+        capacity = max(
+            threshold,
+            len(members) + 8,
+            int(math.ceil(len(members) * 1.35)),
+        )
+        try:
+            index = HNSWIndex.create(
+                dim=self.p.dim,
+                max_elements=capacity,
+                space="cosine",
+                m=max(4, int(self.p.topic_graph_local_hnsw_m)),
+                ef_construction=max(16, int(self.p.topic_graph_local_hnsw_ef_construction)),
+                ef_search=max(8, int(self.p.topic_graph_local_hnsw_ef_search)),
+                random_seed=int(self.p.seed),
+            )
+            for mem_idx in members:
+                index.add(int(mem_idx), self.vec_pool[mem_idx])
+        except Exception:
+            self.local_hnsw_failure_events += 1
+            self._close_topic_hnsw(shard)
+            return None
+
+        shard.hnsw_index = index
+        shard.hnsw_capacity = capacity
+        if force_rebuild:
+            self.local_hnsw_rebuild_events += 1
+        else:
+            self.local_hnsw_build_events += 1
+        return index
+
+    def _ensure_topic_hnsw(self, tid: int) -> Optional["HNSWIndex"]:
+        return self._build_topic_hnsw(tid, force_rebuild=False)
+
+    def _topic_hnsw_query(
+        self,
+        tid: int,
+        query_vec: np.ndarray,
+        k: int,
+    ) -> Tuple[np.ndarray, int, bool]:
+        index = self._ensure_topic_hnsw(tid)
+        if index is None:
+            return np.asarray([], dtype=np.int32), 0, False
+        try:
+            hits = index.search(query_vec, max(1, int(k)))
+        except Exception:
+            self.local_hnsw_failure_events += 1
+            self._build_topic_hnsw(tid, force_rebuild=True)
+            return np.asarray([], dtype=np.int32), 0, False
+        if not hits:
+            return np.asarray([], dtype=np.int32), 0, False
+        self.local_hnsw_query_events += 1
+        ops = min(
+            len(self.topic_shards[tid].members),
+            max(int(k), int(self.p.topic_graph_local_hnsw_ef_search)),
+        )
+        labels = np.asarray([int(hit.label) for hit in hits], dtype=np.int32)
+        return labels, ops, True
+
     def _touch_loaded_topic(self, tid: int, turn: int) -> bool:
         shard = self.topic_shards[tid]
         newly_loaded = not shard.loaded
@@ -3170,6 +3280,7 @@ class TopicGraphSim:
                 alt = [i for i in loaded_ids if i != tid]
                 evict = min(alt, key=lambda i: self.topic_shards[i].last_loaded_turn)
             self.topic_shards[evict].loaded = False
+            self._close_topic_hnsw(self.topic_shards[evict])
             self.topic_evict_events += 1
             loaded_ids = [i for i, item in enumerate(self.topic_shards) if item.loaded]
         return newly_loaded
@@ -3241,6 +3352,16 @@ class TopicGraphSim:
         root, build_ops, fresh = self._ensure_topic_ghsom_root(topic_id, vec)
         if root is not None and not fresh:
             self._ghsom_insert(root, vec, mem_idx)
+
+        if self._local_hnsw_ready() and shard.loaded and shard.hnsw_index is not None:
+            if shard.hnsw_index.count >= shard.hnsw_capacity:
+                self._build_topic_hnsw(topic_id, force_rebuild=True)
+            elif len(shard.members) >= max(2, int(self.p.topic_graph_local_hnsw_threshold)):
+                try:
+                    shard.hnsw_index.add(int(mem_idx), vec)
+                except Exception:
+                    self.local_hnsw_failure_events += 1
+                    self._build_topic_hnsw(topic_id, force_rebuild=True)
 
     def _semantic_topic_scores(
         self,
@@ -3373,6 +3494,7 @@ class TopicGraphSim:
         ranked_topics: List[Tuple[int, float]] = []
         evidence_topics: List[int] = []
         evidence_memories: List[int] = []
+        hnsw_topics: List[int] = []
         ops = 0
 
         for tid in sorted(available_topics):
@@ -3381,16 +3503,35 @@ class TopicGraphSim:
                 continue
             topic_ops = 0
             shard = self.topic_shards[tid]
-            idx: np.ndarray
+            idx = np.asarray([], dtype=np.int32)
             if self.p.ghsom_enabled and shard.ghsom_root is not None:
                 idx, topic_ops = self._ghsom_collect_candidates(
                     shard.ghsom_root,
                     query_vec,
                     max_results=per_topic_evidence,
                 )
-                if idx.size <= 0:
-                    idx = np.asarray(members, dtype=np.int32)
-            else:
+            candidate_threshold = max(
+                per_topic_evidence,
+                int(self.p.topic_graph_local_hnsw_candidate_threshold),
+            )
+            if self._local_hnsw_ready() and len(members) >= max(
+                2, int(self.p.topic_graph_local_hnsw_threshold)
+            ):
+                hnsw_needed = idx.size <= 0 or idx.size > candidate_threshold
+                if hnsw_needed:
+                    hnsw_k = min(
+                        len(members),
+                        max(
+                            per_topic_evidence,
+                            per_topic_evidence * max(1, int(self.p.topic_graph_local_hnsw_k_mult)),
+                        ),
+                    )
+                    hnsw_idx, hnsw_ops, used_hnsw = self._topic_hnsw_query(tid, query_vec, hnsw_k)
+                    topic_ops += hnsw_ops
+                    if used_hnsw and hnsw_idx.size > 0:
+                        idx = hnsw_idx
+                        hnsw_topics.append(int(tid))
+            if idx.size <= 0:
                 idx = np.asarray(members, dtype=np.int32)
             ops += topic_ops
             sims = self.vec_pool[idx] @ query_vec
@@ -3423,6 +3564,7 @@ class TopicGraphSim:
             "evidence_topics": evidence_topics,
             "evidence_memories": evidence_memories,
             "ranked_topics": ranked_topics,
+            "hnsw_topics": hnsw_topics,
         }, ops
 
     def retrieve(
@@ -3559,6 +3701,11 @@ class TopicGraphSim:
             "topic_graph_bridge_hit_events": float(self.bridge_hit_events),
             "topic_graph_bridge_update_events": float(self.bridge_update_events),
             "topic_graph_resident_hit_events": float(self.resident_hit_events),
+            "topic_graph_local_hnsw_enabled": 1.0 if self._local_hnsw_ready() else 0.0,
+            "topic_graph_local_hnsw_build_events": float(self.local_hnsw_build_events),
+            "topic_graph_local_hnsw_rebuild_events": float(self.local_hnsw_rebuild_events),
+            "topic_graph_local_hnsw_query_events": float(self.local_hnsw_query_events),
+            "topic_graph_local_hnsw_failure_events": float(self.local_hnsw_failure_events),
             "preload_attempts": float(self.preload_attempts),
             "preload_successes": float(self.preload_successes),
             "preload_success_rate": (self.preload_successes / max(1, self.preload_attempts)),
@@ -3782,8 +3929,25 @@ def main():
                         help="Minimum samples in a slot before GHSOM split")
     parser.add_argument("--ghsom-threshold", type=int, default=24,
                         help="Only use GHSOM routing when cluster size reaches this threshold")
+    parser.add_argument("--local-hnsw-enabled", type=lambda x: x.lower() == 'true', default=False,
+                        help="Enable topic-local Rust HNSW fallback for large loaded topic shards")
+    parser.add_argument("--local-hnsw-threshold", type=int, default=96,
+                        help="Build topic-local HNSW only when a loaded topic reaches this size")
+    parser.add_argument("--local-hnsw-candidate-threshold", type=int, default=6,
+                        help="Use HNSW when GHSOM candidate pool exceeds this size")
+    parser.add_argument("--local-hnsw-m", type=int, default=16,
+                        help="Local HNSW M parameter")
+    parser.add_argument("--local-hnsw-ef-construction", type=int, default=80,
+                        help="Local HNSW ef_construction")
+    parser.add_argument("--local-hnsw-ef-search", type=int, default=32,
+                        help="Local HNSW ef_search; also used as the sim_ops cost proxy")
+    parser.add_argument("--local-hnsw-k-mult", type=int, default=4,
+                        help="Retrieve this multiple of per-topic evidence from local HNSW before rerank")
     
     args = parser.parse_args()
+
+    if args.local_hnsw_enabled and HNSWIndex is None:
+        raise RuntimeError("local HNSW requested but mori_hnsw binding is unavailable")
     
     ghsom_enabled = args.ghsom_enabled
     if ghsom_enabled is None:
@@ -3803,6 +3967,13 @@ def main():
         ghsom_max_depth=max(1, int(args.ghsom_max_depth)),
         ghsom_min_samples_for_expansion=max(2, int(args.ghsom_min_samples)),
         ghsom_linear_scan_threshold=max(2, int(args.ghsom_threshold)),
+        topic_graph_local_hnsw_enabled=bool(args.local_hnsw_enabled),
+        topic_graph_local_hnsw_threshold=max(2, int(args.local_hnsw_threshold)),
+        topic_graph_local_hnsw_candidate_threshold=max(1, int(args.local_hnsw_candidate_threshold)),
+        topic_graph_local_hnsw_m=max(4, int(args.local_hnsw_m)),
+        topic_graph_local_hnsw_ef_construction=max(16, int(args.local_hnsw_ef_construction)),
+        topic_graph_local_hnsw_ef_search=max(8, int(args.local_hnsw_ef_search)),
+        topic_graph_local_hnsw_k_mult=max(1, int(args.local_hnsw_k_mult)),
     )
     
     print(f"Retrieval model: {args.retrieval_model}")
@@ -3816,6 +3987,13 @@ def main():
             "GHSOM index: "
             f"configured={ghsom_enabled}, active={'yes' if ghsom_enabled else 'no'} "
             "(topic_graph local pruning)"
+        )
+    if args.retrieval_model == "topic_graph":
+        print(
+            "Local HNSW: "
+            f"{'enabled' if args.local_hnsw_enabled else 'disabled'} "
+            f"(threshold={int(args.local_hnsw_threshold)}, "
+            f"candidate_threshold={int(args.local_hnsw_candidate_threshold)})"
         )
     
     result = run_experiment(params)
@@ -3832,6 +4010,9 @@ def main():
     if args.retrieval_model == "topic_graph":
         print(f"Topic graph bridge edges: {summary.get('topic_graph_bridge_edges', 0):.0f}")
         print(f"Loaded topics: {summary.get('topic_graph_loaded_topics', 0):.0f}")
+        if args.local_hnsw_enabled:
+            print(f"Local HNSW query events: {summary.get('topic_graph_local_hnsw_query_events', 0):.0f}")
+            print(f"Local HNSW build events: {summary.get('topic_graph_local_hnsw_build_events', 0):.0f}")
     if ghsom_enabled:
         print(f"GHSOM avg probe depth: {summary.get('ghsom_probe_avg_depth', 0.0):.2f}")
         print(f"GHSOM avg candidate pool: {summary.get('ghsom_probe_avg_candidates', 0.0):.2f}")
