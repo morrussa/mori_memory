@@ -7,6 +7,11 @@ luajit/
 __pycache__/
 target/
 native/**/target/
+!native/hnsw/rust/
+!native/hnsw/rust/Cargo.toml
+!native/hnsw/rust/Cargo.lock
+!native/hnsw/rust/src/
+!native/hnsw/rust/src/*.rs
 module/mori_hnsw.so
 readme.txt
 simu/
