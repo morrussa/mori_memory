@@ -12,10 +12,11 @@ if not status then
     print("[WARN] AVX 库未加载，启用 LuaJIT fallback: " .. tostring(err))
     simdc = nil
 else 
-    print("[OK] AVX cosine 库加载成功")
+    print("[OK] AVX 向量库加载成功")
 end
 
 ffi.cdef[[
+    float dot_product_avx(const float* v1, const float* v2, size_t n);
     float cosine_similarity_avx(const float* v1, const float* v2, size_t n);
 ]]
 
@@ -485,6 +486,30 @@ end
 
 -- ==================== 基础相似度计算（使用 AVX2 float 加速） ====================
 
+local function dot_table_table(vec1, vec2, n)
+    local dot = 0.0
+    for i = 1, n do
+        dot = dot + (vec1[i] or 0.0) * (vec2[i] or 0.0)
+    end
+    return dot
+end
+
+local function dot_ptr_table(ptr, vec, n)
+    local dot = 0.0
+    for i = 0, n - 1 do
+        dot = dot + ptr[i] * (vec[i + 1] or 0.0)
+    end
+    return dot
+end
+
+local function dot_ptr_ptr(ptr1, ptr2, n)
+    local dot = 0.0
+    for i = 0, n - 1 do
+        dot = dot + ptr1[i] * ptr2[i]
+    end
+    return dot
+end
+
 local function cosine_table_table(vec1, vec2, n)
     local dot, norm1_sq, norm2_sq = 0.0, 0.0, 0.0
     for i = 1, n do
@@ -525,6 +550,59 @@ local function cosine_ptr_ptr(ptr1, ptr2, n)
 end
 
 -- 在无 SIMD 环境下使用纯 LuaJIT 的点积/余弦 fallback
+function M.dot_product(vec1, vec2)
+    if type(vec1) == "table" and vec1.__ptr then
+        if type(vec2) == "table" and vec2.__ptr then
+            local d1 = tonumber(vec1.__dim) or 0
+            local d2 = tonumber(vec2.__dim) or 0
+            local n = math.min(d1, d2)
+            if n <= 0 then return 0 end
+            if simdc then
+                return simdc.dot_product_avx(vec1.__ptr, vec2.__ptr, n)
+            end
+            return dot_ptr_ptr(vec1.__ptr, vec2.__ptr, n)
+        end
+        if simdc then
+            local n = tonumber(vec1.__dim) or 0
+            if n <= 0 then return 0 end
+            local p2 = get_scratch_buf(simdc_scratch_b, n)
+            for i = 1, n do
+                p2[i - 1] = vec2[i] or 0.0
+            end
+            return simdc.dot_product_avx(vec1.__ptr, p2, n)
+        end
+        return dot_ptr_table(vec1.__ptr, vec2, vec1.__dim)
+    end
+    if type(vec2) == "table" and vec2.__ptr then
+        if simdc then
+            local n = tonumber(vec2.__dim) or 0
+            if n <= 0 then return 0 end
+            local p1 = get_scratch_buf(simdc_scratch_a, n)
+            for i = 1, n do
+                p1[i - 1] = vec1[i] or 0.0
+            end
+            return simdc.dot_product_avx(p1, vec2.__ptr, n)
+        end
+        return dot_ptr_table(vec2.__ptr, vec1, vec2.__dim)
+    end
+
+    if not vec1 or not vec2 then return 0 end
+    local n = #vec1
+    if n == 0 or n ~= #vec2 then return 0 end
+
+    if simdc then
+        local p1 = get_scratch_buf(simdc_scratch_a, n)
+        local p2 = get_scratch_buf(simdc_scratch_b, n)
+        for i = 1, n do
+            p1[i - 1] = vec1[i]
+            p2[i - 1] = vec2[i]
+        end
+        return simdc.dot_product_avx(p1, p2, n)
+    end
+
+    return dot_table_table(vec1, vec2, n)
+end
+
 function M.cosine_similarity(vec1, vec2)
     -- 1. 检查是否是 FFI 指针 (来自 memory.iterate_all)
     if type(vec1) == "table" and vec1.__ptr then

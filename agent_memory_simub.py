@@ -49,6 +49,7 @@ class SimParams:
     dim: int = 256
     seed: int = 42
     report_every: int = 1000
+    retrieval_model: str = "memory"
 
     # Topic stream generator
     topic_groups: int = 20
@@ -218,6 +219,30 @@ class SimParams:
     
     # Use hierarchical retrieval (if disabled, only top-level nodes used as clusters)
     ghsom_hierarchical_retrieval: bool = True
+    # Only enable GHSOM routing when a cluster is large enough to justify the fixed overhead.
+    ghsom_linear_scan_threshold: int = 24
+    # ========================================================================
+
+    # ========================================================================
+    # Topic-graph retrieval model (NEW)
+    # ========================================================================
+    topic_graph_seed_topics: int = 2
+    topic_graph_expand_budget: int = 6
+    topic_graph_max_return_topics: int = 4
+    topic_graph_per_topic_evidence: int = 3
+    topic_graph_load_budget: int = 4
+    topic_graph_loaded_cap: int = 24
+    topic_graph_bridge_topk: int = 8
+    topic_graph_max_bridge_hops: int = 2
+    topic_graph_transition_lr: float = 0.12
+    topic_graph_recall_lr: float = 0.10
+    topic_graph_adopt_lr: float = 0.18
+    topic_graph_decay: float = 0.995
+    topic_graph_min_bridge_score: float = 0.08
+    topic_graph_query_semantic_weight: float = 1.00
+    topic_graph_bridge_weight: float = 0.55
+    topic_graph_resident_bonus: float = 0.08
+    topic_graph_current_topic_bonus: float = 0.12
     # ========================================================================
 
     # Cold-memory rescue simulation (delayed salvage)
@@ -256,6 +281,38 @@ class ClusterState:
     hot_count: int = 0
     cold_count: int = 0
     is_hot_cluster: bool = False
+    ghsom_root: Optional["GHSOMNodeState"] = None
+
+
+@dataclass
+class GHSOMNodeState:
+    depth: int
+    width: int
+    height: int
+    neurons: np.ndarray
+    slot_members: List[List[int]]
+    slot_count: np.ndarray
+    slot_sim_sum: np.ndarray
+    children: Dict[int, "GHSOMNodeState"] = field(default_factory=dict)
+    member_count: int = 0
+
+
+@dataclass
+class TopicBridgeState:
+    transition: float = 0.0
+    recall: float = 0.0
+    adopt: float = 0.0
+    support: int = 0
+    last_turn: int = 0
+
+
+@dataclass
+class TopicShardState:
+    members: List[int] = field(default_factory=list)
+    centroid: Optional[np.ndarray] = None
+    loaded: bool = False
+    last_loaded_turn: int = 0
+    ghsom_root: Optional["GHSOMNodeState"] = None
 
 
 class TopicStream:
@@ -364,6 +421,9 @@ class AgentMemorySim:
         self.super_rebuild_count = 0
         self.cluster_route_score = np.zeros(self.max_memories, dtype=np.float32)
         self.cluster_route_seen = np.zeros(self.max_memories, dtype=np.float32)
+        self.ghsom_probe_count = 0
+        self.ghsom_probe_candidates_total = 0
+        self.ghsom_probe_depth_total = 0
 
         # ====================================================================
         # EnhancedWeak Strategy State (NEW)
@@ -467,6 +527,223 @@ class AgentMemorySim:
         total = c.hot_count + c.cold_count
         ratio = (c.hot_count / total) if total > 0 else 0.0
         c.is_hot_cluster = ratio >= self.p.hot_cluster_ratio
+
+    def _ghsom_cell_count(self, node: GHSOMNodeState) -> int:
+        return max(1, int(node.width) * int(node.height))
+
+    def _ghsom_slot_xy(self, node: GHSOMNodeState, slot: int) -> Tuple[int, int]:
+        width = max(1, int(node.width))
+        return int(slot % width), int(slot // width)
+
+    def _ghsom_slot_distance(self, node: GHSOMNodeState, a: int, b: int) -> float:
+        ax, ay = self._ghsom_slot_xy(node, a)
+        bx, by = self._ghsom_slot_xy(node, b)
+        dx = ax - bx
+        dy = ay - by
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _ghsom_split_similarity_threshold(self) -> float:
+        target = 1.0 - float(self.p.ghsom_tau2) * 4.0
+        return max(0.60, min(0.92, target))
+
+    def _make_ghsom_node(self, seed_vec: np.ndarray, depth: int) -> GHSOMNodeState:
+        width = max(2, int(self.p.ghsom_initial_width))
+        height = max(2, int(self.p.ghsom_initial_height))
+        cells = max(1, width * height)
+        neurons = np.zeros((cells, self.p.dim), dtype=np.float32)
+        base = unit(seed_vec.astype(np.float32, copy=False))
+        for slot in range(cells):
+            noise = unit(self.rng.normal(size=self.p.dim).astype(np.float32))
+            magnitude = min(0.18, 0.035 + 0.006 * depth + 0.002 * slot)
+            neurons[slot] = unit((1.0 - magnitude) * base + magnitude * noise).astype(np.float32)
+        return GHSOMNodeState(
+            depth=max(1, int(depth)),
+            width=width,
+            height=height,
+            neurons=neurons,
+            slot_members=[[] for _ in range(cells)],
+            slot_count=np.zeros(cells, dtype=np.int32),
+            slot_sim_sum=np.zeros(cells, dtype=np.float32),
+        )
+
+    def _ensure_cluster_ghsom_root(
+        self,
+        cid: int,
+        seed_vec: np.ndarray,
+    ) -> Tuple[Optional[GHSOMNodeState], int, bool]:
+        if not self.p.ghsom_enabled:
+            return None, 0, False
+        if cid < 0 or cid >= len(self.clusters):
+            return None, 0, False
+        clu = self.clusters[cid]
+        if len(clu.members) < max(2, int(self.p.ghsom_linear_scan_threshold)):
+            return None, 0, False
+        if clu.ghsom_root is not None:
+            return clu.ghsom_root, 0, False
+
+        clu.ghsom_root = self._make_ghsom_node(seed_vec, depth=1)
+        ops = 0
+        for mem_idx in clu.members:
+            if 0 <= mem_idx < self.mem_count:
+                ops += self._ghsom_insert(clu.ghsom_root, self.vec_pool[mem_idx], mem_idx)
+        return clu.ghsom_root, ops, True
+
+    def _refresh_supercluster_centroid(self, sid: int) -> None:
+        if sid < 0 or sid >= len(self.super_members):
+            return
+        members = self.super_members[sid]
+        if not members:
+            return
+        idx = np.asarray(members, dtype=np.int32)
+        cen = np.mean(self.cluster_centroids[idx], axis=0).astype(np.float32)
+        self.super_centroids[sid] = unit(cen)
+
+    def _update_cluster_centroid(self, cid: int, vec: np.ndarray) -> None:
+        if cid < 0 or cid >= len(self.clusters):
+            return
+        n = max(1, len(self.clusters[cid].members))
+        if n <= 1:
+            self.cluster_centroids[cid] = vec.astype(np.float32, copy=False)
+        else:
+            prev = self.cluster_centroids[cid].astype(np.float32, copy=False)
+            updated = (((n - 1) * prev) + vec) / float(n)
+            self.cluster_centroids[cid] = unit(updated.astype(np.float32))
+
+        sid = int(self.super_of_cluster[cid]) if cid < len(self.super_of_cluster) else -1
+        if sid >= 0:
+            self._refresh_supercluster_centroid(sid)
+
+    def _ghsom_find_bmu(self, node: GHSOMNodeState, vec: np.ndarray) -> Tuple[int, float, int]:
+        sims = node.neurons @ vec
+        slot = int(np.argmax(sims))
+        return slot, float(sims[slot]), int(sims.size)
+
+    def _ghsom_update_neurons(self, node: GHSOMNodeState, vec: np.ndarray, bmu_slot: int) -> None:
+        cells = self._ghsom_cell_count(node)
+        depth_offset = max(0, int(node.depth) - 1)
+        alpha = float(self.p.ghsom_learning_rate_initial) * (
+            float(self.p.ghsom_learning_rate_decay) ** depth_offset
+        )
+        alpha = max(0.02, alpha / math.sqrt(1.0 + node.member_count / max(1, cells)))
+        radius = float(self.p.ghsom_neighborhood_radius_initial) * (
+            float(self.p.ghsom_neighborhood_radius_decay) ** depth_offset
+        )
+        radius = max(0.8, min(radius, float(max(node.width, node.height))))
+        sigma = max(0.7, radius)
+        for slot in range(cells):
+            dist = self._ghsom_slot_distance(node, slot, bmu_slot)
+            if dist > radius:
+                continue
+            influence = math.exp(-(dist * dist) / (2.0 * sigma * sigma))
+            lr = alpha * influence
+            node.neurons[slot] = unit(
+                (node.neurons[slot] + lr * (vec - node.neurons[slot])).astype(np.float32)
+            ).astype(np.float32)
+
+    def _ghsom_route_path(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+    ) -> Tuple[List[Tuple[GHSOMNodeState, int, float]], int]:
+        if root is None:
+            return [], 0
+        current = root
+        path: List[Tuple[GHSOMNodeState, int, float]] = []
+        ops = 0
+        while current is not None:
+            slot, sim, step_ops = self._ghsom_find_bmu(current, vec)
+            ops += step_ops
+            path.append((current, slot, sim))
+            current = current.children.get(slot)
+        return path, ops
+
+    def _ghsom_insert(self, root: GHSOMNodeState, vec: np.ndarray, mem_idx: int) -> int:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return ops
+        for node, slot, _sim in path:
+            self._ghsom_update_neurons(node, vec, slot)
+            node.member_count += 1
+        leaf, slot, sim = path[-1]
+        leaf.slot_members[slot].append(mem_idx)
+        leaf.slot_count[slot] += 1
+        leaf.slot_sim_sum[slot] += float(sim)
+        self._ghsom_maybe_split(leaf, slot)
+        return ops
+
+    def _ghsom_maybe_split(self, node: GHSOMNodeState, slot: int) -> None:
+        if node.depth >= max(1, int(self.p.ghsom_max_depth)):
+            return
+        if slot in node.children:
+            return
+        count = int(node.slot_count[slot])
+        if count < max(2, int(self.p.ghsom_min_samples_for_expansion)):
+            return
+        avg_sim = float(node.slot_sim_sum[slot]) / max(1, count)
+        if avg_sim >= self._ghsom_split_similarity_threshold():
+            return
+
+        child = self._make_ghsom_node(node.neurons[slot], depth=node.depth + 1)
+        moving = list(node.slot_members[slot])
+        node.children[slot] = child
+        node.slot_members[slot] = []
+        node.slot_count[slot] = 0
+        node.slot_sim_sum[slot] = 0.0
+
+        for mem_idx in moving:
+            if 0 <= mem_idx < self.mem_count:
+                self._ghsom_insert(child, self.vec_pool[mem_idx], mem_idx)
+
+    def _ghsom_collect_candidates(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+        max_results: Optional[int],
+    ) -> Tuple[np.ndarray, int]:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return np.asarray([], dtype=np.int32), ops
+
+        cap = self._effective_scan_cap(max_results)
+        root_members = max(1, int(path[0][0].member_count))
+        if cap is None:
+            candidate_target = root_members
+        else:
+            candidate_target = min(root_members, max(8, int(cap)))
+        min_hits = max(1, int(max_results) if max_results is not None else 1)
+
+        ordered_path = list(reversed(path))
+        if not self.p.ghsom_hierarchical_retrieval:
+            ordered_path = ordered_path[:1]
+
+        candidates: List[int] = []
+        seen: Set[int] = set()
+        for node, route_slot, _ in ordered_path:
+            slot_sims = node.neurons @ vec
+            ops += int(slot_sims.size)
+            order = np.argsort(slot_sims)[::-1].tolist()
+            if route_slot in order:
+                order.remove(route_slot)
+                order.insert(0, route_slot)
+
+            beam_slots = max(1, min(len(order), int(math.ceil(math.sqrt(max(1, len(order)))))))
+            for s_idx, slot in enumerate(order):
+                members = node.slot_members[int(slot)]
+                if members:
+                    for mem_idx in members:
+                        if mem_idx not in seen:
+                            seen.add(mem_idx)
+                            candidates.append(int(mem_idx))
+                enough_for_ranking = (s_idx + 1) >= beam_slots and len(candidates) >= min_hits
+                if len(candidates) >= candidate_target or enough_for_ranking:
+                    break
+            if len(candidates) >= candidate_target:
+                break
+
+        self.ghsom_probe_count += 1
+        self.ghsom_probe_depth_total += len(path)
+        self.ghsom_probe_candidates_total += len(candidates)
+        return np.asarray(candidates, dtype=np.int32), ops
 
     def _set_heat(self, mem_idx: int, new_heat: float) -> None:
         new_heat = max(0.0, float(new_heat))
@@ -693,11 +970,15 @@ class AgentMemorySim:
             return 0.55, 0.35, 0.10
         return hot / s, recent / s, rnd / s
 
-    def _trim_scan_indices(self, indices: np.ndarray, max_results: Optional[int]) -> np.ndarray:
+    def _trim_scan_indices(
+        self,
+        indices: np.ndarray,
+        max_results: Optional[int],
+    ) -> Tuple[np.ndarray, int]:
         cap = self._effective_scan_cap(max_results)
         total = int(indices.size)
         if total <= 0 or cap is None or total <= cap:
-            return indices
+            return indices, 0
 
         cap = min(total, max(1, int(cap)))
         hot_ratio, recent_ratio, _ = self._scan_mix()
@@ -705,6 +986,7 @@ class AgentMemorySim:
         recent_n = max(0, int(round(cap * recent_ratio)))
         hot_n = min(cap, hot_n)
         recent_n = min(cap - hot_n, recent_n)
+        prep_ops = 0
 
         mask = np.zeros(total, dtype=bool)
         if recent_n > 0:
@@ -712,10 +994,12 @@ class AgentMemorySim:
 
         if hot_n > 0:
             heats = self.heat_pool[indices]
+            prep_ops += total
             if hot_n >= total:
                 mask[:] = True
             else:
                 keep = np.argpartition(heats, -hot_n)[-hot_n:]
+                prep_ops += total
                 mask[keep] = True
 
         chosen = int(np.sum(mask))
@@ -737,7 +1021,7 @@ class AgentMemorySim:
             if take > 0:
                 mask[remain[-take:]] = True
 
-        return indices[mask]
+        return indices[mask], prep_ops
 
     def _find_sim_in_indices(
         self,
@@ -747,14 +1031,18 @@ class AgentMemorySim:
     ) -> Tuple[List[Tuple[int, float]], int]:
         if indices.size == 0:
             return [], 0
-        indices = self._trim_scan_indices(indices, max_results=max_results)
+        indices, prep_ops = self._trim_scan_indices(indices, max_results=max_results)
+        if indices.size == 0:
+            return [], prep_ops
         sims = self.vec_pool[indices] @ vec
-        ops = int(indices.size)
+        ops = prep_ops + int(indices.size)
         if max_results is not None and max_results > 0 and sims.size > max_results:
             keep = np.argpartition(sims, -max_results)[-max_results:]
+            ops += int(sims.size)
             order = keep[np.argsort(sims[keep])[::-1]]
         else:
             order = np.argsort(sims)[::-1]
+            ops += int(sims.size)
         out = [(int(indices[i]), float(sims[i])) for i in order]
         return out, ops
 
@@ -768,17 +1056,32 @@ class AgentMemorySim:
     ) -> Tuple[List[Tuple[int, float]], int]:
         if cid < 0 or cid >= len(self.clusters):
             return [], 0
-        members = self.clusters[cid].members
+        clu = self.clusters[cid]
+        members = clu.members
         if not members:
             return [], 0
-        idx = np.asarray(members, dtype=np.int32)
+        ops = 0
+        idx: np.ndarray
+        if self.p.ghsom_enabled and clu.ghsom_root is not None:
+            idx, ops = self._ghsom_collect_candidates(clu.ghsom_root, vec, max_results=max_results)
+            if idx.size <= 0:
+                idx = np.asarray(members, dtype=np.int32)
+        else:
+            idx = np.asarray(members, dtype=np.int32)
         if only_hot and only_cold:
-            return [], 0
+            return [], ops
         if only_hot:
             idx = idx[self.heat_pool[idx] > 0.0]
         elif only_cold:
             idx = idx[self.heat_pool[idx] <= 0.0]
-        return self._find_sim_in_indices(vec, idx, max_results=max_results)
+        if idx.size <= 0 and self.p.ghsom_enabled and clu.ghsom_root is not None:
+            idx = np.asarray(members, dtype=np.int32)
+            if only_hot:
+                idx = idx[self.heat_pool[idx] > 0.0]
+            elif only_cold:
+                idx = idx[self.heat_pool[idx] <= 0.0]
+        results, scan_ops = self._find_sim_in_indices(vec, idx, max_results=max_results)
+        return results, ops + scan_ops
 
     def _find_sim_all_hot(
         self,
@@ -849,6 +1152,7 @@ class AgentMemorySim:
             clu.members.append(mem_idx)
             clu.cold_count += 1
             self._refresh_hot_flag(cid)
+            self._update_cluster_centroid(cid, vec)
         else:
             cid = len(self.clusters)
             self.cluster_centroids[cid] = vec
@@ -857,6 +1161,10 @@ class AgentMemorySim:
             self._refresh_hot_flag(cid)
 
         self.cluster_of[mem_idx] = cid
+        root, build_ops, fresh = self._ensure_cluster_ghsom_root(cid, vec)
+        self.sim_ops_add_total += build_ops
+        if root is not None and not fresh:
+            self.sim_ops_add_total += self._ghsom_insert(root, vec, mem_idx)
         return cid
 
     def _add_new_with_cluster_cap(self, new_idx: int) -> None:
@@ -1009,6 +1317,394 @@ class AgentMemorySim:
             bucket = []
             self.turns_by_topic[topic_id] = bucket
         bucket.append(turn)
+
+    def _ghsom_cell_count(self, node: GHSOMNodeState) -> int:
+        return max(1, int(node.width) * int(node.height))
+
+    def _ghsom_slot_xy(self, node: GHSOMNodeState, slot: int) -> Tuple[int, int]:
+        width = max(1, int(node.width))
+        return int(slot % width), int(slot // width)
+
+    def _ghsom_slot_distance(self, node: GHSOMNodeState, a: int, b: int) -> float:
+        ax, ay = self._ghsom_slot_xy(node, a)
+        bx, by = self._ghsom_slot_xy(node, b)
+        dx = ax - bx
+        dy = ay - by
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _ghsom_split_similarity_threshold(self) -> float:
+        target = 1.0 - float(self.p.ghsom_tau2) * 4.0
+        return max(0.60, min(0.92, target))
+
+    def _make_ghsom_node(self, seed_vec: np.ndarray, depth: int) -> GHSOMNodeState:
+        width = max(2, int(self.p.ghsom_initial_width))
+        height = max(2, int(self.p.ghsom_initial_height))
+        cells = max(1, width * height)
+        neurons = np.zeros((cells, self.p.dim), dtype=np.float32)
+        base = unit(seed_vec.astype(np.float32, copy=False))
+        for slot in range(cells):
+            noise = unit(self.rng.normal(size=self.p.dim).astype(np.float32))
+            magnitude = min(0.18, 0.035 + 0.006 * depth + 0.002 * slot)
+            neurons[slot] = unit((1.0 - magnitude) * base + magnitude * noise).astype(np.float32)
+        return GHSOMNodeState(
+            depth=max(1, int(depth)),
+            width=width,
+            height=height,
+            neurons=neurons,
+            slot_members=[[] for _ in range(cells)],
+            slot_count=np.zeros(cells, dtype=np.int32),
+            slot_sim_sum=np.zeros(cells, dtype=np.float32),
+        )
+
+    def _ghsom_find_bmu(self, node: GHSOMNodeState, vec: np.ndarray) -> Tuple[int, float, int]:
+        sims = node.neurons @ vec
+        slot = int(np.argmax(sims))
+        return slot, float(sims[slot]), int(sims.size)
+
+    def _ghsom_update_neurons(self, node: GHSOMNodeState, vec: np.ndarray, bmu_slot: int) -> None:
+        cells = self._ghsom_cell_count(node)
+        depth_offset = max(0, int(node.depth) - 1)
+        alpha = float(self.p.ghsom_learning_rate_initial) * (
+            float(self.p.ghsom_learning_rate_decay) ** depth_offset
+        )
+        alpha = max(0.02, alpha / math.sqrt(1.0 + node.member_count / max(1, cells)))
+        radius = float(self.p.ghsom_neighborhood_radius_initial) * (
+            float(self.p.ghsom_neighborhood_radius_decay) ** depth_offset
+        )
+        radius = max(0.8, min(radius, float(max(node.width, node.height))))
+        sigma = max(0.7, radius)
+        for slot in range(cells):
+            dist = self._ghsom_slot_distance(node, slot, bmu_slot)
+            if dist > radius:
+                continue
+            influence = math.exp(-(dist * dist) / (2.0 * sigma * sigma))
+            lr = alpha * influence
+            node.neurons[slot] = unit(
+                (node.neurons[slot] + lr * (vec - node.neurons[slot])).astype(np.float32)
+            ).astype(np.float32)
+
+    def _ghsom_route_path(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+    ) -> Tuple[List[Tuple[GHSOMNodeState, int, float]], int]:
+        if root is None:
+            return [], 0
+        current = root
+        path: List[Tuple[GHSOMNodeState, int, float]] = []
+        ops = 0
+        while current is not None:
+            slot, sim, step_ops = self._ghsom_find_bmu(current, vec)
+            ops += step_ops
+            path.append((current, slot, sim))
+            current = current.children.get(slot)
+        return path, ops
+
+    def _ghsom_insert(self, root: GHSOMNodeState, vec: np.ndarray, mem_idx: int) -> int:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return ops
+        for node, slot, _sim in path:
+            self._ghsom_update_neurons(node, vec, slot)
+            node.member_count += 1
+        leaf, slot, sim = path[-1]
+        leaf.slot_members[slot].append(mem_idx)
+        leaf.slot_count[slot] += 1
+        leaf.slot_sim_sum[slot] += float(sim)
+        self._ghsom_maybe_split(leaf, slot)
+        return ops
+
+    def _ghsom_maybe_split(self, node: GHSOMNodeState, slot: int) -> None:
+        if node.depth >= max(1, int(self.p.ghsom_max_depth)):
+            return
+        if slot in node.children:
+            return
+        count = int(node.slot_count[slot])
+        if count < max(2, int(self.p.ghsom_min_samples_for_expansion)):
+            return
+        avg_sim = float(node.slot_sim_sum[slot]) / max(1, count)
+        if avg_sim >= self._ghsom_split_similarity_threshold():
+            return
+
+        child = self._make_ghsom_node(node.neurons[slot], depth=node.depth + 1)
+        moving = list(node.slot_members[slot])
+        node.children[slot] = child
+        node.slot_members[slot] = []
+        node.slot_count[slot] = 0
+        node.slot_sim_sum[slot] = 0.0
+
+        for mem_idx in moving:
+            if 0 <= mem_idx < self.mem_count:
+                self._ghsom_insert(child, self.vec_pool[mem_idx], mem_idx)
+
+    def _ensure_topic_ghsom_root(
+        self,
+        tid: int,
+        seed_vec: np.ndarray,
+    ) -> Tuple[Optional[GHSOMNodeState], int, bool]:
+        if not self.p.ghsom_enabled:
+            return None, 0, False
+        if tid < 0 or tid >= self.topic_count:
+            return None, 0, False
+        shard = self.topic_shards[tid]
+        if len(shard.members) < max(2, int(self.p.ghsom_linear_scan_threshold)):
+            return None, 0, False
+        if shard.ghsom_root is not None:
+            return shard.ghsom_root, 0, False
+
+        shard.ghsom_root = self._make_ghsom_node(seed_vec, depth=1)
+        ops = 0
+        for mem_idx in shard.members:
+            if 0 <= mem_idx < self.mem_count:
+                ops += self._ghsom_insert(shard.ghsom_root, self.vec_pool[mem_idx], mem_idx)
+        return shard.ghsom_root, ops, True
+
+    def _ghsom_collect_candidates(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+        max_results: Optional[int],
+    ) -> Tuple[np.ndarray, int]:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return np.asarray([], dtype=np.int32), ops
+
+        if max_results is None or max_results <= 0:
+            candidate_target = max(1, int(path[0][0].member_count))
+            min_hits = 1
+        else:
+            candidate_target = min(
+                max(1, int(path[0][0].member_count)),
+                max(8, int(max_results) * 2),
+            )
+            min_hits = max(1, int(max_results))
+
+        ordered_path = list(reversed(path))
+        if not self.p.ghsom_hierarchical_retrieval:
+            ordered_path = ordered_path[:1]
+
+        candidates: List[int] = []
+        seen: Set[int] = set()
+        for node, route_slot, _ in ordered_path:
+            slot_sims = node.neurons @ vec
+            ops += int(slot_sims.size)
+            order = np.argsort(slot_sims)[::-1].tolist()
+            if route_slot in order:
+                order.remove(route_slot)
+                order.insert(0, route_slot)
+
+            beam_slots = max(1, min(len(order), int(math.ceil(math.sqrt(max(1, len(order)))))))
+            for s_idx, slot in enumerate(order):
+                members = node.slot_members[int(slot)]
+                if members:
+                    for mem_idx in members:
+                        if mem_idx not in seen:
+                            seen.add(mem_idx)
+                            candidates.append(int(mem_idx))
+                enough = (s_idx + 1) >= beam_slots and len(candidates) >= min_hits
+                if len(candidates) >= candidate_target or enough:
+                    break
+            if len(candidates) >= candidate_target:
+                break
+
+        self.ghsom_probe_count += 1
+        self.ghsom_probe_depth_total += len(path)
+        self.ghsom_probe_candidates_total += len(candidates)
+        return np.asarray(candidates, dtype=np.int32), ops
+
+    def _ghsom_cell_count(self, node: GHSOMNodeState) -> int:
+        return max(1, int(node.width) * int(node.height))
+
+    def _ghsom_slot_xy(self, node: GHSOMNodeState, slot: int) -> Tuple[int, int]:
+        width = max(1, int(node.width))
+        return int(slot % width), int(slot // width)
+
+    def _ghsom_slot_distance(self, node: GHSOMNodeState, a: int, b: int) -> float:
+        ax, ay = self._ghsom_slot_xy(node, a)
+        bx, by = self._ghsom_slot_xy(node, b)
+        dx = ax - bx
+        dy = ay - by
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _ghsom_split_similarity_threshold(self) -> float:
+        target = 1.0 - float(self.p.ghsom_tau2) * 4.0
+        return max(0.60, min(0.92, target))
+
+    def _make_ghsom_node(self, seed_vec: np.ndarray, depth: int) -> GHSOMNodeState:
+        width = max(2, int(self.p.ghsom_initial_width))
+        height = max(2, int(self.p.ghsom_initial_height))
+        cells = max(1, width * height)
+        neurons = np.zeros((cells, self.p.dim), dtype=np.float32)
+        base = unit(seed_vec.astype(np.float32, copy=False))
+        for slot in range(cells):
+            noise = unit(self.rng.normal(size=self.p.dim).astype(np.float32))
+            magnitude = min(0.18, 0.035 + 0.006 * depth + 0.002 * slot)
+            neurons[slot] = unit((1.0 - magnitude) * base + magnitude * noise).astype(np.float32)
+        return GHSOMNodeState(
+            depth=max(1, int(depth)),
+            width=width,
+            height=height,
+            neurons=neurons,
+            slot_members=[[] for _ in range(cells)],
+            slot_count=np.zeros(cells, dtype=np.int32),
+            slot_sim_sum=np.zeros(cells, dtype=np.float32),
+        )
+
+    def _ghsom_find_bmu(self, node: GHSOMNodeState, vec: np.ndarray) -> Tuple[int, float, int]:
+        sims = node.neurons @ vec
+        slot = int(np.argmax(sims))
+        return slot, float(sims[slot]), int(sims.size)
+
+    def _ghsom_update_neurons(self, node: GHSOMNodeState, vec: np.ndarray, bmu_slot: int) -> None:
+        cells = self._ghsom_cell_count(node)
+        depth_offset = max(0, int(node.depth) - 1)
+        alpha = float(self.p.ghsom_learning_rate_initial) * (
+            float(self.p.ghsom_learning_rate_decay) ** depth_offset
+        )
+        alpha = max(0.02, alpha / math.sqrt(1.0 + node.member_count / max(1, cells)))
+        radius = float(self.p.ghsom_neighborhood_radius_initial) * (
+            float(self.p.ghsom_neighborhood_radius_decay) ** depth_offset
+        )
+        radius = max(0.8, min(radius, float(max(node.width, node.height))))
+        sigma = max(0.7, radius)
+        for slot in range(cells):
+            dist = self._ghsom_slot_distance(node, slot, bmu_slot)
+            if dist > radius:
+                continue
+            influence = math.exp(-(dist * dist) / (2.0 * sigma * sigma))
+            lr = alpha * influence
+            node.neurons[slot] = unit(
+                (node.neurons[slot] + lr * (vec - node.neurons[slot])).astype(np.float32)
+            ).astype(np.float32)
+
+    def _ghsom_route_path(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+    ) -> Tuple[List[Tuple[GHSOMNodeState, int, float]], int]:
+        if root is None:
+            return [], 0
+        current = root
+        path: List[Tuple[GHSOMNodeState, int, float]] = []
+        ops = 0
+        while current is not None:
+            slot, sim, step_ops = self._ghsom_find_bmu(current, vec)
+            ops += step_ops
+            path.append((current, slot, sim))
+            current = current.children.get(slot)
+        return path, ops
+
+    def _ghsom_insert(self, root: GHSOMNodeState, vec: np.ndarray, mem_idx: int) -> int:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return ops
+        for node, slot, _sim in path:
+            self._ghsom_update_neurons(node, vec, slot)
+            node.member_count += 1
+        leaf, slot, sim = path[-1]
+        leaf.slot_members[slot].append(mem_idx)
+        leaf.slot_count[slot] += 1
+        leaf.slot_sim_sum[slot] += float(sim)
+        self._ghsom_maybe_split(leaf, slot)
+        return ops
+
+    def _ghsom_maybe_split(self, node: GHSOMNodeState, slot: int) -> None:
+        if node.depth >= max(1, int(self.p.ghsom_max_depth)):
+            return
+        if slot in node.children:
+            return
+        count = int(node.slot_count[slot])
+        if count < max(2, int(self.p.ghsom_min_samples_for_expansion)):
+            return
+        avg_sim = float(node.slot_sim_sum[slot]) / max(1, count)
+        if avg_sim >= self._ghsom_split_similarity_threshold():
+            return
+
+        child = self._make_ghsom_node(node.neurons[slot], depth=node.depth + 1)
+        moving = list(node.slot_members[slot])
+        node.children[slot] = child
+        node.slot_members[slot] = []
+        node.slot_count[slot] = 0
+        node.slot_sim_sum[slot] = 0.0
+
+        for mem_idx in moving:
+            if 0 <= mem_idx < self.mem_count:
+                self._ghsom_insert(child, self.vec_pool[mem_idx], mem_idx)
+
+    def _ensure_topic_ghsom_root(
+        self,
+        tid: int,
+        seed_vec: np.ndarray,
+    ) -> Tuple[Optional[GHSOMNodeState], int, bool]:
+        if not self.p.ghsom_enabled:
+            return None, 0, False
+        if tid < 0 or tid >= self.topic_count:
+            return None, 0, False
+        shard = self.topic_shards[tid]
+        if len(shard.members) < max(2, int(self.p.ghsom_linear_scan_threshold)):
+            return None, 0, False
+        if shard.ghsom_root is not None:
+            return shard.ghsom_root, 0, False
+
+        shard.ghsom_root = self._make_ghsom_node(seed_vec, depth=1)
+        ops = 0
+        for mem_idx in shard.members:
+            if 0 <= mem_idx < self.mem_count:
+                ops += self._ghsom_insert(shard.ghsom_root, self.vec_pool[mem_idx], mem_idx)
+        return shard.ghsom_root, ops, True
+
+    def _ghsom_collect_candidates(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+        max_results: Optional[int],
+    ) -> Tuple[np.ndarray, int]:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return np.asarray([], dtype=np.int32), ops
+
+        if max_results is None or max_results <= 0:
+            candidate_target = max(1, int(path[0][0].member_count))
+            min_hits = 1
+        else:
+            candidate_target = min(
+                max(1, int(path[0][0].member_count)),
+                max(8, int(max_results) * 2),
+            )
+            min_hits = max(1, int(max_results))
+
+        ordered_path = list(reversed(path))
+        if not self.p.ghsom_hierarchical_retrieval:
+            ordered_path = ordered_path[:1]
+
+        candidates: List[int] = []
+        seen: Set[int] = set()
+        for node, route_slot, _ in ordered_path:
+            slot_sims = node.neurons @ vec
+            ops += int(slot_sims.size)
+            order = np.argsort(slot_sims)[::-1].tolist()
+            if route_slot in order:
+                order.remove(route_slot)
+                order.insert(0, route_slot)
+
+            beam_slots = max(1, min(len(order), int(math.ceil(math.sqrt(max(1, len(order)))))))
+            for s_idx, slot in enumerate(order):
+                members = node.slot_members[int(slot)]
+                if members:
+                    for mem_idx in members:
+                        if mem_idx not in seen:
+                            seen.add(mem_idx)
+                            candidates.append(int(mem_idx))
+                enough = (s_idx + 1) >= beam_slots and len(candidates) >= min_hits
+                if len(candidates) >= candidate_target or enough:
+                    break
+            if len(candidates) >= candidate_target:
+                break
+
+        self.ghsom_probe_count += 1
+        self.ghsom_probe_depth_total += len(path)
+        self.ghsom_probe_candidates_total += len(candidates)
+        return np.asarray(candidates, dtype=np.int32), ops
 
     def _bind_memory_topic(self, mem_idx: int, topic_id: int, amount: int = 1) -> None:
         if mem_idx < 0:
@@ -1945,6 +2641,8 @@ class AgentMemorySim:
         # Smart Preloading stats
         preload_success_rate = self.preload_successes / max(1, self.preload_attempts)
         preload_prediction_accuracy = self.preload_correct_predictions / max(1, self.preload_topic_predictions)
+        ghsom_probe_avg_candidates = self.ghsom_probe_candidates_total / max(1, self.ghsom_probe_count)
+        ghsom_probe_avg_depth = self.ghsom_probe_depth_total / max(1, self.ghsom_probe_count)
 
         return {
             "turns": float(self.p.turns),
@@ -2018,6 +2716,10 @@ class AgentMemorySim:
             "preload_topic_predictions": float(self.preload_topic_predictions),
             "preload_correct_predictions": float(self.preload_correct_predictions),
             "preload_prediction_accuracy": preload_prediction_accuracy,
+            "ghsom_enabled": 1.0 if self.p.ghsom_enabled else 0.0,
+            "ghsom_probe_count": float(self.ghsom_probe_count),
+            "ghsom_probe_avg_candidates": float(ghsom_probe_avg_candidates),
+            "ghsom_probe_avg_depth": float(ghsom_probe_avg_depth),
         }
 
     def _record_snapshot(self, turn: int) -> None:
@@ -2194,8 +2896,761 @@ class AgentMemorySim:
         return {"summary": summary, "snapshots": self.snapshots}
 
 
+class TopicGraphSim:
+    def __init__(self, p: SimParams):
+        self.p = p
+        self.rng = np.random.default_rng(p.seed)
+        self.topic = TopicStream(p, self.rng)
+        self.topic_count = self.topic.num_topics
+        self.max_memories = p.turns
+
+        self.vec_pool = np.zeros((self.max_memories, p.dim), dtype=np.float32)
+        self.mem_topic = np.full(self.max_memories, -1, dtype=np.int32)
+        self.mem_turn = np.zeros(self.max_memories, dtype=np.int32)
+        self.mem_count = 0
+
+        self.topic_shards: List[TopicShardState] = [TopicShardState() for _ in range(self.topic_count)]
+        self.topic_bridges: List[Dict[int, TopicBridgeState]] = [dict() for _ in range(self.topic_count)]
+
+        self.turn_topics: List[int] = []
+        self.turns_by_topic: Dict[int, List[int]] = {}
+
+        self.query_turns = 0
+        self.eval_count = 0
+        self.returned_topics_sum = 0
+        self.target_precision_sum = 0.0
+        self.target_hit_sum = 0.0
+        self.target_mrr_sum = 0.0
+        self.empty_query_count = 0
+        self.empty_target_query_count = 0
+        self.sim_ops_query_total = 0
+        self.turn_sim_ops: List[int] = []
+
+        self.topic_load_events = 0
+        self.topic_evict_events = 0
+        self.bridge_expand_events = 0
+        self.bridge_hit_events = 0
+        self.bridge_update_events = 0
+        self.resident_hit_events = 0
+        self.preload_attempts = 0
+        self.preload_successes = 0
+        self.preload_clusters_loaded = 0
+        self.ghsom_probe_count = 0
+        self.ghsom_probe_candidates_total = 0
+        self.ghsom_probe_depth_total = 0
+
+        self.snapshots: List[Dict[str, float]] = []
+
+    def _register_turn_topic(self, turn: int, topic_id: int) -> None:
+        self.turn_topics.append(topic_id)
+        bucket = self.turns_by_topic.get(topic_id)
+        if bucket is None:
+            bucket = []
+            self.turns_by_topic[topic_id] = bucket
+        bucket.append(turn)
+
+    def _ghsom_cell_count(self, node: GHSOMNodeState) -> int:
+        return max(1, int(node.width) * int(node.height))
+
+    def _ghsom_slot_xy(self, node: GHSOMNodeState, slot: int) -> Tuple[int, int]:
+        width = max(1, int(node.width))
+        return int(slot % width), int(slot // width)
+
+    def _ghsom_slot_distance(self, node: GHSOMNodeState, a: int, b: int) -> float:
+        ax, ay = self._ghsom_slot_xy(node, a)
+        bx, by = self._ghsom_slot_xy(node, b)
+        dx = ax - bx
+        dy = ay - by
+        return math.sqrt(dx * dx + dy * dy)
+
+    def _ghsom_split_similarity_threshold(self) -> float:
+        target = 1.0 - float(self.p.ghsom_tau2) * 4.0
+        return max(0.60, min(0.92, target))
+
+    def _make_ghsom_node(self, seed_vec: np.ndarray, depth: int) -> GHSOMNodeState:
+        width = max(2, int(self.p.ghsom_initial_width))
+        height = max(2, int(self.p.ghsom_initial_height))
+        cells = max(1, width * height)
+        neurons = np.zeros((cells, self.p.dim), dtype=np.float32)
+        base = unit(seed_vec.astype(np.float32, copy=False))
+        for slot in range(cells):
+            noise = unit(self.rng.normal(size=self.p.dim).astype(np.float32))
+            magnitude = min(0.18, 0.035 + 0.006 * depth + 0.002 * slot)
+            neurons[slot] = unit((1.0 - magnitude) * base + magnitude * noise).astype(np.float32)
+        return GHSOMNodeState(
+            depth=max(1, int(depth)),
+            width=width,
+            height=height,
+            neurons=neurons,
+            slot_members=[[] for _ in range(cells)],
+            slot_count=np.zeros(cells, dtype=np.int32),
+            slot_sim_sum=np.zeros(cells, dtype=np.float32),
+        )
+
+    def _ghsom_find_bmu(self, node: GHSOMNodeState, vec: np.ndarray) -> Tuple[int, float, int]:
+        sims = node.neurons @ vec
+        slot = int(np.argmax(sims))
+        return slot, float(sims[slot]), int(sims.size)
+
+    def _ghsom_update_neurons(self, node: GHSOMNodeState, vec: np.ndarray, bmu_slot: int) -> None:
+        cells = self._ghsom_cell_count(node)
+        depth_offset = max(0, int(node.depth) - 1)
+        alpha = float(self.p.ghsom_learning_rate_initial) * (
+            float(self.p.ghsom_learning_rate_decay) ** depth_offset
+        )
+        alpha = max(0.02, alpha / math.sqrt(1.0 + node.member_count / max(1, cells)))
+        radius = float(self.p.ghsom_neighborhood_radius_initial) * (
+            float(self.p.ghsom_neighborhood_radius_decay) ** depth_offset
+        )
+        radius = max(0.8, min(radius, float(max(node.width, node.height))))
+        sigma = max(0.7, radius)
+        for slot in range(cells):
+            dist = self._ghsom_slot_distance(node, slot, bmu_slot)
+            if dist > radius:
+                continue
+            influence = math.exp(-(dist * dist) / (2.0 * sigma * sigma))
+            lr = alpha * influence
+            node.neurons[slot] = unit(
+                (node.neurons[slot] + lr * (vec - node.neurons[slot])).astype(np.float32)
+            ).astype(np.float32)
+
+    def _ghsom_route_path(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+    ) -> Tuple[List[Tuple[GHSOMNodeState, int, float]], int]:
+        if root is None:
+            return [], 0
+        current = root
+        path: List[Tuple[GHSOMNodeState, int, float]] = []
+        ops = 0
+        while current is not None:
+            slot, sim, step_ops = self._ghsom_find_bmu(current, vec)
+            ops += step_ops
+            path.append((current, slot, sim))
+            current = current.children.get(slot)
+        return path, ops
+
+    def _ghsom_insert(self, root: GHSOMNodeState, vec: np.ndarray, mem_idx: int) -> int:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return ops
+        for node, slot, _sim in path:
+            self._ghsom_update_neurons(node, vec, slot)
+            node.member_count += 1
+        leaf, slot, sim = path[-1]
+        leaf.slot_members[slot].append(mem_idx)
+        leaf.slot_count[slot] += 1
+        leaf.slot_sim_sum[slot] += float(sim)
+        self._ghsom_maybe_split(leaf, slot)
+        return ops
+
+    def _ghsom_maybe_split(self, node: GHSOMNodeState, slot: int) -> None:
+        if node.depth >= max(1, int(self.p.ghsom_max_depth)):
+            return
+        if slot in node.children:
+            return
+        count = int(node.slot_count[slot])
+        if count < max(2, int(self.p.ghsom_min_samples_for_expansion)):
+            return
+        avg_sim = float(node.slot_sim_sum[slot]) / max(1, count)
+        if avg_sim >= self._ghsom_split_similarity_threshold():
+            return
+
+        child = self._make_ghsom_node(node.neurons[slot], depth=node.depth + 1)
+        moving = list(node.slot_members[slot])
+        node.children[slot] = child
+        node.slot_members[slot] = []
+        node.slot_count[slot] = 0
+        node.slot_sim_sum[slot] = 0.0
+
+        for mem_idx in moving:
+            if 0 <= mem_idx < self.mem_count:
+                self._ghsom_insert(child, self.vec_pool[mem_idx], mem_idx)
+
+    def _ensure_topic_ghsom_root(
+        self,
+        tid: int,
+        seed_vec: np.ndarray,
+    ) -> Tuple[Optional[GHSOMNodeState], int, bool]:
+        if not self.p.ghsom_enabled:
+            return None, 0, False
+        if tid < 0 or tid >= self.topic_count:
+            return None, 0, False
+        shard = self.topic_shards[tid]
+        if len(shard.members) < max(2, int(self.p.ghsom_linear_scan_threshold)):
+            return None, 0, False
+        if shard.ghsom_root is not None:
+            return shard.ghsom_root, 0, False
+
+        shard.ghsom_root = self._make_ghsom_node(seed_vec, depth=1)
+        ops = 0
+        for mem_idx in shard.members:
+            if 0 <= mem_idx < self.mem_count:
+                ops += self._ghsom_insert(shard.ghsom_root, self.vec_pool[mem_idx], mem_idx)
+        return shard.ghsom_root, ops, True
+
+    def _ghsom_collect_candidates(
+        self,
+        root: Optional[GHSOMNodeState],
+        vec: np.ndarray,
+        max_results: Optional[int],
+    ) -> Tuple[np.ndarray, int]:
+        path, ops = self._ghsom_route_path(root, vec)
+        if not path:
+            return np.asarray([], dtype=np.int32), ops
+
+        if max_results is None or max_results <= 0:
+            candidate_target = max(1, int(path[0][0].member_count))
+            min_hits = 1
+        else:
+            candidate_target = min(
+                max(1, int(path[0][0].member_count)),
+                max(8, int(max_results) * 2),
+            )
+            min_hits = max(1, int(max_results))
+
+        ordered_path = list(reversed(path))
+        if not self.p.ghsom_hierarchical_retrieval:
+            ordered_path = ordered_path[:1]
+
+        candidates: List[int] = []
+        seen: Set[int] = set()
+        for node, route_slot, _ in ordered_path:
+            slot_sims = node.neurons @ vec
+            ops += int(slot_sims.size)
+            order = np.argsort(slot_sims)[::-1].tolist()
+            if route_slot in order:
+                order.remove(route_slot)
+                order.insert(0, route_slot)
+
+            beam_slots = max(1, min(len(order), int(math.ceil(math.sqrt(max(1, len(order)))))))
+            for s_idx, slot in enumerate(order):
+                members = node.slot_members[int(slot)]
+                if members:
+                    for mem_idx in members:
+                        if mem_idx not in seen:
+                            seen.add(mem_idx)
+                            candidates.append(int(mem_idx))
+                enough = (s_idx + 1) >= beam_slots and len(candidates) >= min_hits
+                if len(candidates) >= candidate_target or enough:
+                    break
+            if len(candidates) >= candidate_target:
+                break
+
+        self.ghsom_probe_count += 1
+        self.ghsom_probe_depth_total += len(path)
+        self.ghsom_probe_candidates_total += len(candidates)
+        return np.asarray(candidates, dtype=np.int32), ops
+
+    def _known_topic_ids(self) -> np.ndarray:
+        return np.asarray(
+            [tid for tid, shard in enumerate(self.topic_shards) if shard.members],
+            dtype=np.int32,
+        )
+
+    def _topic_centroid(self, tid: int) -> np.ndarray:
+        shard = self.topic_shards[tid]
+        if shard.centroid is not None:
+            return shard.centroid
+        return self.topic.topic_vectors[tid]
+
+    def _touch_loaded_topic(self, tid: int, turn: int) -> bool:
+        shard = self.topic_shards[tid]
+        newly_loaded = not shard.loaded
+        if newly_loaded:
+            self.topic_load_events += 1
+        shard.loaded = True
+        shard.last_loaded_turn = turn
+
+        loaded_ids = [i for i, item in enumerate(self.topic_shards) if item.loaded]
+        while len(loaded_ids) > max(1, int(self.p.topic_graph_loaded_cap)):
+            evict = min(loaded_ids, key=lambda i: self.topic_shards[i].last_loaded_turn)
+            if evict == tid and len(loaded_ids) > 1:
+                alt = [i for i in loaded_ids if i != tid]
+                evict = min(alt, key=lambda i: self.topic_shards[i].last_loaded_turn)
+            self.topic_shards[evict].loaded = False
+            self.topic_evict_events += 1
+            loaded_ids = [i for i, item in enumerate(self.topic_shards) if item.loaded]
+        return newly_loaded
+
+    def _bridge_strength(self, edge: TopicBridgeState) -> float:
+        return (
+            0.45 * float(edge.transition)
+            + 0.75 * float(edge.recall)
+            + 1.00 * float(edge.adopt)
+        )
+
+    def _decay_bridges(self) -> None:
+        decay = min(0.9999, max(0.0, float(self.p.topic_graph_decay)))
+        drop_threshold = max(0.01, float(self.p.topic_graph_min_bridge_score) * 0.35)
+        for src in range(self.topic_count):
+            drop: List[int] = []
+            for dst, edge in self.topic_bridges[src].items():
+                edge.transition *= decay
+                edge.recall *= decay
+                edge.adopt *= decay
+                if self._bridge_strength(edge) < drop_threshold and edge.support <= 1:
+                    drop.append(dst)
+            for dst in drop:
+                self.topic_bridges[src].pop(dst, None)
+
+    def _prune_bridges(self, src: int) -> None:
+        keep = max(1, int(self.p.topic_graph_bridge_topk))
+        edges = self.topic_bridges[src]
+        if len(edges) <= keep:
+            return
+        ranked = sorted(edges.items(), key=lambda it: self._bridge_strength(it[1]), reverse=True)
+        self.topic_bridges[src] = {dst: edge for dst, edge in ranked[:keep]}
+
+    def _reinforce_bridge(self, src: int, dst: int, kind: str, lr: float, turn: int) -> None:
+        if src == dst or src < 0 or dst < 0:
+            return
+        edge = self.topic_bridges[src].get(dst)
+        if edge is None:
+            edge = TopicBridgeState()
+            self.topic_bridges[src][dst] = edge
+        if kind == "transition":
+            edge.transition = min(1.0, edge.transition + lr * (1.0 - edge.transition))
+        elif kind == "recall":
+            edge.recall = min(1.0, edge.recall + lr * (1.0 - edge.recall))
+        elif kind == "adopt":
+            edge.adopt = min(1.0, edge.adopt + lr * (1.0 - edge.adopt))
+        edge.support += 1
+        edge.last_turn = turn
+        self.bridge_update_events += 1
+        self._prune_bridges(src)
+
+    def _add_memory(self, vec: np.ndarray, turn: int, topic_id: int) -> None:
+        if self.mem_count >= self.max_memories:
+            return
+        mem_idx = self.mem_count
+        self.vec_pool[mem_idx] = vec
+        self.mem_topic[mem_idx] = topic_id
+        self.mem_turn[mem_idx] = turn
+        self.mem_count += 1
+
+        shard = self.topic_shards[topic_id]
+        shard.members.append(mem_idx)
+        if shard.centroid is None:
+            shard.centroid = vec.astype(np.float32, copy=True)
+        else:
+            n = len(shard.members)
+            shard.centroid = unit((((n - 1) * shard.centroid) + vec) / float(n)).astype(np.float32)
+
+        root, build_ops, fresh = self._ensure_topic_ghsom_root(topic_id, vec)
+        if root is not None and not fresh:
+            self._ghsom_insert(root, vec, mem_idx)
+
+    def _semantic_topic_scores(
+        self,
+        query_vec: np.ndarray,
+        current_topic: Optional[int],
+    ) -> Tuple[Dict[int, float], int]:
+        known = self._known_topic_ids()
+        if known.size <= 0:
+            return {}, 0
+        centers = np.vstack([self._topic_centroid(int(tid)) for tid in known.tolist()]).astype(np.float32)
+        sims = centers @ query_vec
+        ops = int(centers.shape[0])
+        scores: Dict[int, float] = {}
+        for pos, tid in enumerate(known.tolist()):
+            score = float(self.p.topic_graph_query_semantic_weight) * float(sims[pos])
+            if current_topic is not None and tid == int(current_topic):
+                score += float(self.p.topic_graph_current_topic_bonus)
+            scores[int(tid)] = score
+        return scores, ops
+
+    def _top_seed_topics(
+        self,
+        semantic_scores: Dict[int, float],
+        current_topic: Optional[int],
+    ) -> List[Tuple[int, float]]:
+        ranked = sorted(semantic_scores.items(), key=lambda it: it[1], reverse=True)
+        seeds = ranked[: max(1, int(self.p.topic_graph_seed_topics))]
+        if current_topic is not None and current_topic in semantic_scores and all(t != current_topic for t, _ in seeds):
+            seeds = [(int(current_topic), float(semantic_scores[int(current_topic)]))] + seeds
+        return seeds[: max(1, int(self.p.topic_graph_seed_topics))]
+
+    def _expand_topic_candidates(
+        self,
+        semantic_scores: Dict[int, float],
+        current_topic: Optional[int],
+    ) -> Tuple[Dict[int, float], Set[int], int]:
+        if not semantic_scores:
+            return {}, set(), 0
+
+        budget = max(1, int(self.p.topic_graph_expand_budget))
+        max_hops = max(0, int(self.p.topic_graph_max_bridge_hops))
+        seeds = self._top_seed_topics(semantic_scores, current_topic)
+        frontier: List[Tuple[float, int, int, float]] = []
+        best_total: Dict[int, float] = {}
+        candidate_scores: Dict[int, float] = {}
+        via_bridge: Set[int] = set()
+
+        for tid, sem_score in seeds:
+            resident_bonus = float(self.p.topic_graph_resident_bonus) if self.topic_shards[tid].loaded else 0.0
+            total = sem_score + resident_bonus
+            best_total[tid] = total
+            heapq.heappush(frontier, (-total, 0, tid, 0.0))
+
+        ops = 0
+        expanded = 0
+        visited: Set[int] = set()
+        while frontier and expanded < budget:
+            neg_total, hops, tid, bridge_bonus = heapq.heappop(frontier)
+            total = -neg_total
+            if total + 1e-9 < best_total.get(tid, -1e9):
+                continue
+            if tid in visited:
+                continue
+            visited.add(tid)
+            expanded += 1
+            candidate_scores[tid] = total
+
+            if hops >= max_hops:
+                continue
+
+            edges = self.topic_bridges[tid]
+            if not edges:
+                continue
+            ranked_edges = sorted(edges.items(), key=lambda it: self._bridge_strength(it[1]), reverse=True)
+            for dst, edge in ranked_edges[: max(1, int(self.p.topic_graph_bridge_topk))]:
+                edge_score = self._bridge_strength(edge)
+                if edge_score < float(self.p.topic_graph_min_bridge_score):
+                    continue
+                if dst not in semantic_scores:
+                    continue
+                next_bonus = bridge_bonus * 0.60 + float(self.p.topic_graph_bridge_weight) * edge_score
+                resident_bonus = float(self.p.topic_graph_resident_bonus) if self.topic_shards[dst].loaded else 0.0
+                total_dst = float(semantic_scores[dst]) + next_bonus + resident_bonus
+                ops += 1
+                if total_dst > best_total.get(dst, -1e9):
+                    best_total[dst] = total_dst
+                    heapq.heappush(frontier, (-total_dst, hops + 1, dst, next_bonus))
+                    via_bridge.add(int(dst))
+
+        self.bridge_expand_events += len(via_bridge)
+        return candidate_scores, via_bridge, ops
+
+    def _preload_topics(
+        self,
+        candidate_scores: Dict[int, float],
+        turn: int,
+    ) -> Set[int]:
+        self.preload_attempts += 1
+        load_budget = max(1, int(self.p.topic_graph_load_budget))
+        ranked = sorted(candidate_scores.items(), key=lambda it: it[1], reverse=True)
+        available: Set[int] = set()
+        used_budget = 0
+        for tid, _score in ranked:
+            shard = self.topic_shards[tid]
+            if shard.loaded:
+                shard.last_loaded_turn = turn
+                available.add(int(tid))
+                continue
+            if used_budget >= load_budget:
+                continue
+            used_budget += 1
+            self._touch_loaded_topic(int(tid), turn)
+            available.add(int(tid))
+            self.preload_clusters_loaded += 1
+
+        if available:
+            self.preload_successes += 1
+        return available
+
+    def _retrieve_topic_evidence(
+        self,
+        query_vec: np.ndarray,
+        candidate_scores: Dict[int, float],
+        available_topics: Set[int],
+    ) -> Tuple[List[int], Dict[str, object], int]:
+        if not available_topics:
+            return [], {"evidence_topics": [], "evidence_memories": []}, 0
+
+        per_topic_evidence = max(1, int(self.p.topic_graph_per_topic_evidence))
+        ranked_topics: List[Tuple[int, float]] = []
+        evidence_topics: List[int] = []
+        evidence_memories: List[int] = []
+        ops = 0
+
+        for tid in sorted(available_topics):
+            members = self.topic_shards[tid].members
+            if not members:
+                continue
+            topic_ops = 0
+            shard = self.topic_shards[tid]
+            idx: np.ndarray
+            if self.p.ghsom_enabled and shard.ghsom_root is not None:
+                idx, topic_ops = self._ghsom_collect_candidates(
+                    shard.ghsom_root,
+                    query_vec,
+                    max_results=per_topic_evidence,
+                )
+                if idx.size <= 0:
+                    idx = np.asarray(members, dtype=np.int32)
+            else:
+                idx = np.asarray(members, dtype=np.int32)
+            ops += topic_ops
+            sims = self.vec_pool[idx] @ query_vec
+            ops += int(idx.size)
+            if sims.size <= 0:
+                continue
+            k = min(per_topic_evidence, int(sims.size))
+            if k < sims.size:
+                keep = np.argpartition(sims, -k)[-k:]
+                best = keep[np.argsort(sims[keep])[::-1]]
+                ops += int(sims.size)
+            else:
+                best = np.argsort(sims)[::-1]
+                ops += int(sims.size)
+            best_sims = sims[best]
+            evidence_score = float(np.max(best_sims)) + 0.15 * float(np.mean(best_sims))
+            total_score = float(candidate_scores.get(tid, 0.0)) + evidence_score
+            ranked_topics.append((int(tid), total_score))
+            evidence_topics.append(int(tid))
+            evidence_memories.extend(int(idx[i]) for i in best.tolist())
+            if self.topic_shards[tid].loaded:
+                self.resident_hit_events += 1
+
+        ranked_topics.sort(key=lambda it: it[1], reverse=True)
+        selected_topics = [
+            tid
+            for tid, _score in ranked_topics[: max(1, int(self.p.topic_graph_max_return_topics))]
+        ]
+        return selected_topics, {
+            "evidence_topics": evidence_topics,
+            "evidence_memories": evidence_memories,
+            "ranked_topics": ranked_topics,
+        }, ops
+
+    def retrieve(
+        self,
+        query_vec: np.ndarray,
+        current_topic: Optional[int],
+        current_turn: int,
+    ) -> Tuple[List[int], int, Dict[str, object]]:
+        semantic_scores, ops0 = self._semantic_topic_scores(query_vec, current_topic)
+        if not semantic_scores:
+            return [], ops0, {"candidate_topics": [], "bridge_topics": []}
+
+        candidate_scores, via_bridge, ops1 = self._expand_topic_candidates(semantic_scores, current_topic)
+        available_topics = self._preload_topics(candidate_scores, current_turn)
+        selected_topics, debug, ops2 = self._retrieve_topic_evidence(query_vec, candidate_scores, available_topics)
+        debug["candidate_topics"] = sorted(candidate_scores.items(), key=lambda it: it[1], reverse=True)
+        debug["bridge_topics"] = sorted(via_bridge)
+        return selected_topics, ops0 + ops1 + ops2, debug
+
+    def _sample_query_topic(self, current_topic: int, current_turn: int) -> int:
+        if not self.turn_topics:
+            return current_topic
+        if self.rng.random() < self.p.query_current_intent_prob:
+            return current_topic
+
+        max_old_turn = current_turn - self.p.query_long_term_min_age
+        if max_old_turn > 1:
+            old_turn = int(self.rng.integers(1, max_old_turn))
+            return self.turn_topics[old_turn - 1]
+        past_turn = int(self.rng.integers(1, current_turn))
+        return self.turn_topics[past_turn - 1]
+
+    def _eval_query(self, selected_topics: List[int], target_topic: int) -> Tuple[int, float]:
+        k = len(selected_topics)
+        self.returned_topics_sum += k
+        hit = 1 if target_topic in selected_topics else 0
+        precision = (1.0 / k) if hit and k > 0 else 0.0
+        mrr = 0.0
+        if hit:
+            rank = selected_topics.index(target_topic) + 1
+            mrr = 1.0 / rank
+
+        self.target_precision_sum += precision
+        self.target_hit_sum += float(hit)
+        self.target_mrr_sum += mrr
+        self.eval_count += 1
+        return hit, mrr
+
+    def _apply_query_feedback(
+        self,
+        current_topic: int,
+        target_topic: int,
+        selected_topics: List[int],
+        bridge_topics: Sequence[int],
+        turn: int,
+    ) -> None:
+        if current_topic != target_topic and target_topic in selected_topics:
+            self._reinforce_bridge(
+                current_topic,
+                target_topic,
+                "recall",
+                float(self.p.topic_graph_recall_lr),
+                turn,
+            )
+            self.bridge_hit_events += 1
+        if current_topic != target_topic and selected_topics and selected_topics[0] == target_topic:
+            self._reinforce_bridge(
+                current_topic,
+                target_topic,
+                "adopt",
+                float(self.p.topic_graph_adopt_lr),
+                turn,
+            )
+        for tid in bridge_topics:
+            if tid in selected_topics and tid != current_topic:
+                self._reinforce_bridge(
+                    current_topic,
+                    int(tid),
+                    "recall",
+                    float(self.p.topic_graph_recall_lr) * 0.45,
+                    turn,
+                )
+
+    def _summary(self) -> Dict[str, float]:
+        loaded_topics = sum(1 for shard in self.topic_shards if shard.loaded)
+        active_topics = sum(1 for shard in self.topic_shards if shard.members)
+        bridge_edges = sum(len(edges) for edges in self.topic_bridges)
+        eval_n = max(1, self.eval_count)
+        avg_query_ops = self.sim_ops_query_total / max(1, self.query_turns)
+        avg_turn_ops = float(np.mean(self.turn_sim_ops)) if self.turn_sim_ops else 0.0
+        p95_turn_ops = float(np.quantile(self.turn_sim_ops, 0.95)) if self.turn_sim_ops else 0.0
+        target_hit = self.target_hit_sum / eval_n
+        target_precision = self.target_precision_sum / eval_n
+        target_mrr = self.target_mrr_sum / eval_n
+        ghsom_probe_avg_candidates = self.ghsom_probe_candidates_total / max(1, self.ghsom_probe_count)
+        ghsom_probe_avg_depth = self.ghsom_probe_depth_total / max(1, self.ghsom_probe_count)
+
+        return {
+            "turns": float(self.p.turns),
+            "query_turns": float(self.query_turns),
+            "memory_count": float(self.mem_count),
+            "hot_memory_count": float(loaded_topics),
+            "hot_memory_ratio": (float(loaded_topics) / max(1.0, float(active_topics))),
+            "cluster_count": float(active_topics),
+            "hot_cluster_count": float(loaded_topics),
+            "supercluster_count": 0.0,
+            "supercluster_rebuild_count": 0.0,
+            "avg_clusters_per_super": 0.0,
+            "merge_count": 0.0,
+            "new_count": float(self.mem_count),
+            "merge_rate": 0.0,
+            "normalize_events": 0.0,
+            "total_heat": 0.0,
+            "heat_gini": 0.0,
+            "target_precision_at_k": target_precision,
+            "target_recall_recent": target_hit,
+            "target_recall_all": target_hit,
+            "target_hit_rate": target_hit,
+            "target_recent_hit_rate": target_hit,
+            "target_mrr": target_mrr,
+            "empty_query_rate": (self.empty_query_count / max(1, self.query_turns)),
+            "empty_target_query_rate": (self.empty_target_query_count / max(1, self.query_turns)),
+            "avg_returned_turns": (self.returned_topics_sum / eval_n),
+            "avg_sim_ops_add_per_turn": 0.0,
+            "avg_sim_ops_query_per_query": avg_query_ops,
+            "avg_sim_ops_total_per_turn": avg_turn_ops,
+            "p95_sim_ops_total_per_turn": p95_turn_ops,
+            "topic_graph_loaded_topics": float(loaded_topics),
+            "topic_graph_active_topics": float(active_topics),
+            "topic_graph_bridge_edges": float(bridge_edges),
+            "topic_graph_load_events": float(self.topic_load_events),
+            "topic_graph_evict_events": float(self.topic_evict_events),
+            "topic_graph_bridge_expand_events": float(self.bridge_expand_events),
+            "topic_graph_bridge_hit_events": float(self.bridge_hit_events),
+            "topic_graph_bridge_update_events": float(self.bridge_update_events),
+            "topic_graph_resident_hit_events": float(self.resident_hit_events),
+            "preload_attempts": float(self.preload_attempts),
+            "preload_successes": float(self.preload_successes),
+            "preload_success_rate": (self.preload_successes / max(1, self.preload_attempts)),
+            "preload_memories_heated": 0.0,
+            "preload_clusters_loaded": float(self.preload_clusters_loaded),
+            "preload_topic_predictions": 0.0,
+            "preload_correct_predictions": 0.0,
+            "preload_prediction_accuracy": 0.0,
+            "ghsom_enabled": 1.0 if self.p.ghsom_enabled else 0.0,
+            "ghsom_active": 1.0 if self.p.ghsom_enabled else 0.0,
+            "ghsom_probe_count": float(self.ghsom_probe_count),
+            "ghsom_probe_avg_candidates": float(ghsom_probe_avg_candidates),
+            "ghsom_probe_avg_depth": float(ghsom_probe_avg_depth),
+        }
+
+    def _record_snapshot(self, turn: int) -> None:
+        summary = self._summary()
+        summary["turn"] = float(turn)
+        self.snapshots.append(summary)
+
+    def _finalize_summary(self, summary: Dict[str, float]) -> Dict[str, float]:
+        summary["heat_gini_start"] = 0.0
+        summary["heat_gini_end"] = 0.0
+        summary["heat_gini_delta"] = 0.0
+        summary["heat_gini_max"] = 0.0
+        summary["heat_gini_min"] = 0.0
+        return summary
+
+    def run(self) -> Dict[str, object]:
+        current_topic = self.topic.initial_topic()
+        prev_topic: Optional[int] = None
+
+        for turn in range(1, self.p.turns + 1):
+            self._decay_bridges()
+            if turn > 1:
+                next_topic = self.topic.next_topic(current_topic)
+                if prev_topic is not None and next_topic != current_topic:
+                    self._reinforce_bridge(
+                        prev_topic,
+                        current_topic,
+                        "transition",
+                        float(self.p.topic_graph_transition_lr),
+                        turn,
+                    )
+                prev_topic = current_topic
+                current_topic = next_topic
+
+            turn_vec = self.topic.turn_vector(current_topic)
+            query_ops = 0
+
+            if turn > self.p.warmup_turns and self.rng.random() < self.p.query_prob:
+                target_topic = self._sample_query_topic(current_topic, turn)
+                noise_mix = self.p.query_noise_mix
+                query_vec = self.topic.query_vector(target_topic, noise_mix)
+                selected_topics, query_ops, debug = self.retrieve(
+                    query_vec,
+                    current_topic=current_topic,
+                    current_turn=turn,
+                )
+                self.sim_ops_query_total += query_ops
+                self.query_turns += 1
+                if not selected_topics:
+                    self.empty_query_count += 1
+
+                hit, _mrr = self._eval_query(selected_topics, target_topic)
+                if hit <= 0:
+                    self.empty_target_query_count += 1
+                self._apply_query_feedback(
+                    current_topic=current_topic,
+                    target_topic=target_topic,
+                    selected_topics=selected_topics,
+                    bridge_topics=debug.get("bridge_topics", []),
+                    turn=turn,
+                )
+
+            self._register_turn_topic(turn, current_topic)
+            self._add_memory(turn_vec, turn, current_topic)
+            self.turn_sim_ops.append(int(query_ops))
+
+            if turn % self.p.report_every == 0 or turn == self.p.turns:
+                self._record_snapshot(turn)
+
+        summary = self._summary()
+        summary = self._finalize_summary(summary)
+        return {"summary": summary, "snapshots": self.snapshots}
+
+
 def run_experiment(params: SimParams) -> Dict[str, object]:
-    sim = AgentMemorySim(params)
+    if str(params.retrieval_model).strip().lower() == "topic_graph":
+        sim = TopicGraphSim(params)
+    else:
+        sim = AgentMemorySim(params)
     return sim.run()
 
 
@@ -2295,6 +3750,9 @@ def save_plot(
 
 def main():
     parser = argparse.ArgumentParser(description="Agent Memory Simulator with Smart Preloading and EnhancedWeak")
+    parser.add_argument("--retrieval-model", type=str, default="memory",
+                        choices=["memory", "topic_graph"],
+                        help="Retrieval model to simulate")
     parser.add_argument("--turns", type=int, default=20000, help="Number of simulation turns")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--report-every", type=int, default=1000, help="Report interval")
@@ -2316,10 +3774,23 @@ def main():
                         help="Enable soft gate filtering (true/false)")
     parser.add_argument("--adaptive-gate-enabled", type=lambda x: x.lower() == 'true', default=True,
                         help="Enable adaptive gate adjustment (true/false)")
+    parser.add_argument("--ghsom-enabled", type=lambda x: x.lower() == 'true', default=None,
+                        help="Enable GHSOM-like hierarchical pruning (memory clusters or topic-local shards)")
+    parser.add_argument("--ghsom-max-depth", type=int, default=3,
+                        help="Maximum depth for the in-cluster GHSOM index")
+    parser.add_argument("--ghsom-min-samples", type=int, default=10,
+                        help="Minimum samples in a slot before GHSOM split")
+    parser.add_argument("--ghsom-threshold", type=int, default=24,
+                        help="Only use GHSOM routing when cluster size reaches this threshold")
     
     args = parser.parse_args()
     
+    ghsom_enabled = args.ghsom_enabled
+    if ghsom_enabled is None:
+        ghsom_enabled = (args.retrieval_model == "topic_graph")
+
     params = SimParams(
+        retrieval_model=args.retrieval_model,
         turns=args.turns,
         seed=args.seed,
         report_every=args.report_every,
@@ -2328,11 +3799,24 @@ def main():
         preload_max_io_per_turn=args.preload_max_io,
         memory_drop_sim=max(-1.0, min(1.0, float(args.memory_drop_sim))),
         soft_gate_enabled=args.soft_gate_enabled,
+        ghsom_enabled=ghsom_enabled,
+        ghsom_max_depth=max(1, int(args.ghsom_max_depth)),
+        ghsom_min_samples_for_expansion=max(2, int(args.ghsom_min_samples)),
+        ghsom_linear_scan_threshold=max(2, int(args.ghsom_threshold)),
     )
     
+    print(f"Retrieval model: {args.retrieval_model}")
     print(f"Running simulation with {args.turns} turns...")
     print(f"Smart preloading: {'enabled' if args.preload_enabled else 'disabled'}")
     print(f"Soft gate: {'enabled' if args.soft_gate_enabled else 'disabled'}")
+    if args.retrieval_model == "memory":
+        print(f"GHSOM index: {'enabled' if ghsom_enabled else 'disabled'}")
+    else:
+        print(
+            "GHSOM index: "
+            f"configured={ghsom_enabled}, active={'yes' if ghsom_enabled else 'no'} "
+            "(topic_graph local pruning)"
+        )
     
     result = run_experiment(params)
     
@@ -2345,6 +3829,12 @@ def main():
     print(f"Target hit rate: {summary['target_hit_rate']:.4f}")
     print(f"Target recall (recent): {summary['target_recall_recent']:.4f}")
     print(f"P95 sim ops per turn: {summary['p95_sim_ops_total_per_turn']:.1f}")
+    if args.retrieval_model == "topic_graph":
+        print(f"Topic graph bridge edges: {summary.get('topic_graph_bridge_edges', 0):.0f}")
+        print(f"Loaded topics: {summary.get('topic_graph_loaded_topics', 0):.0f}")
+    if ghsom_enabled:
+        print(f"GHSOM avg probe depth: {summary.get('ghsom_probe_avg_depth', 0.0):.2f}")
+        print(f"GHSOM avg candidate pool: {summary.get('ghsom_probe_avg_candidates', 0.0):.2f}")
     
     if args.preload_enabled:
         print(f"\nSmart Preloading Stats:")

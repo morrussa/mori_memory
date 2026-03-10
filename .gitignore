@@ -5,6 +5,9 @@ memory/
 !module/memory/*.lua
 luajit/
 __pycache__/
+target/
+native/**/target/
+module/mori_hnsw.so
 readme.txt
 simu/
 workspace/

@@ -1,0 +1,15 @@
+[package]
+name = "mori_hnsw_ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[dependencies]
+hnsw_rs = { version = "0.3.4", features = ["simdeez_f"] }
