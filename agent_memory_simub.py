@@ -41,6 +41,9 @@ except Exception:
     HNSWIndex = None
 
 
+TOPIC_FAMILY_DYNAMIC_REBUILD_INTERVAL = 128
+
+
 def unit(v: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(v))
     if norm <= 0:
@@ -260,17 +263,6 @@ class SimParams:
     topic_graph_family_topk: int = 3
     topic_graph_family_similarity: float = 0.82
     topic_graph_family_member_limit: int = 2
-    topic_graph_family_source: str = "deep_artmap"
-    topic_graph_family_rebuild_interval: int = 128
-    topic_graph_family_exemplars_per_topic: int = 3
-    topic_graph_family_query_exemplars: int = 0
-    topic_graph_family_query_gate: float = 0.56
-    topic_graph_family_hnsw_enabled: bool = False
-    topic_graph_family_hnsw_min_members: int = 24
-    topic_graph_family_hnsw_k: int = 12
-    topic_graph_family_hnsw_m: int = 16
-    topic_graph_family_hnsw_ef_construction: int = 80
-    topic_graph_family_hnsw_ef_search: int = 24
     topic_graph_self_excite_penalty: float = 0.18
     topic_graph_family_revisit_penalty: float = 0.10
     topic_graph_family_escape_bonus: float = 0.06
@@ -350,9 +342,6 @@ class SimParams:
     topic_temporal_focus_stickiness: float = 0.72
     topic_temporal_turn_state_mix: float = 0.78
     topic_temporal_query_state_mix: float = 0.68
-    topic_temporal_residual_mix: float = 0.10
-    topic_temporal_query_residual_mix: float = 0.04
-    topic_temporal_residual_drift: float = 0.08
     turn_facet_min: int = 1
     turn_facet_max: int = 2
     turn_bundle_min: int = 1
@@ -471,15 +460,6 @@ class DeepARTMAPState:
     category_to_bundle: Dict[int, int] = field(default_factory=dict)
     last_bundle_id: int = -1
     last_bundle_turn: int = 0
-
-
-@dataclass
-class TopicFamilyConceptState:
-    topic_ids: List[int] = field(default_factory=list)
-    prototype: Optional[np.ndarray] = None
-    exemplar_ids: List[int] = field(default_factory=list)
-    member_ids: List[int] = field(default_factory=list)
-    hnsw_index: Optional["HNSWIndex"] = None
 
 
 @dataclass
@@ -768,13 +748,11 @@ class TopicStream:
         self.topic_bundle_base = np.zeros((self.num_topics, bundle_count), dtype=np.float32)
         self.topic_bundle_state = np.zeros((self.num_topics, bundle_count), dtype=np.float32)
         self.topic_bundle_velocity = np.zeros((self.num_topics, bundle_count), dtype=np.float32)
-        self.topic_residual_state = np.zeros((self.num_topics, self.p.dim), dtype=np.float32)
         self.topic_focus_bundle = np.full(self.num_topics, -1, dtype=np.int32)
         for tid in range(self.num_topics):
             base = self._normalize_simplex(salience[tid])
             self.topic_bundle_base[tid] = base
             self.topic_bundle_state[tid] = base
-            self.topic_residual_state[tid] = self._rand_unit(self.p.dim).astype(np.float32)
 
     def _advance_temporal_topic_state(self, topic_id: int) -> None:
         if not bool(self.p.topic_temporal_state_enabled):
@@ -814,13 +792,6 @@ class TopicStream:
         self.topic_bundle_state[tid] = state
         self.topic_focus_bundle[tid] = int(focus)
 
-        residual = self.topic_residual_state[tid]
-        residual_drift = min(0.95, max(0.0, float(self.p.topic_temporal_residual_drift)))
-        residual_noise = self._rand_unit(self.p.dim)
-        self.topic_residual_state[tid] = unit(
-            ((1.0 - residual_drift) * residual + residual_drift * residual_noise).astype(np.float32)
-        ).astype(np.float32)
-
     def _bundle_prior(self, topic_id: int, for_query: bool) -> Optional[np.ndarray]:
         if not bool(self.p.topic_temporal_state_enabled):
             return None
@@ -839,22 +810,6 @@ class TopicStream:
         velocity_mix = max(0.0, float(self.p.topic_temporal_velocity_mix))
         predicted = self._normalize_simplex(np.maximum(1e-6, state + 0.50 * velocity_mix * velocity))
         return self._normalize_simplex((1.0 - mix) * base + mix * predicted)
-
-    def _temporal_residual(self, topic_id: int, for_query: bool) -> np.ndarray:
-        if not bool(self.p.topic_temporal_state_enabled):
-            return np.zeros(self.p.dim, dtype=np.float32)
-        tid = int(topic_id)
-        if tid < 0 or tid >= self.num_topics:
-            return np.zeros(self.p.dim, dtype=np.float32)
-        mix = (
-            float(self.p.topic_temporal_query_residual_mix)
-            if for_query
-            else float(self.p.topic_temporal_residual_mix)
-        )
-        mix = max(0.0, mix)
-        if mix <= 0.0:
-            return np.zeros(self.p.dim, dtype=np.float32)
-        return (mix * self.topic_residual_state[tid]).astype(np.float32)
 
     def _rand_unit(self, dim: int) -> np.ndarray:
         return unit(self.rng.normal(size=dim).astype(np.float32))
@@ -1039,15 +994,12 @@ class TopicStream:
         facet_vec = np.zeros(self.p.dim, dtype=np.float32)
         for pos, local_id in enumerate(local_ids.tolist()):
             facet_vec += float(facet_weights[pos]) * self.topic_facet_vectors[int(topic_id), int(local_id)]
-        residual_vec = self._temporal_residual(topic_id, for_query=False)
-        residual_mix = float(np.linalg.norm(residual_vec))
-        base_w = max(0.01, 1.0 - noise_mix - anchor_mix - bundle_mix - facet_mix - residual_mix)
+        base_w = max(0.01, 1.0 - noise_mix - anchor_mix - bundle_mix - facet_mix)
         vec = unit(
             base_w * base
             + anchor_mix * self._flow_anchor
             + bundle_mix * bundle_vec
             + facet_mix * facet_vec
-            + residual_vec
             + noise_mix * noise
         )
         return vec.astype(np.float32), facet_ids.astype(np.int32), facet_weights.astype(np.float32)
@@ -1083,14 +1035,11 @@ class TopicStream:
         facet_vec = np.zeros(self.p.dim, dtype=np.float32)
         for pos, local_id in enumerate(local_ids.tolist()):
             facet_vec += float(facet_weights[pos]) * self.topic_facet_vectors[int(topic_id), int(local_id)]
-        residual_vec = self._temporal_residual(topic_id, for_query=True)
-        residual_mix = float(np.linalg.norm(residual_vec))
-        base_w = max(0.01, 1.0 - nm - bundle_mix - facet_mix - residual_mix)
+        base_w = max(0.01, 1.0 - nm - bundle_mix - facet_mix)
         vec = unit(
             base_w * self.topic_vectors[topic_id]
             + bundle_mix * bundle_vec
             + facet_mix * facet_vec
-            + residual_vec
             + nm * noise
         )
         return vec.astype(np.float32), facet_ids.astype(np.int32), facet_weights.astype(np.float32)
@@ -1171,15 +1120,12 @@ class TopicStream:
         for pos, local_id in enumerate(source_local_ids.tolist()):
             facet_pool_vec += float(source_local_weights[pos]) * self.topic_facet_vectors[tid, int(local_id)]
         noise = self._rand_unit(self.p.dim)
-        residual_vec = self._temporal_residual(tid, for_query=False)
-        residual_mix = float(np.linalg.norm(residual_vec))
-        base_w = max(0.01, 1.0 - noise_mix - anchor_mix - bundle_mix - facet_mix - residual_mix)
+        base_w = max(0.01, 1.0 - noise_mix - anchor_mix - bundle_mix - facet_mix)
         turn_vec = unit(
             base_w * base
             + anchor_mix * self._flow_anchor
             + bundle_mix * bundle_vec
             + facet_mix * facet_pool_vec
-            + residual_vec
             + noise_mix * noise
         ).astype(np.float32)
 
@@ -3809,7 +3755,6 @@ class TopicGraphSim:
         self.topic_hnsw_index: Optional["HNSWIndex"] = None
         self.topic_family_of = np.full(self.topic_count, -1, dtype=np.int32)
         self.topic_family_members: List[List[int]] = []
-        self.topic_family_concepts: List[TopicFamilyConceptState] = []
 
         self.turn_topics: List[int] = []
         self.turns_by_topic: Dict[int, List[int]] = {}
@@ -3859,12 +3804,6 @@ class TopicGraphSim:
         self.topic_hnsw_query_events = 0
         self.topic_hnsw_failure_events = 0
         self.topic_family_rebuild_count = 0
-        self.family_concept_borrow_events = 0
-        self.family_concept_borrow_candidates_total = 0
-        self.family_concept_exemplar_total = 0
-        self.family_hnsw_build_events = 0
-        self.family_hnsw_query_events = 0
-        self.family_hnsw_failure_events = 0
         self.self_excite_penalty_total = 0.0
         self.self_excite_event_count = 0
         self.self_excite_skip_events = 0
@@ -4097,18 +4036,13 @@ class TopicGraphSim:
         n = self.topic_count
         if n <= 0:
             self.topic_family_members = []
-            self.topic_family_concepts = []
             return
 
         self.topic_family_of.fill(-1)
         topk = max(1, min(n - 1, int(self.p.topic_graph_family_topk))) if n > 1 else 0
         thresh = float(self.p.topic_graph_family_similarity)
-        source = str(getattr(self.p, "topic_graph_family_source", "centroid")).strip().lower()
-        if source == "deep_artmap_graph":
+        if self._topic_family_mode() == "deep_artmap":
             neighbors = self._topic_bundle_overlap_neighbors(topk=topk)
-        elif source == "deep_artmap":
-            sims = self._topic_bundle_distribution_similarity()
-            neighbors = self._topic_family_neighbors_from_similarity(sims, topk=topk, thresh=thresh)
         else:
             sims = self.topic.topic_sim
             neighbors = self._topic_family_neighbors_from_similarity(sims, topk=topk, thresh=thresh)
@@ -4142,58 +4076,7 @@ class TopicGraphSim:
             self.topic_family_members.append(list(members))
             for tid in members:
                 self.topic_family_of[int(tid)] = int(family_id)
-        self._rebuild_topic_family_concepts()
         self.topic_family_rebuild_count += 1
-
-    def _rebuild_topic_family_concepts(self) -> None:
-        exemplars_per_topic = max(0, int(self.p.topic_graph_family_exemplars_per_topic))
-        for concept in self.topic_family_concepts:
-            index = concept.hnsw_index
-            if index is None:
-                continue
-            try:
-                index.close()
-            except Exception:
-                pass
-        self.topic_family_concepts = []
-        self.family_concept_exemplar_total = 0
-        for members in self.topic_family_members:
-            topic_ids = [int(tid) for tid in members if 0 <= int(tid) < self.topic_count]
-            active_topic_ids = [tid for tid in topic_ids if self.topic_shards[tid].members]
-            proto_parts: List[np.ndarray] = []
-            exemplar_ids: List[int] = []
-            member_ids: List[int] = []
-            seen_mem: Set[int] = set()
-            for tid in active_topic_ids:
-                centroid = self.topic_shards[tid].centroid
-                if centroid is not None:
-                    proto_parts.append(np.asarray(centroid, dtype=np.float32))
-                for mem_idx in self.topic_shards[tid].members:
-                    mem_id = int(mem_idx)
-                    if mem_id < 0 or mem_id >= self.mem_count or mem_id in seen_mem:
-                        continue
-                    seen_mem.add(mem_id)
-                    member_ids.append(mem_id)
-                if exemplars_per_topic <= 0:
-                    continue
-                topic_members = self.topic_shards[tid].members
-                for mem_idx in reversed(topic_members[-exemplars_per_topic:]):
-                    mem_id = int(mem_idx)
-                    if mem_id < 0 or mem_id >= self.mem_count:
-                        continue
-                    exemplar_ids.append(mem_id)
-            prototype: Optional[np.ndarray] = None
-            if proto_parts:
-                stacked = np.vstack(proto_parts).astype(np.float32)
-                prototype = unit(np.mean(stacked, axis=0)).astype(np.float32)
-            concept = TopicFamilyConceptState(
-                topic_ids=topic_ids,
-                prototype=prototype,
-                exemplar_ids=exemplar_ids,
-                member_ids=member_ids,
-            )
-            self.topic_family_concepts.append(concept)
-            self.family_concept_exemplar_total += len(exemplar_ids)
 
     def _topic_family_neighbors_from_similarity(
         self,
@@ -4264,73 +4147,6 @@ class TopicGraphSim:
                 mat[a_pos, b_pos] = float(proto_a @ proto_b)
         return sig_a, sig_b, mat
 
-    def _pair_bundle_distribution_similarity(
-        self,
-        a_tid: int,
-        b_tid: int,
-    ) -> float:
-        if a_tid == b_tid:
-            return 1.0
-        sig_a, sig_b, sim_mat = self._bundle_similarity_matrix(a_tid, b_tid)
-        if sim_mat is None:
-            return float(self.topic.topic_similarity(int(a_tid), int(b_tid)))
-
-        row_best = np.max(sim_mat, axis=1)
-        col_best = np.max(sim_mat, axis=0)
-        row_weights = np.asarray([weight for _proto, weight in sig_a], dtype=np.float32)
-        col_weights = np.asarray([weight for _proto, weight in sig_b], dtype=np.float32)
-        strong_thresh = max(0.55, float(self.p.topic_graph_family_similarity) - 0.18)
-
-        forward = float(np.sum(row_weights * row_best))
-        backward = float(np.sum(col_weights * col_best))
-        coverage_a = float(np.sum(row_weights[row_best >= strong_thresh]))
-        coverage_b = float(np.sum(col_weights[col_best >= strong_thresh]))
-
-        row_active = row_weights[row_best >= strong_thresh]
-        col_active = col_weights[col_best >= strong_thresh]
-        diversity_a = 0.0
-        diversity_b = 0.0
-        if row_active.size > 1:
-            norm = row_active / max(1e-6, float(np.sum(row_active)))
-            diversity_a = float(-np.sum(norm * np.log(norm + 1e-8)) / math.log(float(row_active.size)))
-        elif row_active.size == 1:
-            diversity_a = 0.25
-        if col_active.size > 1:
-            norm = col_active / max(1e-6, float(np.sum(col_active)))
-            diversity_b = float(-np.sum(norm * np.log(norm + 1e-8)) / math.log(float(col_active.size)))
-        elif col_active.size == 1:
-            diversity_b = 0.25
-
-        overlap_mass = 0.0
-        for a_pos, (_proto_a, weight_a) in enumerate(sig_a):
-            for b_pos, (_proto_b, weight_b) in enumerate(sig_b):
-                sim = float(sim_mat[a_pos, b_pos])
-                if sim < strong_thresh:
-                    continue
-                scaled = (sim - strong_thresh) / max(1e-6, 1.0 - strong_thresh)
-                overlap_mass += min(float(weight_a), float(weight_b)) * max(0.0, scaled)
-        overlap_mass = min(1.0, overlap_mass)
-
-        multi_peak = math.sqrt(max(0.0, diversity_a) * max(0.0, diversity_b))
-        coverage = math.sqrt(max(0.0, coverage_a) * max(0.0, coverage_b))
-        return float(
-            0.28 * forward
-            + 0.28 * backward
-            + 0.22 * coverage
-            + 0.12 * overlap_mass
-            + 0.10 * multi_peak
-        )
-
-    def _topic_bundle_distribution_similarity(self) -> np.ndarray:
-        n = self.topic_count
-        sims = np.eye(n, dtype=np.float32)
-        for a_tid in range(n):
-            for b_tid in range(a_tid + 1, n):
-                score = self._pair_bundle_distribution_similarity(a_tid, b_tid)
-                sims[a_tid, b_tid] = float(score)
-                sims[b_tid, a_tid] = float(score)
-        return sims
-
     def _pair_bundle_overlap_graph_score(
         self,
         a_tid: int,
@@ -4361,7 +4177,11 @@ class TopicGraphSim:
         if match_count <= 0:
             return 0.0
         density = min(1.0, float(match_count) / float(max(1, len(sig_a) + len(sig_b) - 1)))
-        return float(0.55 * math.sqrt(max(0.0, coverage_a) * max(0.0, coverage_b)) + 0.30 * min(1.0, overlap) + 0.15 * density)
+        return float(
+            0.55 * math.sqrt(max(0.0, coverage_a) * max(0.0, coverage_b))
+            + 0.30 * min(1.0, overlap)
+            + 0.15 * density
+        )
 
     def _topic_bundle_overlap_neighbors(
         self,
@@ -4379,13 +4199,10 @@ class TopicGraphSim:
         return self._topic_family_neighbors_from_similarity(score_mat, topk=topk, thresh=edge_threshold)
 
     def _maybe_rebuild_topic_families(self, turn: int) -> None:
-        interval = max(0, int(getattr(self.p, "topic_graph_family_rebuild_interval", 0)))
-        if interval <= 0:
+        if self._topic_family_mode() != "deep_artmap":
             return
-        if (int(turn) % interval) != 0:
-            return
-        source = str(getattr(self.p, "topic_graph_family_source", "centroid")).strip().lower()
-        if source in {"deep_artmap", "deep_artmap_graph"} and self._topic_local_index_mode() != "deep_artmap":
+        interval = max(0, int(TOPIC_FAMILY_DYNAMIC_REBUILD_INTERVAL))
+        if interval <= 0 or (int(turn) % interval) != 0:
             return
         self._build_topic_families()
 
@@ -4396,97 +4213,6 @@ class TopicGraphSim:
         if topic_id < 0 or topic_id >= self.topic_count:
             return -1
         return int(self.topic_family_of[topic_id])
-
-    def _family_concept_candidates(
-        self,
-        topic_id: int,
-        query_vec: np.ndarray,
-        max_results: int,
-    ) -> Tuple[List[int], int]:
-        family_id = self._topic_family_id(topic_id)
-        if family_id < 0 or family_id >= len(self.topic_family_concepts):
-            return [], 0
-        concept = self.topic_family_concepts[family_id]
-        if len(concept.topic_ids) <= 1 or not concept.exemplar_ids:
-            return [], 0
-
-        ops = 0
-        query_gate = max(-1.0, min(1.0, float(self.p.topic_graph_family_query_gate)))
-        if concept.prototype is not None:
-            proto_sim = float(np.asarray(concept.prototype, dtype=np.float32) @ query_vec)
-            ops += 1
-            if proto_sim < query_gate:
-                return [], ops
-
-        if self._family_hnsw_ready():
-            index, build_ops = self._ensure_family_hnsw_index(family_id)
-            ops += int(build_ops)
-            if index is not None:
-                want = min(
-                    max(1, len(concept.member_ids)),
-                    max(
-                        max(1, int(max_results)),
-                        int(self.p.topic_graph_family_hnsw_k),
-                    ),
-                )
-                try:
-                    hits = index.search(query_vec, want)
-                    self.family_hnsw_query_events += 1
-                except Exception:
-                    self.family_hnsw_failure_events += 1
-                    hits = []
-                ops += max(want, int(self.p.topic_graph_family_hnsw_ef_search))
-                picked: List[int] = []
-                seen_mem: Set[int] = set()
-                for hit in hits:
-                    mem_id = int(hit.label)
-                    if mem_id < 0 or mem_id >= self.mem_count or mem_id in seen_mem:
-                        continue
-                    dominant_topic = self._dominant_memory_topic(mem_id)
-                    if dominant_topic is None or int(dominant_topic) == int(topic_id):
-                        continue
-                    if self._topic_family_id(int(dominant_topic)) != int(family_id):
-                        continue
-                    seen_mem.add(mem_id)
-                    picked.append(mem_id)
-                if picked:
-                    self.family_concept_borrow_events += 1
-                    self.family_concept_borrow_candidates_total += len(picked)
-                return picked, ops
-
-        candidate_ids: List[int] = []
-        seen_mem: Set[int] = set()
-        for mem_idx in concept.exemplar_ids:
-            mem_id = int(mem_idx)
-            if mem_id < 0 or mem_id >= self.mem_count or mem_id in seen_mem:
-                continue
-            dominant_topic = self._dominant_memory_topic(mem_id)
-            if dominant_topic is None or int(dominant_topic) == int(topic_id):
-                continue
-            seen_mem.add(mem_id)
-            candidate_ids.append(mem_id)
-        if not candidate_ids:
-            return [], ops
-
-        idx = np.asarray(candidate_ids, dtype=np.int32)
-        sims = self.vec_pool[idx] @ query_vec
-        ops += int(idx.size)
-        k = min(len(candidate_ids), max(0, int(self.p.topic_graph_family_query_exemplars)), max(1, int(max_results)))
-        if k <= 0:
-            return [], ops
-        if k < len(candidate_ids):
-            keep = np.argpartition(sims, -k)[-k:]
-            order = keep[np.argsort(sims[keep])[::-1]]
-            ops += int(sims.size)
-        else:
-            order = np.argsort(sims)[::-1]
-            ops += int(sims.size)
-
-        picked = [int(idx[pos]) for pos in order.tolist()]
-        if picked:
-            self.family_concept_borrow_events += 1
-            self.family_concept_borrow_candidates_total += len(picked)
-        return picked, ops
 
     def _self_excitation_adjustment(
         self,
@@ -4530,8 +4256,14 @@ class TopicGraphSim:
             return TopoARTTopicLocalIndex()
         return ExactTopicLocalIndex()
 
+    def _topic_family_mode(self) -> str:
+        return "deep_artmap" if self._topic_local_index_mode() == "deep_artmap" else "centroid"
+
     def _topic_local_index_mode(self) -> str:
-        return self.topic_local_index.name
+        topic_local_index = getattr(self, "topic_local_index", None)
+        if topic_local_index is not None:
+            return topic_local_index.name
+        return str(getattr(self.p, "topic_graph_local_index", "topoart")).strip().lower()
 
     def _topic_ghsom_active(self) -> bool:
         return self.topic_local_index.ghsom_active(self)
@@ -5170,9 +4902,6 @@ class TopicGraphSim:
     def _topic_hnsw_ready(self) -> bool:
         return bool(self.p.topic_graph_topic_hnsw_enabled and HNSWIndex is not None)
 
-    def _family_hnsw_ready(self) -> bool:
-        return bool(self.p.topic_graph_family_hnsw_enabled and HNSWIndex is not None)
-
     def _init_topic_hnsw(self) -> None:
         if not self._topic_hnsw_ready():
             return
@@ -5194,41 +4923,6 @@ class TopicGraphSim:
             return
         self.topic_hnsw_index = index
         self.topic_hnsw_build_events += 1
-
-    def _ensure_family_hnsw_index(
-        self,
-        family_id: int,
-    ) -> Tuple[Optional["HNSWIndex"], int]:
-        if not self._family_hnsw_ready():
-            return None, 0
-        if family_id < 0 or family_id >= len(self.topic_family_concepts):
-            return None, 0
-        concept = self.topic_family_concepts[family_id]
-        member_ids = [int(mem_id) for mem_id in concept.member_ids if 0 <= int(mem_id) < self.mem_count]
-        min_members = max(2, int(self.p.topic_graph_family_hnsw_min_members))
-        if len(member_ids) < min_members:
-            return None, 0
-        if concept.hnsw_index is not None:
-            return concept.hnsw_index, 0
-        try:
-            index = HNSWIndex.create(
-                dim=self.p.dim,
-                max_elements=max(8, len(member_ids)),
-                space="cosine",
-                m=max(4, int(self.p.topic_graph_family_hnsw_m)),
-                ef_construction=max(16, int(self.p.topic_graph_family_hnsw_ef_construction)),
-                ef_search=max(8, int(self.p.topic_graph_family_hnsw_ef_search)),
-                random_seed=int(self.p.seed + family_id * 17 + 1),
-            )
-            for mem_id in member_ids:
-                index.add(int(mem_id), self.vec_pool[int(mem_id)])
-        except Exception:
-            self.family_hnsw_failure_events += 1
-            concept.hnsw_index = None
-            return None, len(member_ids)
-        concept.hnsw_index = index
-        self.family_hnsw_build_events += 1
-        return index, len(member_ids)
 
     def _semantic_topic_score(
         self,
@@ -5680,19 +5374,6 @@ class TopicGraphSim:
             )
             topic_ops = int(query_result.ops)
             idx = query_result.indices
-            family_borrow_ids, family_ops = self._family_concept_candidates(
-                int(tid),
-                query_vec,
-                per_topic_evidence,
-            )
-            ops += int(family_ops)
-            if family_borrow_ids:
-                idx_set = set(int(x) for x in idx.tolist())
-                borrowed = [mem_id for mem_id in family_borrow_ids if mem_id not in idx_set]
-                if borrowed:
-                    idx = np.concatenate(
-                        [np.asarray(borrowed, dtype=np.int32), idx.astype(np.int32, copy=False)]
-                    )
             if tid in anchor_evidence:
                 extra_ids = [int(mem_id) for mem_id in anchor_evidence.get(int(tid), [])]
                 if extra_ids:
@@ -6416,11 +6097,9 @@ class TopicGraphSim:
         multi_topic_count = sum(1 for counts in self.mem_origin_topic_counts[: self.mem_count] if len(counts) > 1)
         family_count = len(self.topic_family_members)
         family_max_size = max((len(members) for members in self.topic_family_members), default=0)
-        family_source = str(getattr(self.p, "topic_graph_family_source", "centroid")).strip().lower()
         self_excite_avg_penalty = self.self_excite_penalty_total / max(1, self.self_excite_event_count)
         self_excite_avg_escape = self.self_excite_escape_bonus_total / max(1, self.self_excite_escape_event_count)
         momentum_avg_candidates = self.momentum_probe_total_candidates / max(1, self.momentum_probe_hits)
-        family_borrow_avg_candidates = self.family_concept_borrow_candidates_total / max(1, self.family_concept_borrow_events)
         anchor_edge_count = sum(len(neighbors) for neighbors in self.anchor_neighbors) / 2.0
         anchor_avg_seeds = self.anchor_probe_seed_total / max(1, self.anchor_probe_count)
         anchor_avg_candidates = self.anchor_probe_candidate_total / max(1, self.anchor_probe_count)
@@ -6455,16 +6134,7 @@ class TopicGraphSim:
             "topic_graph_multi_topic_memory_ratio": float(multi_topic_count / max(1, self.mem_count)),
             "topic_graph_family_count": float(family_count),
             "topic_graph_family_max_size": float(family_max_size),
-            "topic_graph_family_source_is_deep_artmap": 1.0 if family_source == "deep_artmap" else 0.0,
             "topic_graph_family_rebuild_count": float(self.topic_family_rebuild_count),
-            "topic_graph_family_concept_count": float(len(self.topic_family_concepts)),
-            "topic_graph_family_concept_exemplar_count": float(self.family_concept_exemplar_total),
-            "topic_graph_family_borrow_events": float(self.family_concept_borrow_events),
-            "topic_graph_family_borrow_avg_candidates": float(family_borrow_avg_candidates),
-            "topic_graph_family_hnsw_enabled": 1.0 if self._family_hnsw_ready() else 0.0,
-            "topic_graph_family_hnsw_build_events": float(self.family_hnsw_build_events),
-            "topic_graph_family_hnsw_query_events": float(self.family_hnsw_query_events),
-            "topic_graph_family_hnsw_failure_events": float(self.family_hnsw_failure_events),
             "topic_graph_self_excite_event_count": float(self.self_excite_event_count),
             "topic_graph_self_excite_skip_events": float(self.self_excite_skip_events),
             "topic_graph_self_excite_avg_penalty": float(self_excite_avg_penalty),
@@ -6792,7 +6462,7 @@ def main():
     parser.add_argument("--merge-limit", type=float, default=0.95,
                         help="Merge a new memory into an existing one when cosine similarity exceeds this threshold")
     parser.add_argument("--topic-temporal-state", type=lambda x: x.lower() == 'true', default=False,
-                        help="Enable temporal topic state with bundle weights, velocity, and residual channel")
+                        help="Enable temporal topic state with bundle weights and velocity")
     parser.add_argument("--topic-temporal-velocity-mix", type=float, default=0.32,
                         help="How strongly bundle velocity steers temporal topic state")
     parser.add_argument("--topic-temporal-momentum", type=float, default=0.78,
@@ -6807,12 +6477,12 @@ def main():
                         help="How much turn generation follows the temporal bundle state instead of the base topic mix")
     parser.add_argument("--topic-temporal-query-mix", type=float, default=0.68,
                         help="How much query generation follows the temporal bundle state instead of the base topic mix")
-    parser.add_argument("--topic-temporal-residual-mix", type=float, default=0.10,
-                        help="Residual/noise channel weight injected into turn generation")
-    parser.add_argument("--topic-temporal-query-residual-mix", type=float, default=0.04,
-                        help="Residual/noise channel weight injected into query generation")
-    parser.add_argument("--topic-temporal-residual-drift", type=float, default=0.08,
-                        help="Drift rate of the temporal residual/noise channel")
+    parser.add_argument("--topic-temporal-residual-mix", type=float, default=0.0,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--topic-temporal-query-residual-mix", type=float, default=0.0,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--topic-temporal-residual-drift", type=float, default=0.0,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-atomic-min", type=int, default=1,
                         help="Minimum number of atomic memories extracted from each simulated turn")
     parser.add_argument("--topic-atomic-max", type=int, default=1,
@@ -6828,15 +6498,15 @@ def main():
     parser.add_argument("--topic-atomic-anchor-deflate", type=float, default=0.08,
                         help="Subtract a small amount of turn-anchor direction so one atomic memory behaves more like a turn component")
     parser.add_argument("--topic-anchor-graph-enabled", type=lambda x: x.lower() == 'true', default=False,
-                        help="Deprecated no-op; retained only for CLI compatibility")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-anchor-seed-k", type=int, default=2,
-                        help="How many anchor seeds to start from before graph expansion")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-anchor-neighbor-topk", type=int, default=2,
-                        help="How many anchor neighbors to expand per visited anchor")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-anchor-max-hops", type=int, default=1,
-                        help="Maximum hops used when expanding the anchor graph")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-anchor-edge-decay", type=float, default=0.65,
-                        help="How much anchor-edge weight contributes when expanding from one anchor to its neighbors")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-momentum-probe-enabled", type=lambda x: x.lower() == 'true', default=False,
                         help="Let the previous turn's atomic memories join exactly one next-turn probe when the topic stays unchanged")
     parser.add_argument("--topic-momentum-probe-cap", type=int, default=1,
@@ -6879,27 +6549,27 @@ def main():
                         help="Maximum topics from the same family allowed in one query expansion/result set")
     parser.add_argument("--topic-family-source", type=str, default="deep_artmap",
                         choices=["centroid", "deep_artmap", "deep_artmap_graph"],
-                        help="Source used to build topic families")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-rebuild-interval", type=int, default=128,
-                        help="Rebuild topic families every N turns; 0 disables periodic rebuilds")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-exemplars-per-topic", type=int, default=3,
-                        help="How many recent memories each topic contributes to its family concept hub")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-query-exemplars", type=int, default=0,
-                        help="How many family-hub memories may be borrowed into one topic's evidence search")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-query-gate", type=float, default=0.56,
-                        help="Minimum query similarity to a family concept prototype before borrowing family exemplars")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-hnsw-enabled", type=lambda x: x.lower() == 'true', default=False,
-                        help="Use a family-local HNSW to retrieve candidate memories inside each topic family")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-hnsw-min-members", type=int, default=24,
-                        help="Only build a family-local HNSW once the family has at least this many memories")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-hnsw-k", type=int, default=12,
-                        help="How many family-local HNSW hits to request before exact rerank")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-hnsw-m", type=int, default=16,
-                        help="Family-local HNSW M parameter")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-hnsw-ef-construction", type=int, default=80,
-                        help="Family-local HNSW ef_construction")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--topic-family-hnsw-ef-search", type=int, default=24,
-                        help="Family-local HNSW ef_search; also used as the family query cost proxy")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--self-excite-penalty", type=float, default=0.18,
                         help="Penalty for same-family or anchor-family expansion during topic_graph search")
     parser.add_argument("--family-revisit-penalty", type=float, default=0.10,
@@ -6978,8 +6648,6 @@ def main():
 
     if args.topic_hnsw_enabled and HNSWIndex is None:
         raise RuntimeError("HNSW requested but mori_hnsw binding is unavailable")
-    if args.topic_family_hnsw_enabled and HNSWIndex is None:
-        raise RuntimeError("Family HNSW requested but mori_hnsw binding is unavailable")
     
     ghsom_enabled = args.ghsom_enabled
     if ghsom_enabled is None:
@@ -7005,9 +6673,6 @@ def main():
         topic_temporal_focus_stickiness=max(0.0, min(0.999, float(args.topic_temporal_focus_stickiness))),
         topic_temporal_turn_state_mix=max(0.0, min(1.0, float(args.topic_temporal_turn_mix))),
         topic_temporal_query_state_mix=max(0.0, min(1.0, float(args.topic_temporal_query_mix))),
-        topic_temporal_residual_mix=max(0.0, float(args.topic_temporal_residual_mix)),
-        topic_temporal_query_residual_mix=max(0.0, float(args.topic_temporal_query_residual_mix)),
-        topic_temporal_residual_drift=max(0.0, min(0.95, float(args.topic_temporal_residual_drift))),
         topic_atomic_memories_min=max(1, int(args.topic_atomic_min)),
         topic_atomic_memories_max=max(max(1, int(args.topic_atomic_min)), int(args.topic_atomic_max)),
         topic_atomic_facet_min=max(1, int(args.topic_atomic_facet_min)),
@@ -7038,17 +6703,6 @@ def main():
         topic_graph_family_topk=max(1, int(args.topic_family_topk)),
         topic_graph_family_similarity=max(-1.0, min(1.0, float(args.topic_family_similarity))),
         topic_graph_family_member_limit=max(1, int(args.topic_family_member_limit)),
-        topic_graph_family_source=str(args.topic_family_source).strip().lower(),
-        topic_graph_family_rebuild_interval=max(0, int(args.topic_family_rebuild_interval)),
-        topic_graph_family_exemplars_per_topic=max(0, int(args.topic_family_exemplars_per_topic)),
-        topic_graph_family_query_exemplars=max(0, int(args.topic_family_query_exemplars)),
-        topic_graph_family_query_gate=max(-1.0, min(1.0, float(args.topic_family_query_gate))),
-        topic_graph_family_hnsw_enabled=bool(args.topic_family_hnsw_enabled),
-        topic_graph_family_hnsw_min_members=max(2, int(args.topic_family_hnsw_min_members)),
-        topic_graph_family_hnsw_k=max(1, int(args.topic_family_hnsw_k)),
-        topic_graph_family_hnsw_m=max(4, int(args.topic_family_hnsw_m)),
-        topic_graph_family_hnsw_ef_construction=max(16, int(args.topic_family_hnsw_ef_construction)),
-        topic_graph_family_hnsw_ef_search=max(8, int(args.topic_family_hnsw_ef_search)),
         topic_graph_self_excite_penalty=max(0.0, float(args.self_excite_penalty)),
         topic_graph_family_revisit_penalty=max(0.0, float(args.family_revisit_penalty)),
         topic_graph_family_escape_bonus=max(0.0, float(args.family_escape_bonus)),
@@ -7127,17 +6781,11 @@ def main():
                 f"capacity={int(args.topoart_category_capacity)}"
             )
     if args.retrieval_model == "topic_graph":
+        family_mode = "deep_artmap" if args.topic_local_index == "deep_artmap" else "centroid"
         print(
             "Topic HNSW: "
             f"{'enabled' if args.topic_hnsw_enabled else 'disabled'} "
             f"(k={int(args.topic_hnsw_k)})"
-        )
-        print(
-            "Anchor graph: retired "
-            f"(ignoring enabled={bool(args.topic_anchor_graph_enabled)}, "
-            f"seed_k={int(args.topic_anchor_seed_k)}, "
-            f"hops={int(args.topic_anchor_max_hops)}, "
-            f"neighbor_topk={int(args.topic_anchor_neighbor_topk)})"
         )
         print(
             "One-turn momentum probe: "
@@ -7151,15 +6799,8 @@ def main():
             f"topk={int(args.topic_family_topk)}, "
             f"sim={float(args.topic_family_similarity):.2f}, "
             f"member_limit={int(args.topic_family_member_limit)}, "
-            f"source={str(args.topic_family_source).strip().lower()}, "
-            f"borrow={int(args.topic_family_query_exemplars)}"
+            f"mode={family_mode}"
         )
-        if args.topic_family_hnsw_enabled:
-            print(
-                "Family HNSW: "
-                f"enabled (min_members={int(args.topic_family_hnsw_min_members)}, "
-                f"k={int(args.topic_family_hnsw_k)})"
-            )
     
     result = run_experiment(params)
     
@@ -7195,12 +6836,6 @@ def main():
             "Family risk penalty/skip: "
             f"{summary.get('topic_graph_self_excite_avg_penalty', 0.0):.4f}/"
             f"{summary.get('topic_graph_self_excite_skip_events', 0.0):.0f}"
-        )
-        print(
-            "Anchor graph count/edges/probe candidates: "
-            f"{summary.get('topic_graph_anchor_count', 0.0):.0f}/"
-            f"{summary.get('topic_graph_anchor_edge_count', 0.0):.0f}/"
-            f"{summary.get('topic_graph_anchor_probe_avg_candidates', 0.0):.2f}"
         )
         print(
             "Average memories per turn: "

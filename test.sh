@@ -2,7 +2,6 @@
   --retrieval-model topic_graph \
   --topic-local-index deep_artmap \
   --topic-hnsw-enabled true \
-  --topic-family-source deep_artmap_graph \
   --topic-family-topk 2 \
   --topic-family-similarity 0.84 \
   --topic-family-member-limit 1 \
@@ -18,9 +17,6 @@
   --topic-temporal-focus-stickiness 0.90 \
   --topic-temporal-turn-mix 0.80 \
   --topic-temporal-query-mix 0.76 \
-  --topic-temporal-residual-mix 0.00 \
-  --topic-temporal-query-residual-mix 0.00 \
-  --topic-temporal-residual-drift 0.03 \
   --turns 50000 \
   --report-every 1000 \
   --output /tmp/topic_temporal_50k_state_only.json \
