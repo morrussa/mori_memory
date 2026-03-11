@@ -1,0 +1,23 @@
+./.venv/bin/python agent_memory_simub.py \
+  --retrieval-model topic_graph \
+  --topic-local-index deep_artmap \
+  --topic-hnsw-enabled true \
+  --topic-family-topk 2 \
+  --topic-family-similarity 0.84 \
+  --topic-family-member-limit 1 \
+  --self-excite-penalty 0.14 \
+  --family-revisit-penalty 0.10 \
+  --family-escape-bonus 0.06 \
+  --merge-limit 0.95 \
+  --topic-temporal-state true \
+  --topic-temporal-velocity-mix 0.20 \
+  --topic-temporal-momentum 0.88 \
+  --topic-temporal-reversion 0.05 \
+  --topic-temporal-noise 0.03 \
+  --topic-temporal-focus-stickiness 0.90 \
+  --topic-temporal-turn-mix 0.80 \
+  --topic-temporal-query-mix 0.76 \
+  --turns 50000 \
+  --report-every 1000 \
+  --output /tmp/topic_temporal_50k_state_only.json \
+  --plot-out /tmp/topic_temporal_50k_state_only.png
