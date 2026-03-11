@@ -85,6 +85,18 @@ local DEFAULT_SETTINGS = {
             cache_max_entries = 32,
             -- 历史压缩阈值（对话对数）
             history_compress_threshold = 6,
+            -- 历史上下文多压缩等级的构建权重
+            history_variant_weights = {
+                full = 1.00,
+                slight = 0.72,
+                heavy = 0.40,
+                none = 0.00,
+            },
+            -- 历史轮次的时间衰减（越接近1越偏向最近轮）
+            history_recency_decay = 0.90,
+            -- 历史压缩比例（相对原文字符数）
+            history_compress_ratio_slight = 0.65,
+            history_compress_ratio_heavy = 0.30,
             -- 是否启用上下文预算监控
             enable_budget_monitor = true,
             -- 预算警告阈值（相对于input_token_budget的比例）
