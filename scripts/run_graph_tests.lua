@@ -312,13 +312,46 @@ local function setup_stubs(case)
             check_and_retrieve = function(user_input, _vec, opts)
                 opts = opts or {}
                 if opts.suppress == true then
-                    return ""
+                    return {
+                        context = "",
+                        topic_anchor = "",
+                        predicted_topics = {},
+                        predicted_memories = {},
+                        predicted_nodes = {},
+                        selected_turns = {},
+                        selected_memories = {},
+                        fragments = {},
+                        adopted_memories = {},
+                    }
                 end
                 local s = tostring(user_input or "")
                 if s:find("MEMORY_HIT", 1, true) or opts.force == true then
-                    return "memory_context_for_" .. s
+                    return {
+                        context = "memory_context_for_" .. s,
+                        topic_anchor = "topic_stub",
+                        predicted_topics = { "topic_stub" },
+                        predicted_memories = { 11 },
+                        predicted_nodes = {},
+                        selected_turns = { 1 },
+                        selected_memories = { 11 },
+                        fragments = {},
+                        adopted_memories = {},
+                    }
                 end
-                return ""
+                return {
+                    context = "",
+                    topic_anchor = "",
+                    predicted_topics = {},
+                    predicted_memories = {},
+                    predicted_nodes = {},
+                    selected_turns = {},
+                    selected_memories = {},
+                    fragments = {},
+                    adopted_memories = {},
+                }
+            end,
+            infer_adopted_memories = function(_final, _state)
+                return {}
             end,
         }
     end
@@ -341,8 +374,25 @@ local function setup_stubs(case)
             end,
             update_assistant = function(_turn, _assistant)
             end,
+            get_stable_anchor = function(turn)
+                return "topic_" .. tostring(turn or 0)
+            end,
+            get_topic_anchor = function(turn)
+                return "topic_" .. tostring(turn or 0)
+            end,
             get_summary = function(turn)
                 return "topic_summary_turn_" .. tostring(turn or 0)
+            end,
+        }
+    end
+
+    package.preload["module.memory.topic_graph"] = function()
+        return {
+            observe_turn = function(_turn, _anchor)
+                return true
+            end,
+            observe_feedback = function(_anchor, _recall, _adopted, _turn)
+                return true
             end,
         }
     end

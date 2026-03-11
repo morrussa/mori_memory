@@ -16,66 +16,58 @@ end
 
 local root = os.getenv("MORI_TEST_ROOT")
 if not root or root == "" then
-    root = string.format("/tmp/mori_store_integration_%d_%d", os.time(), math.random(1000, 9999))
+    root = string.format("/tmp/mori_topic_graph_integration_%d_%d", os.time(), math.random(1000, 9999))
 end
-os.execute(string.format('mkdir -p "%s/shards"', root))
 
 local config = require("module.config")
-config.settings.storage_v3 = config.settings.storage_v3 or {}
-config.settings.storage_v3.root = root
-config.settings.storage_v3.max_memory = 128
-config.settings.storage_v3.cluster_cache_cap = 2
+config.settings.topic_graph = config.settings.topic_graph or {}
+config.settings.topic_graph.storage = { root = root .. "/topic_graph" }
+config.settings.topic_graph.topic_hnsw = config.settings.topic_graph.topic_hnsw or {}
+config.settings.topic_graph.topic_hnsw.enabled = true
 
 local store = require("module.memory.store")
-local ghsom = require("module.memory.ghsom")
+local topic_graph = require("module.memory.topic_graph")
 
-print("=== store + GHSOM integration ===")
+print("=== store + topic_graph integration ===")
 print("root:", root)
 
-store.load()
-ghsom.load()
+assert(store.load())
 
-local vectors = {
-    norm({1, 0, 0, 0, 0, 0, 0, 0}),
-    norm({0, 1, 0, 0, 0, 0, 0, 0}),
-    norm({0, 0, 1, 0, 0, 0, 0, 0}),
-}
+local vec_a = norm({1, 0, 0, 0, 0, 0, 0, 0})
+local vec_b = norm({0, 1, 0, 0, 0, 0, 0, 0})
+local vec_c = norm({0, 0, 1, 0, 0, 0, 0, 0})
 
-for i, vec in ipairs(vectors) do
-    local line = assert(store.add_memory(vec, 200 + i))
-    assert(line == i, "unexpected line allocation")
-end
+local line_a = assert(store.add_memory(vec_a, 201, { topic_anchor = "topic:a" }))
+local line_b = assert(store.add_memory(vec_b, 202, { topic_anchor = "topic:b" }))
+local line_c = assert(store.add_memory(vec_c, 203, { topic_anchor = "topic:c" }))
+assert(line_a == 1 and line_b == 2 and line_c == 3, "unexpected line allocation")
 
-local merged = assert(store.add_memory(norm({0.999, 0.001, 0, 0, 0, 0, 0, 0}), 300))
+local merged = assert(store.add_memory(norm({0.999, 0.001, 0, 0, 0, 0, 0, 0}), 204, { topic_anchor = "topic:a" }))
 assert(merged == 1, "reachable duplicate should merge into line 1")
 assert(store.get_total_lines() == 3, "merge should not create a new line")
+assert(store.get_cluster_id(1) > 0, "deep_artmap should assign a category id")
 
-local fast_hits = store.find_similar_all_fast(vectors[1], 2)
-assert(#fast_hits >= 1, "expected hot fast search hits")
+topic_graph.observe_turn(205, "topic:a")
+topic_graph.observe_feedback("topic:a", {
+    selected_memories = { line_b },
+    predicted_topics = { "topic:b" },
+}, { line_b }, 205)
 
-local node_hits = ghsom.probe_nodes(vectors[1], 2)
-assert(#node_hits >= 1, "expected reachable nodes")
+local result = topic_graph.retrieve(vec_b, "topic:a", 206, {})
+assert(type(result) == "table", "retrieve should return a table")
+assert(#(result.predicted_topics or {}) >= 1, "retrieve should return topics")
+assert(#(result.selected_memories or {}) >= 1, "retrieve should return memories")
 
-assert(store.store_vector(1, 101, vectors[1]), "should rewrite line 1 into a dedicated shard")
-assert(store.store_vector(2, 102, vectors[2]), "should rewrite line 2 into a dedicated shard")
-assert(store.store_vector(3, 103, vectors[3]), "should rewrite line 3 into a dedicated shard")
+local ok_save, err_save = store.save_to_disk()
+assert(ok_save, err_save)
 
-local ok1, err1 = store.save_to_disk()
-assert(ok1, err1)
-local ok2, err2 = ghsom.save_to_disk()
-assert(ok2, err2)
+package.loaded["module.memory.topic_graph"] = nil
+package.loaded["module.memory.store"] = nil
 
-store.load()
-local preloaded = store.preload_clusters({ 101, 102, 103 }, {
-    max_clusters = 3,
-    max_io = 3,
-})
-assert(#preloaded == 3, "preload should touch all requested shards before LRU trimming")
-local cached = store.get_cached_cluster_ids()
-assert(#cached <= 2, "LRU should cap resident shard count")
-assert(cached[1] == 102 and cached[2] == 103, "LRU should keep the most recently touched shards")
-
-ghsom.load()
-assert(store.get_total_lines() == 3, "reload total mismatch")
+local store2 = require("module.memory.store")
+assert(store2.load())
+assert(store2.get_total_lines() == 3, "reload total mismatch")
+local hits = store2.find_similar_all_fast(vec_a, 1)
+assert(#hits == 1 and hits[1].index == 1, "reloaded nearest hit mismatch")
 
 print("integration-ok")

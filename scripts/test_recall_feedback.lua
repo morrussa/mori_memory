@@ -57,16 +57,9 @@ package.loaded["module.memory.history"] = {
     get_turn = function() return 0 end,
 }
 
-package.loaded["module.memory.ghsom"] = {}
-package.loaded["module.memory.topic"] = {}
-package.loaded["module.memory.adaptive"] = {
-    get_merge_limit = function(v) return v end,
-    update_after_recall = function() end,
-    add_counter = function() end,
-}
-
-package.loaded["module.memory.topic_predictor"] = {
-    predict = function() return { lines = {}, ranked_nodes = {} } end,
+package.loaded["module.memory.topic"] = {
+    get_stable_anchor = function() return "topic:stub" end,
+    get_topic_anchor = function() return "topic:stub" end,
 }
 
 local recall = require("module.memory.recall")

@@ -268,6 +268,7 @@ function M.new_state(args)
             context = "",
             score = nil,
             topic_anchor = "",
+            predicted_topics = {},
             predicted_memories = {},
             predicted_nodes = {},
             selected_turns = {},

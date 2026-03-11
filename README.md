@@ -27,7 +27,7 @@
 
 执行层分为三层：
 
-- `memory/*`：长期事实记忆
+- `memory/*`：长期事实记忆（当前默认实现为 `topic_graph + DeepARTMAP + topic-HNSW`）
 - `episode/*`：run 级执行历史
 
 循环约束：
@@ -47,6 +47,9 @@
 - `module/graph/trace_writer.lua`：JSONL trace
 - `module/graph/tool_registry_v2.lua`：工具执行层（file + external provider）
 - `module/graph/providers/*`：provider 抽象与 qwen 实现
+- `module/memory/topic_graph.lua`：默认记忆召回内核
+- `module/memory/topic_graph_deep_artmap.lua`：topic 局部证据索引
+- `module/memory/topic_graph_hnsw.lua`：topic 级 HNSW seed
 - `module/graph/nodes/router_node.lua|agent_node.lua|tools_node.lua`：retired（保留文件，不再接入主图）
 
 旧 `module/agent/*` 核心链路已删除。

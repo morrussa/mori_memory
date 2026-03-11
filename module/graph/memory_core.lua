@@ -1,6 +1,5 @@
 local tool = require("module.tool")
 local memory = require("module.memory.store")
-local ghsom = require("module.memory.ghsom")
 local history = require("module.memory.history")
 
 local M = {}

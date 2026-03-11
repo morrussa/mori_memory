@@ -366,6 +366,7 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
         context = "",
         score = nil,
         topic_anchor = "",
+        predicted_topics = {},
         predicted_memories = {},
         predicted_nodes = {},
         selected_turns = {},
@@ -374,6 +375,7 @@ local function ensure_v2_shape(state, args, conversation_history, base_system_pr
         adopted_memories = {},
     }
     state.recall.topic_anchor = tostring(state.recall.topic_anchor or "")
+    state.recall.predicted_topics = state.recall.predicted_topics or {}
     state.recall.predicted_memories = state.recall.predicted_memories or {}
     state.recall.predicted_nodes = state.recall.predicted_nodes or {}
     state.recall.selected_turns = state.recall.selected_turns or {}

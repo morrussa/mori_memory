@@ -29,8 +29,9 @@ function M.run(state, _ctx)
     state.recall = {
         triggered = memory_context ~= "",
         context = memory_context,
-        score = nil,
+        score = recall_result.score,
         topic_anchor = tostring(recall_result.topic_anchor or ""),
+        predicted_topics = (recall_result.predicted_topics or {}),
         predicted_memories = (recall_result.predicted_memories or {}),
         predicted_nodes = (recall_result.predicted_nodes or {}),
         selected_turns = (recall_result.selected_turns or {}),

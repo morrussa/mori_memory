@@ -2,12 +2,9 @@ local tool = require("module.tool")
 local history = require("module.memory.history")
 local topic   = require("module.memory.topic")
 local memory = require("module.memory.store")
-local ghsom = require("module.memory.ghsom")
 local math = require("math")
 local saver =require("module.memory.saver")
 local recall = require("module.memory.recall")
-local adaptive = require("module.memory.adaptive")
-local topic_predictor = require("module.memory.topic_predictor")
 local app_config = require("module.config")
 local graph_runtime = require("module.graph.graph_runtime")
 local run_mode = tostring(MORI_RUN_MODE or "cli")
@@ -113,17 +110,13 @@ print("[Lua] large_model path: " .. tostring(large_model_path))
 print("[Lua] embedding_model path: " .. tostring(embedding_model_path))
 py_pipeline:load_models(large_model_path, embedding_model_path)
 
-memory.load()
-ghsom.load()
-saver.mark_dirty()
 history.load()
-adaptive.load()
-topic_predictor.load()
+topic.init()
+memory.load()
+saver.mark_dirty()
 recall.init_all_sentiment_vectors()
 
 print("[Lua] Pipeline started.")
-
-topic.init()
 
 
 
