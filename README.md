@@ -1,192 +1,297 @@
 # Mori
 
-Mori最开始只是想证明目前大部分人的长期记忆设计有问题，所以打算设计一套永久记忆。
+Mori is memeto..ol.. ri.
 
-它不依赖agent，甚至我不保证在复杂agent环境下是否依旧可用。相反，它更适合AI vtuber/AI 女友之类的方向。
+Mori 的核心机制并非选取agent想要查询的 prompt，而是以 `memory` 为中心，在每一轮推理前围绕任务目标、工作状态与历史证据重新组织上下文。
 
-Mori 的记忆不是把“所有历史 + 所有记忆”一次性塞进 prompt，而是每一轮都根据当前任务、当前输入、当前工作状态，重新拼接出一份当下最需要的上下文。
+从 `module/` 的实现出发，可以将系统概括为四个部分：
 
-这套系统的核心不是“保存一大段固定上下文”，而是“维护一组可重组的状态源”，然后在推理前动态装配。
+- `memory`：负责对话状态分层、长期记忆写入与按需召回
+- `graph`：负责单轮执行流程、工具循环、上下文装配与收尾
+- `episode / checkpoint / session`：负责任务连续性恢复与运行态持久化
+- `frontend / native`：提供交互界面与检索性能支撑
 
-## 核心理念：完全动态拼接上下文
+## 系统主流程
 
-所谓“完全动态拼接”，指的是：
-
-1. 每一轮输入到来后，系统先判断这轮到底是在继续原任务、微调原任务，还是已经切换到新任务。
-2. 只有在这轮确实需要记忆时，才触发召回，而不是无条件把长期记忆常驻在 prompt 里。
-3. prompt 中的不同信息块来自不同状态源，例如任务状态、工作记忆、最近 episode、工具结果、历史对话、长期记忆，它们彼此独立、按需组合。
-4. 上下文超预算时，系统优先压缩、裁剪、丢弃低价值部分，而不是让 prompt 无限增长。
-5. 本轮结束后，系统把这轮对话重新写回成“可供未来重组的状态”，下一轮再重新装配，而不是简单续接上一轮 prompt。
-
-换句话说，Mori 保存的不是一个固定 prompt，而是一个可以在每轮推理前重新编译的上下文状态机。
-
-## 一轮上下文是怎么拼出来的
-
-主流程如下：
+单轮请求的执行链路如下：
 
 ```text
-用户输入
-  -> task_node      判断任务连续性
-  -> recall_node    按需召回长期记忆
-  -> context_node   动态组装 system/history/user
-  -> planner/tool   进入工具循环，持续更新 tool context / working memory
-  -> responder      生成最终答复
-  -> writeback      抽取原子事实、写回记忆、记录反馈
-  -> persist        保存 topic / history / episode / session
+ingest_node
+  -> task_node
+  -> recall_node
+  -> context_node
+  -> planner_node
+       -> tool_exec_node <-> planner_node
+       -> repair_node -> planner_node / responder_node / finalize_node
+  -> responder_node
+  -> finalize_node
+  -> writeback_node
+  -> persist_node
 ```
 
-### 1. 先判断“这轮是什么任务”
+在这条链路中，`memory` 贯穿前后两个阶段：
 
-系统不会默认把每条新消息都当作独立请求处理。`task_node` 会先做任务连续性判断，把当前输入归类为：
+- 前半段负责判断是否需要召回记忆，以及应当召回哪些证据
+- 后半段负责将本轮对话沉淀为可复用状态，并更新记忆反馈关系
 
-- `same_task_step`：继续执行同一个任务
-- `same_task_refine`：仍是同一个任务，但约束变了
-- `hard_shift`：切到新任务
-- `meta_turn`：只是问进度或状态
+## 记忆系统结构
 
-这个判断直接决定后续上下文要继承哪些内容，例如：
+记忆系统并非单一存储，而是由四层状态共同构成。
 
-- 要不要保留旧的 task contract
-- 要不要沿用 working memory
-- 要不要恢复上个 episode 的连续性
-- 要不要把这轮视作全新任务重新起步
+### 1. `history`
 
-所以 Mori 的上下文不是“按历史顺序机械累加”，而是先过一层任务语义路由。
+文件：`module/memory/history.lua`
 
-### 2. 再决定“要不要回忆”
+- 以 turn 为单位保存完整的 user / assistant 对话
+- 存储文件为 `memory/history.txt`
+- 其职责是保存原始对话账本，而非承担长期语义记忆
+- recall 阶段最终会回到该层，将命中的 memory 展开为可读对话片段
 
-`recall_node` 不会无条件检索记忆，而是先做一次 recall gating。
+### 2. `topic`
 
-它会综合判断：
+文件：`module/memory/topic.lua`
 
-- 用户输入里是否出现“之前 / 上次 / 以前 / remember / recall”之类的回忆意图
+- 每轮基于用户输入的 embedding 更新话题状态
+- 通过上一轮相似度与头尾漂移共同判断是否发生话题切换
+- 每个话题对应稳定 anchor，形式为 `S:<start_turn>`
+- 该层负责描述“本轮属于哪条语义轨道”，而不是直接保存事实内容
+
+### 3. `topic_graph`
+
+文件：`module/memory/topic_graph.lua`
+
+`topic_graph` 是长期记忆的主体，`module/memory/store.lua` 仅提供兼容性封装。
+
+该模块保存的不是整段对话文本，而是带结构的 memory 节点与 topic 图：
+
+- memory 节点：`vec + turns + text + facets + topic_anchor + cluster_id`
+- topic 节点：每个 anchor 下的 centroid、memory 列表与局部状态 `local_state`
+- topic 边：`transition / recall / adopt`
+- `memory_next`：描述跨轮 memory 的接续关系
+- HNSW 索引：用于 topic centroid 的快速 seed 检索
+- Deep ARTMAP 局部状态：用于 topic 内候选收集与反馈强化
+
+该层有两个重要特征：
+
+- 长期记忆写入对象是“原子事实”，而不是整段 assistant 回复
+- 当新事实与既有 memory 的相似度高于 `merge_limit` 时，会执行合并并补充 turn，而不是无条件新增节点
+
+### 4. `episode`
+
+文件：`module/episode/*`
+
+- 每轮执行结束后会生成一个 episode
+- episode 保存任务目标、工具链路、文件读写、最终回复与 memory writeback 摘要
+- 该层服务于任务连续性恢复，而非长期事实记忆本体
+
+## 记忆写入链路
+
+一轮结束后，记忆相关写入按照如下顺序发生。
+
+### 1. 更新 topic
+
+`persist_node` 先计算 `current_turn = history.get_turn() + 1`，随后执行：
+
+- `topic.add_turn(current_turn, user_input, user_embedding)`
+- 基于局部断裂与全局漂移判断是否切分话题
+- 为本轮建立或延续稳定 topic anchor
+
+因此，topic 的更新先于 history 的写入。
+
+### 2. 写入 history
+
+随后执行：
+
+- `history.add_history(user_input, final_text)`
+- `topic.update_assistant(current_turn, final_text)`
+
+因此，完整对话仍然保存在 `history` 中，后续 recall 所展开的“第 N 轮用户/助手说了什么”也来自这一层。
+
+### 3. 抽取原子事实并写入长期记忆
+
+`writeback_node` 调用 `module/graph/memory_core.lua` 完成事实抽取：
+
+- 输入为本轮 `user_input + final_text`
+- LLM 被约束为只输出 Lua 字符串数组
+- 提取目标是可长期复用的事实，优先覆盖偏好、约束、身份、长期计划与持续需求
+- 若抽取失败，会进入 repair；repair 仍失败时，使用用户输入进行兜底
+
+之后 `save_ingest_items` 会：
+
+- 对每条 fact 计算 embedding
+- 调用 `topic_graph.add_memory(...)`
+- 将该 fact 挂接到本 turn 对应的 topic anchor
+- 自动生成 facets
+- 在满足相似度条件时执行 merge，否则新增 memory 节点
+
+### 4. 识别本轮实际采用的记忆
+
+该步骤并非人工标注，而是基于回复结果反推：
+
+- `recall.infer_adopted_memories(final_text, recall_state)`
+- 对最终回复与 recall fragments 进行 embedding 相似度比较
+- 推断本轮回答中实际采用过的 memory
+
+### 5. 进行反馈学习
+
+`topic_graph.observe_feedback(...)` 会同步更新多类关系：
+
+- 当前 topic 下 memory 的 prior
+- topic 之间的 `recall / adopt / transition` 边
+- `memory_next` 序列连接
+- topic 内 Deep ARTMAP 的 bundle / memory 强化
+
+因此，记忆系统并非仅在写入阶段追加数据，还会根据“召回了什么”与“真正采用了什么”持续修正其内部路由关系。
+
+## 记忆召回链路
+
+### 1. Recall gating
+
+入口位于 `module/memory/recall.lua`。
+
+系统不会在每轮请求上无条件召回长期记忆，而是先计算 recall score。评分信号包括：
+
+- 是否出现“之前 / 上次 / 以前 / recall / remember”等显式回忆意图
 - 是否包含技术关键词
-- 输入长度是否足够
-- 是否出现“不要回忆 / 不查记忆”这样的抑制信号
-- 输入是否是“继续 / 刚才”这类上下文延续型请求
+- 输入长度是否达到阈值
+- 是否表现出焦虑或求助语气 embedding
+- 是否出现“不要回忆 / 不查记忆”等抑制信号
+- 对过短且不具备“继续 / 刚才”等延续意图的输入进行扣分
 
-只有分数过阈值，才会进入 `topic_graph.retrieve(...)`。
+只有当分数超过阈值后，系统才进入 `topic_graph.retrieve(...)`。
 
-这一步很关键，因为它让长期记忆从“常驻背景噪音”变成“按需激活的上下文部件”。
+### 2. 先检索 topic，而非直接检索全库 memory
 
-### 3. 记忆召回不是直接拿全文，而是先过 topic graph
+`topic_graph.retrieve(...)` 的第一阶段是选取 seed topic：
 
-长期记忆的核心不是简单向量 top-k，而是以 topic anchor 为中心的图式检索：
+- 使用 HNSW 在 topic centroid 上进行近邻搜索
+- 对当前 topic 施加额外加权
+- 沿 `topic_edges` 执行 bridge 扩展
+- 在受限的 load budget 内加载候选 topic
 
-- 先根据当前 query 和当前 topic 选出 seed topics
-- 再沿 topic 迁移边扩展候选 topic
-- 在候选 topic 下挑选记忆
-- 再把记忆展开回历史 turn
-- 最终生成 `selected_memories`、`selected_turns`、`fragments` 和 `memory_context`
+因此，召回的第一层单位是 topic，而不是裸 memory 向量。
 
-最终注入 prompt 的不是裸 memory 向量，而是类似“第 N 轮用户说了什么、助手答了什么”的可读片段。
+### 3. 在 topic 内选择 evidence memory
 
-也就是说，Mori 召回的是“与当前任务相关的对话证据”，而不是单纯的 embedding 命中结果。
+对于每个候选 topic，系统会进一步执行局部检索：
 
-### 4. 真正进入 prompt 的上下文块
+- 先通过 Deep ARTMAP 的 `collect_candidates(...)` 收集局部候选
+- 若候选 topic 即为当前 topic，还会叠加 `memory_next` 提供的单轮动量
+- 仅在局部候选不足时，才退回该 topic 下的全部 memory
 
-`context_builder` 会在每轮重新生成一份 system prompt。它拼接的不是固定模板，而是多个动态区块：
+候选 memory 会综合以下因素重新排序：
+
+- query 与 memory 的语义相似度
+- topic 内局部匹配分
+- facets 覆盖增益
+- cluster / bundle 多样性
+- 已选 memory 之间的相似度饱和惩罚
+
+因此，Mori 的 recall 机制本质上是“topic 路由 + topic 内证据选择”，而不是简单的向量 top-k。
+
+### 4. 召回结果会重新展开为历史证据
+
+命中 memory 后，系统会依据其关联的 `turns` 回到 `history`：
+
+- 选取最相关的 turn
+- 生成 `fragments`
+- 产出 `memory_context`
+
+注入 prompt 的内容形式如下：
 
 ```text
-Base System Prompt
-+ Project Knowledge
-+ [ActiveTask]
-+ [TaskContract]
-+ [WorkingMemory]
-+ [MemoryContext]
-+ [TaskContext]
-+ [RecentEpisodes]
-+ [ToolContext]
-+ [PlannerContext]
-+ Budget Warning
+【相关记忆】
+第12轮 用户：...
+助手：...
 ```
 
-这些区块分别回答不同问题：
+因此，大模型最终接收到的是可读的历史证据，而不是抽象 memory id 或单纯 embedding 命中项。
 
-- `ActiveTask / TaskContract`：当前到底在做什么
-- `WorkingMemory`：已经读了哪些文件、写了哪些文件、上一步计划是什么、最近一批工具做了什么
-- `MemoryContext`：从长期记忆里动态召回出来的相关历史片段
-- `RecentEpisodes`：过去几个 episode 的摘要，用于任务恢复和跨轮延续
-- `ToolContext`：本轮工具执行后沉淀出的高价值结果摘要
-- `PlannerContext`：上一轮工具失败、协议错误、修复提示等控制信息
+## 记忆如何进入上下文
 
-这里最重要的一点是：
+上下文组装由 `module/graph/context_builder.lua` 完成。
 
-**这些块不是常驻不变的，它们都是每轮根据 state 现算、现选、现拼。**
+system prompt 的主要组成块包括：
 
-### 5. 对话历史也不是全量保留（目前是全量保留了，复杂度控制住了）
+- Base System Prompt
+- Project Knowledge
+- ActiveTask / TaskContract
+- WorkingMemory
+- MemoryContext
+- TaskContext
+- RecentEpisodes
+- ToolContext
+- PlannerContext
 
-除了 system prompt，`context_builder` 还会处理历史对话：
+其中与记忆系统直接相关的部分主要有两类：
 
-- 只从最近的 user/assistant 对开始向前保留
-- 能放进预算就保留
-- 放不进时先尝试压缩
-- 压缩后还超预算就直接丢弃
+- `MemoryContext`：来自 recall 阶段展开的历史证据
+- `WorkingMemory`、`RecentEpisodes`、`ToolContext`：与 recall 共同参与最终上下文装配
 
-因此 Mori 的历史上下文是“预算感知的最近优先保留”，而不是无限增长的聊天记录回放。
+此外，`history` 虽在磁盘中完整保留，但进入 prompt 时并非完整回放，而是经过预算感知的裁剪：
 
-### 6. 工具结果会进入上下文，但不是原样堆积
+- 最近对话对优先保留
+- 支持 `full / slight / heavy / none` 多档压缩
+- 超出预算后优先丢弃更早的 pair
+- 工具结果还会经过 `context_manager` 的截断、去重与预算控制
 
-在工具循环里，`tool_exec_node` 会持续更新 working memory，并把工具结果交给 `context_manager` 处理：
+## 持久化状态
 
-- 大结果先截断
-- 重复内容做去重提示
-- 多条结果合并成受预算限制的 `tool_context`
-- 超大的 tool message 再次裁剪
+系统主要涉及以下存储对象：
 
-这意味着 workspace 证据也属于动态上下文的一部分，但它同样是“按预算筛选后的摘要”，而不是原始输出的无边界堆积。
+```text
+memory/history.txt
+memory/topic.bin
+memory/v4/topic_graph/state.lua
+memory/v4/topic_graph/vectors.bin
+memory/v4/topic_graph/hnsw/
+memory/episodes/items/*.lua
+memory/episodes/index.lua
+memory/v3/graph/checkpoints/*.bin
+```
 
-## 为什么说它不是传统的“记忆注入”
+需要区分“内存状态更新”与“实际刷盘”两个时机：
 
-很多记忆系统的做法是：
+- `topic.lua` 在每轮更新时直接保存 `memory/topic.bin`
+- `episode.store.save()` 在 `persist_node` 内完成当轮写盘
+- `history`、`topic_graph` 与 `graph checkpoint` 通过 `module/memory/saver.lua` 统一 flush
+- pipeline 正常退出时会调用 `saver.on_exit()`，并执行 `py_pipeline:pack_state()`
 
-- 先把长期记忆检索出来
-- 然后简单 prepend/append 到 prompt
-- 下一轮继续在上一轮 prompt 基础上叠加
+因此，并非所有记忆相关状态都会在 `persist_node` 中立即完成全量落盘。
 
-Mori 不是这样。
+## 其他模块概览
 
-Mori 的运行方式更像：
+### `graph`
 
-1. 持久化保存一组结构化状态
-2. 每轮先判断当前任务语义
-3. 再按需激活记忆、episode、workspace、working memory
-4. 在 token 预算内重新组装消息
-5. 本轮结束后再把新的事实和反馈写回状态
+- `module/graph/graph_runtime.lua` 负责整轮执行与节点跳转
+- `task_node` 负责将输入分类为 `same_task_step / same_task_refine / hard_shift / meta_turn`
+- `planner_node + tool_exec_node + repair_node` 负责工具循环
+- 每个节点结束后都会记录 checkpoint 与 trace，以支持恢复与调试
 
-所以它的关键不是“存了多少”，而是“每轮能不能只拿出当前真正需要的那部分”。
+### `episode`
 
-## 本轮结束后，系统会写回什么
+- 不承担长期事实存储
+- 更接近任务运行快照
+- 为后续任务连续性判断、carryover 与 recent episode summary 提供恢复材料
 
-为了让下一轮还能继续动态组装，这一轮结束后会把结果写回多个层级：
+### `frontend`
 
-- `history`：保存本轮 user / assistant 对话
-- `topic`：更新当前 turn 的 topic anchor 和摘要
-- `memory_core`：从本轮对话中抽取原子事实，写入长期记忆
-- `topic_graph.observe_feedback(...)`：根据本轮真正采用了哪些记忆，强化 topic 和 memory 之间的连接
-- `episode`：把这一轮整理成可恢复的任务连续性摘要
-- `session / working_memory`：保存当前计划、读写文件记录、最近工具摘要等工作状态
+- `module/frontend/` 提供轻量本地前端
+- 负责交互、消息展示与模型 worker 调用
+- 不属于记忆系统主体逻辑
 
-因此下一轮开始时，系统并不是“拿到上一轮完整 prompt”，而是拿到这些被拆开的状态，再重新选择、重新拼装。
+### `native/hnsw`
 
-## 这种设计带来的好处
+- 为 topic centroid 检索提供近邻搜索加速
+- 是 `topic_graph` 的性能支撑模块，而非业务主体
 
-- 不会让 prompt 随对话轮数线性膨胀
-- 能把“任务连续性”和“语义回忆”分开处理
-- 能把工具使用痕迹变成工作记忆，而不是散落在历史消息里
-- 能在恢复中断任务时重建上下文，而不是依赖完整原始对话
-- 能根据最终回答反向学习哪些记忆真的被采用过
+## 总结
 
-## 关键模块
+Mori 的记忆系统可以概括为以下四个步骤：
 
-- `module/graph/nodes/task_node.lua`：任务连续性判断
-- `module/graph/nodes/recall_node.lua`：回忆触发与召回入口
-- `module/memory/topic_graph.lua`：基于 topic 的记忆检索与反馈学习
-- `module/graph/context_builder.lua`：最终消息拼装
-- `module/graph/context_manager.lua`：上下文预算、截断、去重、压缩
-- `module/graph/nodes/tool_exec_node.lua`：工具执行后的工作记忆与上下文回写
-- `module/graph/nodes/persist_node.lua`：history / topic / memory / episode 的持久化
+1. 将对话拆分为 `history + topic + topic_graph + episode`
+2. 在 recall 阶段先定位 topic，再在 topic 内选择证据 memory
+3. 将命中的 memory 重新展开为历史片段并注入 prompt
+4. 在回合结束后回写原子事实、采用反馈与任务快照
 
-## 一句话总结
-
-Mori 的“记忆”不是一段被长期塞在 prompt 里的文本，而是一套在每一轮推理前，围绕当前任务实时重组上下文的动态系统。
+因此，Mori 的核心并不是将一段长期记忆固定塞入 prompt，而是围绕任务语义对上下文进行按需重组，并持续修正其内部记忆路由。
