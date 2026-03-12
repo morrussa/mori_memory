@@ -200,24 +200,6 @@ local function make_variant_pair(pair, variant, cfg)
             _variant = variant,
         }
     end
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-
-    if variant == "full" then
-        return {
-            turn = pair.turn,
-            user = user_text,
-            assistant = assistant_text,
-            _variant = variant,
-        }
-<<<<<<< ours
-<<<<<<< ours
-=======
 
     if variant == "full" then
         return {
@@ -231,37 +213,8 @@ local function make_variant_pair(pair, variant, cfg)
     local ratio = tonumber(cfg.history_compress_ratio_slight) or 0.65
     if variant == "heavy" then
         ratio = tonumber(cfg.history_compress_ratio_heavy) or 0.30
->>>>>>> theirs
     end
     ratio = math.max(0.05, math.min(0.95, ratio))
-
-<<<<<<< ours
-=======
-=======
-    end
-
-    local ratio = tonumber(cfg.history_compress_ratio_slight) or 0.65
-    if variant == "heavy" then
-        ratio = tonumber(cfg.history_compress_ratio_heavy) or 0.30
->>>>>>> theirs
-    end
-    ratio = math.max(0.05, math.min(0.95, ratio))
-
-<<<<<<< ours
->>>>>>> theirs
-    local ratio = tonumber(cfg.history_compress_ratio_slight) or 0.65
-    if variant == "heavy" then
-        ratio = tonumber(cfg.history_compress_ratio_heavy) or 0.30
-    end
-    ratio = math.max(0.05, math.min(0.95, ratio))
-
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
     local budget = math.max(40, math.floor(total_chars * ratio))
     local user_budget = math.max(20, math.floor(budget * 0.45))
     local assistant_budget = math.max(20, budget - user_budget)
@@ -271,13 +224,6 @@ local function make_variant_pair(pair, variant, cfg)
         user = compress_text(user_text, user_budget),
         assistant = compress_text(assistant_text, assistant_budget),
         _variant = variant,
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
-=======
-=======
->>>>>>> theirs
     }
 end
 
@@ -303,8 +249,6 @@ local function select_variant_that_fits(pair, variants, index_from_oldest, total
         { name = "slight", score = pair_weight(weights, "slight") * recency_factor },
         { name = "heavy", score = pair_weight(weights, "heavy") * recency_factor },
         { name = "none", score = pair_weight(weights, "none") },
-<<<<<<< ours
->>>>>>> theirs
     }
 
     table.sort(ranked, function(a, b)
@@ -332,119 +276,6 @@ local function select_variant_that_fits(pair, variants, index_from_oldest, total
     end
 
     return nil, "none", nil, nil
-end
-
-local function build_pair_variants(pair, cfg)
-    return {
-        full = make_variant_pair(pair, "full", cfg),
-        slight = make_variant_pair(pair, "slight", cfg),
-        heavy = make_variant_pair(pair, "heavy", cfg),
-        none = nil,
-=======
->>>>>>> theirs
-    }
-
-    table.sort(ranked, function(a, b)
-        if a.score == b.score then
-            local order = { full = 1, slight = 2, heavy = 3, none = 4 }
-            return (order[a.name] or 99) < (order[b.name] or 99)
-        end
-        return a.score > b.score
-    end)
-
-    for _, item in ipairs(ranked) do
-        if item.name == "none" then
-            return nil, "none", nil, nil
-        end
-        local selected_variant = variants[item.name]
-        if selected_variant ~= nil then
-            local candidate = { selected_variant }
-            for k = 1, #kept do
-                candidate[#candidate + 1] = kept[k]
-            end
-            local candidate_messages = build_messages(system_prompt, user_input, candidate)
-            local candidate_tokens = count_tokens(candidate_messages)
-            return selected_variant, item.name, candidate_messages, candidate_tokens
-        end
-    end
-
-    return nil, "none", nil, nil
-end
-
-local function select_variant_that_fits(pair, variants, index_from_oldest, total_pairs, cfg, system_prompt, user_input, kept)
-    local weights = cfg.history_variant_weights or {}
-    local decay = tonumber(cfg.history_recency_decay) or 0.90
-    decay = math.max(0.01, math.min(1.0, decay))
-
-    local recency_index = math.max(0, total_pairs - index_from_oldest)
-    local recency_factor = decay ^ recency_index
-
-    local ranked = {
-        { name = "full", score = pair_weight(weights, "full") * recency_factor },
-        { name = "slight", score = pair_weight(weights, "slight") * recency_factor },
-        { name = "heavy", score = pair_weight(weights, "heavy") * recency_factor },
-        { name = "none", score = pair_weight(weights, "none") },
->>>>>>> theirs
-    }
-
-    table.sort(ranked, function(a, b)
-        if a.score == b.score then
-            local order = { full = 1, slight = 2, heavy = 3, none = 4 }
-            return (order[a.name] or 99) < (order[b.name] or 99)
-        end
-        return a.score > b.score
-    end)
-
-    for _, item in ipairs(ranked) do
-        if item.name == "none" then
-            return nil, "none", nil, nil
-        end
-        local selected_variant = variants[item.name]
-        if selected_variant ~= nil then
-            local candidate = { selected_variant }
-            for k = 1, #kept do
-                candidate[#candidate + 1] = kept[k]
-            end
-            local candidate_messages = build_messages(system_prompt, user_input, candidate)
-            local candidate_tokens = count_tokens(candidate_messages)
-            return selected_variant, item.name, candidate_messages, candidate_tokens
-        end
-    end
-
-    return nil, "none", nil, nil
-end
-
-local function choose_variant_for_pair(pair, index_from_oldest, total_pairs, cfg)
-    local weights = cfg.history_variant_weights or {}
-    local decay = tonumber(cfg.history_recency_decay) or 0.90
-    decay = math.max(0.01, math.min(1.0, decay))
-
-    local recency_index = math.max(0, total_pairs - index_from_oldest)
-    local recency_factor = decay ^ recency_index
-
-    local ranked = {
-        { name = "full", score = pair_weight(weights, "full") * recency_factor },
-        { name = "slight", score = pair_weight(weights, "slight") * recency_factor },
-        { name = "heavy", score = pair_weight(weights, "heavy") * recency_factor },
-        { name = "none", score = pair_weight(weights, "none") },
-    }
-
-    table.sort(ranked, function(a, b)
-        if a.score == b.score then
-            local order = { full = 1, slight = 2, heavy = 3, none = 4 }
-            return (order[a.name] or 99) < (order[b.name] or 99)
-        end
-        return a.score > b.score
-    end)
-
-    for _, item in ipairs(ranked) do
-        local built = make_variant_pair(pair, item.name, cfg)
-        if built ~= nil then
-            return built, item.name
-        end
-    end
-
-    return nil, "none"
 end
 
 function M.build_chat_messages(state)
@@ -477,43 +308,8 @@ function M.build_chat_messages(state)
     local total_tokens = count_tokens(messages)
 
     for i = #pairs, 1, -1 do
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-        local candidate_pair = pairs[i]
-        local selected_variant, variant_name = choose_variant_for_pair(candidate_pair, i, #pairs, cfg)
-
-        if selected_variant ~= nil then
-            local candidate = { selected_variant }
-            for k = 1, #kept do
-                candidate[#candidate + 1] = kept[k]
-            end
-            local candidate_messages = build_messages(system_prompt, user_input, candidate)
-            local candidate_tokens = count_tokens(candidate_messages)
-
-            if candidate_tokens <= token_budget then
-                kept = candidate
-                messages = candidate_messages
-                total_tokens = candidate_tokens
-                variant_counts[variant_name] = (variant_counts[variant_name] or 0) + 1
-            else
-                dropped[#dropped + 1] = pairs[i]
-                variant_counts.none = (variant_counts.none or 0) + 1
-            end
-=======
         local selected_variant, variant_name, candidate_messages, candidate_tokens =
             select_variant_that_fits(pairs[i], pair_variants[i], i, #pairs, cfg, system_prompt, user_input, kept)
-
-=======
-        local selected_variant, variant_name, candidate_messages, candidate_tokens =
-            select_variant_that_fits(pairs[i], pair_variants[i], i, #pairs, cfg, system_prompt, user_input, kept)
-
->>>>>>> theirs
-=======
-        local selected_variant, variant_name, candidate_messages, candidate_tokens =
-            select_variant_that_fits(pairs[i], pair_variants[i], i, #pairs, cfg, system_prompt, user_input, kept)
-
->>>>>>> theirs
         if selected_variant ~= nil and candidate_messages and candidate_tokens and candidate_tokens <= token_budget then
             local next_kept = { selected_variant }
             for k = 1, #kept do
@@ -523,13 +319,6 @@ function M.build_chat_messages(state)
             messages = candidate_messages
             total_tokens = candidate_tokens
             variant_counts[variant_name] = (variant_counts[variant_name] or 0) + 1
-<<<<<<< ours
-<<<<<<< ours
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
         else
             dropped[#dropped + 1] = pairs[i]
             variant_counts.none = (variant_counts.none or 0) + 1
