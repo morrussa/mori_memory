@@ -463,6 +463,16 @@ local DEFAULT_SETTINGS = {
         min_topic_length =2,--防止话题被切的太碎
         summary_max_tokens = 192, -- topic 摘要生成的最大输出长度（默认加大，减少截断）。
         rebuild = true,--当异常退出时，如果rebuild为true，那么就找到文件一开始写的current_turn上一个topic的末尾，然后自己根据history.txt的输出自动重建整个topic。这个过程会阻塞主pipeline，因为如果不阻塞就不安全。
+        -- 话题摘要分级配置
+        summary_variant_weights = {
+            full = 1.00,
+            slight = 0.72,
+            heavy = 0.40,
+            none = 0.00,
+        },
+        -- 话题摘要压缩比例
+        summary_compress_ratio_slight = 0.65,
+        summary_compress_ratio_heavy = 0.30,
     },
     storage_v3 = {
         root = "memory/v3",

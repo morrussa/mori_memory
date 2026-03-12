@@ -23,16 +23,26 @@ local CHAIN_CENTROID_WEIGHT = tonumber(T_CONF.chain_centroid_weight) or 0.55
 local CHAIN_HIST_WEIGHT = tonumber(T_CONF.chain_hist_weight) or 0.45
 local CHAIN_DOMINANT_BONUS = tonumber(T_CONF.chain_dominant_bonus) or 0.05
 
+-- 话题摘要分级配置
+local SUMMARY_VARIANT_WEIGHTS = T_CONF.summary_variant_weights or {
+    full = 1.00,
+    slight = 0.72,
+    heavy = 0.40,
+    none = 0.00,
+}
+local SUMMARY_COMPRESS_RATIO_SLIGHT = tonumber(T_CONF.summary_compress_ratio_slight) or 0.65
+local SUMMARY_COMPRESS_RATIO_HEAVY = tonumber(T_CONF.summary_compress_ratio_heavy) or 0.30
+
 local DO_REBUILD = T_CONF.rebuild
 local IDX_FILE = "memory/topic.bin"
-local TOPIC_VERSION = 2
+local TOPIC_VERSION = 3  -- 版本升级，支持分级摘要
 local ACTIVE_HEAD_MASK = 1
 local ACTIVE_TAIL_MASK = 2
 local ACTIVE_LAST_MASK = 4
 
 -- ==================== 核心状态 ====================
 M.turn_vectors = {}       -- 缓存近期轮次的向量 (只保留必要的)
-M.topics = {}             -- 已完成的话题列表 {{start, end_, summary, centroid}, ...}
+M.topics = {}             -- 已完成的话题列表 {{start, end_, summary, centroid, summary_variants}, ...}
 M.dialogues = {}          -- turn -> {user=, ai=}
 
 -- 当前活跃话题状态
@@ -41,7 +51,10 @@ M.active_topic = {
     head_centroid = nil,  -- 头质心
     vectors = {},         -- 当前话题累积的向量 (用于最后生成 overall centroid)
     tail_window = {},     -- 尾部滑动窗口
-    last_vec = nil        -- [新增] 记录上一轮的向量，用于计算话语对相似度
+    last_vec = nil,       -- [新增] 记录上一轮的向量，用于计算话语对相似度
+    summary_cache = "",
+    summary_turn = 0,
+    summary_variants = { full = "", slight = "", heavy = "", none = "" }  -- 分级摘要缓存
 }
 
 M._last_processed_turn = 0
@@ -58,6 +71,91 @@ local function shallow_copy_array(src)
         out[i] = src[i]
     end
     return out
+end
+
+local function trim(text)
+    return tostring(text or ""):match("^%s*(.-)%s*$")
+end
+
+-- 压缩文本函数，类似于 context_builder.lua 中的实现
+local function compress_text(text, max_chars)
+    local raw = trim(text or "")
+    max_chars = math.max(0, math.floor(tonumber(max_chars) or 0))
+    if raw == "" or max_chars <= 0 then
+        return ""
+    end
+    -- 简单的截断，实际实现中可以使用更智能的压缩
+    if #raw <= max_chars then
+        return raw
+    end
+    -- 保留开头和结尾的部分
+    local prefix_len = math.floor(max_chars * 0.6)
+    local suffix_len = max_chars - prefix_len - 3  -- 减去 "..."
+    if suffix_len < 10 then
+        -- 如果后缀太短，只保留前缀
+        return raw:sub(1, max_chars - 3) .. "..."
+    end
+    return raw:sub(1, prefix_len) .. "..." .. raw:sub(-suffix_len)
+end
+
+-- 构建分级摘要
+local function build_topic_summary_variants(start_turn, end_turn)
+    start_turn = math.max(0, math.floor(tonumber(start_turn) or 0))
+    end_turn = math.max(0, math.floor(tonumber(end_turn) or 0))
+    if start_turn <= 0 or end_turn <= 0 or end_turn < start_turn then
+        return { full = "", slight = "", heavy = "", none = "" }
+    end
+
+    local dialog_texts = {}
+    for t = start_turn, math.min(start_turn + 4, end_turn) do
+        local d = M.dialogues[t]
+        local user_text = d and d.user or history_module.get_turn_text(t, "user")
+        local ai_text = d and d.ai or history_module.get_turn_text(t, "ai")
+        if user_text or ai_text then
+            dialog_texts[#dialog_texts + 1] = string.format(
+                "第%d轮\n用户：%s\n助手：%s",
+                t,
+                tostring(user_text or ""),
+                tostring(ai_text or "")
+            )
+        end
+    end
+    if #dialog_texts <= 0 then
+        return { full = "", slight = "", heavy = "", none = "" }
+    end
+
+    local prompt = "请用一句话概括话题：\n" .. table.concat(dialog_texts, "\n")
+    prompt = prompt .. "\n/no_think"
+    local messages = {{role="user", content=prompt}}
+    local ok, summary = pcall(function()
+        if not py_pipeline or not py_pipeline.generate_chat_sync then
+            return ""
+        end
+        return py_pipeline:generate_chat_sync(messages, {
+            max_tokens = SUMMARY_MAX_TOKENS,
+            temperature = 0.1,
+        }) or ""
+    end)
+    if not ok then
+        print("[Topic][WARN] 按需生成摘要失败: " .. tostring(summary))
+        return { full = "", slight = "", heavy = "", none = "" }
+    end
+    
+    local full_summary = trim(tool.remove_cot(summary))
+    if full_summary == "" then
+        return { full = "", slight = "", heavy = "", none = "" }
+    end
+    
+    -- 生成分级摘要
+    local slight_summary = compress_text(full_summary, math.floor(#full_summary * SUMMARY_COMPRESS_RATIO_SLIGHT))
+    local heavy_summary = compress_text(full_summary, math.floor(#full_summary * SUMMARY_COMPRESS_RATIO_HEAVY))
+    
+    return {
+        full = full_summary,
+        slight = slight_summary,
+        heavy = heavy_summary,
+        none = ""
+    }
 end
 
 local function stable_topic_key_from_record(rec)
@@ -208,7 +306,7 @@ local function save_to_disk()
 
         -- 2. Records
         for _, t in ipairs(M.topics) do
-            local bin = tool.create_topic_record(t.start, t.end_, t.summary or "", t.centroid)
+            local bin = tool.create_topic_record(t.start, t.end_, t.summary or "", t.centroid, t.summary_variants)
             local wb_ok, wb_err = write_or_fail(bin)
             if not wb_ok then return false, wb_err end
         end
@@ -280,10 +378,20 @@ local function load_from_disk()
         M.active_topic.head_centroid = head_vec
         M.active_topic.tail_window = tail_vec and {tail_vec} or {}
         M.active_topic.last_vec = last_vec
+        M.active_topic.summary_cache = ""
+        M.active_topic.summary_turn = 0
         
         print(string.format("[Topic] 恢复活跃话题: %d - ?, LastVec=%s", active_start, last_vec and "Yes" or "No"))
     else
-        M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
+        M.active_topic = {
+            start = nil,
+            head_centroid = nil,
+            vectors = {},
+            tail_window = {},
+            last_vec = nil,
+            summary_cache = "",
+            summary_turn = 0,
+        }
     end
     
     -- 清空旧 topics
@@ -318,7 +426,14 @@ local function rebuild_active_topic(current_turn, forced_start_turn)
     end
     
     -- 2. 重新嵌入并计算
-    M.active_topic = { start = start_turn, vectors = {}, tail_window = {}, last_vec = nil }
+    M.active_topic = {
+        start = start_turn,
+        vectors = {},
+        tail_window = {},
+        last_vec = nil,
+        summary_cache = "",
+        summary_turn = 0,
+    }
     
     print(string.format("[Topic] 正在从 history.txt 重建 Turn %d -> %d 的向量...", start_turn, current_turn))
     
@@ -398,41 +513,165 @@ end
 
 -- ==================== 核心逻辑 ====================
 
+local function invalidate_active_topic_summary()
+    M.active_topic.summary_cache = ""
+    M.active_topic.summary_turn = 0
+end
+
+local function build_topic_summary(start_turn, end_turn)
+    start_turn = math.max(0, math.floor(tonumber(start_turn) or 0))
+    end_turn = math.max(0, math.floor(tonumber(end_turn) or 0))
+    if start_turn <= 0 or end_turn <= 0 or end_turn < start_turn then
+        return ""
+    end
+
+    local dialog_texts = {}
+    for t = start_turn, math.min(start_turn + 4, end_turn) do
+        local d = M.dialogues[t]
+        local user_text = d and d.user or history_module.get_turn_text(t, "user")
+        local ai_text = d and d.ai or history_module.get_turn_text(t, "ai")
+        if user_text or ai_text then
+            dialog_texts[#dialog_texts + 1] = string.format(
+                "第%d轮\n用户：%s\n助手：%s",
+                t,
+                tostring(user_text or ""),
+                tostring(ai_text or "")
+            )
+        end
+    end
+    if #dialog_texts <= 0 then
+        return ""
+    end
+
+    local prompt = "请用一句话概括话题：\n" .. table.concat(dialog_texts, "\n")
+    prompt = prompt .. "\n/no_think"
+    local messages = {{role="user", content=prompt}}
+    local ok, summary = pcall(function()
+        if not py_pipeline or not py_pipeline.generate_chat_sync then
+            return ""
+        end
+        return py_pipeline:generate_chat_sync(messages, {
+            max_tokens = SUMMARY_MAX_TOKENS,
+            temperature = 0.1,
+        }) or ""
+    end)
+    if not ok then
+        print("[Topic][WARN] 按需生成摘要失败: " .. tostring(summary))
+        return ""
+    end
+    return trim(tool.remove_cot(summary))
+end
+
+local function ensure_topic_summary(rec, variant)
+    if type(rec) ~= "table" then
+        return ""
+    end
+    
+    variant = variant or "full"
+    if variant ~= "full" and variant ~= "slight" and variant ~= "heavy" and variant ~= "none" then
+        variant = "full"
+    end
+
+    if rec.is_active == true then
+        local current_turn = math.max(0, tonumber(M._last_processed_turn) or 0)
+        
+        -- 检查缓存
+        if variant == "full" then
+            if trim(M.active_topic.summary_cache) ~= "" and tonumber(M.active_topic.summary_turn) == current_turn then
+                return trim(M.active_topic.summary_cache)
+            end
+        else
+            local cached_variant = trim(M.active_topic.summary_variants[variant] or "")
+            if cached_variant ~= "" and tonumber(M.active_topic.summary_turn) == current_turn then
+                return cached_variant
+            end
+        end
+        
+        -- 生成分级摘要
+        local variants = build_topic_summary_variants(rec.start, current_turn)
+        
+        -- 更新缓存
+        M.active_topic.summary_cache = variants.full
+        M.active_topic.summary_variants = variants
+        M.active_topic.summary_turn = current_turn
+        
+        return trim(variants[variant] or "")
+    end
+
+    -- 对于已完成的话题
+    local topic = nil
+    if rec.topic_idx and M.topics[tonumber(rec.topic_idx)] then
+        topic = M.topics[tonumber(rec.topic_idx)]
+    else
+        -- 查找对应的话题记录
+        for _, t in ipairs(M.topics) do
+            if tonumber(t.start) == tonumber(rec.start) then
+                topic = t
+                break
+            end
+        end
+    end
+    
+    if not topic then
+        return ""
+    end
+    
+    -- 确保有summary_variants字段
+    topic.summary_variants = topic.summary_variants or { full = "", slight = "", heavy = "", none = "" }
+    
+    -- 检查是否已经有该变体的摘要
+    local cached_variant = trim(topic.summary_variants[variant] or "")
+    if cached_variant ~= "" then
+        return cached_variant
+    end
+    
+    -- 如果没有full摘要，先生成full摘要
+    if trim(topic.summary_variants.full or "") == "" then
+        local variants = build_topic_summary_variants(rec.start, rec.end_)
+        topic.summary_variants = variants
+        topic.summary = variants.full  -- 保持向后兼容
+        
+        -- 保存到磁盘
+        local ok, err = save_to_disk()
+        if not ok then
+            print("[Topic][WARN] 摘要回写失败: " .. tostring(err))
+        end
+    end
+    
+    return trim(topic.summary_variants[variant] or "")
+end
+
 local function close_current_topic(end_turn)
     if not M.active_topic.start then return end
-    
+
     -- 生成整体质心
     local overall_centroid = tool.average_vectors(M.active_topic.vectors)
     
-    -- 获取摘要
-    local key = M.active_topic.start .. "-" .. end_turn
-    local summary = ""
-    
-    local dialog_texts = {}
-    for t = M.active_topic.start, math.min(M.active_topic.start + 4, end_turn) do
-         local d = M.dialogues[t]
-         if d then table.insert(dialog_texts, string.format("第%d轮\n用户：%s\n助手：%s", t, d.user or "", d.ai or "")) end
-    end
-    if #dialog_texts > 0 then
-        local prompt = "请用一句话概括话题：\n" .. table.concat(dialog_texts, "\n")
-        -- /no_think 为 Qwen 家族特有控制符，直接硬编码
-        prompt = prompt .. "\n/no_think"
-        local messages = {{role="user", content=prompt}}
-        summary = py_pipeline:generate_chat_sync(messages, {max_tokens=SUMMARY_MAX_TOKENS, temperature=0.1}) or ""
-        summary = tool.remove_cot(summary):match("^%s*(.-)%s*$")
-    end
+    -- 保存已经生成的摘要（如果有的话）
+    local summary = trim(M.active_topic.summary_cache or "")
+    local summary_variants = M.active_topic.summary_variants or { full = "", slight = "", heavy = "", none = "" }
 
     table.insert(M.topics, {
         start = M.active_topic.start,
         end_ = end_turn,
         summary = summary,
-        centroid = overall_centroid
+        centroid = overall_centroid,
+        summary_variants = summary_variants
     })
-    
-    print(string.format("[Topic] 话题结束: %d-%d. 摘要: %s", M.active_topic.start, end_turn, summary))
-    
+
+    print(string.format("[Topic] 话题结束: %d-%d. 摘要已保存（如果已生成）", M.active_topic.start, end_turn))
+
     -- 重置状态
-    M.active_topic = { start = nil, head_centroid = nil, vectors = {}, tail_window = {}, last_vec = nil }
+    M.active_topic = {
+        start = nil,
+        head_centroid = nil,
+        vectors = {},
+        tail_window = {},
+        last_vec = nil,
+        summary_cache = "",
+        summary_turn = 0,
+        summary_variants = { full = "", slight = "", heavy = "", none = "" }
+    }
     local ok, err = save_to_disk()
     if not ok then
         print("[Topic][ERROR] 保存失败: " .. tostring(err))
@@ -445,6 +684,7 @@ function M.add_turn(turn, user_text, vector)
     M.dialogues[turn] = M.dialogues[turn] or {}
     M.dialogues[turn].user = user_text
     M._last_processed_turn = turn
+    invalidate_active_topic_summary()
     
     -- 2. 初始化或延续话题
     if not M.active_topic.start then
@@ -453,7 +693,9 @@ function M.add_turn(turn, user_text, vector)
         M.active_topic.vectors = {vector}
         M.active_topic.tail_window = {vector}
         M.active_topic.last_vec = vector
-        M.active_topic.head_centroid = nil 
+        M.active_topic.head_centroid = nil
+        M.active_topic.summary_cache = ""
+        M.active_topic.summary_turn = 0
         print("[Topic] 开启新话题: 第" .. turn .. "轮")
     else
         -- ========== 核心优化：基于论文的话语对建模 ==========
@@ -538,6 +780,8 @@ function M.add_turn(turn, user_text, vector)
                 M.active_topic.tail_window = {vector}
                 M.active_topic.last_vec = vector
                 M.active_topic.head_centroid = nil
+                M.active_topic.summary_cache = ""
+                M.active_topic.summary_turn = 0
             end
         end
         
@@ -555,13 +799,43 @@ end
 
 function M.update_assistant(turn, text)
     if M.dialogues[turn] then M.dialogues[turn].ai = text end
+    if M.active_topic.start and tonumber(turn) and tonumber(turn) >= tonumber(M.active_topic.start) then
+        invalidate_active_topic_summary()
+    end
 end
 
 function M.get_summary(turn)
     local t = turn or M._last_processed_turn
+    if M.active_topic.start and t >= M.active_topic.start then
+        return ensure_topic_summary({
+            start = M.active_topic.start,
+            is_active = true,
+        })
+    end
     for _, topic in ipairs(M.topics) do
         if topic.start <= t and t <= (topic.end_ or 999999) then
-            return topic.summary or ""
+            return ensure_topic_summary(topic)
+        end
+    end
+    return ""
+end
+
+function M.get_summary_variant(turn, variant)
+    local t = turn or M._last_processed_turn
+    variant = variant or "full"
+    if variant ~= "full" and variant ~= "slight" and variant ~= "heavy" and variant ~= "none" then
+        variant = "full"
+    end
+    
+    if M.active_topic.start and t >= M.active_topic.start then
+        return ensure_topic_summary({
+            start = M.active_topic.start,
+            is_active = true,
+        }, variant)
+    end
+    for _, topic in ipairs(M.topics) do
+        if topic.start <= t and t <= (topic.end_ or 999999) then
+            return ensure_topic_summary(topic, variant)
         end
     end
     return ""
@@ -719,6 +993,8 @@ function M.get_topic_fingerprint(topic_key)
         }
     end
 
+    local summary = ensure_topic_summary(rec)
+
     return {
         key = stable_key,
         memory_count = memory_count,
@@ -728,7 +1004,7 @@ function M.get_topic_fingerprint(topic_key)
         histogram = histogram,
         weights = weights,
         centroid = rec and rec.centroid or nil,
-        summary = rec and tostring(rec.summary or "") or "",
+        summary = summary,
         start = rec and rec.start or nil,
         topic_idx = rec and rec.topic_idx or nil,
         is_active = rec and (rec.is_active == true) or false,

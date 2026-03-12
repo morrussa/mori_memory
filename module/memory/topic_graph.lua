@@ -1634,6 +1634,108 @@ local function ranked_memories_from_evidence(selected_topics, evidence_rows)
     return ranked
 end
 
+local function representative_turn_rows(rows, cap)
+    cap = math.max(1, math.floor(tonumber(cap) or 2))
+    local ranked = {}
+    local seen_turns = {}
+    for _, item in ipairs(rows or {}) do
+        local mem = M.state.memories[tonumber((item or {}).mem_idx)]
+        local best_turn = 0
+        for _, turn in ipairs((mem or {}).turns or {}) do
+            local t = tonumber(turn) or 0
+            if t > best_turn then
+                best_turn = t
+            end
+        end
+        if best_turn > 0 and not seen_turns[best_turn] then
+            seen_turns[best_turn] = true
+            ranked[#ranked + 1] = {
+                turn = best_turn,
+                score = tonumber((item or {}).score) or 0.0,
+                mem_idx = tonumber((item or {}).mem_idx) or 0,
+            }
+        end
+    end
+    table.sort(ranked, function(a, b)
+        if (a.score or 0.0) ~= (b.score or 0.0) then
+            return (a.score or 0.0) > (b.score or 0.0)
+        end
+        return (a.turn or 0) > (b.turn or 0)
+    end)
+    while #ranked > cap do
+        table.remove(ranked)
+    end
+    return ranked
+end
+
+local function topic_summary_fallback(rows)
+    local turn_rows = representative_turn_rows(rows, 2)
+    if #turn_rows <= 0 then
+        return ""
+    end
+
+    local parts = {}
+    for _, row in ipairs(turn_rows) do
+        local entry = history.get_by_turn(row.turn)
+        if entry then
+            local user_text, ai_text = history.parse_entry(entry)
+            local user_compact = util.utf8_take(trim(user_text), 80)
+            local ai_compact = util.utf8_take(trim(ai_text), 100)
+            if user_compact ~= "" and ai_compact ~= "" then
+                parts[#parts + 1] = string.format(
+                    "第%d轮：用户提到%s；助手回应%s",
+                    row.turn,
+                    user_compact,
+                    ai_compact
+                )
+            elseif user_compact ~= "" then
+                parts[#parts + 1] = string.format("第%d轮：用户提到%s", row.turn, user_compact)
+            elseif ai_compact ~= "" then
+                parts[#parts + 1] = string.format("第%d轮：助手回应%s", row.turn, ai_compact)
+            end
+        end
+    end
+
+    if #parts <= 0 then
+        return ""
+    end
+    return "当前活跃 topic 尚未生成闭环摘要。代表片段：" .. table.concat(parts, "；")
+end
+
+local function topic_context_from_selection(selected_topics, evidence_rows)
+    local context_lines = {}
+    for i, anchor in ipairs(selected_topics or {}) do
+        anchor = trim(anchor)
+        if anchor ~= "" then
+            local fp = topic.get_topic_fingerprint and topic.get_topic_fingerprint(anchor) or {}
+            local summary = trim((fp or {}).summary)
+            if summary == "" then
+                summary = topic_summary_fallback((evidence_rows or {})[anchor] or {})
+            end
+            if summary ~= "" then
+                local label = (((fp or {}).is_active) == true) and "当前主题" or "相关主题"
+                local extra = {}
+                if tonumber((fp or {}).start) then
+                    extra[#extra + 1] = string.format("起始轮次=%d", tonumber(fp.start) or 0)
+                end
+                if tonumber((fp or {}).memory_count) and tonumber(fp.memory_count) > 0 then
+                    extra[#extra + 1] = string.format("memory=%d", tonumber(fp.memory_count) or 0)
+                end
+                local head = string.format("%s%d", label, i)
+                if #extra > 0 then
+                    head = head .. "（" .. table.concat(extra, "，") .. "）"
+                end
+                context_lines[#context_lines + 1] = head .. "\n概况：" .. summary
+            end
+        end
+    end
+
+    if #context_lines <= 0 then
+        return ""
+    end
+    return "【相关主题】\n" .. table.concat(context_lines, "\n\n")
+end
+
 local function turns_from_memories(ranked_memories)
     local limit = math.max(1, tonumber(tg_cfg().retrieve_max_turns) or tonumber(ai_cfg().max_turns) or 10)
     local turn_best = {}
@@ -2008,7 +2110,11 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
     end
     selected_memories = unique_sorted_numbers(selected_memories)
 
-    local selected_turns, fragments, context = turns_from_memories(ranked_memories)
+    local selected_turns, fragments, memory_fallback_context = turns_from_memories(ranked_memories)
+    local context = topic_context_from_selection(selected_topics, evidence_rows)
+    if context == "" then
+        context = memory_fallback_context
+    end
     return {
         context = context,
         topic_anchor = current_anchor,

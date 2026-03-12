@@ -189,23 +189,99 @@ ingest_node
 
 因此，Mori 的 recall 机制本质上是“topic 路由 + topic 内证据选择”，而不是简单的向量 top-k。
 
-### 4. 召回结果会重新展开为历史证据
+#### Deep ARTMAP 在 topic 内是如何工作的
 
-命中 memory 后，系统会依据其关联的 `turns` 回到 `history`：
+这里的 Deep ARTMAP 不是教科书版监督式 ARTMAP，而是一个面向长期记忆检索的“两层局部路由器”：
 
-- 选取最相关的 turn
-- 生成 `fragments`
-- 产出 `memory_context`
+- 第一层是 `category`：把 topic 内相似 memory 做在线聚类
+- 第二层是 `bundle`：把多个 category 再聚成更高一层的局部语义簇
+- `bundle` 还会维护 `recall_prior / adopt_prior` 与邻接边，用于后续查询时做强化路由
 
-注入 prompt 的内容形式如下：
+因此，它的检索路径并不是“query 直接和每条 memory 比较”，而是：
 
 ```text
-【相关记忆】
-第12轮 用户：...
-助手：...
+query -> bundle -> category -> exemplar memories -> context rerank
 ```
 
-因此，大模型最终接收到的是可读的历史证据，而不是抽象 memory id 或单纯 embedding 命中项。
+可以把它理解为“先找 topic 内的大方向，再找局部小簇，再从小簇里挑代表性 memory”。
+
+#### Deep ARTMAP 的写入过程
+
+每当一条 memory 被挂到某个 topic 下时，局部状态会同步更新：
+
+1. 先将 memory 向量归一化，并与当前 topic 内已有 `category` 做相似度比较
+2. 若最佳相似度低于 `category_vigilance`，则新建 category；否则用 `category_beta` 更新该 category 的 centroid
+3. 将该 memory 记为 category member，并维护一组 exemplar memories
+4. 再把这个 category 分配到最相近的 `bundle`
+5. 若 category 与现有 bundle 的相似度低于 `bundle_vigilance`，则新建 bundle；否则用 `bundle_beta` 更新 bundle centroid
+6. 若连续几轮命中了不同 bundle，且 turn 间隔仍在窗口内，则自动为这两个 bundle 建立邻接边
+
+这使得 topic 内部会逐步长出一个“category 小簇 + bundle 大簇”的局部结构，而不是只保留一堆离散 memory。
+
+#### Deep ARTMAP 的查询过程
+
+当 query 命中某个候选 topic 后，Deep ARTMAP 会在这个 topic 内按以下顺序工作：
+
+1. 先给每个 bundle 打分：`query 与 bundle centroid 的相似度 + learned prior`
+2. 若最佳 bundle 分数都低于门槛，则退回较朴素的 category 路径
+3. 选择最强的若干 bundle；如果 bundle 之间已有强邻接边，还会顺着邻接边扩展少量上下文 bundle
+4. 在选中的 bundle 内部分别挑出最相关的 category，并按 bundle 做预算分配，避免全部候选都挤在一个 bundle 里
+5. 从每个 category 的 exemplar memories 中抽取候选 memory
+6. 最后再对候选 memory 做一次上下文重排
+
+最后这一步的排序不只看语义相似度，还会混合：
+
+- query 与 memory 的语义相似度
+- category / bundle 提供的局部分数
+- facets 覆盖增益
+- bundle 多样性奖励
+- 与已选 memory 过于相似时的饱和惩罚
+
+所以它更像是“局部路由 + 多样化证据选择”，而不是单纯的 ANN top-k。
+
+#### Deep ARTMAP 的反馈学习
+
+Deep ARTMAP 不只是建索引，还会根据真实使用结果继续学习：
+
+- 某个 bundle 在本轮被成功召回，会提高其 `recall_prior`
+- 某个 bundle 的内容最终真的被回答采用，会提高其 `adopt_prior`
+- 同一轮共同激活的 bundle，会进一步加强彼此的邻接边
+- 若某条 memory 被召回或被采用，也会通过 `memory -> category -> bundle` 的映射把反馈传回 bundle
+- 随着 turn 推进，prior 与 bundle 边会按衰减系数逐步下降，避免旧热点永久占优
+
+因此，Deep ARTMAP 的作用不只是“把 memory 分组”，而是持续学习：
+
+- topic 内哪些局部簇最容易被问到
+- 哪些局部簇虽然经常被召回，但不一定真的会被回答采用
+- 哪些 bundle 之间存在稳定的共现或时序关系
+
+### 4. 进入 prompt 的基本单位是 topic，而不是 memory
+
+当前实现里，memory 仍然是 topic 内部检索、排序与反馈学习的细粒度证据，但真正注入 prompt 的基本单位已经改为 topic：
+
+- 系统先选出候选 topic
+- 再在 topic 内用 Deep ARTMAP 找到支撑该 topic 的 evidence memories
+- 最后优先把 topic 的 `summary` 作为上下文块注入 prompt
+- 只有当某个 topic 还没有形成闭环摘要时，才回退到少量代表性 turn 作为临时概况
+
+其中，topic 的压缩摘要现在采用懒构建：
+
+- 话题闭合时先只记录 topic 边界与 centroid
+- 只有当 recall / fingerprint / context 注入真正需要该 topic 概况时，才按需生成摘要
+- 历史 topic 的摘要生成后会回写缓存；活跃 topic 则按当前 turn 做短期缓存
+
+注入 prompt 的内容形式更接近：
+
+```text
+【相关主题】
+相关主题1（起始轮次=12，memory=8）
+概况：...
+
+相关主题2（起始轮次=31，memory=5）
+概况：...
+```
+
+因此，Mori 的 recall 虽然底层仍依赖 memory 做精细匹配，但进入上下文时采用的是“topic 概况块”，而不是把若干离散 memory / turn 直接平铺进 prompt。
 
 ## 记忆如何进入上下文
 

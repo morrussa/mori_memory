@@ -925,21 +925,41 @@ function M.parse_cluster_record(data, offset)
     }, record_len
 end
 
--- ==================== Topic 记录构造/解析 (新增 Centroid 字段) ====================
+-- ==================== Topic 记录构造/解析 (支持分级摘要) ====================
 
-function M.create_topic_record(start, end_, summary, centroid)
+function M.create_topic_record(start, end_, summary, centroid, summary_variants)
     summary = summary or ""
     local summary_bytes = tostring(summary)
     local summary_len = #summary_bytes
     local end_val = end_ or 0xFFFFFFFF
+    
+    -- 处理分级摘要
+    local variants = summary_variants or {}
+    local full_summary = variants.full or ""
+    local slight_summary = variants.slight or ""
+    local heavy_summary = variants.heavy or ""
+    local none_summary = variants.none or ""
+    
+    local full_bytes = tostring(full_summary)
+    local slight_bytes = tostring(slight_summary)
+    local heavy_bytes = tostring(heavy_summary)
+    local none_bytes = tostring(none_summary)
+    
+    local full_len = #full_bytes
+    local slight_len = #slight_bytes
+    local heavy_len = #heavy_bytes
+    local none_len = #none_bytes
     
     local vec_bin = ""
     if centroid then
         vec_bin = M.vector_to_bin(centroid)
     end
     
-    -- record_size = size(4) + start(4) + end(4) + sum_len(2) + summary + vec_bin
-    local record_size = 4 + 4 + 4 + 2 + summary_len + #vec_bin
+    -- record_size = size(4) + start(4) + end(4) + sum_len(2) + summary + 
+    --               full_len(2) + full + slight_len(2) + slight + heavy_len(2) + heavy + none_len(2) + none + vec_bin
+    local record_size = 4 + 4 + 4 + 2 + summary_len + 
+                        2 + full_len + 2 + slight_len + 2 + heavy_len + 2 + none_len + 
+                        #vec_bin
 
     local buf = ffi.new("uint8_t[?]", record_size)
     local offset = 0
@@ -952,6 +972,31 @@ function M.create_topic_record(start, end_, summary, centroid)
     if summary_len > 0 then
         ffi.copy(buf + offset, summary_bytes, summary_len)
         offset = offset + summary_len
+    end
+    
+    -- 写入分级摘要
+    ffi.cast("uint16_t*", buf + offset)[0] = full_len; offset = offset + 2
+    if full_len > 0 then
+        ffi.copy(buf + offset, full_bytes, full_len)
+        offset = offset + full_len
+    end
+    
+    ffi.cast("uint16_t*", buf + offset)[0] = slight_len; offset = offset + 2
+    if slight_len > 0 then
+        ffi.copy(buf + offset, slight_bytes, slight_len)
+        offset = offset + slight_len
+    end
+    
+    ffi.cast("uint16_t*", buf + offset)[0] = heavy_len; offset = offset + 2
+    if heavy_len > 0 then
+        ffi.copy(buf + offset, heavy_bytes, heavy_len)
+        offset = offset + heavy_len
+    end
+    
+    ffi.cast("uint16_t*", buf + offset)[0] = none_len; offset = offset + 2
+    if none_len > 0 then
+        ffi.copy(buf + offset, none_bytes, none_len)
+        offset = offset + none_len
     end
     
     if #vec_bin > 0 then
@@ -976,6 +1021,41 @@ function M.parse_topic_record(data, offset)
     local summary = summary_len > 0 and ffi.string(p + base, summary_len) or ""
     base = base + summary_len
     
+    -- 解析分级摘要
+    local full_summary, slight_summary, heavy_summary, none_summary = "", "", "", ""
+    
+    if base + 2 <= record_len then
+        local full_len = ffi.cast("const uint16_t*", p + base)[0]; base = base + 2
+        if full_len > 0 and base + full_len <= record_len then
+            full_summary = ffi.string(p + base, full_len)
+            base = base + full_len
+        end
+    end
+    
+    if base + 2 <= record_len then
+        local slight_len = ffi.cast("const uint16_t*", p + base)[0]; base = base + 2
+        if slight_len > 0 and base + slight_len <= record_len then
+            slight_summary = ffi.string(p + base, slight_len)
+            base = base + slight_len
+        end
+    end
+    
+    if base + 2 <= record_len then
+        local heavy_len = ffi.cast("const uint16_t*", p + base)[0]; base = base + 2
+        if heavy_len > 0 and base + heavy_len <= record_len then
+            heavy_summary = ffi.string(p + base, heavy_len)
+            base = base + heavy_len
+        end
+    end
+    
+    if base + 2 <= record_len then
+        local none_len = ffi.cast("const uint16_t*", p + base)[0]; base = base + 2
+        if none_len > 0 and base + none_len <= record_len then
+            none_summary = ffi.string(p + base, none_len)
+            base = base + none_len
+        end
+    end
+    
     -- 解析剩余部分为向量
     local centroid = nil
     if base < record_len then
@@ -984,7 +1064,18 @@ function M.parse_topic_record(data, offset)
 
     local end_ = (end_val == 0xFFFFFFFF) and nil or end_val
 
-    return { start = start, end_ = end_, summary = summary, centroid = centroid }, record_len
+    return { 
+        start = start, 
+        end_ = end_, 
+        summary = summary, 
+        centroid = centroid,
+        summary_variants = {
+            full = full_summary,
+            slight = slight_summary,
+            heavy = heavy_summary,
+            none = none_summary
+        }
+    }, record_len
 end
 
 return M
