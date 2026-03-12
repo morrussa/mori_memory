@@ -192,6 +192,8 @@ function M.check_and_retrieve(user_input, user_vec, _opts)
     result.selected_memories = shallow_copy_array(result.selected_memories or {})
     result.fragments = result.fragments or {}
     result.adopted_memories = shallow_copy_array(result.adopted_memories or {})
+    result.local_signals = result.local_signals or {}
+    result.topic_debug = result.topic_debug or {}
     result.context = tostring(result.context or "")
     return result
 end

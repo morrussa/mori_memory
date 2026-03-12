@@ -151,6 +151,232 @@ local function unique_sorted_numbers(items)
     return out
 end
 
+local FACET_PUNCT = {
+    [" "] = true, ["\t"] = true, ["\r"] = true, ["\n"] = true,
+    [","] = true, ["."] = true, ["!"] = true, ["?"] = true, [":"] = true, [";"] = true,
+    ["("] = true, [")"] = true, ["["] = true, ["]"] = true, ["{"] = true, ["}"] = true,
+    ["-"] = true, ["_"] = true, ["/"] = true, ["\\"] = true, ["'"] = true, ['"'] = true,
+    ["`"] = true, ["~"] = true, ["@"] = true, ["#"] = true, ["$"] = true, ["%"] = true,
+    ["^"] = true, ["&"] = true, ["*"] = true, ["+"] = true, ["="] = true, ["<"] = true,
+    [">"] = true, ["|"] = true,
+    ["，"] = true, ["。"] = true, ["！"] = true, ["？"] = true, ["："] = true, ["；"] = true,
+    ["（"] = true, ["）"] = true, ["【"] = true, ["】"] = true, ["《"] = true, ["》"] = true,
+    ["“"] = true, ["”"] = true, ["‘"] = true, ["’"] = true, ["、"] = true, ["…"] = true,
+}
+
+local function utf8_chars(text)
+    local out = {}
+    for ch in tostring(text or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        out[#out + 1] = ch
+    end
+    return out
+end
+
+local function add_token_weight(map, token, weight)
+    token = trim(token):lower()
+    weight = tonumber(weight) or 0.0
+    if token == "" or weight <= 0.0 then
+        return
+    end
+    map[token] = (tonumber(map[token]) or 0.0) + weight
+end
+
+local function flush_ascii_token(buf, weights)
+    local token = table.concat(buf or "")
+    if #token >= 2 then
+        add_token_weight(weights, token, 1.0 + math.min(0.6, (#token - 2) * 0.08))
+    end
+    for i = #buf, 1, -1 do
+        buf[i] = nil
+    end
+end
+
+local function flush_cjk_run(run, weights)
+    local n = #(run or {})
+    if n <= 0 then
+        return
+    end
+    if n == 1 then
+        add_token_weight(weights, run[1], 0.45)
+    else
+        for i = 1, n - 1 do
+            add_token_weight(weights, (run[i] or "") .. (run[i + 1] or ""), 1.0)
+        end
+        for i = 1, n - 2 do
+            add_token_weight(weights, (run[i] or "") .. (run[i + 1] or "") .. (run[i + 2] or ""), 0.45)
+        end
+    end
+    for i = n, 1, -1 do
+        run[i] = nil
+    end
+end
+
+local function extract_text_facet_weights(text)
+    local weights = {}
+    local ascii_buf = {}
+    local cjk_run = {}
+    for _, ch in ipairs(utf8_chars(text)) do
+        local byte = string.byte(ch)
+        if byte and byte < 128 then
+            if ch:match("[%w]") then
+                flush_cjk_run(cjk_run, weights)
+                ascii_buf[#ascii_buf + 1] = ch:lower()
+            else
+                flush_ascii_token(ascii_buf, weights)
+                flush_cjk_run(cjk_run, weights)
+            end
+        else
+            flush_ascii_token(ascii_buf, weights)
+            if FACET_PUNCT[ch] then
+                flush_cjk_run(cjk_run, weights)
+            else
+                cjk_run[#cjk_run + 1] = ch
+            end
+        end
+    end
+    flush_ascii_token(ascii_buf, weights)
+    flush_cjk_run(cjk_run, weights)
+    return weights
+end
+
+local function facet_slot_cap()
+    return math.max(1, math.floor(tonumber(tg_cfg().facet_slots) or 6))
+end
+
+local function normalize_facet_rows(raw_rows, cap)
+    cap = math.max(1, math.floor(tonumber(cap) or facet_slot_cap()))
+    local rows = {}
+    local total = 0.0
+    if type(raw_rows) == "table" and type(raw_rows[1]) == "table" then
+        for _, row in ipairs(raw_rows) do
+            local facet_id = tonumber((row or {}).id or (row or {}).facet_id or row[1])
+            local weight = tonumber((row or {}).weight or row[2]) or 0.0
+            if facet_id and facet_id > 0 and weight > 0.0 then
+                rows[#rows + 1] = { id = facet_id, weight = weight }
+            end
+        end
+    else
+        for facet_id, weight in pairs(raw_rows or {}) do
+            local id = tonumber(facet_id)
+            local w = tonumber(weight) or 0.0
+            if id and id > 0 and w > 0.0 then
+                rows[#rows + 1] = { id = id, weight = w }
+            end
+        end
+    end
+    if #rows <= 0 then
+        return {}
+    end
+    table.sort(rows, function(a, b)
+        if (a.weight or 0.0) ~= (b.weight or 0.0) then
+            return (a.weight or 0.0) > (b.weight or 0.0)
+        end
+        return (a.id or 0) < (b.id or 0)
+    end)
+    local out = {}
+    for i = 1, math.min(cap, #rows) do
+        total = total + rows[i].weight
+        out[#out + 1] = {
+            id = rows[i].id,
+            weight = rows[i].weight,
+        }
+    end
+    total = math.max(1e-6, total)
+    for i = 1, #out do
+        out[i].weight = out[i].weight / total
+    end
+    return out
+end
+
+local function facet_rows_to_map(rows)
+    local out = {}
+    if type(rows) == "table" and type(rows[1]) == "table" then
+        for _, row in ipairs(rows or {}) do
+            local facet_id = tonumber((row or {}).id or (row or {}).facet_id or row[1])
+            local weight = tonumber((row or {}).weight or row[2]) or 0.0
+            if facet_id and facet_id > 0 and weight > 0.0 then
+                out[facet_id] = math.max(tonumber(out[facet_id]) or 0.0, weight)
+            end
+        end
+    else
+        for facet_id, weight in pairs(rows or {}) do
+            local id = tonumber(facet_id)
+            local w = tonumber(weight) or 0.0
+            if id and id > 0 and w > 0.0 then
+                out[id] = math.max(tonumber(out[id]) or 0.0, w)
+            end
+        end
+    end
+    return out
+end
+
+local function ensure_facet_id(token)
+    token = trim(token):lower()
+    if token == "" then
+        return nil
+    end
+    M.state.facet_vocab = type(M.state.facet_vocab) == "table" and M.state.facet_vocab or {}
+    local facet_id = tonumber(M.state.facet_vocab[token])
+    if facet_id and facet_id > 0 then
+        return facet_id
+    end
+    facet_id = math.max(1, math.floor(tonumber(M.state.next_facet_id) or 1))
+    M.state.facet_vocab[token] = facet_id
+    M.state.next_facet_id = facet_id + 1
+    return facet_id
+end
+
+local function build_facet_rows_from_text(text, create_missing)
+    local weights = extract_text_facet_weights(text)
+    local mapped = {}
+    for token, weight in pairs(weights) do
+        local facet_id = tonumber(((M.state or {}).facet_vocab or {})[token])
+        if (not facet_id or facet_id <= 0) and create_missing then
+            facet_id = ensure_facet_id(token)
+        end
+        if facet_id and facet_id > 0 then
+            mapped[facet_id] = (tonumber(mapped[facet_id]) or 0.0) + (tonumber(weight) or 0.0)
+        end
+    end
+    return normalize_facet_rows(mapped, facet_slot_cap())
+end
+
+local function merge_facet_rows(base_rows, extra_rows)
+    local merged = facet_rows_to_map(base_rows or {})
+    for facet_id, weight in pairs(facet_rows_to_map(extra_rows or {})) do
+        merged[facet_id] = (tonumber(merged[facet_id]) or 0.0) + (tonumber(weight) or 0.0)
+    end
+    return normalize_facet_rows(merged, facet_slot_cap())
+end
+
+local function memory_facet_rows(mem)
+    mem = type(mem) == "table" and mem or {}
+    local rows = normalize_facet_rows(mem.facets or {}, facet_slot_cap())
+    if #rows <= 0 and trim(mem.text) ~= "" then
+        rows = build_facet_rows_from_text(mem.text, false)
+    end
+    return rows
+end
+
+local function memory_facet_map(mem_id)
+    local mem = M.state.memories[tonumber(mem_id)]
+    return facet_rows_to_map(memory_facet_rows(mem))
+end
+
+local function build_query_facet_map(user_input)
+    return facet_rows_to_map(build_facet_rows_from_text(user_input, false))
+end
+
+local function topic_facet_cover(mem_ids)
+    local cover = {}
+    for _, mem_id in ipairs(mem_ids or {}) do
+        for facet_id, weight in pairs(memory_facet_map(mem_id)) do
+            cover[facet_id] = math.max(tonumber(cover[facet_id]) or 0.0, tonumber(weight) or 0.0)
+        end
+    end
+    return cover
+end
+
 local function mark_dirty()
     M.dirty = true
     local ok, saver = pcall(require, "module.memory.saver")
@@ -163,7 +389,9 @@ local function default_state()
     return {
         version = STATE_VERSION,
         next_line = 1,
+        next_facet_id = 1,
         current_turn = 0,
+        facet_vocab = {},
         memories = {},
         topic_nodes = {},
         topic_edges = {},
@@ -374,6 +602,8 @@ local function bind_memory_to_topic(mem_id, anchor, vec, turn, amount, opts)
             category_beta = tonumber(local_cfg.category_beta) or 0.28,
             bundle_vigilance = tonumber(local_cfg.bundle_vigilance) or 0.82,
             bundle_beta = tonumber(local_cfg.bundle_beta) or 0.18,
+            temporal_link_window = tonumber(local_cfg.temporal_link_window) or 8,
+            exemplars = tonumber(local_cfg.exemplars) or 12,
         })
         if inserted and tonumber(inserted.category_id) then
             mem.cluster_id = tonumber(inserted.category_id) or tonumber(mem.cluster_id) or -1
@@ -426,6 +656,8 @@ local function export_state()
                 topic_anchor = trim(mem.topic_anchor),
                 cluster_id = tonumber(mem.cluster_id) or -1,
                 origin_topics = prune_weight_map(mem.origin_topics or {}, 16),
+                text = tostring(mem.text or ""),
+                facets = normalize_facet_rows(mem.facets or {}, facet_slot_cap()),
                 type = tostring(mem.type or "fact"),
             }
         end
@@ -445,6 +677,8 @@ local function export_state()
                 memory_to_category = node.local_state.memory_to_category or {},
                 next_category_id = tonumber(node.local_state.next_category_id) or 1,
                 next_bundle_id = tonumber(node.local_state.next_bundle_id) or 1,
+                last_bundle_id = tonumber(node.local_state.last_bundle_id) or -1,
+                last_bundle_turn = tonumber(node.local_state.last_bundle_turn) or 0,
             },
             last_turn = tonumber(node.last_turn) or 0,
         }
@@ -473,7 +707,9 @@ local function export_state()
     return {
         version = STATE_VERSION,
         next_line = tonumber(M.state.next_line) or 1,
+        next_facet_id = tonumber(M.state.next_facet_id) or 1,
         current_turn = tonumber(M.state.current_turn) or 0,
+        facet_vocab = type(M.state.facet_vocab) == "table" and M.state.facet_vocab or {},
         memories = memories,
         topic_nodes = topic_nodes,
         topic_edges = topic_edges,
@@ -583,7 +819,9 @@ local function adopt_loaded_state(parsed)
     parsed = type(parsed) == "table" and parsed or {}
     M.state.version = tostring(parsed.version or STATE_VERSION)
     M.state.next_line = math.max(1, math.floor(tonumber(parsed.next_line) or 1))
+    M.state.next_facet_id = math.max(1, math.floor(tonumber(parsed.next_facet_id) or 1))
     M.state.current_turn = math.max(0, math.floor(tonumber(parsed.current_turn) or 0))
+    M.state.facet_vocab = type(parsed.facet_vocab) == "table" and parsed.facet_vocab or {}
     M.state.runtime = type(parsed.runtime) == "table" and parsed.runtime or M.state.runtime
     M.state.legacy = type(parsed.legacy) == "table" and parsed.legacy or M.state.legacy
     local vectors = load_vectors()
@@ -596,6 +834,8 @@ local function adopt_loaded_state(parsed)
                 topic_anchor = trim((meta or {}).topic_anchor),
                 cluster_id = tonumber((meta or {}).cluster_id) or -1,
                 origin_topics = type((meta or {}).origin_topics) == "table" and (meta or {}).origin_topics or {},
+                text = tostring((meta or {}).text or ""),
+                facets = normalize_facet_rows((meta or {}).facets or {}, facet_slot_cap()),
                 type = tostring((meta or {}).type or "fact"),
                 vec = vectors[line] or {},
             }
@@ -661,6 +901,8 @@ local function import_legacy()
                 topic_anchor = trim(mem.topic_anchor),
                 cluster_id = tonumber(mem.cluster_id) or -1,
                 origin_topics = {},
+                text = "",
+                facets = {},
                 type = "fact",
                 vec = copy_vec(mem.vec or {}),
             }
@@ -795,7 +1037,7 @@ local function is_topic_loaded(anchor)
     return M.runtime.loaded_topics[trim(anchor)] ~= nil
 end
 
-local function select_seed_topics(query_vec, current_anchor)
+local function semantic_topic_scores(query_vec, current_anchor)
     local scores = {}
     local seen = {}
     local hcfg = hnsw_cfg()
@@ -831,6 +1073,7 @@ local function expand_topic_candidates(seed_scores)
 
     local scores = {}
     local frontier = {}
+    local via_bridge = {}
     for anchor, score in pairs(seed_scores or {}) do
         scores[anchor] = tonumber(score) or 0.0
         frontier[#frontier + 1] = { anchor = anchor, score = tonumber(score) or 0.0 }
@@ -868,6 +1111,9 @@ local function expand_topic_candidates(seed_scores)
                     score = score + resident_bonus
                 end
                 if (scores[dst] or -1e9) < score then
+                    if scores[dst] == nil then
+                        via_bridge[dst] = true
+                    end
                     scores[dst] = score
                     next_frontier[#next_frontier + 1] = { anchor = dst, score = score }
                 end
@@ -879,15 +1125,17 @@ local function expand_topic_candidates(seed_scores)
         end
     end
 
-    return scores
+    return scores, sort_string_keys(via_bridge)
 end
 
-local function select_topics(candidate_scores, current_anchor)
+local function preload_topics(candidate_scores, turn)
     local ranked = {}
+    local load_budget = math.max(0, math.floor(tonumber(tg_cfg().load_budget) or 4))
     for anchor, score in pairs(candidate_scores or {}) do
-        if trim(anchor) ~= "" then
+        anchor = trim(anchor)
+        if anchor ~= "" then
             ranked[#ranked + 1] = {
-                anchor = trim(anchor),
+                anchor = anchor,
                 score = tonumber(score) or 0.0,
             }
         end
@@ -898,110 +1146,483 @@ local function select_topics(candidate_scores, current_anchor)
         end
         return tostring(a.anchor) < tostring(b.anchor)
     end)
-    local anchor_order = {}
-    for _, item in ipairs(ranked) do
-        anchor_order[#anchor_order + 1] = item.anchor
-    end
-    local family_of = get_topic_families(anchor_order)
-    local family_limit = math.max(1, tonumber(tg_cfg().family_member_limit) or 1)
-    local self_penalty = math.max(0.0, tonumber(tg_cfg().self_excite_penalty) or 0.14)
-    local revisit_penalty = math.max(0.0, tonumber(tg_cfg().family_revisit_penalty) or 0.10)
-    local escape_bonus = math.max(0.0, tonumber(tg_cfg().family_escape_bonus) or 0.06)
-    local max_topics = math.max(1, tonumber(tg_cfg().max_return_topics) or 4)
 
-    local out = {}
-    local family_counts = {}
-    local last_family = nil
-    for _, item in ipairs(ranked) do
-        local anchor = item.anchor
-        local family_id = tonumber(family_of[anchor]) or 0
-        local score = tonumber(item.score) or 0.0
-        if anchor == current_anchor then
-            score = score - self_penalty
-        end
-        if family_counts[family_id] and family_counts[family_id] >= family_limit then
-            score = score - revisit_penalty
-        end
-        if last_family and last_family ~= family_id then
-            score = score + escape_bonus
-        end
-        if score > -1e9 and ((not family_counts[family_id]) or family_counts[family_id] < family_limit or #out <= 0) then
-            out[#out + 1] = anchor
-            family_counts[family_id] = (family_counts[family_id] or 0) + 1
-            last_family = family_id
-            if #out >= max_topics then
-                break
+    local available = {}
+    local used_budget = 0
+    for _, row in ipairs(ranked) do
+        local anchor = trim(row.anchor)
+        if anchor ~= "" then
+            if is_topic_loaded(anchor) then
+                available[#available + 1] = anchor
+            elseif used_budget < load_budget then
+                used_budget = used_budget + 1
+                available[#available + 1] = anchor
             end
         end
     end
-    return out
+    if #available > 0 then
+        mark_topics_loaded(available, turn)
+    end
+    return available
 end
 
-local function memory_candidates_for_topics(selected_topics, query_vec, current_anchor, current_turn)
-    local out = {}
-    local debug = {}
-    local per_topic_evidence = math.max(1, tonumber(tg_cfg().per_topic_evidence) or 3)
-    local recent_weight = math.max(0.0, tonumber(tg_cfg().recent_weight) or 0.55)
-    local prior_weight = math.max(0.0, tonumber(tg_cfg().topic_prior_weight) or 1.00)
+local function select_memories_for_context(memory_ids, query_vec, query_map, budget, semantic_scores, local_scores, group_ids)
+    budget = math.max(1, math.floor(tonumber(budget) or 1))
+    semantic_scores = type(semantic_scores) == "table" and semantic_scores or {}
+    local_scores = type(local_scores) == "table" and local_scores or {}
+    group_ids = type(group_ids) == "table" and group_ids or {}
 
-    local function note(mem_id, score, anchor, category_id, bundle_id)
-        mem_id = tonumber(mem_id)
-        if not mem_id or mem_id <= 0 then
-            return
+    local unique_ids = unique_sorted_numbers(memory_ids or {})
+    if #unique_ids <= 0 then
+        return {}
+    end
+
+    local local_max = 0.0
+    for _, score in pairs(local_scores) do
+        local s = math.max(0.0, tonumber(score) or 0.0)
+        if s > local_max then
+            local_max = s
         end
-        local current = out[mem_id]
-        if current == nil or score > current.score then
-            out[mem_id] = {
-                mem_idx = mem_id,
-                score = score,
+    end
+    local query_total_weight = 0.0
+    for _, weight in pairs(query_map or {}) do
+        query_total_weight = query_total_weight + math.max(0.0, tonumber(weight) or 0.0)
+    end
+    query_total_weight = math.max(1e-6, query_total_weight)
+    local saturation_threshold = clamp(
+        tonumber(tg_cfg().context_similarity_saturation_threshold) or 0.95,
+        -1.0,
+        0.999
+    )
+
+    local cache = {}
+    for _, mem_id in ipairs(unique_ids) do
+        local mem = M.state.memories[tonumber(mem_id)] or {}
+        cache[mem_id] = {
+            semantic = math.max(0.0, tonumber(semantic_scores[mem_id]) or safe_similarity(query_vec, mem.vec)),
+            local_score = (local_max > 1e-6) and (math.max(0.0, tonumber(local_scores[mem_id]) or 0.0) / local_max) or 0.0,
+            map = memory_facet_map(mem_id),
+            group_id = tonumber(group_ids[mem_id]) or -1,
+            vec = mem.vec,
+        }
+    end
+
+    local remaining = {}
+    local selected = {}
+    local selected_ids = {}
+    local best_facet_cover = {}
+    local group_counts = {}
+    for _, mem_id in ipairs(unique_ids) do
+        remaining[mem_id] = true
+    end
+    for facet_id in pairs(query_map or {}) do
+        best_facet_cover[facet_id] = 0.0
+    end
+
+    while next(remaining) and #selected < budget do
+        local best_mem = nil
+        local best_score = -1e9
+        for _, mem_id in ipairs(unique_ids) do
+            if remaining[mem_id] then
+                local info = cache[mem_id]
+                local mem_map = info.map or {}
+                local coverage_gain = 0.0
+                if next(query_map or {}) and next(mem_map or {}) then
+                    for facet_id, query_weight in pairs(query_map or {}) do
+                        local current = tonumber(best_facet_cover[facet_id]) or 0.0
+                        local updated = tonumber(mem_map[facet_id]) or 0.0
+                        if updated > current then
+                            coverage_gain = coverage_gain + (tonumber(query_weight) or 0.0) * (updated - current)
+                        end
+                    end
+                    coverage_gain = coverage_gain / query_total_weight
+                end
+
+                local max_pair_excess = 0.0
+                for _, selected_id in ipairs(selected_ids) do
+                    local sim = safe_similarity(info.vec, ((cache[selected_id] or {}).vec))
+                    if sim > saturation_threshold then
+                        max_pair_excess = math.max(
+                            max_pair_excess,
+                            (sim - saturation_threshold) / math.max(1e-6, 1.0 - saturation_threshold)
+                        )
+                    end
+                end
+
+                local group_id = tonumber(info.group_id) or -1
+                local group_repeat = (group_id >= 0) and (tonumber(group_counts[group_id]) or 0) or 0
+                local group_bonus = (group_id >= 0 and group_repeat <= 0) and 0.08 or 0.0
+                local group_penalty = (group_repeat > 0) and (0.05 * (group_repeat / (group_repeat + 1.0))) or 0.0
+                local semantic = tonumber(info.semantic) or 0.0
+                local local_score = tonumber(info.local_score) or 0.0
+                local context_score
+                if next(query_map or {}) then
+                    context_score = coverage_gain
+                        + 0.50 * semantic
+                        + 0.22 * local_score
+                        + group_bonus
+                        - 0.14 * max_pair_excess
+                        - group_penalty
+                else
+                    context_score = 0.72 * semantic
+                        + 0.28 * local_score
+                        + group_bonus
+                        - 0.14 * max_pair_excess
+                        - group_penalty
+                end
+                if context_score > best_score then
+                    best_score = context_score
+                    best_mem = mem_id
+                end
+            end
+        end
+
+        if not best_mem then
+            break
+        end
+
+        selected[#selected + 1] = {
+            mem_idx = best_mem,
+            score = best_score,
+        }
+        selected_ids[#selected_ids + 1] = best_mem
+        remaining[best_mem] = nil
+
+        local info = cache[best_mem] or {}
+        for facet_id in pairs(query_map or {}) do
+            best_facet_cover[facet_id] = math.max(
+                tonumber(best_facet_cover[facet_id]) or 0.0,
+                tonumber(((info.map or {})[facet_id])) or 0.0
+            )
+        end
+        local group_id = tonumber(info.group_id) or -1
+        if group_id >= 0 then
+            group_counts[group_id] = (tonumber(group_counts[group_id]) or 0) + 1
+        end
+    end
+
+    return selected
+end
+
+local function select_topics_for_context(topic_rows, query_map)
+    if #(topic_rows or {}) <= 0 then
+        return {}
+    end
+
+    local max_topics = math.max(1, tonumber(tg_cfg().max_return_topics) or 4)
+    local query_total_weight = 0.0
+    for _, weight in pairs(query_map or {}) do
+        query_total_weight = query_total_weight + math.max(0.0, tonumber(weight) or 0.0)
+    end
+    query_total_weight = math.max(1e-6, query_total_weight)
+    local family_limit = math.max(1, tonumber(tg_cfg().family_member_limit) or 1)
+
+    local selected = {}
+    local selected_set = {}
+    local best_facet_cover = {}
+    local family_counts = {}
+    for facet_id in pairs(query_map or {}) do
+        best_facet_cover[facet_id] = 0.0
+    end
+
+    while #selected < max_topics do
+        local best_anchor = nil
+        local best_score = -1e9
+        local best_cover = nil
+        local best_family = 0
+        for _, row in ipairs(topic_rows or {}) do
+            local anchor = trim((row or {}).anchor)
+            if anchor ~= "" and not selected_set[anchor] then
+                local family_id = tonumber((row or {}).family_id) or 0
+                local family_repeat = (family_id > 0) and (tonumber(family_counts[family_id]) or 0) or 0
+                if family_id <= 0 or family_repeat < family_limit or #selected <= 0 then
+                    local topic_cover = type((row or {}).topic_cover) == "table" and (row or {}).topic_cover or {}
+                    local coverage_gain = 0.0
+                    if next(query_map or {}) and next(topic_cover or {}) then
+                        for facet_id, query_weight in pairs(query_map or {}) do
+                            local current = tonumber(best_facet_cover[facet_id]) or 0.0
+                            local updated = tonumber(topic_cover[facet_id]) or 0.0
+                            if updated > current then
+                                coverage_gain = coverage_gain + (tonumber(query_weight) or 0.0) * (updated - current)
+                            end
+                        end
+                        coverage_gain = coverage_gain / query_total_weight
+                    end
+
+                    local peak_sim = math.max(0.0, tonumber((row or {}).peak_sim) or 0.0)
+                    local mean_sim = math.max(0.0, tonumber((row or {}).mean_sim) or 0.0)
+                    local route_score = math.max(0.0, math.min(1.0, tonumber((row or {}).route_score) or 0.0))
+                    local semantic_support = math.min(1.0, 0.55 * peak_sim + 0.20 * mean_sim + 0.25 * route_score)
+                    local novelty_bonus = (family_id > 0 and family_repeat <= 0) and 0.10 or 0.0
+                    local repeat_penalty = (family_repeat > 0) and (0.06 * (family_repeat / (family_repeat + 1.0))) or 0.0
+                    local context_score = coverage_gain + 0.55 * semantic_support + novelty_bonus - repeat_penalty
+                    if context_score > best_score then
+                        best_anchor = anchor
+                        best_score = context_score
+                        best_cover = topic_cover
+                        best_family = family_id
+                    end
+                end
+            end
+        end
+
+        if not best_anchor then
+            break
+        end
+
+        selected[#selected + 1] = {
+            anchor = best_anchor,
+            score = best_score,
+        }
+        selected_set[best_anchor] = true
+        if type(best_cover) == "table" then
+            for facet_id, weight in pairs(best_cover) do
+                best_facet_cover[facet_id] = math.max(
+                    tonumber(best_facet_cover[facet_id]) or 0.0,
+                    tonumber(weight) or 0.0
+                )
+            end
+        end
+        if best_family > 0 then
+            family_counts[best_family] = (tonumber(family_counts[best_family]) or 0) + 1
+        end
+    end
+
+    if #selected > 0 then
+        return selected
+    end
+
+    local fallback = {}
+    for _, row in ipairs(topic_rows or {}) do
+        local anchor = trim((row or {}).anchor)
+        if anchor ~= "" then
+            fallback[#fallback + 1] = {
                 anchor = anchor,
-                category_id = tonumber(category_id) or 0,
-                bundle_id = tonumber(bundle_id) or 0,
+                score = tonumber((row or {}).total_score) or 0.0,
+            }
+        end
+    end
+    table.sort(fallback, function(a, b)
+        if (a.score or 0.0) ~= (b.score or 0.0) then
+            return (a.score or 0.0) > (b.score or 0.0)
+        end
+        return tostring(a.anchor) < tostring(b.anchor)
+    end)
+    while #fallback > max_topics do
+        table.remove(fallback)
+    end
+    return fallback
+end
+
+local function one_turn_momentum_scores(query_vec, current_anchor, current_turn)
+    local scores = {}
+    if tonumber((((M.state or {}).runtime or {}).last_turn)) ~= (math.floor(tonumber(current_turn) or 0) - 1) then
+        return scores
+    end
+    if trim((((M.state or {}).runtime or {}).last_anchor)) ~= trim(current_anchor) then
+        return scores
+    end
+    local recent_weight = math.max(0.0, tonumber(tg_cfg().recent_weight) or 0.55)
+    for _, prev_mem in ipairs((((M.state or {}).runtime or {}).last_selected) or {}) do
+        local bucket = M.state.memory_next[tonumber(prev_mem)] or {}
+        for mem_id, weight in pairs(bucket) do
+            local mem = M.state.memories[tonumber(mem_id)]
+            if mem and type(mem.vec) == "table" and #mem.vec > 0 then
+                scores[tonumber(mem_id)] = math.max(
+                    tonumber(scores[tonumber(mem_id)]) or -1e9,
+                    safe_similarity(query_vec, mem.vec) + recent_weight * (tonumber(weight) or 0.0)
+                )
+            end
+        end
+    end
+    return scores
+end
+
+local function retrieve_topic_evidence(query_vec, candidate_scores, available_topics, current_anchor, current_turn, query_map)
+    local per_topic_evidence = math.max(1, tonumber(tg_cfg().per_topic_evidence) or 3)
+    local local_cfg = tg_cfg().deep_artmap or {}
+    local family_of = get_topic_families(available_topics)
+    local momentum_scores = one_turn_momentum_scores(query_vec, current_anchor, current_turn)
+    local evidence_topics = {}
+    local evidence_memories = {}
+    local evidence_by_topic = {}
+    local evidence_rows = {}
+    local local_signals = {}
+    local topic_rows = {}
+
+    for _, anchor in ipairs(available_topics or {}) do
+        local node = ensure_topic_node(anchor)
+        if node and #(node.memory_ids or {}) > 0 then
+            local candidates, local_debug = deep_artmap.collect_candidates(
+                node.local_state,
+                query_vec,
+                function(mem_id)
+                    local mem = M.state.memories[tonumber(mem_id)]
+                    return mem and mem.vec or nil
+                end,
+                function(mem_id)
+                    local mem = M.state.memories[tonumber(mem_id)]
+                    return memory_facet_rows(mem)
+                end,
+                {
+                    query_bundles = tonumber(local_cfg.query_bundles) or 2,
+                    query_margin = tonumber(local_cfg.query_margin) or 0.06,
+                    neighbor_topk = tonumber(local_cfg.neighbor_topk) or 2,
+                    query_categories = tonumber(local_cfg.query_categories) or 4,
+                    exemplars = tonumber(local_cfg.exemplars) or 12,
+                    bundle_vigilance = tonumber(local_cfg.bundle_vigilance) or 0.82,
+                    bundle_prior_weight = tonumber(local_cfg.bundle_prior_weight) or 0.18,
+                    saturation_threshold = tonumber(tg_cfg().context_similarity_saturation_threshold) or 0.95,
+                    max_results = per_topic_evidence * 4,
+                    query_map = query_map,
+                }
+            )
+
+            local local_score_map = {}
+            local local_group_map = {}
+            local local_category_map = {}
+            local local_bundle_map = {}
+            local candidate_ids = {}
+            local seen_ids = {}
+            for _, item in ipairs(candidates or {}) do
+                local mem_id = tonumber((item or {}).mem_idx)
+                if mem_id and mem_id > 0 then
+                    if not seen_ids[mem_id] then
+                        seen_ids[mem_id] = true
+                        candidate_ids[#candidate_ids + 1] = mem_id
+                    end
+                    local_score_map[mem_id] = math.max(
+                        tonumber(local_score_map[mem_id]) or -1e9,
+                        tonumber((item or {}).score) or 0.0
+                    )
+                    local_group_map[mem_id] = tonumber((item or {}).bundle_id) or 0
+                    local_category_map[mem_id] = tonumber((item or {}).category_id) or 0
+                    local_bundle_map[mem_id] = tonumber((item or {}).bundle_id) or 0
+                end
+            end
+
+            if trim(anchor) == trim(current_anchor) then
+                for mem_id, score in pairs(momentum_scores) do
+                    if not seen_ids[mem_id] then
+                        seen_ids[mem_id] = true
+                        candidate_ids[#candidate_ids + 1] = mem_id
+                    end
+                    local_score_map[mem_id] = math.max(tonumber(local_score_map[mem_id]) or -1e9, tonumber(score) or 0.0)
+                end
+            end
+
+            if #candidate_ids <= 0 then
+                for _, mem_id in ipairs(node.memory_ids or {}) do
+                    mem_id = tonumber(mem_id)
+                    if mem_id and mem_id > 0 and not seen_ids[mem_id] then
+                        seen_ids[mem_id] = true
+                        candidate_ids[#candidate_ids + 1] = mem_id
+                    end
+                    local_score_map[mem_id] = safe_similarity(query_vec, ((M.state.memories[mem_id] or {}).vec))
+                    local_group_map[mem_id] = tonumber(((M.state.memories[mem_id] or {}).cluster_id)) or 0
+                    local_category_map[mem_id] = tonumber(((M.state.memories[mem_id] or {}).cluster_id)) or 0
+                    local_bundle_map[mem_id] = 0
+                end
+            end
+
+            local semantic_map = {}
+            for _, mem_id in ipairs(candidate_ids) do
+                local mem = M.state.memories[tonumber(mem_id)]
+                semantic_map[mem_id] = safe_similarity(query_vec, mem and mem.vec)
+            end
+
+            local ranked_local = select_memories_for_context(
+                candidate_ids,
+                query_vec,
+                query_map,
+                per_topic_evidence,
+                semantic_map,
+                local_score_map,
+                local_group_map
+            )
+            local best_memories = {}
+            local best_rows = {}
+            local peak_sim = 0.0
+            local mean_sim = 0.0
+            for _, item in ipairs(ranked_local) do
+                local mem_id = tonumber(item.mem_idx) or 0
+                if mem_id > 0 then
+                    local sim = tonumber(semantic_map[mem_id]) or 0.0
+                    best_memories[#best_memories + 1] = mem_id
+                    best_rows[#best_rows + 1] = {
+                        mem_idx = mem_id,
+                        score = tonumber(item.score) or 0.0,
+                        anchor = anchor,
+                        category_id = tonumber(local_category_map[mem_id]) or 0,
+                        bundle_id = tonumber(local_bundle_map[mem_id]) or 0,
+                    }
+                    peak_sim = math.max(peak_sim, sim)
+                    mean_sim = mean_sim + sim
+                end
+            end
+            mean_sim = (#best_memories > 0) and (mean_sim / #best_memories) or 0.0
+
+            local evidence_score = math.max(tonumber((local_debug or {}).score) or 0.0, peak_sim) + 0.15 * mean_sim
+            local total_score = (tonumber(candidate_scores[anchor]) or 0.0) + evidence_score
+            evidence_topics[#evidence_topics + 1] = anchor
+            for _, mem_id in ipairs(best_memories) do
+                evidence_memories[#evidence_memories + 1] = mem_id
+            end
+            evidence_by_topic[anchor] = best_memories
+            evidence_rows[anchor] = best_rows
+            local_signals[anchor] = {
+                bundle_ids = shallow_copy_array(((local_debug or {}).bundle_ids) or {}),
+                category_ids = shallow_copy_array(((local_debug or {}).category_ids) or {}),
+                route = tostring(((local_debug or {}).route) or ""),
+            }
+            topic_rows[#topic_rows + 1] = {
+                anchor = anchor,
+                total_score = total_score,
+                route_score = tonumber(candidate_scores[anchor]) or 0.0,
+                peak_sim = peak_sim,
+                mean_sim = mean_sim,
+                topic_cover = topic_facet_cover(best_memories),
+                family_id = tonumber(family_of[anchor]) or 0,
             }
         end
     end
 
-    if tonumber((((M.state or {}).runtime or {}).last_turn)) == (math.floor(tonumber(current_turn) or 0) - 1)
-        and trim((((M.state or {}).runtime or {}).last_anchor)) == trim(current_anchor) then
-        for _, prev_mem in ipairs((((M.state or {}).runtime or {}).last_selected) or {}) do
-            local bucket = M.state.memory_next[tonumber(prev_mem)] or {}
-            for mem_id, weight in pairs(bucket) do
-                local mem = M.state.memories[tonumber(mem_id)]
-                local sim = safe_similarity(query_vec, mem and mem.vec)
-                note(mem_id, sim + recent_weight * (tonumber(weight) or 0.0), trim((mem or {}).topic_anchor), 0, 0)
-            end
-        end
+    local ranked_topics = select_topics_for_context(topic_rows, query_map)
+    local selected_topics = {}
+    for _, row in ipairs(ranked_topics or {}) do
+        selected_topics[#selected_topics + 1] = trim((row or {}).anchor)
     end
+    return selected_topics, {
+        evidence_topics = evidence_topics,
+        evidence_memories = unique_sorted_numbers(evidence_memories),
+        evidence_by_topic = evidence_by_topic,
+        ranked_topics = ranked_topics,
+        local_signals = local_signals,
+        topic_rows = topic_rows,
+    }, evidence_rows
+end
 
+local function ranked_memories_from_evidence(selected_topics, evidence_rows)
+    local merged = {}
     for _, anchor in ipairs(selected_topics or {}) do
-        local node = ensure_topic_node(anchor)
-        local candidates, local_debug = deep_artmap.collect_candidates(node.local_state, query_vec, function(mem_id)
-            local mem = M.state.memories[tonumber(mem_id)]
-            return mem and mem.vec or nil
-        end, {
-            query_bundles = tonumber((((tg_cfg().deep_artmap) or {}).query_bundles)) or 2,
-            query_margin = tonumber((((tg_cfg().deep_artmap) or {}).query_margin)) or 0.06,
-            neighbor_topk = tonumber((((tg_cfg().deep_artmap) or {}).neighbor_topk)) or 2,
-            max_results = per_topic_evidence * 2,
-        })
-        for _, item in ipairs(candidates or {}) do
-            local prior = tonumber((node.memory_prior or {})[tonumber(item.mem_idx)]) or 0.0
-            local resident = is_topic_loaded(anchor) and (tonumber(tg_cfg().resident_bonus) or 0.08) or 0.0
-            note(item.mem_idx, (tonumber(item.score) or 0.0) + prior_weight * prior + resident, anchor, item.category_id, item.bundle_id)
-        end
-        debug[anchor] = local_debug
-
-        if #(candidates or {}) <= 0 then
-            for _, mem_id in ipairs(node.memory_ids or {}) do
-                local mem = M.state.memories[tonumber(mem_id)]
-                local score = safe_similarity(query_vec, mem and mem.vec) + prior_weight * (tonumber((node.memory_prior or {})[tonumber(mem_id)]) or 0.0)
-                note(mem_id, score, anchor, tonumber((mem or {}).cluster_id) or 0, 0)
+        for _, item in ipairs((evidence_rows or {})[anchor] or {}) do
+            local mem_id = tonumber((item or {}).mem_idx)
+            if mem_id and mem_id > 0 then
+                local current = merged[mem_id]
+                if not current or (tonumber(item.score) or 0.0) > (tonumber(current.score) or -1e9) then
+                    merged[mem_id] = {
+                        mem_idx = mem_id,
+                        score = tonumber(item.score) or 0.0,
+                        anchor = trim((item or {}).anchor),
+                        category_id = tonumber((item or {}).category_id) or 0,
+                        bundle_id = tonumber((item or {}).bundle_id) or 0,
+                    }
+                end
             end
         end
     end
-
     local ranked = {}
-    for _, item in pairs(out) do
+    for _, item in pairs(merged) do
         ranked[#ranked + 1] = item
     end
     table.sort(ranked, function(a, b)
@@ -1010,7 +1631,7 @@ local function memory_candidates_for_topics(selected_topics, query_vec, current_
         end
         return (a.mem_idx or 0) < (b.mem_idx or 0)
     end)
-    return ranked, debug
+    return ranked
 end
 
 local function turns_from_memories(ranked_memories)
@@ -1086,6 +1707,8 @@ local function apply_decay(turn)
         return
     end
     local factor = decay ^ delta
+    local bundle_decay = clamp(tonumber((((tg_cfg().deep_artmap) or {}).bundle_decay)) or decay, 0.0, 1.0)
+    local bundle_factor = bundle_decay ^ delta
     for src, bucket in pairs(M.state.topic_edges or {}) do
         for dst, edge in pairs(bucket or {}) do
             edge.transition = (tonumber(edge.transition) or 0.0) * factor
@@ -1113,7 +1736,7 @@ local function apply_decay(turn)
         end
     end
     for _, node in pairs(M.state.topic_nodes or {}) do
-        deep_artmap.decay(node.local_state, factor)
+        deep_artmap.decay(node.local_state, bundle_factor)
     end
     M.runtime.last_decay_turn = turn
     mark_dirty()
@@ -1178,6 +1801,8 @@ function M.iterate_all()
                     turns = shallow_copy_array(mem.turns),
                     cluster_id = tonumber(mem.cluster_id) or -1,
                     topic_anchor = trim(mem.topic_anchor),
+                    text = tostring(mem.text or ""),
+                    facets = normalize_facet_rows(mem.facets or {}, facet_slot_cap()),
                     vec = mem.vec,
                 }
             end
@@ -1245,6 +1870,11 @@ function M.add_memory(vec, turn, opts)
     end
     turn = math.max(0, math.floor(tonumber(turn) or 0))
     local anchor = trim(opts.topic_anchor or current_anchor_for_turn(turn))
+    local text = tostring(opts.text or opts.fact or "")
+    local facets = normalize_facet_rows(opts.facets or {}, facet_slot_cap())
+    if #facets <= 0 and text ~= "" then
+        facets = build_facet_rows_from_text(text, true)
+    end
     local merge_limit = tonumber(config.settings.merge_limit) or 0.95
 
     local best_line, best_sim = nil, -1.0
@@ -1265,6 +1895,10 @@ function M.add_memory(vec, turn, opts)
         if last_turn ~= turn then
             mem.turns[#mem.turns + 1] = turn
         end
+        if text ~= "" and trim(mem.text) == "" then
+            mem.text = text
+        end
+        mem.facets = merge_facet_rows(mem.facets or {}, facets)
         if anchor ~= "" then
             bind_memory_to_topic(best_line, anchor, mem.vec, turn, 1.0, { preserve_cluster_id = true })
         end
@@ -1279,6 +1913,8 @@ function M.add_memory(vec, turn, opts)
         topic_anchor = anchor,
         cluster_id = -1,
         origin_topics = {},
+        text = text,
+        facets = facets,
         type = tostring(opts.kind or "fact"),
         vec = vec,
     }
@@ -1325,7 +1961,8 @@ function M.observe_turn(turn, current_anchor)
     return true
 end
 
-function M.retrieve(query_vec, current_anchor, current_turn, _opts)
+function M.retrieve(query_vec, current_anchor, current_turn, opts)
+    opts = type(opts) == "table" and opts or {}
     query_vec = normalize(query_vec or {})
     current_anchor = trim(current_anchor)
     current_turn = math.max(0, math.floor(tonumber(current_turn) or 0))
@@ -1342,15 +1979,24 @@ function M.retrieve(query_vec, current_anchor, current_turn, _opts)
             selected_memories = {},
             fragments = {},
             adopted_memories = {},
+            local_signals = {},
+            topic_debug = {},
         }
     end
 
-    local seed_scores = select_seed_topics(query_vec, current_anchor)
-    local expanded_scores = expand_topic_candidates(seed_scores)
-    local selected_topics = select_topics(expanded_scores, current_anchor)
-    mark_topics_loaded(selected_topics, current_turn)
-
-    local ranked_memories, topic_debug = memory_candidates_for_topics(selected_topics, query_vec, current_anchor, current_turn)
+    local query_map = build_query_facet_map(opts.user_input or "")
+    local seed_scores = semantic_topic_scores(query_vec, current_anchor)
+    local expanded_scores, bridge_topics = expand_topic_candidates(seed_scores)
+    local available_topics = preload_topics(expanded_scores, current_turn)
+    local selected_topics, topic_debug, evidence_rows = retrieve_topic_evidence(
+        query_vec,
+        expanded_scores,
+        available_topics,
+        current_anchor,
+        current_turn,
+        query_map
+    )
+    local ranked_memories = ranked_memories_from_evidence(selected_topics, evidence_rows)
     local max_memories = math.max(1, tonumber(tg_cfg().retrieve_max_memories) or tonumber(ai_cfg().max_memory) or 8)
     while #ranked_memories > max_memories do
         table.remove(ranked_memories)
@@ -1373,7 +2019,10 @@ function M.retrieve(query_vec, current_anchor, current_turn, _opts)
         selected_memories = shallow_copy_array(selected_memories),
         fragments = fragments,
         adopted_memories = {},
+        local_signals = type((topic_debug or {}).local_signals) == "table" and (topic_debug or {}).local_signals or {},
         topic_debug = topic_debug,
+        candidate_topics = expanded_scores,
+        bridge_topics = shallow_copy_array(bridge_topics or {}),
     }
 end
 
@@ -1394,6 +2043,10 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
     local next_cap = math.max(8, tonumber(tg_cfg().next_cap) or 32)
     local recall_lr = math.max(0.0, tonumber(tg_cfg().recall_lr) or 0.10)
     local adopt_lr = math.max(recall_lr, tonumber(tg_cfg().adopt_lr) or 0.18)
+    local local_cfg = tg_cfg().deep_artmap or {}
+    local bundle_recall_lr = math.max(0.0, tonumber(local_cfg.bundle_recall_lr) or recall_lr)
+    local bundle_adopt_lr = math.max(0.0, tonumber(local_cfg.bundle_adopt_lr) or adopt_lr)
+    local bundle_edge_feedback = math.max(0.0, tonumber(local_cfg.bundle_edge_feedback) or 0.14)
 
     if current_anchor ~= "" then
         local node = ensure_topic_node(current_anchor)
@@ -1443,6 +2096,10 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
         end
     end
 
+    local local_signals = type(recall_state.local_signals) == "table" and recall_state.local_signals or {}
+    local current_signal = type(local_signals[current_anchor]) == "table" and local_signals[current_anchor] or {}
+    local signal_bundle_ids = unique_sorted_numbers((current_signal or {}).bundle_ids)
+
     if current_anchor ~= "" then
         for _, anchor in ipairs(predicted_topics) do
             if anchor ~= current_anchor then
@@ -1457,6 +2114,46 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
         end
     elseif prev_anchor ~= "" and current_anchor ~= "" and prev_anchor ~= current_anchor then
         boost_edge(prev_anchor, current_anchor, "transition", tonumber(tg_cfg().transition_lr) or 0.12, turn)
+    end
+
+    if current_anchor ~= "" and #signal_bundle_ids > 0 then
+        local node = ensure_topic_node(current_anchor)
+        if node then
+            local predicted_hit = false
+            for _, anchor in ipairs(predicted_topics) do
+                if trim(anchor) == current_anchor then
+                    predicted_hit = true
+                    break
+                end
+            end
+            if predicted_hit then
+                for _, bundle_id in ipairs(signal_bundle_ids) do
+                    deep_artmap.reinforce_bundle(node.local_state, bundle_id, "recall", turn, {
+                        recall_lr = bundle_recall_lr,
+                        adopt_lr = bundle_adopt_lr,
+                    })
+                end
+                if bundle_edge_feedback > 0.0 then
+                    for i = 1, #signal_bundle_ids do
+                        for j = i + 1, #signal_bundle_ids do
+                            deep_artmap.link_bundles(node.local_state, signal_bundle_ids[i], signal_bundle_ids[j], bundle_edge_feedback)
+                        end
+                    end
+                end
+            end
+            if trim(predicted_topics[1]) == current_anchor then
+                deep_artmap.reinforce_bundle(node.local_state, signal_bundle_ids[1], "adopt", turn, {
+                    recall_lr = bundle_recall_lr,
+                    adopt_lr = bundle_adopt_lr,
+                })
+                for i = 2, #signal_bundle_ids do
+                    deep_artmap.reinforce_bundle(node.local_state, signal_bundle_ids[i], "adopt", turn, {
+                        recall_lr = bundle_recall_lr,
+                        adopt_lr = bundle_adopt_lr * 0.35,
+                    })
+                end
+            end
+        end
     end
 
     for _, mem_id in ipairs(retrieved) do

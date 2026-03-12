@@ -37,12 +37,15 @@ local vec_a = norm({1, 0, 0, 0, 0, 0, 0, 0})
 local vec_b = norm({0, 1, 0, 0, 0, 0, 0, 0})
 local vec_c = norm({0, 0, 1, 0, 0, 0, 0, 0})
 
-local line_a = assert(store.add_memory(vec_a, 201, { topic_anchor = "topic:a" }))
-local line_b = assert(store.add_memory(vec_b, 202, { topic_anchor = "topic:b" }))
-local line_c = assert(store.add_memory(vec_c, 203, { topic_anchor = "topic:c" }))
+local line_a = assert(store.add_memory(vec_a, 201, { topic_anchor = "topic:a", text = "alpha topic lua" }))
+local line_b = assert(store.add_memory(vec_b, 202, { topic_anchor = "topic:b", text = "beta topic python" }))
+local line_c = assert(store.add_memory(vec_c, 203, { topic_anchor = "topic:c", text = "gamma topic graph" }))
 assert(line_a == 1 and line_b == 2 and line_c == 3, "unexpected line allocation")
 
-local merged = assert(store.add_memory(norm({0.999, 0.001, 0, 0, 0, 0, 0, 0}), 204, { topic_anchor = "topic:a" }))
+local merged = assert(store.add_memory(norm({0.999, 0.001, 0, 0, 0, 0, 0, 0}), 204, {
+    topic_anchor = "topic:a",
+    text = "alpha topic lua repeated",
+}))
 assert(merged == 1, "reachable duplicate should merge into line 1")
 assert(store.get_total_lines() == 3, "merge should not create a new line")
 assert(store.get_cluster_id(1) > 0, "deep_artmap should assign a category id")

@@ -185,7 +185,10 @@ function M.save_ingest_items(facts, mem_turn)
     local saved = 0
     for _, fact in ipairs(facts or {}) do
         local fact_vec = tool.get_embedding_passage(fact)
-        local line, err = memory.add_memory(fact_vec, mem_turn)
+        local line, err = memory.add_memory(fact_vec, mem_turn, {
+            text = tostring(fact or ""),
+            kind = "atomic_fact",
+        })
         if line then
             saved = saved + 1
         else

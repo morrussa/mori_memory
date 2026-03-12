@@ -38,6 +38,8 @@ function M.run(state, _ctx)
         selected_memories = (recall_result.selected_memories or {}),
         fragments = (recall_result.fragments or {}),
         adopted_memories = (recall_result.adopted_memories or {}),
+        local_signals = (recall_result.local_signals or {}),
+        topic_debug = (recall_result.topic_debug or {}),
     }
 
     state.context = state.context or {}

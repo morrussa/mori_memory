@@ -283,10 +283,11 @@ class SimParams:
     topic_graph_topoart_link_margin: float = 0.045
     topic_graph_topoart_query_margin: float = 0.080
     topic_graph_topoart_temporal_link_window: int = 6
-    topic_graph_deep_artmap_bundle_vigilance: float = 0.82
+    topic_graph_deep_artmap_min_members: int = 4
+    topic_graph_deep_artmap_bundle_vigilance: float = 0.78
     topic_graph_deep_artmap_bundle_beta: float = 0.18
-    topic_graph_deep_artmap_query_bundles: int = 2
-    topic_graph_deep_artmap_query_margin: float = 0.06
+    topic_graph_deep_artmap_query_bundles: int = 3
+    topic_graph_deep_artmap_query_margin: float = 0.10
     topic_graph_deep_artmap_neighbor_topk: int = 2
     topic_graph_deep_artmap_temporal_link_window: int = 8
     topic_graph_deep_artmap_bundle_prior_weight: float = 0.18
@@ -348,7 +349,7 @@ class SimParams:
     turn_bundle_max: int = 1
     turn_bundle_mix: float = 0.30
     topic_atomic_memories_min: int = 1
-    topic_atomic_memories_max: int = 1
+    topic_atomic_memories_max: int = 3
     topic_atomic_facet_min: int = 1
     topic_atomic_facet_max: int = 2
     topic_atomic_secondary_mix: float = 0.16
@@ -469,6 +470,8 @@ class TopicLocalQueryResult:
     ops: int = 0
     bundle_ids: List[int] = field(default_factory=list)
     category_ids: List[int] = field(default_factory=list)
+    memory_scores: List[float] = field(default_factory=list)
+    memory_bundle_ids: List[int] = field(default_factory=list)
 
 
 class TopicLocalIndex:
@@ -490,6 +493,8 @@ class TopicLocalIndex:
         topic_id: int,
         query_vec: np.ndarray,
         max_results: int,
+        query_facet_ids: Optional[np.ndarray] = None,
+        query_facet_weights: Optional[np.ndarray] = None,
     ) -> TopicLocalQueryResult:
         return TopicLocalQueryResult()
 
@@ -552,6 +557,8 @@ class GHSOMTopicLocalIndex(TopicLocalIndex):
         topic_id: int,
         query_vec: np.ndarray,
         max_results: int,
+        query_facet_ids: Optional[np.ndarray] = None,
+        query_facet_weights: Optional[np.ndarray] = None,
     ) -> TopicLocalQueryResult:
         if not bool(sim.p.ghsom_enabled):
             return TopicLocalQueryResult()
@@ -602,6 +609,8 @@ class TopoARTTopicLocalIndex(TopicLocalIndex):
         topic_id: int,
         query_vec: np.ndarray,
         max_results: int,
+        query_facet_ids: Optional[np.ndarray] = None,
+        query_facet_weights: Optional[np.ndarray] = None,
     ) -> TopicLocalQueryResult:
         shard = sim.topic_shards[topic_id]
         if len(shard.members) < max(2, int(sim.p.topic_graph_topoart_min_members)):
@@ -667,8 +676,16 @@ class DeepARTMAPTopicLocalIndex(TopoARTTopicLocalIndex):
         topic_id: int,
         query_vec: np.ndarray,
         max_results: int,
+        query_facet_ids: Optional[np.ndarray] = None,
+        query_facet_weights: Optional[np.ndarray] = None,
     ) -> TopicLocalQueryResult:
-        return sim._deep_artmap_collect_candidates(topic_id, query_vec, max_results)
+        return sim._deep_artmap_collect_candidates(
+            topic_id,
+            query_vec,
+            max_results,
+            query_facet_ids=query_facet_ids,
+            query_facet_weights=query_facet_weights,
+        )
 
     def summary(self, sim: "TopicGraphSim", active_topics: int) -> Dict[str, float]:
         data = super().summary(sim, active_topics)
@@ -4756,11 +4773,13 @@ class TopicGraphSim:
         tid: int,
         query_vec: np.ndarray,
         max_results: int,
+        query_facet_ids: Optional[np.ndarray] = None,
+        query_facet_weights: Optional[np.ndarray] = None,
     ) -> TopicLocalQueryResult:
         if tid < 0 or tid >= self.topic_count:
             return TopicLocalQueryResult()
         shard = self.topic_shards[tid]
-        if len(shard.members) < max(2, int(self.p.topic_graph_topoart_min_members)):
+        if len(shard.members) < max(2, int(self.p.topic_graph_deep_artmap_min_members)):
             return TopicLocalQueryResult()
         topo_state = shard.topoart
         deep_state = shard.deep_artmap
@@ -4803,6 +4822,7 @@ class TopicGraphSim:
         query_bundles = max(1, int(self.p.topic_graph_deep_artmap_query_bundles))
         bundle_margin = max(0.0, float(self.p.topic_graph_deep_artmap_query_margin))
         neighbor_topk = max(0, int(self.p.topic_graph_deep_artmap_neighbor_topk))
+        query_map = self._build_query_facet_map(query_facet_ids, query_facet_weights)
 
         selected_bundles: List[int] = [int(active_bundle_ids[order[0]])]
         selected_bundle_set: Set[int] = {int(active_bundle_ids[order[0]])}
@@ -4840,12 +4860,22 @@ class TopicGraphSim:
             selected_bundle_set.add(int(bundle_id))
 
         query_categories = max(1, int(self.p.topic_graph_topoart_query_categories))
-        candidate_categories: List[Tuple[float, int]] = []
+        category_budget = max(query_categories, len(selected_bundles))
+        bundle_category_rows: Dict[int, List[Tuple[float, int]]] = {}
+        candidate_categories: List[Tuple[float, int, int]] = []
+        spill_categories: List[Tuple[float, int, int]] = []
         seen_categories: Set[int] = set()
+        bundle_query_scores = {
+            int(active_bundle_ids[pos]): float(bundle_scores[pos]) for pos in range(len(active_bundle_ids))
+        }
         bundle_score = 0.0
         for bundle_id in selected_bundles:
             bundle = deep_state.bundles[bundle_id]
-            bundle_score = max(bundle_score, float(bundle.prototype @ query_vec))
+            bundle_query_score = max(
+                float(bundle.prototype @ query_vec),
+                float(bundle_query_scores.get(int(bundle_id), float(bundle.prototype @ query_vec))),
+            )
+            bundle_score = max(bundle_score, bundle_query_score)
             active_categories = [
                 cid for cid in bundle.category_ids
                 if 0 <= cid < len(topo_state.categories) and topo_state.categories[cid].active
@@ -4855,22 +4885,43 @@ class TopicGraphSim:
             cat_protos = np.vstack([topo_state.categories[cid].prototype for cid in active_categories]).astype(np.float32)
             cat_sims = cat_protos @ query_vec
             ops += int(cat_protos.shape[0])
-            ranked = np.argsort(cat_sims)[::-1].tolist()
-            for pos in ranked:
-                cid = int(active_categories[pos])
-                if cid in seen_categories:
-                    continue
-                seen_categories.add(cid)
-                candidate_categories.append((float(cat_sims[pos]), cid))
+            rows = [(float(cat_sims[pos]), int(active_categories[pos])) for pos in np.argsort(cat_sims)[::-1].tolist()]
+            bundle_category_rows[int(bundle_id)] = rows
 
-        candidate_categories.sort(key=lambda it: it[0], reverse=True)
-        selected_categories = [cid for _score, cid in candidate_categories[: max(query_categories, len(selected_bundles))]]
+        if bundle_category_rows:
+            per_bundle_budget = max(1, (category_budget + len(selected_bundles) - 1) // max(1, len(selected_bundles)))
+            for bundle_id in selected_bundles:
+                rows = bundle_category_rows.get(int(bundle_id), [])
+                kept = 0
+                for cat_score, cid in rows:
+                    if cid in seen_categories:
+                        continue
+                    row = (float(cat_score), int(cid), int(bundle_id))
+                    if kept < per_bundle_budget:
+                        candidate_categories.append(row)
+                        seen_categories.add(int(cid))
+                        kept += 1
+                    else:
+                        spill_categories.append(row)
+
+            if len(candidate_categories) < category_budget:
+                for row in sorted(spill_categories, key=lambda it: it[0], reverse=True):
+                    _cat_score, cid, _bundle_id = row
+                    if int(cid) in seen_categories:
+                        continue
+                    candidate_categories.append(row)
+                    seen_categories.add(int(cid))
+                    if len(candidate_categories) >= category_budget:
+                        break
+
+        selected_categories = [int(cid) for _score, cid, _bundle_id in candidate_categories[:category_budget]]
 
         candidate_target = max(4, int(max_results or 1) * 4)
-        candidates: List[int] = []
-        seen_mem: Set[int] = set()
+        candidate_local_scores: Dict[int, float] = {}
+        candidate_bundle_ids: Dict[int, int] = {}
+        semantic_scores: Dict[int, float] = {}
         proto_score = bundle_score
-        for cid in selected_categories:
+        for cat_score, cid, bundle_id in candidate_categories[:category_budget]:
             cat = topo_state.categories[cid]
             proto_score = max(proto_score, float(cat.prototype @ query_vec))
             ranked_exemplars = sorted(
@@ -4878,15 +4929,36 @@ class TopicGraphSim:
                 key=lambda it: it[1],
                 reverse=True,
             )
-            for mem_idx, _score in ranked_exemplars:
-                if int(mem_idx) in seen_mem:
+            bundle_query_score = float(bundle_query_scores.get(int(bundle_id), float(cat_score)))
+            for mem_idx, exemplar_score in ranked_exemplars:
+                mem_id = int(mem_idx)
+                if mem_id < 0 or mem_id >= self.mem_count:
                     continue
-                seen_mem.add(int(mem_idx))
-                candidates.append(int(mem_idx))
-                if len(candidates) >= candidate_target:
-                    break
-            if len(candidates) >= candidate_target:
-                break
+                semantic = float(self.vec_pool[mem_id] @ query_vec)
+                local_score = (
+                    0.55 * max(0.0, float(cat_score))
+                    + 0.25 * max(0.0, bundle_query_score)
+                    + 0.20 * max(0.0, float(exemplar_score))
+                )
+                if local_score > float(candidate_local_scores.get(mem_id, -1e9)):
+                    candidate_local_scores[mem_id] = float(local_score)
+                    candidate_bundle_ids[mem_id] = int(bundle_id)
+                if semantic > float(semantic_scores.get(mem_id, -1e9)):
+                    semantic_scores[mem_id] = float(semantic)
+                ops += 1
+
+        ranked_memories = self._select_memories_for_context(
+            memory_ids=list(candidate_local_scores.keys()),
+            query_vec=query_vec,
+            query_map=query_map,
+            budget=candidate_target,
+            semantic_scores=semantic_scores,
+            local_scores=candidate_local_scores,
+            group_ids=candidate_bundle_ids,
+        )
+        candidates = [int(mem_id) for mem_id, _score in ranked_memories]
+        memory_scores = [float(score) for _mem_id, score in ranked_memories]
+        memory_bundle_ids = [int(candidate_bundle_ids.get(int(mem_id), -1)) for mem_id in candidates]
 
         self.deep_artmap_probe_count += 1
         self.deep_artmap_probe_bundle_total += len(selected_bundles)
@@ -4897,6 +4969,8 @@ class TopicGraphSim:
             ops=ops,
             bundle_ids=[int(bid) for bid in selected_bundles],
             category_ids=[int(cid) for cid in selected_categories],
+            memory_scores=memory_scores,
+            memory_bundle_ids=memory_bundle_ids,
         )
 
     def _topic_hnsw_ready(self) -> bool:
@@ -5307,10 +5381,19 @@ class TopicGraphSim:
         candidate_scores: Dict[int, float],
         turn: int,
     ) -> Set[int]:
-        self.preload_attempts += 1
-        load_budget = max(1, int(self.p.topic_graph_load_budget))
         ranked = sorted(candidate_scores.items(), key=lambda it: it[1], reverse=True)
         available: Set[int] = set()
+        if not bool(self.p.smart_preload_enabled):
+            for tid, _score in ranked:
+                shard = self.topic_shards[tid]
+                if not shard.loaded:
+                    continue
+                shard.last_loaded_turn = turn
+                available.add(int(tid))
+            return available
+
+        self.preload_attempts += 1
+        load_budget = max(1, int(self.p.topic_graph_load_budget))
         used_budget = 0
         for tid, _score in ranked:
             shard = self.topic_shards[tid]
@@ -5337,6 +5420,8 @@ class TopicGraphSim:
         current_topic: Optional[int],
         current_turn: int,
         semantic_scores: Dict[int, float],
+        query_facet_ids: Optional[np.ndarray] = None,
+        query_facet_weights: Optional[np.ndarray] = None,
         anchor_evidence: Optional[Dict[int, List[int]]] = None,
         anchor_debug: Optional[Dict[str, object]] = None,
     ) -> Tuple[List[int], Dict[str, object], int]:
@@ -5349,7 +5434,9 @@ class TopicGraphSim:
         evidence_memories: List[int] = []
         evidence_by_topic: Dict[int, List[int]] = {}
         local_signals: Dict[int, Dict[str, List[int]]] = {}
+        topic_rows: List[Dict[str, object]] = []
         ops = 0
+        query_map = self._build_query_facet_map(query_facet_ids, query_facet_weights)
         momentum_probe, momentum_ops = self._one_turn_momentum_probe(
             query_vec=query_vec,
             current_topic=current_topic,
@@ -5371,9 +5458,19 @@ class TopicGraphSim:
                 tid,
                 query_vec,
                 per_topic_evidence,
+                query_facet_ids=query_facet_ids,
+                query_facet_weights=query_facet_weights,
             )
             topic_ops = int(query_result.ops)
             idx = query_result.indices
+            local_score_map: Dict[int, float] = {}
+            local_group_map: Dict[int, int] = {}
+            if len(query_result.memory_scores) == int(idx.size):
+                for pos, mem_idx in enumerate(idx.tolist()):
+                    local_score_map[int(mem_idx)] = float(query_result.memory_scores[pos])
+            if len(query_result.memory_bundle_ids) == int(idx.size):
+                for pos, mem_idx in enumerate(idx.tolist()):
+                    local_group_map[int(mem_idx)] = int(query_result.memory_bundle_ids[pos])
             if tid in anchor_evidence:
                 extra_ids = [int(mem_id) for mem_id in anchor_evidence.get(int(tid), [])]
                 if extra_ids:
@@ -5398,15 +5495,33 @@ class TopicGraphSim:
             if sims.size <= 0:
                 continue
             k = min(per_topic_evidence, int(sims.size))
-            if k < sims.size:
-                keep = np.argpartition(sims, -k)[-k:]
-                best = keep[np.argsort(sims[keep])[::-1]]
-                ops += int(sims.size)
+            if local_score_map and query_map:
+                semantic_map = {int(idx[pos]): float(sims[pos]) for pos in range(int(idx.size))}
+                ranked_memories = self._select_memories_for_context(
+                    memory_ids=idx.tolist(),
+                    query_vec=query_vec,
+                    query_map=query_map,
+                    budget=k,
+                    semantic_scores=semantic_map,
+                    local_scores=local_score_map,
+                    group_ids=local_group_map,
+                )
+                best_memories = [int(mem_id) for mem_id, _score in ranked_memories]
+                best_sims = np.asarray(
+                    [float(semantic_map.get(int(mem_id), 0.0)) for mem_id in best_memories],
+                    dtype=np.float32,
+                )
+                ops += int(idx.size)
             else:
-                best = np.argsort(sims)[::-1]
-                ops += int(sims.size)
-            best_sims = sims[best]
-            best_memories = [int(idx[i]) for i in best.tolist()]
+                if k < sims.size:
+                    keep = np.argpartition(sims, -k)[-k:]
+                    best = keep[np.argsort(sims[keep])[::-1]]
+                    ops += int(sims.size)
+                else:
+                    best = np.argsort(sims)[::-1]
+                    ops += int(sims.size)
+                best_sims = sims[best]
+                best_memories = [int(idx[i]) for i in best.tolist()]
             evidence_score = max(float(query_result.score), float(np.max(best_sims))) + 0.15 * float(np.mean(best_sims))
             total_score = float(candidate_scores.get(tid, 0.0)) + evidence_score
             ranked_topics.append((int(tid), total_score))
@@ -5417,27 +5532,22 @@ class TopicGraphSim:
                 "bundle_ids": [int(bid) for bid in query_result.bundle_ids],
                 "category_ids": [int(cid) for cid in query_result.category_ids],
             }
+            topic_rows.append(
+                {
+                    "tid": int(tid),
+                    "total_score": float(total_score),
+                    "route_score": float(candidate_scores.get(tid, 0.0)),
+                    "peak_sim": float(np.max(best_sims)),
+                    "mean_sim": float(np.mean(best_sims)),
+                    "topic_cover": self._topic_facet_cover(best_memories),
+                    "family_id": int(self._topic_family_id(int(tid))),
+                }
+            )
             if self.topic_shards[tid].loaded:
                 self.resident_hit_events += 1
 
-        ranked_topics.sort(key=lambda it: it[1], reverse=True)
-        selected_topics: List[int] = []
-        kept_family_counts: Dict[int, int] = {}
-        family_limit = max(1, int(self.p.topic_graph_family_member_limit))
-        for tid, _score in ranked_topics:
-            family_id = self._topic_family_id(tid)
-            if (
-                tid != -1
-                and family_id >= 0
-                and kept_family_counts.get(family_id, 0) >= family_limit
-            ):
-                self.self_excite_skip_events += 1
-                continue
-            selected_topics.append(int(tid))
-            if family_id >= 0:
-                kept_family_counts[family_id] = kept_family_counts.get(family_id, 0) + 1
-            if len(selected_topics) >= max(1, int(self.p.topic_graph_max_return_topics)):
-                break
+        ranked_topics = self._select_topics_for_context(topic_rows, query_map)
+        selected_topics: List[int] = [int(tid) for tid, _score in ranked_topics]
         return selected_topics, {
             "evidence_topics": evidence_topics,
             "evidence_memories": evidence_memories,
@@ -5457,6 +5567,8 @@ class TopicGraphSim:
         query_vec: np.ndarray,
         current_topic: Optional[int],
         current_turn: int,
+        query_facet_ids: Optional[np.ndarray] = None,
+        query_facet_weights: Optional[np.ndarray] = None,
     ) -> Tuple[List[int], int, Dict[str, object]]:
         semantic_scores, ops0 = self._semantic_topic_scores(query_vec, current_topic)
         if not semantic_scores:
@@ -5471,6 +5583,8 @@ class TopicGraphSim:
             current_topic=current_topic,
             current_turn=current_turn,
             semantic_scores=semantic_scores,
+            query_facet_ids=query_facet_ids,
+            query_facet_weights=query_facet_weights,
             anchor_evidence=None,
             anchor_debug=None,
         )
@@ -5522,6 +5636,262 @@ class TopicGraphSim:
                 continue
             out[facet_id] = weight
         return out
+
+    def _build_query_facet_map(
+        self,
+        query_facet_ids: Optional[np.ndarray],
+        query_facet_weights: Optional[np.ndarray],
+    ) -> Dict[int, float]:
+        if query_facet_ids is None or query_facet_weights is None:
+            return {}
+        out: Dict[int, float] = {}
+        for pos in range(min(len(query_facet_ids), len(query_facet_weights))):
+            facet_id = int(query_facet_ids[pos])
+            if facet_id < 0:
+                continue
+            weight = float(query_facet_weights[pos])
+            if weight <= 0.0:
+                continue
+            out[facet_id] = out.get(facet_id, 0.0) + weight
+        return out
+
+    def _topic_facet_cover(
+        self,
+        mem_ids: Sequence[int],
+    ) -> Dict[int, float]:
+        cover: Dict[int, float] = {}
+        for mem_idx in mem_ids:
+            mem_map = self._memory_facet_map(int(mem_idx))
+            if not mem_map:
+                continue
+            for facet_id, weight in mem_map.items():
+                if float(weight) > float(cover.get(int(facet_id), 0.0)):
+                    cover[int(facet_id)] = float(weight)
+        return cover
+
+    def _select_topics_for_context(
+        self,
+        topic_rows: Sequence[Dict[str, object]],
+        query_map: Dict[int, float],
+    ) -> List[Tuple[int, float]]:
+        if not topic_rows:
+            return []
+
+        max_topics = max(1, int(self.p.topic_graph_max_return_topics))
+        query_total_weight = max(1e-6, float(sum(query_map.values())))
+        selected: List[Tuple[int, float]] = []
+        selected_set: Set[int] = set()
+        best_facet_cover = {int(facet_id): 0.0 for facet_id in query_map}
+        family_counts: Dict[int, int] = {}
+        family_limit = max(1, int(self.p.topic_graph_family_member_limit))
+
+        while len(selected) < max_topics:
+            best_tid = -1
+            best_score = -1e9
+            best_cover: Optional[Dict[int, float]] = None
+            best_family = -1
+
+            for row in topic_rows:
+                tid = int(row.get("tid", -1))
+                if tid < 0 or tid in selected_set:
+                    continue
+
+                family_id = int(row.get("family_id", -1))
+                family_repeat = family_counts.get(family_id, 0) if family_id >= 0 else 0
+                if family_id >= 0 and family_repeat >= family_limit and len(selected) > 0:
+                    self.self_excite_skip_events += 1
+                    continue
+
+                topic_cover = row.get("topic_cover", {})
+                if not isinstance(topic_cover, dict):
+                    topic_cover = {}
+
+                coverage_gain = 0.0
+                if query_map and topic_cover:
+                    for facet_id, query_weight in query_map.items():
+                        current = float(best_facet_cover.get(int(facet_id), 0.0))
+                        updated = float(topic_cover.get(int(facet_id), 0.0))
+                        if updated > current:
+                            coverage_gain += float(query_weight) * (updated - current)
+                    coverage_gain /= query_total_weight
+
+                peak_sim = max(0.0, float(row.get("peak_sim", 0.0)))
+                mean_sim = max(0.0, float(row.get("mean_sim", 0.0)))
+                route_score = max(0.0, min(1.0, float(row.get("route_score", 0.0))))
+                semantic_support = min(
+                    1.0,
+                    0.55 * peak_sim + 0.20 * mean_sim + 0.25 * route_score,
+                )
+
+                novelty_bonus = 0.10 if family_id >= 0 and family_repeat <= 0 else 0.0
+                repeat_penalty = 0.06 * (family_repeat / float(family_repeat + 1)) if family_repeat > 0 else 0.0
+                context_score = (
+                    float(coverage_gain)
+                    + 0.55 * float(semantic_support)
+                    + float(novelty_bonus)
+                    - float(repeat_penalty)
+                )
+                if context_score > best_score:
+                    best_tid = tid
+                    best_score = float(context_score)
+                    best_cover = {int(fid): float(val) for fid, val in topic_cover.items()}
+                    best_family = family_id
+
+            if best_tid < 0:
+                break
+
+            selected.append((int(best_tid), float(best_score)))
+            selected_set.add(int(best_tid))
+            if best_cover:
+                for facet_id, weight in best_cover.items():
+                    best_facet_cover[int(facet_id)] = max(
+                        float(best_facet_cover.get(int(facet_id), 0.0)),
+                        float(weight),
+                    )
+            if best_family >= 0:
+                family_counts[int(best_family)] = family_counts.get(int(best_family), 0) + 1
+
+        if selected:
+            return selected
+
+        fallback = sorted(
+            (
+                (int(row.get("tid", -1)), float(row.get("total_score", 0.0)))
+                for row in topic_rows
+                if int(row.get("tid", -1)) >= 0
+            ),
+            key=lambda it: it[1],
+            reverse=True,
+        )
+        return fallback[:max_topics]
+
+    def _select_memories_for_context(
+        self,
+        memory_ids: Sequence[int],
+        query_vec: np.ndarray,
+        query_map: Dict[int, float],
+        budget: int,
+        semantic_scores: Optional[Dict[int, float]] = None,
+        local_scores: Optional[Dict[int, float]] = None,
+        group_ids: Optional[Dict[int, int]] = None,
+    ) -> List[Tuple[int, float]]:
+        if not memory_ids:
+            return []
+
+        semantic_scores = semantic_scores or {}
+        local_scores = local_scores or {}
+        group_ids = group_ids or {}
+        unique_ids: List[int] = []
+        seen_ids: Set[int] = set()
+        for mem_idx in memory_ids:
+            mem_id = int(mem_idx)
+            if mem_id < 0 or mem_id >= self.mem_count or mem_id in seen_ids:
+                continue
+            seen_ids.add(mem_id)
+            unique_ids.append(mem_id)
+        if not unique_ids:
+            return []
+
+        local_max = max((max(0.0, float(score)) for score in local_scores.values()), default=0.0)
+        query_total_weight = max(1e-6, float(sum(query_map.values())))
+        sim_threshold = min(
+            0.999,
+            max(-1.0, float(self.p.context_similarity_saturation_threshold)),
+        )
+
+        cache: Dict[int, Dict[str, object]] = {}
+        for mem_id in unique_ids:
+            semantic = float(semantic_scores.get(mem_id, float(self.vec_pool[mem_id] @ query_vec)))
+            local = float(local_scores.get(mem_id, 0.0))
+            local_norm = (local / local_max) if local_max > 1e-6 else 0.0
+            cache[mem_id] = {
+                "semantic": max(0.0, semantic),
+                "local": max(0.0, local_norm),
+                "map": self._memory_facet_map(mem_id),
+                "group_id": int(group_ids.get(mem_id, -1)),
+                "vec": self.vec_pool[mem_id],
+            }
+
+        remaining: Set[int] = set(unique_ids)
+        selected: List[Tuple[int, float]] = []
+        selected_ids: List[int] = []
+        best_facet_cover = {int(facet_id): 0.0 for facet_id in query_map}
+        group_counts: Dict[int, int] = {}
+
+        while remaining and len(selected) < max(1, int(budget)):
+            best_mem = -1
+            best_score = -1e9
+            for mem_id in sorted(remaining):
+                info = cache[mem_id]
+                mem_map = info["map"]
+
+                coverage_gain = 0.0
+                if query_map and mem_map:
+                    for facet_id, query_weight in query_map.items():
+                        current = float(best_facet_cover.get(int(facet_id), 0.0))
+                        updated = float(mem_map.get(int(facet_id), 0.0))
+                        if updated > current:
+                            coverage_gain += float(query_weight) * (updated - current)
+                    coverage_gain /= query_total_weight
+
+                max_pair_excess = 0.0
+                if selected_ids:
+                    for selected_id in selected_ids:
+                        sim = float(info["vec"] @ self.vec_pool[int(selected_id)])
+                        if sim > sim_threshold:
+                            max_pair_excess = max(
+                                max_pair_excess,
+                                (sim - sim_threshold) / max(1e-6, 1.0 - sim_threshold),
+                            )
+
+                group_id = int(info["group_id"])
+                group_repeat = group_counts.get(group_id, 0) if group_id >= 0 else 0
+                group_bonus = 0.08 if group_id >= 0 and group_repeat <= 0 else 0.0
+                group_penalty = 0.05 * (group_repeat / float(group_repeat + 1)) if group_repeat > 0 else 0.0
+
+                semantic = float(info["semantic"])
+                local = float(info["local"])
+                if query_map:
+                    context_score = (
+                        float(coverage_gain)
+                        + 0.50 * semantic
+                        + 0.22 * local
+                        + float(group_bonus)
+                        - 0.14 * float(max_pair_excess)
+                        - float(group_penalty)
+                    )
+                else:
+                    context_score = (
+                        0.72 * semantic
+                        + 0.28 * local
+                        + float(group_bonus)
+                        - 0.14 * float(max_pair_excess)
+                        - float(group_penalty)
+                    )
+
+                if context_score > best_score:
+                    best_mem = int(mem_id)
+                    best_score = float(context_score)
+
+            if best_mem < 0:
+                break
+
+            selected.append((int(best_mem), float(best_score)))
+            selected_ids.append(int(best_mem))
+            remaining.remove(int(best_mem))
+            info = cache[int(best_mem)]
+            mem_map = info["map"]
+            if isinstance(mem_map, dict):
+                for facet_id in query_map:
+                    best_facet_cover[int(facet_id)] = max(
+                        float(best_facet_cover.get(int(facet_id), 0.0)),
+                        float(mem_map.get(int(facet_id), 0.0)),
+                    )
+            group_id = int(info["group_id"])
+            if group_id >= 0:
+                group_counts[group_id] = group_counts.get(group_id, 0) + 1
+
+        return selected
 
     def _dominant_memory_topic(self, mem_idx: int) -> Optional[int]:
         if mem_idx < 0 or mem_idx >= len(self.mem_origin_topic_counts):
@@ -5919,15 +6289,7 @@ class TopicGraphSim:
         query_facet_ids: np.ndarray,
         query_facet_weights: np.ndarray,
     ) -> float:
-        query_map: Dict[int, float] = {}
-        for pos in range(min(len(query_facet_ids), len(query_facet_weights))):
-            facet_id = int(query_facet_ids[pos])
-            if facet_id < 0:
-                continue
-            weight = float(query_facet_weights[pos])
-            if weight <= 0.0:
-                continue
-            query_map[facet_id] = query_map.get(facet_id, 0.0) + weight
+        query_map = self._build_query_facet_map(query_facet_ids, query_facet_weights)
 
         context_budget = max(
             1,
@@ -6249,6 +6611,8 @@ class TopicGraphSim:
                     query_vec,
                     current_topic=current_topic,
                     current_turn=turn,
+                    query_facet_ids=query_facet_ids,
+                    query_facet_weights=query_facet_weights,
                 )
                 self.sim_ops_query_total += query_ops
                 self.query_turns += 1
@@ -6485,7 +6849,7 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--topic-atomic-min", type=int, default=1,
                         help="Minimum number of atomic memories extracted from each simulated turn")
-    parser.add_argument("--topic-atomic-max", type=int, default=1,
+    parser.add_argument("--topic-atomic-max", type=int, default=3,
                         help="Maximum number of atomic memories extracted from each simulated turn")
     parser.add_argument("--topic-atomic-facet-min", type=int, default=1,
                         help="Minimum number of latent facets carried by one simulated atomic memory")
@@ -6581,6 +6945,8 @@ def main():
                         help="Topic-local index used inside topic_graph retrieval")
     parser.add_argument("--topoart-min-members", type=int, default=8,
                         help="Only use TopoART routing after a topic has at least this many memories")
+    parser.add_argument("--deep-artmap-min-members", type=int, default=4,
+                        help="Only use deep_artmap routing after a topic has at least this many memories")
     parser.add_argument("--topoart-vigilance", type=float, default=0.88,
                         help="Primary TopoART resonance threshold")
     parser.add_argument("--topoart-secondary-vigilance", type=float, default=0.80,
@@ -6611,13 +6977,13 @@ def main():
                         help="Expand extra query categories within this similarity margin of the best category")
     parser.add_argument("--topoart-temporal-link-window", type=int, default=6,
                         help="Link recently consecutive TopoART winners within the same topic")
-    parser.add_argument("--deep-artmap-bundle-vigilance", type=float, default=0.82,
+    parser.add_argument("--deep-artmap-bundle-vigilance", type=float, default=0.78,
                         help="Bundle-level resonance threshold for deep_artmap")
     parser.add_argument("--deep-artmap-bundle-beta", type=float, default=0.18,
                         help="Bundle-level prototype learning rate for deep_artmap")
-    parser.add_argument("--deep-artmap-query-bundles", type=int, default=2,
+    parser.add_argument("--deep-artmap-query-bundles", type=int, default=3,
                         help="Max context bundles to expand per topic query in deep_artmap")
-    parser.add_argument("--deep-artmap-query-margin", type=float, default=0.06,
+    parser.add_argument("--deep-artmap-query-margin", type=float, default=0.10,
                         help="Expand additional bundles within this margin of the best bundle")
     parser.add_argument("--deep-artmap-neighbor-topk", type=int, default=2,
                         help="Max linked neighbor bundles considered per selected bundle")
@@ -6708,6 +7074,7 @@ def main():
         topic_graph_family_escape_bonus=max(0.0, float(args.family_escape_bonus)),
         topic_graph_local_index=str(args.topic_local_index).strip().lower(),
         topic_graph_topoart_min_members=max(2, int(args.topoart_min_members)),
+        topic_graph_deep_artmap_min_members=max(2, int(args.deep_artmap_min_members)),
         topic_graph_topoart_vigilance=max(-1.0, min(1.0, float(args.topoart_vigilance))),
         topic_graph_topoart_secondary_vigilance=max(-1.0, min(1.0, float(args.topoart_secondary_vigilance))),
         topic_graph_topoart_beta=max(0.0, min(1.0, float(args.topoart_beta))),
@@ -6768,6 +7135,7 @@ def main():
         elif args.topic_local_index == "deep_artmap":
             print(
                 "Deep ARTMAP: "
+                f"min_members={int(args.deep_artmap_min_members)}, "
                 f"bundle_vigilance={float(args.deep_artmap_bundle_vigilance):.2f}, "
                 f"query_bundles={int(args.deep_artmap_query_bundles)}, "
                 "layers=2"

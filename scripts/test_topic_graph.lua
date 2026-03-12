@@ -68,9 +68,9 @@ local vec_a1 = norm({1, 0, 0, 0, 0, 0, 0, 0})
 local vec_a2 = norm({0.96, 0.04, 0, 0, 0, 0, 0, 0})
 local vec_b1 = norm({0, 1, 0, 0, 0, 0, 0, 0})
 
-local line_a1 = assert(store.add_memory(vec_a1, 1, { topic_anchor = "topic:a" }))
-local line_a2 = assert(store.add_memory(vec_a2, 2, { topic_anchor = "topic:a" }))
-local line_b1 = assert(store.add_memory(vec_b1, 3, { topic_anchor = "topic:b" }))
+local line_a1 = assert(store.add_memory(vec_a1, 1, { topic_anchor = "topic:a", text = "lua metatable index" }))
+local line_a2 = assert(store.add_memory(vec_a2, 2, { topic_anchor = "topic:a", text = "lua table method" }))
+local line_b1 = assert(store.add_memory(vec_b1, 3, { topic_anchor = "topic:b", text = "python list comprehension" }))
 
 topic_graph.observe_turn(4, "topic:a")
 topic_graph.observe_feedback("topic:a", {
@@ -99,5 +99,30 @@ for _, mem_id in ipairs(adopted.selected_memories or {}) do
     selected[tonumber(mem_id)] = true
 end
 assert(selected[line_b1] == true, "topic:b memory should be retrievable after feedback")
+
+config.settings.topic_graph.max_return_topics = 1
+config.settings.topic_graph.retrieve_max_memories = 2
+local mix_1 = assert(store.add_memory(norm({1.0, 0.0, 0, 0, 0, 0, 0, 0}), 8, {
+    topic_anchor = "topic:mix",
+    text = "lua metatable __index",
+}))
+local mix_2 = assert(store.add_memory(norm({0.93, 0.36, 0, 0, 0, 0, 0, 0}), 9, {
+    topic_anchor = "topic:mix",
+    text = "lua metatable __newindex",
+}))
+local mix_3 = assert(store.add_memory(norm({0.70, 0.71, 0, 0, 0, 0, 0, 0}), 10, {
+    topic_anchor = "topic:mix",
+    text = "python list comprehension",
+}))
+
+local facet_query = topic_graph.retrieve(norm({0.92, 0.39, 0, 0, 0, 0, 0, 0}), "topic:mix", 11, {
+    user_input = "比较 Lua metatable 和 Python list 的用法",
+})
+local facet_selected = {}
+for _, mem_id in ipairs(facet_query.selected_memories or {}) do
+    facet_selected[tonumber(mem_id)] = true
+end
+assert((facet_selected[mix_1] or facet_selected[mix_2]) == true, "facet-aware query should keep one Lua metatable memory")
+assert(facet_selected[mix_3] == true, "facet-aware query should keep the Python-list memory instead of two redundant Lua memories")
 
 print("test_topic_graph: ok")
