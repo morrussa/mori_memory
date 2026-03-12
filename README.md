@@ -3,15 +3,21 @@
 *“让 agent 具备可持续工作状态，而不是只具备一次性回答能力。”*
 
 第一，它不是普通 RAG。
+
 普通 RAG 的中心是“query -> chunk -> answer”
+
 mori的中心是“任务状态 -> topic 路由 -> evidence 选择 -> 上下文重组 -> 反馈学习”。
 
 第二，它不是单纯的 chat memory。
+
 很多memory只是偏好记录或历史摘要
+
 而mori有 history / topic / topic_graph / episode / checkpoint / session 的分层，已经在做状态操作系统而不是“记住几条事实”。
 
 第三，它也不只是一个 agent framework。
+
 像 LangGraph、ADK 这一类更多解决 orchestration
+
 我把 orchestration 和 long-term state 本体绑在了一起。我承认确实是个难点和坑点，但是我认为值得。
 
 Mori的memory是agent runtime的第一公民，而不是agent本身。**其实一开始只是想在直播间画NSFW的时候帮我回复弹幕。**
