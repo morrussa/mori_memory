@@ -416,6 +416,7 @@ class TopicShardState:
 @dataclass
 class TopoARTCategoryState:
     prototype: np.ndarray
+    vector_sum: np.ndarray  # unnormalized sum of member vectors
     support: int = 0
     member_count: int = 0
     exemplars: List[int] = field(default_factory=list)
@@ -446,6 +447,7 @@ class TopoARTInsertResult:
 @dataclass
 class DeepARTMAPBundleState:
     prototype: np.ndarray
+    vector_sum: np.ndarray  # unnormalized sum of category prototypes (or member vectors)
     category_ids: List[int] = field(default_factory=list)
     support: int = 0
     last_update_turn: int = 0
@@ -693,17 +695,19 @@ class DeepARTMAPTopicLocalIndex(TopoARTTopicLocalIndex):
         bundle_category_total = 0
         bundle_recall_total = 0.0
         bundle_adopt_total = 0.0
-        for shard in sim.topic_shards:
-            state = shard.deep_artmap
-            if state is None:
+        # Use global deep artmap state
+        state = sim.global_deep_artmap
+        for bundle in state.bundles:
+            if not bundle.active:
                 continue
-            for bundle in state.bundles:
-                if not bundle.active:
-                    continue
-                bundle_count += 1
-                bundle_category_total += len(bundle.category_ids)
-                bundle_recall_total += float(bundle.recall_score)
-                bundle_adopt_total += float(bundle.adopt_score)
+            bundle_count += 1
+            bundle_category_total += len(bundle.category_ids)
+        # Sum per-topic priors across all topics
+        for tid in range(sim.topic_count):
+            for prior in sim.bundle_recall_prior[tid].values():
+                bundle_recall_total += prior
+            for prior in sim.bundle_adopt_prior[tid].values():
+                bundle_adopt_total += prior
         data.update(
             {
                 "topic_graph_local_index_is_topoart": 0.0,
@@ -3766,6 +3770,18 @@ class TopicGraphSim:
         self.last_anchor_id = -1
         self.last_anchor_by_topic: Dict[int, int] = {}
 
+        # Global DeepARTMAP state (category and bundle are globally unique)
+        self.global_topoart: TopoARTState = TopoARTState()
+        self.global_deep_artmap: DeepARTMAPState = DeepARTMAPState()
+        # Mapping from topic to categories/bundles
+        self.topic_to_categories: List[Set[int]] = [set() for _ in range(self.topic_count)]
+        self.topic_to_bundles: List[Set[int]] = [set() for _ in range(self.topic_count)]
+        # Prior scores per (topic, bundle)
+        self.bundle_recall_prior: List[Dict[int, float]] = [{} for _ in range(self.topic_count)]
+        self.bundle_adopt_prior: List[Dict[int, float]] = [{} for _ in range(self.topic_count)]
+        # Category to bundle mapping (global)
+        self.global_category_to_bundle: Dict[int, int] = {}
+
         self.topic_shards: List[TopicShardState] = [TopicShardState() for _ in range(self.topic_count)]
         self.topic_member_sets: List[Set[int]] = [set() for _ in range(self.topic_count)]
         self.topic_bridges: List[Dict[int, TopicBridgeState]] = [dict() for _ in range(self.topic_count)]
@@ -4131,16 +4147,16 @@ class TopicGraphSim:
     ) -> List[Tuple[np.ndarray, float]]:
         if tid < 0 or tid >= self.topic_count:
             return []
-        shard = self.topic_shards[tid]
-        state = shard.deep_artmap
-        if state is None:
-            return []
+        state = self.global_deep_artmap
         signature: List[Tuple[np.ndarray, float]] = []
-        for bundle in state.bundles:
+        for bundle_id, bundle in enumerate(state.bundles):
             if not bundle.active:
                 continue
+            if bundle_id not in self.topic_to_bundles[tid]:
+                continue
             weight = float(max(1, int(bundle.support)))
-            weight += 0.25 * float(bundle.recall_score) + 0.35 * float(bundle.adopt_score)
+            weight += 0.25 * float(self.bundle_recall_prior[tid].get(bundle_id, 0.0))
+            weight += 0.35 * float(self.bundle_adopt_prior[tid].get(bundle_id, 0.0))
             if weight <= 0.0:
                 continue
             signature.append((bundle.prototype, weight))
@@ -4286,16 +4302,12 @@ class TopicGraphSim:
         return self.topic_local_index.ghsom_active(self)
 
     def _ensure_topic_topoart(self, tid: int) -> TopoARTState:
-        shard = self.topic_shards[tid]
-        if shard.topoart is None:
-            shard.topoart = TopoARTState()
-        return shard.topoart
+        # Global topology: all categories are shared across topics
+        return self.global_topoart
 
     def _ensure_topic_deep_artmap(self, tid: int) -> DeepARTMAPState:
-        shard = self.topic_shards[tid]
-        if shard.deep_artmap is None:
-            shard.deep_artmap = DeepARTMAPState()
-        return shard.deep_artmap
+        # Global deep ARTMAP: all bundles are shared across topics
+        return self.global_deep_artmap
 
     def _topoart_active_category_ids(self, state: Optional[TopoARTState]) -> List[int]:
         if state is None:
@@ -4397,6 +4409,7 @@ class TopicGraphSim:
             state.categories.append(
                 TopoARTCategoryState(
                     prototype=vec.astype(np.float32, copy=True),
+                    vector_sum=vec.astype(np.float32, copy=True),
                     support=1,
                     member_count=1,
                     exemplars=[int(mem_idx)],
@@ -4407,6 +4420,7 @@ class TopicGraphSim:
                 )
             )
             new_id = len(state.categories) - 1
+            self.topic_to_categories[tid].add(new_id)
             prev_id = int(state.last_winner_id)
             if (
                 temporal_link_window > 0
@@ -4463,7 +4477,8 @@ class TopicGraphSim:
             return result
 
         winner = state.categories[winner_id]
-        winner.prototype = unit(((1.0 - beta) * winner.prototype + beta * vec).astype(np.float32)).astype(np.float32)
+        winner.vector_sum += vec
+        winner.prototype = unit(winner.vector_sum)
         winner.support += 1
         winner.member_count += 1
         winner.last_update_turn = int(turn)
@@ -4475,10 +4490,8 @@ class TopicGraphSim:
             second_id = runner_up_id
         if second_id is not None:
             second = state.categories[second_id]
-            if beta_secondary > 0.0:
-                second.prototype = unit(
-                    ((1.0 - beta_secondary) * second.prototype + beta_secondary * vec).astype(np.float32)
-                ).astype(np.float32)
+            # centroid update removed for second category (global geometry)
+            # second.prototype remains unchanged
             second.last_update_turn = int(turn)
             second.match_ema = (1.0 - match_alpha) * float(second.match_ema) + match_alpha * float(max(0.0, runner_up_sim))
             second.match_min = min(float(second.match_min), float(max(0.0, runner_up_sim)))
@@ -4518,7 +4531,7 @@ class TopicGraphSim:
     ) -> Tuple[np.ndarray, float, int]:
         if tid < 0 or tid >= self.topic_count:
             return np.asarray([], dtype=np.int32), 0.0, 0
-        state = self.topic_shards[tid].topoart
+        state = self._ensure_topic_topoart(tid)
         active_ids = self._topoart_active_category_ids(state)
         if not active_ids:
             return np.asarray([], dtype=np.int32), 0.0, 0
@@ -4647,38 +4660,51 @@ class TopicGraphSim:
     ) -> None:
         if tid < 0 or tid >= self.topic_count or bundle_id < 0:
             return
-        state = self.topic_shards[tid].deep_artmap
-        if state is None or bundle_id >= len(state.bundles):
+        # Check bundle exists in global deep artmap state
+        if bundle_id >= len(self.global_deep_artmap.bundles):
             return
-        bundle = state.bundles[bundle_id]
+        bundle = self.global_deep_artmap.bundles[bundle_id]
         if not bundle.active:
             return
         rate = max(0.0, float(lr))
         if kind == "recall":
-            bundle.recall_score = min(1.0, bundle.recall_score + rate * (1.0 - bundle.recall_score))
+            prior = self.bundle_recall_prior[tid].get(bundle_id, 0.0)
+            new_prior = min(1.0, prior + rate * (1.0 - prior))
+            self.bundle_recall_prior[tid][bundle_id] = new_prior
         elif kind == "adopt":
-            bundle.adopt_score = min(1.0, bundle.adopt_score + rate * (1.0 - bundle.adopt_score))
+            prior = self.bundle_adopt_prior[tid].get(bundle_id, 0.0)
+            new_prior = min(1.0, prior + rate * (1.0 - prior))
+            self.bundle_adopt_prior[tid][bundle_id] = new_prior
 
     def _decay_deep_artmap_feedback(self) -> None:
         decay = min(0.9999, max(0.0, float(self.p.topic_graph_deep_artmap_bundle_decay)))
-        for shard in self.topic_shards:
-            state = shard.deep_artmap
-            if state is None:
+        # Decay per-topic prior maps
+        for tid in range(self.topic_count):
+            for bundle_id, prior in list(self.bundle_recall_prior[tid].items()):
+                new_prior = prior * decay
+                if new_prior < 0.001:
+                    del self.bundle_recall_prior[tid][bundle_id]
+                else:
+                    self.bundle_recall_prior[tid][bundle_id] = new_prior
+            for bundle_id, prior in list(self.bundle_adopt_prior[tid].items()):
+                new_prior = prior * decay
+                if new_prior < 0.001:
+                    del self.bundle_adopt_prior[tid][bundle_id]
+                else:
+                    self.bundle_adopt_prior[tid][bundle_id] = new_prior
+        # Decay global bundle neighbor strengths
+        for bundle in self.global_deep_artmap.bundles:
+            if not bundle.active:
                 continue
-            for bundle in state.bundles:
-                if not bundle.active:
-                    continue
-                bundle.recall_score *= decay
-                bundle.adopt_score *= decay
-                if bundle.neighbors:
-                    drop: List[int] = []
-                    for nid, strength in bundle.neighbors.items():
-                        new_strength = float(strength) * decay
-                        bundle.neighbors[nid] = new_strength
-                        if new_strength < 0.02:
-                            drop.append(int(nid))
-                    for nid in drop:
-                        bundle.neighbors.pop(nid, None)
+            if bundle.neighbors:
+                drop: List[int] = []
+                for nid, strength in bundle.neighbors.items():
+                    new_strength = float(strength) * decay
+                    bundle.neighbors[nid] = new_strength
+                    if new_strength < 0.02:
+                        drop.append(int(nid))
+                for nid in drop:
+                    bundle.neighbors.pop(nid, None)
 
     def _deep_artmap_assign_bundle(
         self,
@@ -4686,9 +4712,8 @@ class TopicGraphSim:
         category_id: int,
         turn: int,
     ) -> Tuple[int, int]:
-        shard = self.topic_shards[tid]
-        topo_state = shard.topoart
-        if topo_state is None or category_id < 0 or category_id >= len(topo_state.categories):
+        topo_state = self._ensure_topic_topoart(tid)
+        if category_id < 0 or category_id >= len(topo_state.categories):
             return -1, 0
         deep_state = self._ensure_topic_deep_artmap(tid)
         category = topo_state.categories[category_id]
@@ -4701,6 +4726,7 @@ class TopicGraphSim:
         assigned = -1
         if 0 <= existing < len(deep_state.bundles) and deep_state.bundles[existing].active:
             assigned = int(existing)
+            self.topic_to_bundles[tid].add(assigned)
         else:
             active_bundle_ids = self._deep_artmap_active_bundle_ids(deep_state)
             if active_bundle_ids:
@@ -4712,26 +4738,29 @@ class TopicGraphSim:
                 best_sim = float(sims[best_pos])
                 if best_sim >= bundle_vigilance:
                     assigned = best_bundle_id
+                    self.topic_to_bundles[tid].add(assigned)
             if assigned < 0:
                 deep_state.bundles.append(
                     DeepARTMAPBundleState(
                         prototype=category.prototype.astype(np.float32, copy=True),
+                        vector_sum=category.prototype.astype(np.float32, copy=True),
                         category_ids=[int(category_id)],
                         support=0,
                         last_update_turn=int(turn),
                     )
                 )
                 assigned = len(deep_state.bundles) - 1
+                self.topic_to_bundles[tid].add(assigned)
 
         bundle = deep_state.bundles[assigned]
         if int(category_id) not in bundle.category_ids:
             bundle.category_ids.append(int(category_id))
-        bundle.prototype = unit(
-            ((1.0 - bundle_beta) * bundle.prototype + bundle_beta * category.prototype).astype(np.float32)
-        ).astype(np.float32)
+        bundle.vector_sum += category.prototype
+        bundle.prototype = unit(bundle.vector_sum)
         bundle.support += 1
         bundle.last_update_turn = int(turn)
         deep_state.category_to_bundle[int(category_id)] = int(assigned)
+        self.global_category_to_bundle[int(category_id)] = int(assigned)
 
         prev_bundle = int(deep_state.last_bundle_id)
         if (
@@ -4781,11 +4810,8 @@ class TopicGraphSim:
         shard = self.topic_shards[tid]
         if len(shard.members) < max(2, int(self.p.topic_graph_deep_artmap_min_members)):
             return TopicLocalQueryResult()
-        topo_state = shard.topoart
-        deep_state = shard.deep_artmap
-        if topo_state is None or deep_state is None:
-            idx, score, ops = self._topoart_collect_candidates(tid, query_vec, max_results=max_results)
-            return TopicLocalQueryResult(indices=idx, score=score, ops=ops)
+        topo_state = self._ensure_topic_topoart(tid)
+        deep_state = self._ensure_topic_deep_artmap(tid)
 
         active_bundle_ids = self._deep_artmap_active_bundle_ids(deep_state)
         if not active_bundle_ids:
@@ -4805,8 +4831,8 @@ class TopicGraphSim:
                 float(sims[pos])
                 + prior_weight
                 * (
-                    0.65 * float(deep_state.bundles[int(active_bundle_ids[pos])].recall_score)
-                    + 1.00 * float(deep_state.bundles[int(active_bundle_ids[pos])].adopt_score)
+                    0.65 * float(self.bundle_recall_prior[tid].get(int(active_bundle_ids[pos]), 0.0))
+                    + 1.00 * float(self.bundle_adopt_prior[tid].get(int(active_bundle_ids[pos]), 0.0))
                 )
                 for pos in range(len(active_bundle_ids))
             ],
@@ -4846,7 +4872,7 @@ class TopicGraphSim:
                 neighbor = deep_state.bundles[int(nid)]
                 if not neighbor.active:
                     continue
-                prior = prior_weight * (0.65 * float(neighbor.recall_score) + 1.00 * float(neighbor.adopt_score))
+                prior = prior_weight * (0.65 * float(self.bundle_recall_prior[tid].get(int(nid), 0.0)) + 1.00 * float(self.bundle_adopt_prior[tid].get(int(nid), 0.0)))
                 score = float(strength) + 0.35 * float(neighbor.prototype @ query_vec) + prior
                 neighbor_pool.append((score, int(nid)))
 
