@@ -107,6 +107,13 @@ local DEFAULT_SETTINGS = {
             -- 历史压缩比例（相对原文字符数）
             history_compress_ratio_slight = 0.65,
             history_compress_ratio_heavy = 0.30,
+            -- 历史对话对：承诺制变体（KV-cache 稳定）
+            -- enabled=true 时：
+            -- 1) 历史对话只使用 full/none（不再在 full/slight/heavy 间波动）
+            -- 2) 超预算时仅从最旧端连续丢弃；一旦丢弃不会“回填”旧对话
+            history_committed_variants = {
+                enabled = true,
+            },
             -- 是否启用上下文预算监控
             enable_budget_monitor = true,
             -- 预算警告阈值（相对于input_token_budget的比例）

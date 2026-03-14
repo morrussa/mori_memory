@@ -734,6 +734,14 @@ local function build_pair_variants(pair, cfg)
     }
 end
 
+local function history_committed_enabled(cfg)
+    local committed = (cfg or {}).history_committed_variants
+    if type(committed) ~= "table" then
+        return false
+    end
+    return committed.enabled == true
+end
+
 local function select_variant_that_fits(pair, variants, index_from_oldest, total_pairs, cfg, system_prompt, dynamic_context, user_input, kept)
     local weights = cfg.history_variant_weights or {}
     local decay = tonumber(cfg.history_recency_decay) or 0.90
@@ -776,6 +784,75 @@ local function select_variant_that_fits(pair, variants, index_from_oldest, total
     return nil, "none", nil, nil
 end
 
+local function select_committed_history_pairs(state, history_pairs, cfg, system_prompt, dynamic_context, user_input, token_budget)
+    state.context = state.context or {}
+    local committed = type(state.context.committed_variants) == "table" and state.context.committed_variants or {}
+    state.context.committed_variants = committed
+
+    local total_pairs = #history_pairs
+    local drop_until = math.max(0, math.floor(tonumber(state.context.committed_drop_until_turn) or 0))
+    if drop_until > total_pairs then
+        drop_until = 0
+        state.context.committed_drop_until_turn = 0
+        for k in pairs(committed) do
+            committed[k] = nil
+        end
+    end
+
+    local start_idx = drop_until + 1
+    local kept = {}
+    local dropped = {}
+    local messages = build_messages(system_prompt, dynamic_context, user_input, kept)
+    local total_tokens = estimate_tokens_from_messages(messages)
+
+    while true do
+        kept = {}
+        dropped = {}
+        for i = 1, total_pairs do
+            if i < start_idx then
+                dropped[#dropped + 1] = history_pairs[i]
+            else
+                local full_variant = make_variant_pair(history_pairs[i], "full", cfg)
+                if full_variant ~= nil then
+                    kept[#kept + 1] = full_variant
+                end
+            end
+        end
+
+        messages = build_messages(system_prompt, dynamic_context, user_input, kept)
+        total_tokens = estimate_tokens_from_messages(messages)
+        if total_tokens <= token_budget or start_idx > total_pairs then
+            break
+        end
+        start_idx = start_idx + 1
+    end
+
+    local new_drop_until = math.max(0, start_idx - 1)
+    if new_drop_until > drop_until then
+        state.context.committed_drop_until_turn = new_drop_until
+        for i = 1, math.min(new_drop_until, total_pairs) do
+            local turn = tonumber((history_pairs[i] or {}).turn or i) or i
+            committed[turn] = "none"
+        end
+    end
+
+    for key, _ in pairs(committed) do
+        local turn = tonumber(key)
+        if turn == nil or turn < 1 or turn > total_pairs then
+            committed[key] = nil
+        end
+    end
+
+    local variant_counts = {
+        full = math.max(0, total_pairs - new_drop_until),
+        slight = 0,
+        heavy = 0,
+        none = math.max(0, new_drop_until),
+    }
+
+    return kept, dropped, messages, total_tokens, variant_counts, new_drop_until
+end
+
 function M.build_chat_messages(state)
     local graph_cfg = default_graph_cfg()
     local cfg = ctx_cfg()
@@ -794,9 +871,12 @@ function M.build_chat_messages(state)
     local user_input = tostring((((state or {}).input or {}).message) or "")
 
     local pairs = extract_history_pairs(conversation_history)
+    local committed_enabled = history_committed_enabled(cfg)
     local pair_variants = {}
-    for i, pair in ipairs(pairs) do
-        pair_variants[i] = build_pair_variants(pair, cfg)
+    if not committed_enabled then
+        for i, pair in ipairs(pairs) do
+            pair_variants[i] = build_pair_variants(pair, cfg)
+        end
     end
 
     local kept = {}
@@ -806,21 +886,34 @@ function M.build_chat_messages(state)
     local messages = build_messages(system_prompt, dynamic_context, user_input, kept)
     local total_tokens = estimate_tokens_from_messages(messages)
 
-    for i = #pairs, 1, -1 do
-        local selected_variant, variant_name, candidate_messages, candidate_tokens =
-            select_variant_that_fits(pairs[i], pair_variants[i], i, #pairs, cfg, system_prompt, dynamic_context, user_input, kept)
-        if selected_variant ~= nil and candidate_messages and candidate_tokens and candidate_tokens <= token_budget then
-            local next_kept = { selected_variant }
-            for k = 1, #kept do
-                next_kept[#next_kept + 1] = kept[k]
+    local committed_drop_until_turn = 0
+    if committed_enabled then
+        kept, dropped, messages, total_tokens, variant_counts, committed_drop_until_turn = select_committed_history_pairs(
+            state,
+            pairs,
+            cfg,
+            system_prompt,
+            dynamic_context,
+            user_input,
+            token_budget
+        )
+    else
+        for i = #pairs, 1, -1 do
+            local selected_variant, variant_name, candidate_messages, candidate_tokens =
+                select_variant_that_fits(pairs[i], pair_variants[i], i, #pairs, cfg, system_prompt, dynamic_context, user_input, kept)
+            if selected_variant ~= nil and candidate_messages and candidate_tokens and candidate_tokens <= token_budget then
+                local next_kept = { selected_variant }
+                for k = 1, #kept do
+                    next_kept[#next_kept + 1] = kept[k]
+                end
+                kept = next_kept
+                messages = candidate_messages
+                total_tokens = candidate_tokens
+                variant_counts[variant_name] = (variant_counts[variant_name] or 0) + 1
+            else
+                dropped[#dropped + 1] = pairs[i]
+                variant_counts.none = (variant_counts.none or 0) + 1
             end
-            kept = next_kept
-            messages = candidate_messages
-            total_tokens = candidate_tokens
-            variant_counts[variant_name] = (variant_counts[variant_name] or 0) + 1
-        else
-            dropped[#dropped + 1] = pairs[i]
-            variant_counts.none = (variant_counts.none or 0) + 1
         end
     end
 
@@ -849,6 +942,8 @@ function M.build_chat_messages(state)
         dropped_pairs = #dropped,
         compressed_pairs = (variant_counts.slight or 0) + (variant_counts.heavy or 0),
         history_variant_counts = variant_counts,
+        history_committed_enabled = committed_enabled,
+        history_committed_drop_until_turn = committed_drop_until_turn,
         optimized_messages = opt_stats.truncated_count,
     }
 end

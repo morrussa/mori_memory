@@ -7377,6 +7377,356 @@ def run_experiment(params: SimParams) -> Dict[str, object]:
     return sim.run()
 
 
+# =============================================================================
+# History KV-cache prefix reuse simulation (llama.cpp-style: prefix-only reuse)
+# =============================================================================
+
+
+def _kv_clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _kv_sample_tokens_normal(
+    rng: np.random.Generator,
+    mean: int,
+    std: int,
+    min_tokens: int = 0,
+) -> int:
+    mean_f = float(mean)
+    std_f = float(max(0, std))
+    if std_f <= 1e-9:
+        return max(int(min_tokens), int(round(mean_f)))
+    sample = float(rng.normal(loc=mean_f, scale=std_f))
+    return max(int(min_tokens), int(round(sample)))
+
+
+@dataclass(frozen=True)
+class HistoryPairTokens:
+    pair_id: int
+    full: int
+    slight: int
+    heavy: int
+
+    def tokens_for(self, variant: str) -> int:
+        if variant == "full":
+            return int(self.full)
+        if variant == "slight":
+            return int(self.slight)
+        if variant == "heavy":
+            return int(self.heavy)
+        return 0
+
+
+@dataclass(frozen=True)
+class HistoryKVSimConfig:
+    turns: int = 200
+    seed: int = 42
+    prompt_token_budget: int = 6000
+    system_tokens: int = 500
+    dynctx_tokens_mean: int = 600
+    dynctx_tokens_std: int = 60
+    input_tokens_mean: int = 100
+    input_tokens_std: int = 20
+    pair_full_tokens_mean: int = 500
+    pair_full_tokens_std: int = 140
+    ratio_slight: float = 0.65
+    ratio_heavy: float = 0.30
+    recency_decay: float = 0.90
+    weight_full: float = 1.00
+    weight_slight: float = 0.72
+    weight_heavy: float = 0.40
+    weight_none: float = 0.00
+    selection_mode: str = "ranked"  # ranked | weighted
+
+
+def _kv_lcp_tokens(
+    prev_segments: Sequence[Tuple[str, int]],
+    cur_segments: Sequence[Tuple[str, int]],
+) -> int:
+    reused = 0
+    for (pid, plen), (cid, clen) in zip(prev_segments, cur_segments):
+        if pid != cid or int(plen) != int(clen):
+            break
+        reused += int(plen)
+    return int(reused)
+
+
+def _kv_pick_variant_unstable(
+    pair: HistoryPairTokens,
+    remaining_tokens: int,
+    recency_factor: float,
+    cfg: HistoryKVSimConfig,
+    rng: np.random.Generator,
+) -> str:
+    remaining_tokens = max(0, int(remaining_tokens))
+    decay_factor = max(0.0, float(recency_factor))
+    scores = {
+        "full": max(0.0, float(cfg.weight_full) * decay_factor),
+        "slight": max(0.0, float(cfg.weight_slight) * decay_factor),
+        "heavy": max(0.0, float(cfg.weight_heavy) * decay_factor),
+        "none": max(0.0, float(cfg.weight_none)),
+    }
+    order = {"full": 0, "slight": 1, "heavy": 2, "none": 3}
+    feasible = [
+        name
+        for name in ("full", "slight", "heavy", "none")
+        if pair.tokens_for(name) <= remaining_tokens
+    ]
+    if not feasible:
+        return "none"
+
+    mode = str(cfg.selection_mode).strip().lower()
+    if mode not in {"ranked", "weighted"}:
+        mode = "ranked"
+
+    if mode == "ranked":
+        best = feasible[0]
+        best_score = float(scores.get(best, 0.0))
+        for name in feasible[1:]:
+            sc = float(scores.get(name, 0.0))
+            if sc > best_score:
+                best = name
+                best_score = sc
+            elif sc == best_score and order.get(name, 99) < order.get(best, 99):
+                best = name
+                best_score = sc
+        return str(best)
+
+    weights = [float(scores.get(name, 0.0)) for name in feasible]
+    total = float(sum(weights))
+    if total <= 1e-12:
+        return str(feasible[0])
+    pick = float(rng.random()) * total
+    acc = 0.0
+    for name, w in zip(feasible, weights):
+        acc += float(w)
+        if pick <= acc:
+            return str(name)
+    return str(feasible[-1])
+
+
+def _kv_select_history_unstable(
+    pairs: Sequence[HistoryPairTokens],
+    history_budget: int,
+    cfg: HistoryKVSimConfig,
+    rng: np.random.Generator,
+) -> List[Tuple[str, int]]:
+    history_budget = max(0, int(history_budget))
+    remaining = history_budget
+    kept_rev: List[Tuple[str, int]] = []
+
+    decay = _kv_clamp(float(cfg.recency_decay), 0.01, 1.0)
+    recency_factor = 1.0  # newest = 1.0
+    for pair in reversed(list(pairs)):  # newest -> oldest
+        choice = _kv_pick_variant_unstable(pair, remaining, recency_factor, cfg, rng)
+        cost = int(pair.tokens_for(choice))
+        if choice != "none" and cost > 0:
+            kept_rev.append((f"pair{int(pair.pair_id)}:{choice}", cost))
+        remaining = max(0, int(remaining - cost))
+        recency_factor *= decay
+
+    kept_rev.reverse()  # oldest -> newest (prompt order)
+    return kept_rev
+
+
+def _kv_build_prompt_segments(
+    system_tokens: int,
+    history_segments: Sequence[Tuple[str, int]],
+    dynctx_tokens: int,
+    input_tokens: int,
+    turn: int,
+) -> List[Tuple[str, int]]:
+    segs: List[Tuple[str, int]] = []
+    sys_tok = max(0, int(system_tokens))
+    if sys_tok > 0:
+        segs.append(("system", sys_tok))
+    for sid, tok in history_segments:
+        segs.append((str(sid), max(0, int(tok))))
+    segs.append((f"dynctx@{int(turn)}", max(0, int(dynctx_tokens))))
+    segs.append((f"input@{int(turn)}", max(0, int(input_tokens))))
+    return segs
+
+
+def run_history_kv_cache_sim(cfg: HistoryKVSimConfig) -> Dict[str, object]:
+    turns = max(2, int(cfg.turns))
+    rng = np.random.default_rng(int(cfg.seed))
+
+    pairs: List[HistoryPairTokens] = []
+
+    committed_start = 0
+    committed_history_tokens = 0
+    committed_drop_turns = 0
+    committed_pairs_dropped = 0
+
+    prev_unstable: Optional[List[Tuple[str, int]]] = None
+    prev_committed: Optional[List[Tuple[str, int]]] = None
+
+    reused_unstable_sum = 0.0
+    total_unstable_sum = 0.0
+    reused_committed_sum = 0.0
+    total_committed_sum = 0.0
+    kept_pairs_unstable_sum = 0.0
+    kept_pairs_committed_sum = 0.0
+
+    reuse_ratio_unstable: List[float] = []
+    reuse_ratio_committed: List[float] = []
+
+    committed_stable_total_sum = 0.0
+    committed_stable_reused_sum = 0.0
+    committed_stable_turns = 0
+    committed_drop_total_sum = 0.0
+    committed_drop_reused_sum = 0.0
+    committed_drop_transitions = 0
+
+    def make_pair(pair_id: int) -> HistoryPairTokens:
+        full = _kv_sample_tokens_normal(
+            rng,
+            mean=int(cfg.pair_full_tokens_mean),
+            std=int(cfg.pair_full_tokens_std),
+            min_tokens=10,
+        )
+        ratio_slight = _kv_clamp(float(cfg.ratio_slight), 0.05, 0.95)
+        ratio_heavy = _kv_clamp(float(cfg.ratio_heavy), 0.05, 0.95)
+        slight = max(1, int(math.ceil(full * ratio_slight)))
+        heavy = max(1, int(math.ceil(full * ratio_heavy)))
+        slight = min(slight, full)
+        heavy = min(heavy, slight)
+        return HistoryPairTokens(pair_id=int(pair_id), full=int(full), slight=int(slight), heavy=int(heavy))
+
+    for turn in range(1, turns + 1):
+        dynctx_tokens = _kv_sample_tokens_normal(
+            rng,
+            mean=int(cfg.dynctx_tokens_mean),
+            std=int(cfg.dynctx_tokens_std),
+            min_tokens=0,
+        )
+        input_tokens = _kv_sample_tokens_normal(
+            rng,
+            mean=int(cfg.input_tokens_mean),
+            std=int(cfg.input_tokens_std),
+            min_tokens=1,
+        )
+
+        budget = max(0, int(cfg.prompt_token_budget))
+        system_tokens = max(0, int(cfg.system_tokens))
+        history_budget = budget - system_tokens - int(dynctx_tokens) - int(input_tokens)
+        history_budget = max(0, int(history_budget))
+
+        unstable_history = _kv_select_history_unstable(pairs, history_budget, cfg, rng)
+        unstable_prompt = _kv_build_prompt_segments(
+            system_tokens=system_tokens,
+            history_segments=unstable_history,
+            dynctx_tokens=int(dynctx_tokens),
+            input_tokens=int(input_tokens),
+            turn=turn,
+        )
+
+        dropped_this_turn = 0
+        while committed_history_tokens > history_budget and committed_start < len(pairs):
+            committed_history_tokens -= int(pairs[committed_start].full)
+            committed_start += 1
+            committed_pairs_dropped += 1
+            dropped_this_turn += 1
+        if dropped_this_turn:
+            committed_drop_turns += 1
+
+        committed_history = [
+            (f"pair{int(pair.pair_id)}:full", int(pair.full))
+            for pair in pairs[committed_start:]
+        ]
+        committed_prompt = _kv_build_prompt_segments(
+            system_tokens=system_tokens,
+            history_segments=committed_history,
+            dynctx_tokens=int(dynctx_tokens),
+            input_tokens=int(input_tokens),
+            turn=turn,
+        )
+
+        if prev_unstable is not None and prev_committed is not None:
+            total_u = float(sum(tok for _sid, tok in unstable_prompt))
+            reused_u = float(_kv_lcp_tokens(prev_unstable, unstable_prompt))
+            total_unstable_sum += total_u
+            reused_unstable_sum += reused_u
+            kept_pairs_unstable_sum += float(len(unstable_history))
+            reuse_ratio_unstable.append(float(reused_u / total_u) if total_u > 0 else 0.0)
+
+            total_c = float(sum(tok for _sid, tok in committed_prompt))
+            reused_c = float(_kv_lcp_tokens(prev_committed, committed_prompt))
+            total_committed_sum += total_c
+            reused_committed_sum += reused_c
+            kept_pairs_committed_sum += float(len(committed_history))
+            reuse_ratio_committed.append(float(reused_c / total_c) if total_c > 0 else 0.0)
+            if dropped_this_turn:
+                committed_drop_transitions += 1
+                committed_drop_total_sum += total_c
+                committed_drop_reused_sum += reused_c
+            else:
+                committed_stable_turns += 1
+                committed_stable_total_sum += total_c
+                committed_stable_reused_sum += reused_c
+
+        prev_unstable = unstable_prompt
+        prev_committed = committed_prompt
+
+        # Append the new (turn) pair for the next prompt.
+        new_pair = make_pair(turn)
+        pairs.append(new_pair)
+        committed_history_tokens += int(new_pair.full)
+
+    denom = float(max(1, turns - 1))
+
+    def q(values: Sequence[float], p: float) -> float:
+        if not values:
+            return 0.0
+        return float(np.quantile(np.asarray(values, dtype=np.float64), p))
+
+    unstable_reuse_ratio = float(reused_unstable_sum / total_unstable_sum) if total_unstable_sum > 0 else 0.0
+    committed_reuse_ratio = float(reused_committed_sum / total_committed_sum) if total_committed_sum > 0 else 0.0
+    committed_stable_reuse_ratio = (
+        float(committed_stable_reused_sum / committed_stable_total_sum)
+        if committed_stable_total_sum > 0
+        else 0.0
+    )
+    committed_drop_reuse_ratio = (
+        float(committed_drop_reused_sum / committed_drop_total_sum)
+        if committed_drop_total_sum > 0
+        else 0.0
+    )
+
+    summary = {
+        "turns": float(turns),
+        "prompt_token_budget": float(max(0, int(cfg.prompt_token_budget))),
+        "system_tokens": float(max(0, int(cfg.system_tokens))),
+        "history_kv_selection_mode": str(cfg.selection_mode),
+        "unstable_avg_prompt_tokens": float(total_unstable_sum / denom),
+        "unstable_avg_reused_tokens": float(reused_unstable_sum / denom),
+        "unstable_avg_new_tokens": float((total_unstable_sum - reused_unstable_sum) / denom),
+        "unstable_avg_kept_pairs": float(kept_pairs_unstable_sum / denom),
+        "unstable_reuse_ratio": float(unstable_reuse_ratio),
+        "unstable_new_ratio": float(1.0 - unstable_reuse_ratio),
+        "unstable_reuse_ratio_p50": q(reuse_ratio_unstable, 0.50),
+        "unstable_reuse_ratio_p95": q(reuse_ratio_unstable, 0.95),
+        "committed_avg_prompt_tokens": float(total_committed_sum / denom),
+        "committed_avg_reused_tokens": float(reused_committed_sum / denom),
+        "committed_avg_new_tokens": float((total_committed_sum - reused_committed_sum) / denom),
+        "committed_avg_kept_pairs": float(kept_pairs_committed_sum / denom),
+        "committed_reuse_ratio": float(committed_reuse_ratio),
+        "committed_new_ratio": float(1.0 - committed_reuse_ratio),
+        "committed_reuse_ratio_p50": q(reuse_ratio_committed, 0.50),
+        "committed_reuse_ratio_p95": q(reuse_ratio_committed, 0.95),
+        "committed_stable_reuse_ratio": float(committed_stable_reuse_ratio),
+        "committed_drop_reuse_ratio": float(committed_drop_reuse_ratio),
+        "committed_stable_turns": float(committed_stable_turns),
+        "committed_stable_turn_ratio": float(committed_stable_turns / denom),
+        "committed_drop_transitions": float(committed_drop_transitions),
+        "committed_drop_turns": float(committed_drop_turns),
+        "committed_pairs_dropped": float(committed_pairs_dropped),
+        "committed_drop_turn_ratio": float(committed_drop_turns / denom),
+    }
+
+    return {"summary": summary, "snapshots": []}
+
+
 def save_plot(
     path: Path,
     rows: List[Dict[str, float]],
@@ -7505,7 +7855,7 @@ def save_plot(
 def main():
     parser = argparse.ArgumentParser(description="Agent Memory Simulator with Smart Preloading and EnhancedWeak")
     parser.add_argument("--retrieval-model", type=str, default="memory",
-                        choices=["memory", "topic_graph"],
+                        choices=["memory", "topic_graph", "history_kv"],
                         help="Retrieval model to simulate")
     parser.add_argument("--turns", type=int, default=20000, help="Number of simulation turns")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -7514,6 +7864,44 @@ def main():
     parser.add_argument("--no-plot", action="store_true", help="Disable png dashboard generation")
     parser.add_argument("--plot-out", type=str, default="", help="Output png path (default: output with .png)")
     parser.add_argument("--plot-dpi", type=int, default=160)
+
+    # ---------------------------------------------------------------------
+    # history_kv mode: simulate llama.cpp KV-cache prefix reuse under
+    # (1) unstable per-turn re-variant selection vs (2) committed drop-only.
+    # ---------------------------------------------------------------------
+    parser.add_argument("--kv-prompt-budget", type=int, default=6000,
+                        help="Total prompt token budget (history_kv)")
+    parser.add_argument("--kv-system-tokens", type=int, default=500,
+                        help="Stable system-prompt token count (history_kv)")
+    parser.add_argument("--kv-dynctx-mean", type=int, default=600,
+                        help="Dynamic-context mean tokens (history_kv)")
+    parser.add_argument("--kv-dynctx-std", type=int, default=60,
+                        help="Dynamic-context std tokens (history_kv)")
+    parser.add_argument("--kv-input-mean", type=int, default=100,
+                        help="User-input mean tokens (history_kv)")
+    parser.add_argument("--kv-input-std", type=int, default=20,
+                        help="User-input std tokens (history_kv)")
+    parser.add_argument("--kv-pair-mean", type=int, default=500,
+                        help="History pair full-variant mean tokens (history_kv)")
+    parser.add_argument("--kv-pair-std", type=int, default=140,
+                        help="History pair full-variant std tokens (history_kv)")
+    parser.add_argument("--kv-ratio-slight", type=float, default=0.65,
+                        help="Slight compression ratio vs full (history_kv)")
+    parser.add_argument("--kv-ratio-heavy", type=float, default=0.30,
+                        help="Heavy compression ratio vs full (history_kv)")
+    parser.add_argument("--kv-recency-decay", type=float, default=0.90,
+                        help="Recency decay for unstable selection (history_kv)")
+    parser.add_argument("--kv-weight-full", type=float, default=1.00,
+                        help="Variant weight: full (history_kv)")
+    parser.add_argument("--kv-weight-slight", type=float, default=0.72,
+                        help="Variant weight: slight (history_kv)")
+    parser.add_argument("--kv-weight-heavy", type=float, default=0.40,
+                        help="Variant weight: heavy (history_kv)")
+    parser.add_argument("--kv-weight-none", type=float, default=0.00,
+                        help="Variant weight: none (history_kv)")
+    parser.add_argument("--kv-selection-mode", type=str, default="ranked",
+                        choices=["ranked", "weighted"],
+                        help="Unstable selection: ranked or weighted (history_kv)")
     
     # Smart Preloading parameters
     parser.add_argument("--preload-enabled", type=lambda x: x.lower() == 'true', default=True, 
@@ -7735,6 +8123,64 @@ def main():
                         help="Topic HNSW ef_search; used as the topic seed cost proxy")
     
     args = parser.parse_args()
+
+    if args.retrieval_model == "history_kv":
+        cfg = HistoryKVSimConfig(
+            turns=max(2, int(args.turns)),
+            seed=int(args.seed),
+            prompt_token_budget=max(256, int(args.kv_prompt_budget)),
+            system_tokens=max(0, int(args.kv_system_tokens)),
+            dynctx_tokens_mean=max(0, int(args.kv_dynctx_mean)),
+            dynctx_tokens_std=max(0, int(args.kv_dynctx_std)),
+            input_tokens_mean=max(1, int(args.kv_input_mean)),
+            input_tokens_std=max(0, int(args.kv_input_std)),
+            pair_full_tokens_mean=max(10, int(args.kv_pair_mean)),
+            pair_full_tokens_std=max(0, int(args.kv_pair_std)),
+            ratio_slight=_kv_clamp(float(args.kv_ratio_slight), 0.05, 0.95),
+            ratio_heavy=_kv_clamp(float(args.kv_ratio_heavy), 0.05, 0.95),
+            recency_decay=_kv_clamp(float(args.kv_recency_decay), 0.01, 1.0),
+            weight_full=max(0.0, float(args.kv_weight_full)),
+            weight_slight=max(0.0, float(args.kv_weight_slight)),
+            weight_heavy=max(0.0, float(args.kv_weight_heavy)),
+            weight_none=max(0.0, float(args.kv_weight_none)),
+            selection_mode=str(args.kv_selection_mode),
+        )
+        result = run_history_kv_cache_sim(cfg)
+        summary = result["summary"]
+        print("\n" + "=" * 60)
+        print("HISTORY KV-CACHE PREFIX REUSE SIM")
+        print("=" * 60)
+        print(f"Turns: {int(summary.get('turns', 0))}")
+        print(
+            "Unstable reuse/new ratio: "
+            f"{summary.get('unstable_reuse_ratio', 0.0):.4f}/"
+            f"{summary.get('unstable_new_ratio', 0.0):.4f} "
+            f"(p50={summary.get('unstable_reuse_ratio_p50', 0.0):.4f}, "
+            f"p95={summary.get('unstable_reuse_ratio_p95', 0.0):.4f})"
+        )
+        print(
+            "Committed reuse/new ratio: "
+            f"{summary.get('committed_reuse_ratio', 0.0):.4f}/"
+            f"{summary.get('committed_new_ratio', 0.0):.4f} "
+            f"(p50={summary.get('committed_reuse_ratio_p50', 0.0):.4f}, "
+            f"p95={summary.get('committed_reuse_ratio_p95', 0.0):.4f})"
+        )
+        print(
+            "Committed drop turns/ratio: "
+            f"{summary.get('committed_drop_turns', 0.0):.0f}/"
+            f"{summary.get('committed_drop_turn_ratio', 0.0):.4f}"
+        )
+        print(
+            "Committed stable reuse ratio: "
+            f"{summary.get('committed_stable_reuse_ratio', 0.0):.4f} "
+            f"(stable_turn_ratio={summary.get('committed_stable_turn_ratio', 0.0):.4f})"
+        )
+        if args.output:
+            output_path = Path(args.output)
+            with open(output_path, "w") as f:
+                json.dump({"summary": summary, "snapshots": []}, f, indent=2)
+            print(f"\nResults saved to {output_path}")
+        return
 
     if args.topic_hnsw_enabled and HNSWIndex is None:
         raise RuntimeError("HNSW requested but mori_hnsw binding is unavailable")
