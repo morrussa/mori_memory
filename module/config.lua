@@ -111,6 +111,16 @@ local DEFAULT_SETTINGS = {
             enable_budget_monitor = true,
             -- 预算警告阈值（相对于input_token_budget的比例）
             budget_warning_ratio = 0.85,
+            -- PastTopics 多级齿轮缓存：根据“动量变化”决定刷新深度，减少上下文抖动与重算开销。
+            -- enabled=true 会改变 PastTopics 的更新节奏（更偏向复用旧 topic 顺序与条目文本）。
+            past_topics_gear = {
+                enabled = true,
+                momentum_gear0 = 0.88, -- 动量>=该阈值：gear0（最高复用）
+                momentum_gear1 = 0.70, -- 动量>=该阈值：gear1（局部刷新）；否则 gear2（全刷新）
+                full_refresh_every = 24, -- 每 N 次更新强制 gear2（0 禁用）
+                semantic_focus = 2, -- gear1 刷新前 N 个语义 topic
+                adjacent_focus = 2, -- gear1 刷新前 N 个邻接 topic
+            },
         },
         -- 项目知识注入配置（新增：帮助模型理解自身代码）
         project_knowledge = {

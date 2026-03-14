@@ -268,6 +268,66 @@ local function select_topics_with_saturation(semantic_ranked, adjacent_ranked, c
     return semantic_selected, adjacent_selected
 end
 
+local function past_topics_gear_cfg()
+    local cfg = ctx_cfg()
+    local gear = type((cfg or {}).past_topics_gear) == "table" and cfg.past_topics_gear or {}
+    return {
+        enabled = gear.enabled == true,
+        momentum_gear0 = tonumber(gear.momentum_gear0) or 0.88,
+        momentum_gear1 = tonumber(gear.momentum_gear1) or 0.70,
+        full_refresh_every = math.max(0, math.floor(tonumber(gear.full_refresh_every) or 24)),
+        semantic_focus = math.max(1, math.floor(tonumber(gear.semantic_focus) or 2)),
+        adjacent_focus = math.max(0, math.floor(tonumber(gear.adjacent_focus) or 2)),
+    }
+end
+
+local function dedup_list(items)
+    local out = {}
+    local seen = {}
+    for _, item in ipairs(items or {}) do
+        local key = util.trim(item or "")
+        if key ~= "" and not seen[key] then
+            seen[key] = true
+            out[#out + 1] = key
+        end
+    end
+    return out
+end
+
+local function jaccard_similarity(list_a, list_b)
+    local a = {}
+    local b = {}
+    for _, v in ipairs(list_a or {}) do
+        local key = util.trim(v or "")
+        if key ~= "" then
+            a[key] = true
+        end
+    end
+    for _, v in ipairs(list_b or {}) do
+        local key = util.trim(v or "")
+        if key ~= "" then
+            b[key] = true
+        end
+    end
+    local inter = 0
+    local uni = 0
+    for k in pairs(a) do
+        uni = uni + 1
+        if b[k] then
+            inter = inter + 1
+        end
+    end
+    for k in pairs(b) do
+        if not a[k] then
+            uni = uni + 1
+        end
+    end
+    if uni <= 0 then
+        return 0.0
+    end
+    return inter / uni
+end
+
 local function format_topic_entry(anchor, score, max_summary_chars)
     if util.trim(anchor or "") == "" then
         return ""
@@ -285,6 +345,188 @@ local function format_topic_entry(anchor, score, max_summary_chars)
         line = line .. "\nsummary=" .. summary
     end
     return line
+end
+
+local function build_past_topics_block_with_gears(state, semantic_selected, adjacent_selected, scores, max_summary_chars)
+    local cfg = past_topics_gear_cfg()
+    local desired_order = {}
+    for _, anchor in ipairs(semantic_selected or {}) do
+        desired_order[#desired_order + 1] = anchor
+    end
+    for _, anchor in ipairs(adjacent_selected or {}) do
+        desired_order[#desired_order + 1] = anchor
+    end
+    desired_order = dedup_list(desired_order)
+    if #desired_order <= 0 then
+        return ""
+    end
+    if not cfg.enabled then
+        local semantic_lines = {}
+        for _, anchor in ipairs(semantic_selected or {}) do
+            local entry = format_topic_entry(anchor, scores[anchor], max_summary_chars)
+            if entry ~= "" then
+                semantic_lines[#semantic_lines + 1] = entry
+            end
+        end
+        local adjacent_lines = {}
+        for _, anchor in ipairs(adjacent_selected or {}) do
+            local entry = format_topic_entry(anchor, scores[anchor], max_summary_chars)
+            if entry ~= "" then
+                adjacent_lines[#adjacent_lines + 1] = entry
+            end
+        end
+        local past_blocks = {}
+        if #semantic_lines > 0 then
+            past_blocks[#past_blocks + 1] = "[SemanticTopics]\n" .. table.concat(semantic_lines, "\n\n")
+        end
+        if #adjacent_lines > 0 then
+            past_blocks[#past_blocks + 1] = "[AdjacentTopics]\n" .. table.concat(adjacent_lines, "\n\n")
+        end
+        if #past_blocks <= 0 then
+            return ""
+        end
+        return "[PastTopics]\n" .. table.concat(past_blocks, "\n\n")
+    end
+
+    state.context = state.context or {}
+    local cache = type(state.context.past_topics_cache) == "table" and state.context.past_topics_cache or {}
+    cache.order = type(cache.order) == "table" and cache.order or {}
+    cache.entries = type(cache.entries) == "table" and cache.entries or {}
+    cache.update_events = math.max(0, math.floor(tonumber(cache.update_events) or 0))
+    cache.last_full_refresh_event = math.max(0, math.floor(tonumber(cache.last_full_refresh_event) or 0))
+
+    cache.update_events = cache.update_events + 1
+    local event_id = cache.update_events
+
+    local desired_set = {}
+    for _, anchor in ipairs(desired_order) do
+        desired_set[anchor] = true
+    end
+    local old_order = {}
+    for _, anchor in ipairs(cache.order or {}) do
+        local key = util.trim(anchor or "")
+        if key ~= "" and desired_set[key] then
+            old_order[#old_order + 1] = key
+        end
+    end
+
+    local momentum = jaccard_similarity(old_order, desired_order)
+    local force_full = cfg.full_refresh_every > 0
+        and (event_id - cache.last_full_refresh_event) >= cfg.full_refresh_every
+
+    local primary_new = util.trim((semantic_selected or {})[1] or "")
+    local primary_old = util.trim(cache.primary_anchor or "")
+
+    local gear = 2
+    if #cache.order > 0 and (not force_full) then
+        if momentum >= cfg.momentum_gear0 then
+            gear = 0
+        elseif momentum >= cfg.momentum_gear1 then
+            gear = 1
+        else
+            gear = 2
+        end
+        if primary_new ~= "" and primary_old ~= "" and primary_new ~= primary_old and gear <= 0 then
+            gear = 1
+        end
+    end
+    if gear == 2 then
+        cache.last_full_refresh_event = event_id
+    end
+
+    local focus = {}
+    for i = 1, math.min(cfg.semantic_focus, #(semantic_selected or {})) do
+        focus[#focus + 1] = semantic_selected[i]
+    end
+    for i = 1, math.min(cfg.adjacent_focus, #(adjacent_selected or {})) do
+        focus[#focus + 1] = adjacent_selected[i]
+    end
+    focus = dedup_list(focus)
+
+    local new_order = {}
+    local refresh = {}
+    if gear == 2 then
+        new_order = desired_order
+        for _, anchor in ipairs(new_order) do
+            refresh[anchor] = true
+        end
+    elseif gear == 1 then
+        local candidate = {}
+        for _, anchor in ipairs(focus) do candidate[#candidate + 1] = anchor end
+        for _, anchor in ipairs(old_order) do candidate[#candidate + 1] = anchor end
+        for _, anchor in ipairs(desired_order) do candidate[#candidate + 1] = anchor end
+        new_order = dedup_list(candidate)
+        for _, anchor in ipairs(focus) do
+            refresh[anchor] = true
+        end
+        for _, anchor in ipairs(new_order) do
+            if cache.entries[anchor] == nil then
+                refresh[anchor] = true
+            end
+        end
+    else
+        local candidate = {}
+        for _, anchor in ipairs(old_order) do candidate[#candidate + 1] = anchor end
+        for _, anchor in ipairs(desired_order) do candidate[#candidate + 1] = anchor end
+        new_order = dedup_list(candidate)
+        if primary_new ~= "" then
+            refresh[primary_new] = true
+        end
+        for _, anchor in ipairs(new_order) do
+            if cache.entries[anchor] == nil then
+                refresh[anchor] = true
+            end
+        end
+    end
+
+    for anchor in pairs(refresh) do
+        local entry = format_topic_entry(anchor, scores[anchor], max_summary_chars)
+        if entry ~= "" then
+            cache.entries[anchor] = entry
+        else
+            cache.entries[anchor] = nil
+        end
+    end
+
+    cache.order = new_order
+    cache.primary_anchor = primary_new
+    cache.last_gear = gear
+    cache.last_momentum = momentum
+    state.context.past_topics_cache = cache
+
+    local semantic_set = {}
+    for _, anchor in ipairs(semantic_selected or {}) do
+        semantic_set[anchor] = true
+    end
+    local adjacent_set = {}
+    for _, anchor in ipairs(adjacent_selected or {}) do
+        adjacent_set[anchor] = true
+    end
+
+    local semantic_lines = {}
+    local adjacent_lines = {}
+    for _, anchor in ipairs(new_order or {}) do
+        local entry = cache.entries[anchor]
+        if util.trim(entry or "") ~= "" then
+            if semantic_set[anchor] then
+                semantic_lines[#semantic_lines + 1] = entry
+            elseif adjacent_set[anchor] then
+                adjacent_lines[#adjacent_lines + 1] = entry
+            end
+        end
+    end
+
+    local past_blocks = {}
+    if #semantic_lines > 0 then
+        past_blocks[#past_blocks + 1] = "[SemanticTopics]\n" .. table.concat(semantic_lines, "\n\n")
+    end
+    if #adjacent_lines > 0 then
+        past_blocks[#past_blocks + 1] = "[AdjacentTopics]\n" .. table.concat(adjacent_lines, "\n\n")
+    end
+    if #past_blocks <= 0 then
+        return ""
+    end
+    return "[PastTopics]\n" .. table.concat(past_blocks, "\n\n")
 end
 
 local function build_topic_blocks(state)
@@ -306,35 +548,14 @@ local function build_topic_blocks(state)
         scores
     )
 
-    local semantic_lines = {}
     local max_summary_chars = 220
-    for _, anchor in ipairs(semantic_selected) do
-        local entry = format_topic_entry(anchor, scores[anchor], max_summary_chars)
-        if entry ~= "" then
-            semantic_lines[#semantic_lines + 1] = entry
-        end
-    end
-
-    local adjacent_lines = {}
-    for _, anchor in ipairs(adjacent_selected) do
-        local entry = format_topic_entry(anchor, scores[anchor], max_summary_chars)
-        if entry ~= "" then
-            adjacent_lines[#adjacent_lines + 1] = entry
-        end
-    end
-
-    local past_blocks = {}
-    if #semantic_lines > 0 then
-        past_blocks[#past_blocks + 1] = "[SemanticTopics]\n" .. table.concat(semantic_lines, "\n\n")
-    end
-    if #adjacent_lines > 0 then
-        past_blocks[#past_blocks + 1] = "[AdjacentTopics]\n" .. table.concat(adjacent_lines, "\n\n")
-    end
-
-    local past_block = ""
-    if #past_blocks > 0 then
-        past_block = "[PastTopics]\n" .. table.concat(past_blocks, "\n\n")
-    end
+    local past_block = build_past_topics_block_with_gears(
+        state,
+        semantic_selected,
+        adjacent_selected,
+        scores,
+        max_summary_chars
+    )
 
     local current_block = ""
     if current_anchor ~= "" then

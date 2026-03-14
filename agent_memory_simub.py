@@ -369,6 +369,31 @@ class SimParams:
     context_saturation_weight: float = 0.22
     context_similarity_saturation_threshold: float = 0.95
     context_min_marginal_gain: float = 0.02
+    # Context assembly/update strategy (topic_graph evaluation only).
+    # - greedy: legacy greedy context memory assembly (max quality, max recompute).
+    # - topic_concat: concatenate per-topic evidence memories in (semantic, adjacent) order.
+    # - gear: multi-level cached concat; update scope chosen by momentum change.
+    context_update_strategy: str = "greedy"
+    context_adjacent_topic_budget: int = 2
+    # Context token budget model (topic_graph only).
+    # If <= 0, we approximate a budget from the memory cap:
+    #   token_budget ~= context_memory_budget * context_tokens_per_memory
+    # where context_memory_budget = max_return_topics * per_topic_evidence.
+    context_token_budget: int = 0
+    # Simulated per-memory token size distribution (mean/std in tokens).
+    # This replaces the old "constant tokens_per_memory" proxy and better matches
+    # real budget behavior where memory chunks vary in size.
+    context_tokens_per_memory: int = 80
+    context_tokens_per_memory_std: int = 32
+
+    # Multi-level gear parameters (only used when context_update_strategy == "gear")
+    context_gear_momentum_gear0: float = 0.88
+    context_gear_momentum_gear1: float = 0.70
+    context_gear_query_weight: float = 0.65
+    context_gear_full_refresh_every: int = 24
+    context_gear_semantic_focus: int = 2
+    context_gear_adjacent_focus: int = 2
+    context_gear_compare_to_full: bool = True
 
 
 @dataclass
@@ -3739,6 +3764,9 @@ class TopicGraphSim:
     def __init__(self, p: SimParams):
         self.p = p
         self.rng = np.random.default_rng(p.seed)
+        # Use a dedicated RNG for token-length simulation so token-budget modeling
+        # doesn't perturb the existing stochastic dynamics (topic flow, retrieval, etc.).
+        self.token_rng = np.random.default_rng((int(p.seed) + 1000003) % (2**32 - 1))
         self.topic = TopicStream(p, self.rng)
         self.topic_count = self.topic.num_topics
         self.max_memories = p.turns * max(1, int(self.p.topic_atomic_memories_max))
@@ -3754,6 +3782,9 @@ class TopicGraphSim:
         self.mem_turn = np.zeros(self.max_memories, dtype=np.int32)
         self.mem_facet_ids = np.full((self.max_memories, self.max_facet_slots), -1, dtype=np.int32)
         self.mem_facet_weights = np.zeros((self.max_memories, self.max_facet_slots), dtype=np.float32)
+        # Estimated token length of each memory chunk when injected into context.
+        # (Not tied to a concrete tokenizer; used to model budget + (re)tokenization cost.)
+        self.mem_context_tokens = np.zeros(self.max_memories, dtype=np.int32)
         self.mem_origin_topic_counts: List[Dict[int, int]] = []
         self.mem_count = 0
         self.anchor_vec_pool = np.zeros((self.max_anchors, p.dim), dtype=np.float32)
@@ -3835,6 +3866,37 @@ class TopicGraphSim:
         self.anchor_probe_count = 0
         self.anchor_probe_seed_total = 0
         self.anchor_probe_candidate_total = 0
+
+        # ====================================================================
+        # Context update (topic_concat / gear) accounting (NEW)
+        # ====================================================================
+        self.context_update_events = 0
+        self.context_full_eval_count = 0
+        self.context_quality_full_sum = 0.0
+        self.context_coverage_full_sum = 0.0
+        self.context_association_full_sum = 0.0
+        self.context_saturation_full_sum = 0.0
+        self.context_redundancy_full_sum = 0.0
+        self.context_irrelevance_full_sum = 0.0
+        self.context_fill_ratio_full_sum = 0.0
+        self.context_quality_delta_sum = 0.0
+
+        self.context_retoken_full_tokens = 0.0
+        self.context_retoken_gear_tokens = 0.0
+        self.context_gear_level_counts = [0, 0, 0]
+        self.context_gear_topic_order: List[int] = []
+        self.context_gear_blocks: Dict[int, List[int]] = {}
+        self.context_gear_prev_query_vec: Optional[np.ndarray] = None
+        self.context_gear_last_full_refresh_event = 0
+        # Token budget telemetry (assembled context, topic_graph only).
+        self.context_token_used_sum = 0.0
+        self.context_token_fill_ratio_sum = 0.0
+        self.context_token_budget_sum = 0.0
+        self.context_token_budget_hit_count = 0
+        self.context_token_used_full_sum = 0.0
+        self.context_token_fill_ratio_full_sum = 0.0
+        self.context_token_budget_full_sum = 0.0
+        self.context_token_budget_full_hit_count = 0
 
         self.snapshots: List[Dict[str, float]] = []
         self._build_topic_families()
@@ -5075,6 +5137,95 @@ class TopicGraphSim:
         self.bridge_update_events += 1
         self._prune_bridges(src)
 
+    def _context_token_budget(self, memory_budget: int) -> int:
+        explicit = int(getattr(self.p, "context_token_budget", 0))
+        if explicit > 0:
+            return max(32, explicit)
+        per_mem = max(1, int(self.p.context_tokens_per_memory))
+        memory_budget = max(1, int(memory_budget))
+        return max(32, int(memory_budget) * per_mem)
+
+    def _context_memory_tokens(self, mem_id: int) -> int:
+        mem_id = int(mem_id)
+        if 0 <= mem_id < self.mem_count:
+            n = int(self.mem_context_tokens[mem_id])
+            if n > 0:
+                return n
+        return max(1, int(self.p.context_tokens_per_memory))
+
+    def _context_tokens_for_memories(self, memories: Sequence[int]) -> int:
+        total = 0
+        for mem_idx in memories:
+            total += int(self._context_memory_tokens(int(mem_idx)))
+        return int(total)
+
+    def _truncate_memories_to_token_budget(
+        self,
+        memories: Sequence[int],
+        token_budget: int,
+    ) -> Tuple[List[int], int]:
+        token_budget = max(1, int(token_budget))
+        out: List[int] = []
+        used = 0
+        for mem_idx in memories:
+            mem_id = int(mem_idx)
+            if mem_id < 0 or mem_id >= self.mem_count:
+                continue
+            tok = int(self._context_memory_tokens(mem_id))
+            if used + tok > token_budget:
+                if not out:
+                    # Allow a single truncated chunk so we never return empty context
+                    # purely due to token-budget mismatch.
+                    out.append(mem_id)
+                    used = min(token_budget, tok)
+                break
+            out.append(mem_id)
+            used += tok
+        return out, int(used)
+
+    def _sample_context_memory_tokens(
+        self,
+        facet_ids: Optional[np.ndarray],
+        facet_weights: Optional[np.ndarray],
+    ) -> int:
+        mean = max(8.0, float(self.p.context_tokens_per_memory))
+        std = max(4.0, float(getattr(self.p, "context_tokens_per_memory_std", 0) or 0))
+        if std <= 0.0:
+            std = max(6.0, 0.35 * mean)
+
+        facet_count = 0
+        if facet_ids is not None:
+            facet_count = int(np.sum(np.asarray(facet_ids, dtype=np.int32) >= 0))
+
+        # Slightly increase mean for multi-facet chunks (richer snippets tend to be longer).
+        adj = 1.0 + 0.10 * max(0, facet_count - 1)
+        mean = mean * adj
+
+        # Gamma distribution: positive, moderately heavy tail, easy to control mean/std.
+        std = min(std, 0.95 * mean)
+        shape = (mean / std) ** 2
+        scale = (std * std) / mean
+        sample = float(self.token_rng.gamma(shape, scale))
+        tokens = int(max(8, round(sample)))
+        # Hard cap approximates real systems where long memories are summarized/truncated.
+        cap = max(128, int(4.0 * float(self.p.context_tokens_per_memory)))
+        return int(min(tokens, cap))
+
+    def _grow_context_memory_tokens(self, mem_idx: int, added_tokens: int) -> None:
+        mem_idx = int(mem_idx)
+        if mem_idx < 0 or mem_idx >= self.mem_count:
+            return
+        added_tokens = max(0, int(added_tokens))
+        if added_tokens <= 0:
+            return
+        # Merged memories are typically re-summarized, so injected context length
+        # should not grow linearly with the number of merged events.
+        current = int(self._context_memory_tokens(mem_idx))
+        cap = max(128, int(4.0 * float(self.p.context_tokens_per_memory)))
+        bump = int(round(0.10 * float(min(current, added_tokens))))
+        updated = min(cap, max(current, added_tokens) + bump)
+        self.mem_context_tokens[mem_idx] = int(max(1, updated))
+
     def _add_memory(
         self,
         vec: np.ndarray,
@@ -5083,9 +5234,11 @@ class TopicGraphSim:
         facet_ids: Optional[np.ndarray] = None,
         facet_weights: Optional[np.ndarray] = None,
     ) -> Tuple[int, List[int]]:
+        new_tokens = self._sample_context_memory_tokens(facet_ids, facet_weights)
         merge_target, merge_sim, add_ops = self._find_merge_target(vec, topic_id)
         if merge_target is not None and merge_sim >= float(self.p.merge_limit):
             self._merge_memory_facets(merge_target, facet_ids, facet_weights)
+            self._grow_context_memory_tokens(int(merge_target), int(new_tokens))
             add_ops += self._bind_memory_topic(
                 merge_target,
                 topic_id,
@@ -5113,6 +5266,7 @@ class TopicGraphSim:
             if limit > 0:
                 self.mem_facet_ids[mem_idx, :limit] = np.asarray(facet_ids[:limit], dtype=np.int32)
                 self.mem_facet_weights[mem_idx, :limit] = np.asarray(facet_weights[:limit], dtype=np.float32)
+        self.mem_context_tokens[mem_idx] = int(max(1, int(new_tokens)))
         self.mem_count += 1
         self.new_count += 1
         self.mem_origin_topic_counts.append({})
@@ -6028,6 +6182,417 @@ class TopicGraphSim:
         best_pos = int(np.argmax(sims))
         return int(idx[best_pos]), float(sims[best_pos]), ops
 
+    @staticmethod
+    def _jaccard_similarity(a: Sequence[int], b: Sequence[int]) -> float:
+        sa = {int(x) for x in a}
+        sb = {int(x) for x in b}
+        if not sa and not sb:
+            return 1.0
+        if not sa or not sb:
+            return 0.0
+        inter = sa & sb
+        union = sa | sb
+        if not union:
+            return 0.0
+        return float(len(inter) / len(union))
+
+    def _context_semantic_topic_order(
+        self,
+        selected_topics: Sequence[int],
+        debug: Dict[str, object],
+        current_topic: Optional[int],
+    ) -> List[int]:
+        selected_set = {int(tid) for tid in selected_topics}
+        current_id = int(current_topic) if current_topic is not None else None
+        ordered: List[int] = []
+        seen: Set[int] = set()
+
+        ranked_topics = debug.get("ranked_topics", [])
+        if isinstance(ranked_topics, list):
+            for item in ranked_topics:
+                if not isinstance(item, (list, tuple)) or not item:
+                    continue
+                tid = int(item[0])
+                if tid not in selected_set or tid in seen:
+                    continue
+                if current_id is not None and tid == current_id:
+                    continue
+                ordered.append(tid)
+                seen.add(tid)
+
+        for tid in selected_topics:
+            topic_id = int(tid)
+            if topic_id in seen or topic_id not in selected_set:
+                continue
+            if current_id is not None and topic_id == current_id:
+                continue
+            ordered.append(topic_id)
+            seen.add(topic_id)
+
+        return ordered
+
+    def _context_adjacent_topic_order(
+        self,
+        semantic_topics: Sequence[int],
+        debug: Dict[str, object],
+        current_topic: Optional[int],
+    ) -> List[int]:
+        budget = max(0, int(self.p.context_adjacent_topic_budget))
+        if budget <= 0:
+            return []
+
+        bridge_topics = debug.get("bridge_topics", [])
+        if not isinstance(bridge_topics, list) or not bridge_topics:
+            return []
+
+        current_id = int(current_topic) if current_topic is not None else None
+        semantic_set = {int(tid) for tid in semantic_topics}
+
+        score_map: Dict[int, float] = {}
+        candidate_topics = debug.get("candidate_topics", [])
+        if isinstance(candidate_topics, list):
+            for item in candidate_topics:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                score_map[int(item[0])] = float(item[1])
+
+        ranked: List[Tuple[float, int]] = []
+        seen: Set[int] = set()
+        for tid_raw in bridge_topics:
+            tid = int(tid_raw)
+            if tid in seen or tid in semantic_set:
+                continue
+            if current_id is not None and tid == current_id:
+                continue
+            seen.add(tid)
+            ranked.append((float(score_map.get(tid, 0.0)), tid))
+
+        ranked.sort(key=lambda it: it[0], reverse=True)
+        return [int(tid) for _score, tid in ranked[:budget]]
+
+    def _context_topic_block(
+        self,
+        topic_id: int,
+        evidence_by_topic: Dict[int, object],
+    ) -> List[int]:
+        mem_ids = evidence_by_topic.get(int(topic_id), [])
+        if not isinstance(mem_ids, list):
+            return []
+        out: List[int] = []
+        seen: Set[int] = set()
+        for mem_idx in mem_ids:
+            mem_id = int(mem_idx)
+            if mem_id < 0 or mem_id >= self.mem_count or mem_id in seen:
+                continue
+            seen.add(mem_id)
+            out.append(mem_id)
+        return out
+
+    def _context_concat_blocks(
+        self,
+        topic_order: Sequence[int],
+        blocks_by_topic: Dict[int, Sequence[int]],
+        memory_budget: int,
+        token_budget: int,
+    ) -> Tuple[List[int], int]:
+        memory_budget = max(1, int(memory_budget))
+        token_budget = max(1, int(token_budget))
+        out: List[int] = []
+        seen: Set[int] = set()
+        used_tokens = 0
+        for tid in topic_order:
+            for mem_idx in blocks_by_topic.get(int(tid), []):
+                mem_id = int(mem_idx)
+                if mem_id < 0 or mem_id >= self.mem_count or mem_id in seen:
+                    continue
+                tok = int(self._context_memory_tokens(mem_id))
+                if used_tokens + tok > token_budget:
+                    if not out:
+                        out.append(mem_id)
+                        used_tokens = min(token_budget, tok)
+                    return out, int(used_tokens)
+                seen.add(mem_id)
+                out.append(mem_id)
+                used_tokens += tok
+                if len(out) >= memory_budget:
+                    return out, int(used_tokens)
+        return out, int(used_tokens)
+
+    def _context_topic_capacity(self, memory_budget: int) -> int:
+        per_topic = max(1, int(self.p.topic_graph_per_topic_evidence))
+        memory_budget = max(1, int(memory_budget))
+        return max(1, int(math.ceil(memory_budget / float(per_topic))))
+
+    def _context_momentum_score(
+        self,
+        query_vec: np.ndarray,
+        new_topic_order: Sequence[int],
+    ) -> float:
+        if self.context_gear_prev_query_vec is None:
+            return 0.0
+
+        query_sim = float(self.context_gear_prev_query_vec @ query_vec)
+        query_sim = max(-1.0, min(1.0, query_sim))
+        query_sim = (query_sim + 1.0) / 2.0
+        topic_overlap = self._jaccard_similarity(self.context_gear_topic_order, new_topic_order)
+        w = max(0.0, min(1.0, float(self.p.context_gear_query_weight)))
+        momentum = w * query_sim + (1.0 - w) * topic_overlap
+        return max(0.0, min(1.0, float(momentum)))
+
+    def _context_update_gears(
+        self,
+        event_id: int,
+        semantic_topics: List[int],
+        adjacent_topics: List[int],
+        evidence_by_topic: Dict[int, object],
+        query_vec: np.ndarray,
+        memory_budget: int,
+    ) -> Tuple[List[int], List[int], int, float, float]:
+        memory_budget = max(1, int(memory_budget))
+        token_budget = self._context_token_budget(memory_budget)
+        topic_cap = self._context_topic_capacity(memory_budget)
+
+        desired_topics = [int(tid) for tid in (list(semantic_topics) + list(adjacent_topics))]
+        desired_topics = desired_topics[:topic_cap]
+
+        full_blocks = {int(tid): self._context_topic_block(int(tid), evidence_by_topic) for tid in desired_topics}
+        full_context, full_used_tokens = self._context_concat_blocks(
+            desired_topics, full_blocks, memory_budget, token_budget
+        )
+        tokens_full = float(full_used_tokens)
+        if not desired_topics:
+            if self.context_gear_topic_order:
+                reused, reused_used_tokens = self._context_concat_blocks(
+                    self.context_gear_topic_order,
+                    self.context_gear_blocks,
+                    memory_budget,
+                    token_budget,
+                )
+                tokens_full = float(reused_used_tokens)
+                self.context_gear_prev_query_vec = query_vec.astype(np.float32, copy=True)
+                self.context_retoken_full_tokens += tokens_full
+                if self.context_gear_level_counts:
+                    self.context_gear_level_counts[0] += 1
+                return reused, reused, 0, 0.0, tokens_full
+            self.context_gear_prev_query_vec = query_vec.astype(np.float32, copy=True)
+            if self.context_gear_level_counts:
+                self.context_gear_level_counts[2] += 1
+            return [], [], 2, 0.0, 0.0
+
+        refresh_every = max(0, int(self.p.context_gear_full_refresh_every))
+        force_full = refresh_every > 0 and (event_id - self.context_gear_last_full_refresh_event) >= refresh_every
+
+        primary_new = int(semantic_topics[0]) if semantic_topics else -1
+        primary_old = int(self.context_gear_topic_order[0]) if self.context_gear_topic_order else -1
+
+        if not self.context_gear_topic_order:
+            gear = 2
+        elif force_full:
+            gear = 2
+        else:
+            momentum = self._context_momentum_score(query_vec, desired_topics)
+            t0 = max(0.0, min(1.0, float(self.p.context_gear_momentum_gear0)))
+            t1 = max(0.0, min(1.0, float(self.p.context_gear_momentum_gear1)))
+            if momentum >= t0:
+                gear = 0
+            elif momentum >= t1:
+                gear = 1
+            else:
+                gear = 2
+            if primary_new >= 0 and primary_old >= 0 and primary_new != primary_old and gear <= 0:
+                gear = 1
+
+        old_order = list(self.context_gear_topic_order)
+        updated_topics: Set[int] = set()
+
+        def dedup(seq: Sequence[int]) -> List[int]:
+            out: List[int] = []
+            seen: Set[int] = set()
+            for item in seq:
+                tid = int(item)
+                if tid < 0 or tid in seen:
+                    continue
+                seen.add(tid)
+                out.append(tid)
+            return out
+
+        if gear == 2:
+            new_order = desired_topics
+            updated_topics = set(new_order)
+            self.context_gear_last_full_refresh_event = int(event_id)
+        elif gear == 1:
+            focus_sem = max(1, int(self.p.context_gear_semantic_focus))
+            focus_adj = max(0, int(self.p.context_gear_adjacent_focus))
+            focus_topics = dedup(list(semantic_topics[:focus_sem]) + list(adjacent_topics[:focus_adj]))
+            candidate_order = focus_topics + old_order + desired_topics
+            new_order = dedup(candidate_order)[:topic_cap]
+            updated_topics = set(focus_topics)
+            for tid in new_order:
+                if tid not in self.context_gear_blocks:
+                    updated_topics.add(int(tid))
+        else:
+            new_order = old_order[:topic_cap]
+            if not new_order:
+                gear = 2
+                new_order = desired_topics
+                updated_topics = set(new_order)
+                self.context_gear_last_full_refresh_event = int(event_id)
+            elif primary_new >= 0 and primary_new == int(new_order[0]):
+                updated_topics = {int(primary_new)}
+                for tid in new_order:
+                    if tid not in self.context_gear_blocks:
+                        updated_topics.add(int(tid))
+            else:
+                gear = 1
+                focus_sem = max(1, int(self.p.context_gear_semantic_focus))
+                focus_adj = max(0, int(self.p.context_gear_adjacent_focus))
+                focus_topics = dedup(list(semantic_topics[:focus_sem]) + list(adjacent_topics[:focus_adj]))
+                candidate_order = focus_topics + old_order + desired_topics
+                new_order = dedup(candidate_order)[:topic_cap]
+                updated_topics = set(focus_topics)
+                for tid in new_order:
+                    if tid not in self.context_gear_blocks:
+                        updated_topics.add(int(tid))
+
+        self.context_gear_topic_order = list(new_order)
+
+        changed_topics: Set[int] = set()
+        for tid in updated_topics:
+            new_block = full_blocks.get(int(tid))
+            if new_block is None:
+                new_block = self._context_topic_block(int(tid), evidence_by_topic)
+            if not new_block and int(tid) in self.context_gear_blocks:
+                continue
+            old_block = self.context_gear_blocks.get(int(tid))
+            if old_block is None or list(old_block) != list(new_block):
+                changed_topics.add(int(tid))
+            if new_block or old_block is None:
+                self.context_gear_blocks[int(tid)] = list(new_block)
+
+        context_memories, _used_tokens = self._context_concat_blocks(
+            self.context_gear_topic_order,
+            self.context_gear_blocks,
+            memory_budget,
+            token_budget,
+        )
+        tokens_gear = 0.0
+        if changed_topics and context_memories:
+            # Only count (re)tokenization for refreshed topics that actually
+            # contribute content under the current token budget.
+            for mem_id in context_memories:
+                owner = -1
+                for tid in self.context_gear_topic_order:
+                    block = self.context_gear_blocks.get(int(tid), [])
+                    if mem_id in block:
+                        owner = int(tid)
+                        break
+                if owner in changed_topics:
+                    tokens_gear += float(self._context_memory_tokens(int(mem_id)))
+        self.context_gear_prev_query_vec = query_vec.astype(np.float32, copy=True)
+        self.context_retoken_full_tokens += tokens_full
+        self.context_retoken_gear_tokens += tokens_gear
+        if 0 <= gear < len(self.context_gear_level_counts):
+            self.context_gear_level_counts[int(gear)] += 1
+        return context_memories, full_context, int(gear), float(tokens_gear), float(tokens_full)
+
+    def _score_context_memories(
+        self,
+        context_memories: Sequence[int],
+        query_vec: np.ndarray,
+        query_map: Dict[int, float],
+        budget: int,
+    ) -> Tuple[float, float, float, float, float, float, float]:
+        budget = max(1, int(budget))
+        context_memories = [int(mid) for mid in context_memories if 0 <= int(mid) < self.mem_count]
+        fill_ratio = float(len(context_memories)) / float(budget)
+
+        cached_maps = [self._memory_facet_map(mem_idx) for mem_idx in context_memories]
+        total_query_weight = max(1e-6, float(sum(query_map.values())))
+
+        coverage = 0.0
+        if query_map and context_memories:
+            for facet_id, query_weight in query_map.items():
+                best = 0.0
+                for mem_map in cached_maps:
+                    if not mem_map:
+                        continue
+                    best = max(best, float(mem_map.get(int(facet_id), 0.0)))
+                coverage += float(query_weight) * best
+            coverage /= total_query_weight
+
+        redundancy = 0.0
+        if len(context_memories) >= 2:
+            pair_sum = 0.0
+            pair_count = 0
+            for i in range(len(cached_maps)):
+                a = cached_maps[i]
+                if not a:
+                    continue
+                for j in range(i + 1, len(cached_maps)):
+                    b = cached_maps[j]
+                    if not b:
+                        continue
+                    overlap = 0.0
+                    for facet_id, weight_a in a.items():
+                        overlap += min(float(weight_a), float(b.get(facet_id, 0.0)))
+                    pair_sum += overlap
+                    pair_count += 1
+            if pair_count > 0:
+                redundancy = pair_sum / float(pair_count)
+
+        irrelevance = 0.0
+        if context_memories:
+            irr_sum = 0.0
+            query_ids = {int(fid) for fid in query_map}
+            for idx, mem_map in enumerate(cached_maps):
+                relevance = 0.0
+                if query_ids and mem_map:
+                    relevance = sum(float(weight) for facet_id, weight in mem_map.items() if facet_id in query_ids)
+                elif query_vec is not None:
+                    mem_id = int(context_memories[idx])
+                    relevance = max(0.0, float(self.vec_pool[mem_id] @ query_vec))
+                irr_sum += max(0.0, 1.0 - min(1.0, relevance))
+            irrelevance = irr_sum / float(len(context_memories))
+
+        saturation = self._context_saturation_score(context_memories)
+
+        association = 0.0
+        if context_memories:
+            topics: Set[int] = set()
+            families: Set[int] = set()
+            for mem_id in context_memories:
+                dominant = self._dominant_memory_topic(int(mem_id))
+                if dominant is None:
+                    continue
+                topics.add(int(dominant))
+                fid = self._topic_family_id(int(dominant))
+                if fid >= 0:
+                    families.add(int(fid))
+            topic_div = len(topics) / float(len(context_memories)) if context_memories else 0.0
+            fam_div = len(families) / float(len(context_memories)) if context_memories else 0.0
+            association = min(1.0, 0.60 * topic_div + 0.40 * fam_div)
+
+        quality = max(
+            0.0,
+            min(
+                1.0,
+                float(coverage)
+                + float(self.p.context_association_weight) * float(association)
+                - float(self.p.context_redundancy_weight) * float(redundancy)
+                - float(self.p.context_saturation_weight) * float(saturation)
+                - float(self.p.context_irrelevance_weight) * float(irrelevance),
+            ),
+        )
+        return (
+            float(quality),
+            float(coverage),
+            float(association),
+            float(saturation),
+            float(redundancy),
+            float(irrelevance),
+            float(fill_ratio),
+        )
+
     def _context_candidate_memories(
         self,
         selected_topics: Sequence[int],
@@ -6286,6 +6851,7 @@ class TopicGraphSim:
         selected_topics: Sequence[int],
         debug: Dict[str, object],
         query_vec: np.ndarray,
+        current_topic: Optional[int],
         query_facet_ids: np.ndarray,
         query_facet_weights: np.ndarray,
     ) -> float:
@@ -6295,82 +6861,191 @@ class TopicGraphSim:
             1,
             int(self.p.topic_graph_max_return_topics) * int(self.p.topic_graph_per_topic_evidence),
         )
-        candidate_memories = self._context_candidate_memories(selected_topics, debug)
-        context_memories, association, fill_ratio = self._assemble_context_memories(
-            candidate_memories=candidate_memories,
+        token_budget = self._context_token_budget(context_budget)
+        strategy = str(self.p.context_update_strategy).strip().lower()
+        if strategy not in {"greedy", "topic_concat", "gear"}:
+            strategy = "greedy"
+
+        if strategy == "greedy":
+            candidate_memories = self._context_candidate_memories(selected_topics, debug)
+            context_memories, association, fill_ratio = self._assemble_context_memories(
+                candidate_memories=candidate_memories,
+                query_vec=query_vec,
+                query_map=query_map,
+                context_budget=context_budget,
+            )
+            context_memories, used_tokens = self._truncate_memories_to_token_budget(
+                context_memories, token_budget
+            )
+            debug["assembled_context_memories"] = [int(mem_idx) for mem_idx in context_memories]
+            debug["assembled_context_fill_ratio"] = float(fill_ratio)
+            debug["context_token_budget"] = int(token_budget)
+            debug["assembled_context_tokens"] = int(used_tokens)
+            debug["assembled_context_token_fill_ratio"] = float(used_tokens) / float(max(1, token_budget))
+
+            quality, coverage, _assoc2, saturation, redundancy, irrelevance, _fill2 = self._score_context_memories(
+                context_memories,
+                query_vec=query_vec,
+                query_map=query_map,
+                budget=context_budget,
+            )
+            # Preserve the greedy association/fill_ratio semantics for legacy runs.
+            self.context_eval_count += 1
+            self.context_quality_sum += float(quality)
+            self.context_coverage_sum += float(coverage)
+            self.context_association_sum += float(association)
+            self.context_saturation_sum += float(saturation)
+            self.context_redundancy_sum += float(redundancy)
+            self.context_irrelevance_sum += float(irrelevance)
+            self.context_fill_ratio_sum += float(fill_ratio)
+            token_fill = float(used_tokens) / float(max(1, token_budget))
+            self.context_token_used_sum += float(used_tokens)
+            self.context_token_fill_ratio_sum += float(token_fill)
+            self.context_token_budget_sum += float(token_budget)
+            if used_tokens >= int(0.98 * float(token_budget)):
+                self.context_token_budget_hit_count += 1
+            return float(quality)
+
+        evidence_by_topic = debug.get("evidence_by_topic", {})
+        if not isinstance(evidence_by_topic, dict):
+            evidence_by_topic = {}
+
+        semantic_topics = self._context_semantic_topic_order(selected_topics, debug, current_topic)
+        if not semantic_topics:
+            fallback_topics: List[int] = []
+            current_id = int(current_topic) if current_topic is not None else None
+            evidence_topics = debug.get("evidence_topics", [])
+            if isinstance(evidence_topics, list):
+                for tid_raw in evidence_topics:
+                    tid = int(tid_raw)
+                    if current_id is not None and tid == current_id:
+                        continue
+                    fallback_topics.append(tid)
+                    if len(fallback_topics) >= max(1, int(self.p.topic_graph_max_return_topics)):
+                        break
+            if not fallback_topics:
+                candidate_topics = debug.get("candidate_topics", [])
+                if isinstance(candidate_topics, list):
+                    for item in candidate_topics:
+                        if not isinstance(item, (list, tuple)) or not item:
+                            continue
+                        tid = int(item[0])
+                        if current_id is not None and tid == current_id:
+                            continue
+                        fallback_topics.append(tid)
+                        if len(fallback_topics) >= max(1, int(self.p.topic_graph_max_return_topics)):
+                            break
+            semantic_topics = fallback_topics
+
+        adjacent_topics = self._context_adjacent_topic_order(semantic_topics, debug, current_topic)
+        desired_topics = [int(tid) for tid in (list(semantic_topics) + list(adjacent_topics))]
+        debug["context_semantic_topics"] = [int(tid) for tid in semantic_topics]
+        debug["context_adjacent_topics"] = [int(tid) for tid in adjacent_topics]
+
+        if strategy == "topic_concat":
+            blocks = {int(tid): self._context_topic_block(int(tid), evidence_by_topic) for tid in desired_topics}
+            context_memories, used_tokens = self._context_concat_blocks(
+                desired_topics, blocks, context_budget, token_budget
+            )
+            debug["assembled_context_memories"] = [int(mem_idx) for mem_idx in context_memories]
+            quality, coverage, association, saturation, redundancy, irrelevance, fill_ratio = self._score_context_memories(
+                context_memories,
+                query_vec=query_vec,
+                query_map=query_map,
+                budget=context_budget,
+            )
+            debug["assembled_context_fill_ratio"] = float(fill_ratio)
+            debug["context_token_budget"] = int(token_budget)
+            debug["assembled_context_tokens"] = int(used_tokens)
+            debug["assembled_context_token_fill_ratio"] = float(used_tokens) / float(max(1, token_budget))
+            self.context_eval_count += 1
+            self.context_quality_sum += float(quality)
+            self.context_coverage_sum += float(coverage)
+            self.context_association_sum += float(association)
+            self.context_saturation_sum += float(saturation)
+            self.context_redundancy_sum += float(redundancy)
+            self.context_irrelevance_sum += float(irrelevance)
+            self.context_fill_ratio_sum += float(fill_ratio)
+            token_fill = float(used_tokens) / float(max(1, token_budget))
+            self.context_token_used_sum += float(used_tokens)
+            self.context_token_fill_ratio_sum += float(token_fill)
+            self.context_token_budget_sum += float(token_budget)
+            if used_tokens >= int(0.98 * float(token_budget)):
+                self.context_token_budget_hit_count += 1
+            return float(quality)
+
+        # gear strategy: cached topic blocks + momentum-based refresh depth
+        self.context_update_events += 1
+        context_memories, full_context, gear, tokens_gear, tokens_full = self._context_update_gears(
+            event_id=self.context_update_events,
+            semantic_topics=semantic_topics,
+            adjacent_topics=adjacent_topics,
+            evidence_by_topic=evidence_by_topic,
+            query_vec=query_vec,
+            memory_budget=context_budget,
+        )
+        debug["context_gear_level"] = int(gear)
+        debug["context_retoken_tokens"] = float(tokens_gear)
+        debug["context_full_retoken_tokens"] = float(tokens_full)
+        debug["assembled_context_memories"] = [int(mem_idx) for mem_idx in context_memories]
+        _ctx_trim, used_tokens = self._truncate_memories_to_token_budget(context_memories, token_budget)
+        debug["context_token_budget"] = int(token_budget)
+        debug["assembled_context_tokens"] = int(used_tokens)
+        debug["assembled_context_token_fill_ratio"] = float(used_tokens) / float(max(1, token_budget))
+        quality, coverage, association, saturation, redundancy, irrelevance, fill_ratio = self._score_context_memories(
+            context_memories,
             query_vec=query_vec,
             query_map=query_map,
-            context_budget=context_budget,
+            budget=context_budget,
         )
-        debug["assembled_context_memories"] = [int(mem_idx) for mem_idx in context_memories]
         debug["assembled_context_fill_ratio"] = float(fill_ratio)
 
-        coverage = 0.0
-        total_query_weight = max(1e-6, float(sum(query_map.values())))
-        cached_maps = [self._memory_facet_map(mem_idx) for mem_idx in context_memories]
-        if query_map and context_memories:
-            for facet_id, query_weight in query_map.items():
-                best = 0.0
-                for mem_map in cached_maps:
-                    if not mem_map:
-                        continue
-                    best = max(best, float(mem_map.get(int(facet_id), 0.0)))
-                coverage += query_weight * best
-            coverage /= total_query_weight
-
-        redundancy = 0.0
-        if len(context_memories) >= 2:
-            pair_sum = 0.0
-            pair_count = 0
-            for i in range(len(cached_maps)):
-                a = cached_maps[i]
-                if not a:
-                    continue
-                for j in range(i + 1, len(cached_maps)):
-                    b = cached_maps[j]
-                    if not b:
-                        continue
-                    overlap = 0.0
-                    for facet_id, weight_a in a.items():
-                        overlap += min(float(weight_a), float(b.get(facet_id, 0.0)))
-                    pair_sum += overlap
-                    pair_count += 1
-            if pair_count > 0:
-                redundancy = pair_sum / float(pair_count)
-
-        irrelevance = 0.0
-        if context_memories:
-            irr_sum = 0.0
-            query_ids = set(int(fid) for fid in query_map)
-            for mem_map in cached_maps:
-                if not mem_map:
-                    continue
-                relevance = sum(float(weight) for facet_id, weight in mem_map.items() if facet_id in query_ids)
-                irr_sum += max(0.0, 1.0 - min(1.0, relevance))
-            irrelevance = irr_sum / float(len(context_memories))
-
-        saturation = self._context_saturation_score(context_memories)
-        quality = max(
-            0.0,
-            min(
-                1.0,
-                float(coverage)
-                + float(self.p.context_association_weight) * float(association)
-                - float(self.p.context_redundancy_weight) * float(redundancy)
-                - float(self.p.context_saturation_weight) * float(saturation)
-                - float(self.p.context_irrelevance_weight) * float(irrelevance),
-            ),
-        )
-
         self.context_eval_count += 1
-        self.context_quality_sum += quality
+        self.context_quality_sum += float(quality)
         self.context_coverage_sum += float(coverage)
         self.context_association_sum += float(association)
         self.context_saturation_sum += float(saturation)
         self.context_redundancy_sum += float(redundancy)
         self.context_irrelevance_sum += float(irrelevance)
         self.context_fill_ratio_sum += float(fill_ratio)
-        return quality
+        token_fill = float(used_tokens) / float(max(1, token_budget))
+        self.context_token_used_sum += float(used_tokens)
+        self.context_token_fill_ratio_sum += float(token_fill)
+        self.context_token_budget_sum += float(token_budget)
+        if used_tokens >= int(0.98 * float(token_budget)):
+            self.context_token_budget_hit_count += 1
+
+        if bool(self.p.context_gear_compare_to_full):
+            _full_trim, full_used_tokens = self._truncate_memories_to_token_budget(full_context, token_budget)
+            full_quality, full_coverage, full_assoc, full_saturation, full_redundancy, full_irrelevance, full_fill = (
+                self._score_context_memories(
+                    full_context,
+                    query_vec=query_vec,
+                    query_map=query_map,
+                    budget=context_budget,
+                )
+            )
+            self.context_full_eval_count += 1
+            self.context_quality_full_sum += float(full_quality)
+            self.context_coverage_full_sum += float(full_coverage)
+            self.context_association_full_sum += float(full_assoc)
+            self.context_saturation_full_sum += float(full_saturation)
+            self.context_redundancy_full_sum += float(full_redundancy)
+            self.context_irrelevance_full_sum += float(full_irrelevance)
+            self.context_fill_ratio_full_sum += float(full_fill)
+            self.context_quality_delta_sum += float(quality) - float(full_quality)
+            full_token_fill = float(full_used_tokens) / float(max(1, token_budget))
+            self.context_token_used_full_sum += float(full_used_tokens)
+            self.context_token_fill_ratio_full_sum += float(full_token_fill)
+            self.context_token_budget_full_sum += float(token_budget)
+            if full_used_tokens >= int(0.98 * float(token_budget)):
+                self.context_token_budget_full_hit_count += 1
+            debug["context_full_tokens"] = int(full_used_tokens)
+            debug["context_full_token_fill_ratio"] = float(full_token_fill)
+            debug["context_quality_full"] = float(full_quality)
+            debug["context_quality_delta"] = float(quality) - float(full_quality)
+
+        return float(quality)
 
     def _apply_query_feedback(
         self,
@@ -6466,6 +7141,13 @@ class TopicGraphSim:
         anchor_avg_seeds = self.anchor_probe_seed_total / max(1, self.anchor_probe_count)
         anchor_avg_candidates = self.anchor_probe_candidate_total / max(1, self.anchor_probe_count)
         avg_memories_per_turn = float(self.mem_count / max(1, self.p.turns))
+        full_ctx_n = max(1, int(self.context_full_eval_count))
+        gear_events = int(sum(self.context_gear_level_counts))
+        gear_events = max(1, gear_events)
+        retoken_saved_ratio = 0.0
+        if self.context_retoken_full_tokens > 0.0:
+            retoken_saved_ratio = 1.0 - (self.context_retoken_gear_tokens / float(self.context_retoken_full_tokens))
+            retoken_saved_ratio = max(-1.0, min(1.0, float(retoken_saved_ratio)))
 
         return {
             "turns": float(self.p.turns),
@@ -6492,6 +7174,22 @@ class TopicGraphSim:
             "context_redundancy_score": (self.context_redundancy_sum / context_n),
             "context_irrelevance_score": (self.context_irrelevance_sum / context_n),
             "context_fill_ratio": (self.context_fill_ratio_sum / context_n),
+            "context_token_budget": (self.context_token_budget_sum / context_n),
+            "context_tokens_used": (self.context_token_used_sum / context_n),
+            "context_token_fill_ratio": (self.context_token_fill_ratio_sum / context_n),
+            "context_token_budget_hit_rate": (self.context_token_budget_hit_count / context_n),
+            "context_quality_full_score": (self.context_quality_full_sum / full_ctx_n),
+            "context_quality_delta_score": (self.context_quality_delta_sum / full_ctx_n),
+            "context_tokens_used_full": (self.context_token_used_full_sum / full_ctx_n),
+            "context_token_fill_ratio_full": (self.context_token_fill_ratio_full_sum / full_ctx_n),
+            "context_token_budget_full": (self.context_token_budget_full_sum / full_ctx_n),
+            "context_token_budget_hit_rate_full": (self.context_token_budget_full_hit_count / full_ctx_n),
+            "context_retoken_full_tokens": float(self.context_retoken_full_tokens),
+            "context_retoken_gear_tokens": float(self.context_retoken_gear_tokens),
+            "context_retoken_saved_ratio": float(retoken_saved_ratio),
+            "context_gear0_ratio": float(self.context_gear_level_counts[0] / gear_events),
+            "context_gear1_ratio": float(self.context_gear_level_counts[1] / gear_events),
+            "context_gear2_ratio": float(self.context_gear_level_counts[2] / gear_events),
             "topic_graph_avg_origin_topics_per_memory": float(origin_topic_total / max(1, self.mem_count)),
             "topic_graph_multi_topic_memory_ratio": float(multi_topic_count / max(1, self.mem_count)),
             "topic_graph_family_count": float(family_count),
@@ -6624,6 +7322,7 @@ class TopicGraphSim:
                     selected_topics=selected_topics,
                     debug=debug,
                     query_vec=query_vec,
+                    current_topic=current_topic,
                     query_facet_ids=query_facet_ids,
                     query_facet_weights=query_facet_weights,
                 )
@@ -6891,6 +7590,31 @@ def main():
                         help="Cosine threshold above which similar memories start saturating the context budget")
     parser.add_argument("--context-min-marginal-gain", type=float, default=0.02,
                         help="Stop filling context budget once the best remaining memory falls below this marginal gain")
+    parser.add_argument("--context-update-strategy", type=str, default="greedy",
+                        choices=["greedy", "topic_concat", "gear"],
+                        help="Context assembly strategy for topic_graph evaluation")
+    parser.add_argument("--context-adjacent-topic-budget", type=int, default=2,
+                        help="Max adjacent/bridge topics appended after semantic topics (topic_concat/gear)")
+    parser.add_argument("--context-token-budget", type=int, default=0,
+                        help="Token budget for assembled context (topic_graph). 0=auto ~= memory_budget * mean_tokens")
+    parser.add_argument("--context-tokens-per-memory", type=int, default=80,
+                        help="Mean tokens per memory chunk (used for token-budget auto mode and sizing simulation)")
+    parser.add_argument("--context-tokens-per-memory-std", type=int, default=32,
+                        help="Stddev tokens for simulated per-memory sizes (gamma distribution)")
+    parser.add_argument("--context-gear-momentum-gear0", type=float, default=0.88,
+                        help="Momentum threshold for gear-0 (highest reuse)")
+    parser.add_argument("--context-gear-momentum-gear1", type=float, default=0.70,
+                        help="Momentum threshold for gear-1 (partial refresh)")
+    parser.add_argument("--context-gear-query-weight", type=float, default=0.65,
+                        help="Weight of query-vector similarity vs topic overlap in momentum score")
+    parser.add_argument("--context-gear-full-refresh-every", type=int, default=24,
+                        help="Force a full context refresh every N context updates (0 disables)")
+    parser.add_argument("--context-gear-semantic-focus", type=int, default=2,
+                        help="How many semantic topics to refresh in gear-1 (gear)")
+    parser.add_argument("--context-gear-adjacent-focus", type=int, default=2,
+                        help="How many adjacent topics to refresh in gear-1 (gear)")
+    parser.add_argument("--context-gear-compare-to-full", type=lambda x: x.lower() == 'true', default=True,
+                        help="Also score the full refresh context each query and record deltas (gear)")
     
     # EnhancedWeak parameters
     parser.add_argument("--soft-gate-enabled", type=lambda x: x.lower() == 'true', default=True,
@@ -7061,6 +7785,18 @@ def main():
         context_saturation_weight=max(0.0, float(args.context_saturation_weight)),
         context_similarity_saturation_threshold=max(-1.0, min(0.999, float(args.context_similarity_threshold))),
         context_min_marginal_gain=float(args.context_min_marginal_gain),
+        context_update_strategy=str(args.context_update_strategy).strip().lower(),
+        context_adjacent_topic_budget=max(0, int(args.context_adjacent_topic_budget)),
+        context_token_budget=int(args.context_token_budget),
+        context_tokens_per_memory=max(1, int(args.context_tokens_per_memory)),
+        context_tokens_per_memory_std=int(args.context_tokens_per_memory_std),
+        context_gear_momentum_gear0=max(0.0, min(1.0, float(args.context_gear_momentum_gear0))),
+        context_gear_momentum_gear1=max(0.0, min(1.0, float(args.context_gear_momentum_gear1))),
+        context_gear_query_weight=max(0.0, min(1.0, float(args.context_gear_query_weight))),
+        context_gear_full_refresh_every=max(0, int(args.context_gear_full_refresh_every)),
+        context_gear_semantic_focus=max(1, int(args.context_gear_semantic_focus)),
+        context_gear_adjacent_focus=max(0, int(args.context_gear_adjacent_focus)),
+        context_gear_compare_to_full=bool(args.context_gear_compare_to_full),
         soft_gate_enabled=args.soft_gate_enabled,
         ghsom_enabled=ghsom_enabled,
         ghsom_max_depth=max(1, int(args.ghsom_max_depth)),
@@ -7189,6 +7925,26 @@ def main():
             f"{summary.get('context_association_score', 0.0):.4f}/"
             f"{summary.get('context_saturation_score', 0.0):.4f}"
         )
+        print(f"Context update strategy: {args.context_update_strategy}")
+        if args.context_update_strategy == "gear":
+            print(
+                "Context recompute saved ratio: "
+                f"{summary.get('context_retoken_saved_ratio', 0.0):.4f} "
+                f"(gear={summary.get('context_retoken_gear_tokens', 0.0):.0f}, "
+                f"full={summary.get('context_retoken_full_tokens', 0.0):.0f})"
+            )
+            print(
+                "Gear ratios (0/1/2): "
+                f"{summary.get('context_gear0_ratio', 0.0):.3f}/"
+                f"{summary.get('context_gear1_ratio', 0.0):.3f}/"
+                f"{summary.get('context_gear2_ratio', 0.0):.3f}"
+            )
+            if args.context_gear_compare_to_full:
+                print(
+                    "Context quality (full/delta): "
+                    f"{summary.get('context_quality_full_score', 0.0):.4f}/"
+                    f"{summary.get('context_quality_delta_score', 0.0):.4f}"
+                )
         print(
             "Merge rate/origin-topics: "
             f"{summary.get('merge_rate', 0.0):.4f}/"
@@ -7200,6 +7956,21 @@ def main():
             f"{summary.get('context_redundancy_score', 0.0):.4f}/"
             f"{summary.get('context_irrelevance_score', 0.0):.4f}"
         )
+        print(
+            "Context tokens (used/budget/fill/hit): "
+            f"{summary.get('context_tokens_used', 0.0):.0f}/"
+            f"{summary.get('context_token_budget', 0.0):.0f}/"
+            f"{summary.get('context_token_fill_ratio', 0.0):.3f}/"
+            f"{summary.get('context_token_budget_hit_rate', 0.0):.3f}"
+        )
+        if args.context_update_strategy == "gear" and args.context_gear_compare_to_full:
+            print(
+                "Context tokens full (used/budget/fill/hit): "
+                f"{summary.get('context_tokens_used_full', 0.0):.0f}/"
+                f"{summary.get('context_token_budget_full', 0.0):.0f}/"
+                f"{summary.get('context_token_fill_ratio_full', 0.0):.3f}/"
+                f"{summary.get('context_token_budget_hit_rate_full', 0.0):.3f}"
+            )
         print(
             "Family risk penalty/skip: "
             f"{summary.get('topic_graph_self_excite_avg_penalty', 0.0):.4f}/"
