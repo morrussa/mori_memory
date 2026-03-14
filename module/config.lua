@@ -10,7 +10,7 @@ local DEFAULT_SETTINGS = {
             embedding_model = "Qwen3-Embedding-0.6B-Q8_0.gguf",
             -- Speculative decoding (draft model) for llama.cpp server.
             -- Set draft_enabled=false or draft_model="" to disable.
-            draft_enabled = false,
+            draft_enabled = true,
             draft_model = "Qwen3-0.6B-Q8_0.gguf",
             draft_gpu_layers = 0,
             draft_max = 16,
