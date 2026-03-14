@@ -2081,6 +2081,8 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
             selected_memories = {},
             fragments = {},
             adopted_memories = {},
+            bridge_topics = {},
+            candidate_topics = {},
             local_signals = {},
             topic_debug = {},
         }

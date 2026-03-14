@@ -19,6 +19,15 @@ local function count_tokens(messages)
     return math.max(0, math.floor(tonumber(n) or 0))
 end
 
+local function estimate_tokens_from_messages(messages)
+    local chars = 0
+    for _, row in ipairs(messages or {}) do
+        local content = tostring((row or {}).content or "")
+        chars = chars + util.utf8_len(content)
+    end
+    return math.max(0, math.ceil(chars / 3))
+end
+
 local function extract_history_pairs(conversation_history)
     local out = {}
     if type(conversation_history) ~= "table" then
@@ -538,7 +547,7 @@ local function select_variant_that_fits(pair, variants, index_from_oldest, total
                 candidate[#candidate + 1] = kept[k]
             end
             local candidate_messages = build_messages(system_prompt, dynamic_context, user_input, candidate)
-            local candidate_tokens = count_tokens(candidate_messages)
+            local candidate_tokens = estimate_tokens_from_messages(candidate_messages)
             return selected_variant, item.name, candidate_messages, candidate_tokens
         end
     end
@@ -574,7 +583,7 @@ function M.build_chat_messages(state)
     local variant_counts = { full = 0, slight = 0, heavy = 0, none = 0 }
 
     local messages = build_messages(system_prompt, dynamic_context, user_input, kept)
-    local total_tokens = count_tokens(messages)
+    local total_tokens = estimate_tokens_from_messages(messages)
 
     for i = #pairs, 1, -1 do
         local selected_variant, variant_name, candidate_messages, candidate_tokens =
@@ -595,6 +604,7 @@ function M.build_chat_messages(state)
     end
 
     local optimized_messages, opt_stats = context_manager.optimize_runtime_messages(messages, 4000)
+    total_tokens = estimate_tokens_from_messages(optimized_messages)
 
     if total_tokens > token_budget then
         for i, msg in ipairs(optimized_messages) do
@@ -603,16 +613,17 @@ function M.build_chat_messages(state)
                     .. "\n[Truncated for context budget]"
             end
         end
-        total_tokens = count_tokens(optimized_messages)
+        total_tokens = estimate_tokens_from_messages(optimized_messages)
     end
 
-    if total_tokens > token_budget then
-        print(string.format("[GraphContext] Warning: token budget exceeded total=%d budget=%d", total_tokens, token_budget))
+    local exact_tokens = count_tokens(optimized_messages)
+    if exact_tokens > token_budget then
+        print(string.format("[GraphContext] Warning: token budget exceeded total=%d budget=%d", exact_tokens, token_budget))
     end
 
     return optimized_messages, {
         token_budget = token_budget,
-        total_tokens = total_tokens,
+        total_tokens = exact_tokens,
         kept_pairs = #kept,
         dropped_pairs = #dropped,
         compressed_pairs = (variant_counts.slight or 0) + (variant_counts.heavy or 0),
