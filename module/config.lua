@@ -6,12 +6,12 @@ local DEFAULT_SETTINGS = {
     runtime = {
         models = {
             base_dir = "/home/morusa/AI/mori/model/",
-            large_model = "Qwen3.5-9B-Q6_K.gguf",
+            large_model = "Qwen3-4B-Q4_K_M.gguf",
             embedding_model = "Qwen3-Embedding-0.6B-Q8_0.gguf",
             -- Speculative decoding (draft model) for llama.cpp server.
             -- Set draft_enabled=false or draft_model="" to disable.
-            draft_enabled = true,
-            draft_model = "Qwen3.5-0.8B-UD-Q4_K_XL.gguf",
+            draft_enabled = false,
+            draft_model = "Qwen3-0.6B-Q8_0.gguf",
             draft_gpu_layers = 0,
             draft_max = 16,
             draft_min = 0,
