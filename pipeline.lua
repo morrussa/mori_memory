@@ -105,10 +105,24 @@ end
 local model_base = tostring(model_cfg.base_dir or model_defaults.base_dir or "")
 local large_model_path = join_model_path(model_base, model_cfg.large_model or model_defaults.large_model)
 local embedding_model_path = join_model_path(model_base, model_cfg.embedding_model or model_defaults.embedding_model)
+local draft_enabled = (model_cfg.draft_enabled ~= nil) and (model_cfg.draft_enabled == true) or (model_defaults.draft_enabled == true)
+local draft_model_path = ""
+if draft_enabled then
+    draft_model_path = join_model_path(model_base, model_cfg.draft_model or model_defaults.draft_model)
+end
+local spec_cfg = {
+    enabled = draft_enabled == true and draft_model_path ~= "",
+    draft_gpu_layers = tonumber(model_cfg.draft_gpu_layers or model_defaults.draft_gpu_layers or 0) or 0,
+    draft_max = tonumber(model_cfg.draft_max or model_defaults.draft_max or 0) or 0,
+    draft_min = tonumber(model_cfg.draft_min or model_defaults.draft_min or 0) or 0,
+    draft_p_min = tonumber(model_cfg.draft_p_min or model_defaults.draft_p_min or 0) or 0,
+    draft_ctx_size = tonumber(model_cfg.draft_ctx_size or model_defaults.draft_ctx_size or 0) or 0,
+}
 
 print("[Lua] large_model path: " .. tostring(large_model_path))
 print("[Lua] embedding_model path: " .. tostring(embedding_model_path))
-py_pipeline:load_models(large_model_path, embedding_model_path)
+print("[Lua] draft_model path: " .. tostring(draft_model_path))
+py_pipeline:load_models(large_model_path, embedding_model_path, draft_model_path, spec_cfg)
 
 history.load()
 topic.init()

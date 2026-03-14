@@ -43,6 +43,14 @@ local function shallow_copy_array(src)
     return out
 end
 
+local function shallow_copy_map(src)
+    local out = {}
+    for k, v in pairs(src or {}) do
+        out[tostring(k)] = v
+    end
+    return out
+end
+
 local function unique_sorted_memories(memories)
     local seen = {}
     local out = {}
@@ -157,6 +165,8 @@ local function empty_recall_result(current_anchor, score)
         selected_memories = {},
         fragments = {},
         adopted_memories = {},
+        bridge_topics = {},
+        candidate_topics = {},
     }
 end
 
@@ -194,6 +204,8 @@ function M.check_and_retrieve(user_input, user_vec, _opts)
     result.adopted_memories = shallow_copy_array(result.adopted_memories or {})
     result.local_signals = result.local_signals or {}
     result.topic_debug = result.topic_debug or {}
+    result.bridge_topics = shallow_copy_array(result.bridge_topics or {})
+    result.candidate_topics = shallow_copy_map(result.candidate_topics or {})
     result.context = tostring(result.context or "")
     return result
 end

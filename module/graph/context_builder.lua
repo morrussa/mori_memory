@@ -2,6 +2,7 @@ local util = require("module.graph.util")
 local config = require("module.config")
 local context_manager = require("module.graph.context_manager")
 local project_knowledge = require("module.graph.project_knowledge")
+local topic = require("module.memory.topic")
 
 local M = {}
 
@@ -106,6 +107,246 @@ local function summarize_working_memory(state)
     return table.concat(lines, "\n")
 end
 
+local function unique_topic_list(items)
+    local out = {}
+    local seen = {}
+    for _, item in ipairs(items or {}) do
+        local key = util.trim(item or "")
+        if key ~= "" and not seen[key] then
+            seen[key] = true
+            out[#out + 1] = key
+        end
+    end
+    return out
+end
+
+local function build_topic_score_map(recall_state)
+    local scores = {}
+    local topic_rows = (((recall_state or {}).topic_debug or {}).topic_rows) or {}
+    for _, row in ipairs(topic_rows or {}) do
+        local anchor = util.trim((row or {}).anchor or "")
+        if anchor ~= "" then
+            local score = tonumber((row or {}).total_score)
+            if score == nil then
+                score = tonumber((row or {}).score) or tonumber((row or {}).route_score) or 0.0
+            end
+            scores[anchor] = score
+        end
+    end
+    for anchor, score in pairs((recall_state or {}).candidate_topics or {}) do
+        local key = util.trim(anchor or "")
+        if key ~= "" and scores[key] == nil then
+            scores[key] = tonumber(score) or 0.0
+        end
+    end
+    return scores
+end
+
+local function topic_overlap_score(fp_a, fp_b)
+    local weights_a = (fp_a or {}).weights or {}
+    local weights_b = (fp_b or {}).weights or {}
+    local total = 0.0
+    for cid, wa in pairs(weights_a) do
+        local wb = weights_b[cid]
+        if wb ~= nil then
+            local a = tonumber(wa) or 0.0
+            local b = tonumber(wb) or 0.0
+            total = total + math.min(a, b)
+        end
+    end
+    return total
+end
+
+local function rank_topics(candidates, scores)
+    local out = {}
+    local seen = {}
+    for _, anchor in ipairs(candidates or {}) do
+        local key = util.trim(anchor or "")
+        if key ~= "" and not seen[key] then
+            seen[key] = true
+            out[#out + 1] = {
+                anchor = key,
+                score = tonumber(scores[key]) or -1e9,
+            }
+        end
+    end
+    table.sort(out, function(a, b)
+        if (a.score or 0.0) ~= (b.score or 0.0) then
+            return (a.score or 0.0) > (b.score or 0.0)
+        end
+        return tostring(a.anchor) < tostring(b.anchor)
+    end)
+    return out
+end
+
+local function select_topics_with_saturation(semantic_ranked, adjacent_ranked, current_anchor, scores)
+    local tg_cfg = (config.settings or {}).topic_graph or {}
+    local total_budget = math.max(1, math.floor(tonumber(tg_cfg.max_return_topics) or 4))
+    local overlap_threshold = tonumber(tg_cfg.context_overlap_threshold) or 0.55
+
+    local selected = {}
+    local selected_set = {}
+    local fp_cache = {}
+
+    local function get_fp(anchor)
+        local key = util.trim(anchor or "")
+        if key == "" then
+            return nil
+        end
+        if fp_cache[key] == nil then
+            fp_cache[key] = (topic.get_topic_fingerprint and topic.get_topic_fingerprint(key)) or {}
+        end
+        return fp_cache[key]
+    end
+
+    local function is_saturated(anchor)
+        if overlap_threshold <= 0 then
+            return false
+        end
+        local fp = get_fp(anchor)
+        if not fp or not fp.weights then
+            return false
+        end
+        for _, picked in ipairs(selected) do
+            local fp_b = get_fp(picked)
+            if fp_b and fp_b.weights then
+                if topic_overlap_score(fp, fp_b) >= overlap_threshold then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function try_pick(anchor)
+        if util.trim(anchor or "") == "" then
+            return false
+        end
+        if anchor == current_anchor then
+            return false
+        end
+        if selected_set[anchor] then
+            return false
+        end
+        if is_saturated(anchor) then
+            return false
+        end
+        selected_set[anchor] = true
+        selected[#selected + 1] = anchor
+        return true
+    end
+
+    local semantic_selected = {}
+    for _, row in ipairs(semantic_ranked or {}) do
+        if #selected >= total_budget then
+            break
+        end
+        if try_pick(row.anchor) then
+            semantic_selected[#semantic_selected + 1] = row.anchor
+        end
+    end
+
+    local adjacent_selected = {}
+    for _, row in ipairs(adjacent_ranked or {}) do
+        if #selected >= total_budget then
+            break
+        end
+        if try_pick(row.anchor) then
+            adjacent_selected[#adjacent_selected + 1] = row.anchor
+        end
+    end
+
+    return semantic_selected, adjacent_selected
+end
+
+local function format_topic_entry(anchor, score, max_summary_chars)
+    if util.trim(anchor or "") == "" then
+        return ""
+    end
+    local fp = (topic.get_topic_fingerprint and topic.get_topic_fingerprint(anchor)) or {}
+    local ts = tonumber((fp or {}).start)
+    local ts_text = ts and tostring(ts) or "?"
+    local line = string.format("t=%s | anchor=%s", ts_text, tostring(anchor))
+    if score ~= nil then
+        line = line .. string.format(" | score=%.3f", tonumber(score) or 0.0)
+    end
+    local summary = util.trim((fp or {}).summary or "")
+    if summary ~= "" then
+        summary = util.utf8_take(summary, max_summary_chars)
+        line = line .. "\nsummary=" .. summary
+    end
+    return line
+end
+
+local function build_topic_blocks(state)
+    local recall_state = ((state or {}).recall) or {}
+    local current_anchor = util.trim(recall_state.topic_anchor or "")
+    if current_anchor == "" then
+        current_anchor = util.trim((((state or {}).episode or {}).current or {}).topic_anchor or "")
+    end
+
+    local scores = build_topic_score_map(recall_state)
+    local semantic_topics = unique_topic_list(recall_state.predicted_topics or {})
+    local adjacent_topics = unique_topic_list(recall_state.bridge_topics or {})
+    local semantic_ranked = rank_topics(semantic_topics, scores)
+    local adjacent_ranked = rank_topics(adjacent_topics, scores)
+    local semantic_selected, adjacent_selected = select_topics_with_saturation(
+        semantic_ranked,
+        adjacent_ranked,
+        current_anchor,
+        scores
+    )
+
+    local semantic_lines = {}
+    local max_summary_chars = 220
+    for _, anchor in ipairs(semantic_selected) do
+        local entry = format_topic_entry(anchor, scores[anchor], max_summary_chars)
+        if entry ~= "" then
+            semantic_lines[#semantic_lines + 1] = entry
+        end
+    end
+
+    local adjacent_lines = {}
+    for _, anchor in ipairs(adjacent_selected) do
+        local entry = format_topic_entry(anchor, scores[anchor], max_summary_chars)
+        if entry ~= "" then
+            adjacent_lines[#adjacent_lines + 1] = entry
+        end
+    end
+
+    local past_blocks = {}
+    if #semantic_lines > 0 then
+        past_blocks[#past_blocks + 1] = "[SemanticTopics]\n" .. table.concat(semantic_lines, "\n\n")
+    end
+    if #adjacent_lines > 0 then
+        past_blocks[#past_blocks + 1] = "[AdjacentTopics]\n" .. table.concat(adjacent_lines, "\n\n")
+    end
+
+    local past_block = ""
+    if #past_blocks > 0 then
+        past_block = "[PastTopics]\n" .. table.concat(past_blocks, "\n\n")
+    end
+
+    local current_block = ""
+    if current_anchor ~= "" then
+        state.context = state.context or {}
+        if util.trim(state.context.current_topic_anchor or "") ~= current_anchor
+            or util.trim(state.context.current_topic_block or "") == "" then
+            local entry = format_topic_entry(current_anchor, scores[current_anchor], max_summary_chars)
+            if entry ~= "" then
+                state.context.current_topic_anchor = current_anchor
+                state.context.current_topic_block = "[CurrentTopic]\n" .. entry
+            else
+                state.context.current_topic_anchor = current_anchor
+                state.context.current_topic_block = ""
+            end
+        end
+        current_block = util.trim(state.context.current_topic_block or "")
+    end
+
+    return past_block, current_block
+end
+
 -- Static system prompt prefix: must be as stable as possible for KV-cache reuse.
 local function compose_static_system_prompt(base_system_prompt, state)
     local lines = { tostring(base_system_prompt or "") }
@@ -124,13 +365,24 @@ local function compose_dynamic_context(state)
     local context = ((state or {}).context) or {}
     local lines = { "[DynamicContext]" }
 
-    lines[#lines + 1] = summarize_working_memory(state)
+    local past_topics, current_topic = build_topic_blocks(state)
+    if util.trim(past_topics or "") ~= "" then
+        lines[#lines + 1] = past_topics
+    end
+    if util.trim(current_topic or "") ~= "" then
+        lines[#lines + 1] = current_topic
+    end
 
     if util.trim((context or {}).memory_context or "") ~= "" then
-        lines[#lines + 1] = "[MemoryContext]"
-        lines[#lines + 1] = tostring(context.memory_context)
+        local memory_text = tostring(context.memory_context or "")
+        if not memory_text:find("【相关主题】", 1, true)
+            or (util.trim(past_topics or "") == "" and util.trim(current_topic or "") == "") then
+            lines[#lines + 1] = "[MemoryContext]"
+            lines[#lines + 1] = memory_text
+        end
     end
     if util.trim((context or {}).task_context or "") ~= "" then
+        lines[#lines + 1] = "[TaskContext]"
         lines[#lines + 1] = tostring(context.task_context)
     end
     local recent_episode_summary = util.trim((((state or {}).episode or {}).recent or {}).summary or "")
@@ -146,6 +398,8 @@ local function compose_dynamic_context(state)
         lines[#lines + 1] = "[PlannerContext]"
         lines[#lines + 1] = tostring(context.planner_context)
     end
+
+    lines[#lines + 1] = summarize_working_memory(state)
 
     if (context or {})._budget_warning then
         lines[#lines + 1] = "[System Note: " .. context._budget_warning .. "]"

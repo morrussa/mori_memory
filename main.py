@@ -38,6 +38,12 @@ class LlamaCppServerClient:
         model_path: str,
         ctx_size: int,
         embedding: bool = False,
+        draft_model_path: str | None = None,
+        draft_max: int | None = None,
+        draft_min: int | None = None,
+        draft_p_min: float | None = None,
+        ctx_size_draft: int | None = None,
+        draft_gpu_layers="0",
         host: str = "127.0.0.1",
         port: int = None,
         enable_webui: bool = False,
@@ -52,6 +58,11 @@ class LlamaCppServerClient:
         self.model_path = model_path
         self.ctx_size = int(ctx_size)
         self.embedding = bool(embedding)
+        self.draft_model_path = str(draft_model_path).strip() if draft_model_path else ""
+        self.draft_max = int(draft_max) if draft_max is not None else None
+        self.draft_min = int(draft_min) if draft_min is not None else None
+        self.draft_p_min = float(draft_p_min) if draft_p_min is not None else None
+        self.ctx_size_draft = int(ctx_size_draft) if ctx_size_draft is not None else None
         self.server_host = str(host or "127.0.0.1")
         self.request_host = "127.0.0.1" if self.server_host in ("0.0.0.0", "::") else self.server_host
         self.enable_webui = bool(enable_webui) and not self.embedding
@@ -69,6 +80,17 @@ class LlamaCppServerClient:
             except ValueError:
                 parsed_layers = -1
             self.gpu_layers = max(0, parsed_layers) if parsed_layers >= 0 else "all"
+
+        raw_draft_gpu_layers = str(draft_gpu_layers if draft_gpu_layers is not None else "0").strip().lower()
+        if raw_draft_gpu_layers in {"all", "-1"}:
+            self.draft_gpu_layers = "all"
+        else:
+            try:
+                parsed_layers = int(raw_draft_gpu_layers)
+            except ValueError:
+                parsed_layers = 0
+            self.draft_gpu_layers = max(0, parsed_layers)
+
         self.model_name = os.path.basename(model_path) or "local-model"
         self.port = int(port) if port else self._find_free_port(self.request_host)
         self.base_url = f"http://{self.request_host}:{self.port}"
@@ -113,6 +135,18 @@ class LlamaCppServerClient:
             str(self.ctx_size),
         ]
         cmd.extend(["--gpu-layers", str(self.gpu_layers)])
+
+        if self.draft_model_path and not self.embedding:
+            cmd.extend(["--model-draft", self.draft_model_path])
+            if self.ctx_size_draft is not None and self.ctx_size_draft > 0:
+                cmd.extend(["--ctx-size-draft", str(int(self.ctx_size_draft))])
+            if self.draft_max is not None and self.draft_max > 0:
+                cmd.extend(["--draft-max", str(int(self.draft_max))])
+            if self.draft_min is not None and self.draft_min > 0:
+                cmd.extend(["--draft-min", str(int(self.draft_min))])
+            if self.draft_p_min is not None and self.draft_p_min > 0:
+                cmd.extend(["--draft-p-min", str(float(self.draft_p_min))])
+            cmd.extend(["--gpu-layers-draft", str(self.draft_gpu_layers)])
 
         if not self.embedding:
             cmd.extend(["--reasoning-format", "none"])
@@ -418,6 +452,15 @@ class AIPipeline:
         self.large_server_gpu_layers = str(os.environ.get("MORI_LARGE_SERVER_GPU_LAYERS", "all") or "all").strip()
         self.embed_server_gpu_layers = str(os.environ.get("MORI_EMBED_SERVER_GPU_LAYERS", "0") or "0").strip()
         self.large_server_gpu_fallback_cpu = self._get_env_bool("MORI_LARGE_SERVER_GPU_FALLBACK_CPU", True)
+        self.large_server_spec_enabled = self._get_env_bool("MORI_LARGE_SERVER_SPEC_ENABLED", False)
+        self.large_server_draft_model = str(os.environ.get("MORI_LARGE_SERVER_DRAFT_MODEL", "") or "").strip()
+        self.large_server_draft_gpu_layers = str(
+            os.environ.get("MORI_LARGE_SERVER_DRAFT_GPU_LAYERS", "") or ""
+        ).strip()
+        self.large_server_draft_max = self._get_env_int("MORI_LARGE_SERVER_DRAFT_MAX", 0)
+        self.large_server_draft_min = self._get_env_int("MORI_LARGE_SERVER_DRAFT_MIN", 0)
+        self.large_server_draft_p_min = self._get_env_float("MORI_LARGE_SERVER_DRAFT_P_MIN", 0.0)
+        self.large_server_draft_ctx_size = self._get_env_int("MORI_LARGE_SERVER_DRAFT_CTX_SIZE", 0)
         self.llama_server_log_to_file = self._get_env_bool("MORI_LLAMA_SERVER_LOG_TO_FILE", True)
         self.agent_files_root = os.path.abspath(
             str(os.environ.get("MORI_AGENT_FILES_DIR", "workspace") or "workspace")
@@ -459,6 +502,16 @@ class AIPipeline:
             return int(raw)
         except ValueError:
             return int(default)
+
+    @staticmethod
+    def _get_env_float(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None:
+            return float(default)
+        try:
+            return float(raw)
+        except ValueError:
+            return float(default)
 
     @staticmethod
     def _normalize_embedding_vec(embedding):
@@ -2025,7 +2078,7 @@ class AIPipeline:
             "tool_calls": normalized_calls,
         })
 
-    def load_models(self, large_model_path: str, embedding_model_path: str):
+    def load_models(self, large_model_path: str, embedding_model_path: str, draft_model_path=None, spec_cfg=None):
         print("[Python] Loading models...")
 
         self.shutdown()
@@ -2036,6 +2089,29 @@ class AIPipeline:
         if large_model_path:
             if not os.path.exists(large_model_path):
                 raise FileNotFoundError(f"Large model not found: {large_model_path}")
+
+            spec_cfg_value = self._coerce_lua_value(spec_cfg)
+            if not isinstance(spec_cfg_value, dict):
+                spec_cfg_value = {}
+
+            draft_model_path_arg = str(draft_model_path or "").strip()
+            spec_enabled = None
+            if "enabled" in spec_cfg_value:
+                spec_enabled = bool(spec_cfg_value.get("enabled"))
+            if spec_enabled is None:
+                spec_enabled = bool(draft_model_path_arg) or bool(self.large_server_spec_enabled)
+
+            draft_model_candidate = ""
+            if spec_enabled:
+                draft_model_candidate = draft_model_path_arg or self.large_server_draft_model
+
+            if draft_model_candidate and not os.path.exists(draft_model_candidate):
+                print(
+                    f"[Python][WARN] Draft model not found for speculative decoding: {draft_model_candidate}; "
+                    "continuing without draft model."
+                )
+                draft_model_candidate = ""
+
             print(
                 f"[Python] Loading Large LLM: {large_model_path} "
                 f"(gpu_layers={self.large_server_gpu_layers})"
@@ -2054,9 +2130,56 @@ class AIPipeline:
                 "log_to_file": self.llama_server_log_to_file,
             }
             configured_layers = self.large_server_gpu_layers
+            draft_cfg_gpu_layers = spec_cfg_value.get("draft_gpu_layers")
+            draft_cfg_max = spec_cfg_value.get("draft_max")
+            draft_cfg_min = spec_cfg_value.get("draft_min")
+            draft_cfg_p_min = spec_cfg_value.get("draft_p_min")
+            draft_cfg_ctx = spec_cfg_value.get("draft_ctx_size")
+
+            draft_gpu_layers = draft_cfg_gpu_layers
+            if draft_gpu_layers is None:
+                draft_gpu_layers = self.large_server_draft_gpu_layers or "0"
+
+            draft_ctx_size = 0
+            try:
+                draft_ctx_size = int(draft_cfg_ctx) if draft_cfg_ctx is not None else int(self.large_server_draft_ctx_size or 0)
+            except (TypeError, ValueError):
+                draft_ctx_size = int(self.large_server_draft_ctx_size or 0)
+            if draft_ctx_size <= 0:
+                draft_ctx_size = int(large_common_kwargs["ctx_size"])
+
+            draft_max = None
+            try:
+                parsed_max = int(draft_cfg_max) if draft_cfg_max is not None else int(self.large_server_draft_max or 0)
+            except (TypeError, ValueError):
+                parsed_max = int(self.large_server_draft_max or 0)
+            if parsed_max > 0:
+                draft_max = parsed_max
+
+            draft_min = None
+            try:
+                parsed_min = int(draft_cfg_min) if draft_cfg_min is not None else int(self.large_server_draft_min or 0)
+            except (TypeError, ValueError):
+                parsed_min = int(self.large_server_draft_min or 0)
+            if parsed_min > 0:
+                draft_min = parsed_min
+
+            draft_p_min = None
+            try:
+                parsed_p_min = float(draft_cfg_p_min) if draft_cfg_p_min is not None else float(self.large_server_draft_p_min or 0.0)
+            except (TypeError, ValueError):
+                parsed_p_min = float(self.large_server_draft_p_min or 0.0)
+            if parsed_p_min > 0:
+                draft_p_min = parsed_p_min
             try:
                 self.llm_large = LlamaCppServerClient(
                     gpu_layers=configured_layers,
+                    draft_model_path=draft_model_candidate or None,
+                    ctx_size_draft=draft_ctx_size if draft_model_candidate else None,
+                    draft_max=draft_max if draft_model_candidate else None,
+                    draft_min=draft_min if draft_model_candidate else None,
+                    draft_p_min=draft_p_min if draft_model_candidate else None,
+                    draft_gpu_layers=draft_gpu_layers,
                     **large_common_kwargs,
                 )
             except RuntimeError as e:
@@ -2075,6 +2198,12 @@ class AIPipeline:
                 )
                 self.llm_large = LlamaCppServerClient(
                     gpu_layers=0,
+                    draft_model_path=draft_model_candidate or None,
+                    ctx_size_draft=draft_ctx_size if draft_model_candidate else None,
+                    draft_max=draft_max if draft_model_candidate else None,
+                    draft_min=draft_min if draft_model_candidate else None,
+                    draft_p_min=draft_p_min if draft_model_candidate else None,
+                    draft_gpu_layers=draft_gpu_layers,
                     **large_common_kwargs,
                 )
             if self.large_server_webui and not self.suppress_large_webui_log:
