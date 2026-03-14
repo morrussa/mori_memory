@@ -75,7 +75,7 @@ local DEFAULT_SETTINGS = {
         tools = {
             file_context_max_chars = 6000,
         },
-        -- 上下文管理配置（新增）
+        -- 上下文管理配置
         context_manager = {
             -- 工具结果最大字符数（单条）
             tool_result_max_chars = 4000,
