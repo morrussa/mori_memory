@@ -106,8 +106,8 @@ local function summarize_working_memory(state)
     return table.concat(lines, "\n")
 end
 
-local function compose_system_prompt(base_system_prompt, state)
-    local context = ((state or {}).context) or {}
+-- Static system prompt prefix: must be as stable as possible for KV-cache reuse.
+local function compose_static_system_prompt(base_system_prompt, state)
     local lines = { tostring(base_system_prompt or "") }
 
     local pk_overview = project_knowledge.get_project_knowledge(state)
@@ -115,6 +115,14 @@ local function compose_system_prompt(base_system_prompt, state)
         lines[#lines + 1] = ""
         lines[#lines + 1] = pk_overview
     end
+
+    return table.concat(lines, "\n\n")
+end
+
+-- Dynamic runtime context: changes frequently; keep it OUT of the system message.
+local function compose_dynamic_context(state)
+    local context = ((state or {}).context) or {}
+    local lines = { "[DynamicContext]" }
 
     lines[#lines + 1] = summarize_working_memory(state)
 
@@ -140,14 +148,13 @@ local function compose_system_prompt(base_system_prompt, state)
     end
 
     if (context or {})._budget_warning then
-        lines[#lines + 1] = ""
         lines[#lines + 1] = "[System Note: " .. context._budget_warning .. "]"
     end
 
     return table.concat(lines, "\n\n")
 end
 
-local function build_messages(system_prompt, user_input, history_pairs)
+local function build_messages(system_prompt, dynamic_context, user_input, history_pairs)
     local msgs = {
         { role = "system", content = tostring(system_prompt or "") },
     }
@@ -159,6 +166,13 @@ local function build_messages(system_prompt, user_input, history_pairs)
             msgs[#msgs + 1] = { role = "assistant", content = tostring(pair.assistant or "") }
         end
     end
+
+    local ctx_text = util.trim(dynamic_context or "")
+    if ctx_text ~= "" then
+        msgs[#msgs + 1] = { role = "user", content = ctx_text }
+        msgs[#msgs + 1] = { role = "assistant", content = "Context noted." }
+    end
+
     msgs[#msgs + 1] = { role = "user", content = tostring(user_input or "") }
     return msgs
 end
@@ -236,7 +250,7 @@ local function build_pair_variants(pair, cfg)
     }
 end
 
-local function select_variant_that_fits(pair, variants, index_from_oldest, total_pairs, cfg, system_prompt, user_input, kept)
+local function select_variant_that_fits(pair, variants, index_from_oldest, total_pairs, cfg, system_prompt, dynamic_context, user_input, kept)
     local weights = cfg.history_variant_weights or {}
     local decay = tonumber(cfg.history_recency_decay) or 0.90
     decay = math.max(0.01, math.min(1.0, decay))
@@ -269,7 +283,7 @@ local function select_variant_that_fits(pair, variants, index_from_oldest, total
             for k = 1, #kept do
                 candidate[#candidate + 1] = kept[k]
             end
-            local candidate_messages = build_messages(system_prompt, user_input, candidate)
+            local candidate_messages = build_messages(system_prompt, dynamic_context, user_input, candidate)
             local candidate_tokens = count_tokens(candidate_messages)
             return selected_variant, item.name, candidate_messages, candidate_tokens
         end
@@ -291,7 +305,8 @@ function M.build_chat_messages(state)
         end
     end
 
-    local system_prompt = compose_system_prompt(base_system_prompt, state)
+    local system_prompt = compose_static_system_prompt(base_system_prompt, state)
+    local dynamic_context = compose_dynamic_context(state)
     local user_input = tostring((((state or {}).input or {}).message) or "")
 
     local pairs = extract_history_pairs(conversation_history)
@@ -304,12 +319,12 @@ function M.build_chat_messages(state)
     local dropped = {}
     local variant_counts = { full = 0, slight = 0, heavy = 0, none = 0 }
 
-    local messages = build_messages(system_prompt, user_input, kept)
+    local messages = build_messages(system_prompt, dynamic_context, user_input, kept)
     local total_tokens = count_tokens(messages)
 
     for i = #pairs, 1, -1 do
         local selected_variant, variant_name, candidate_messages, candidate_tokens =
-            select_variant_that_fits(pairs[i], pair_variants[i], i, #pairs, cfg, system_prompt, user_input, kept)
+            select_variant_that_fits(pairs[i], pair_variants[i], i, #pairs, cfg, system_prompt, dynamic_context, user_input, kept)
         if selected_variant ~= nil and candidate_messages and candidate_tokens and candidate_tokens <= token_budget then
             local next_kept = { selected_variant }
             for k = 1, #kept do

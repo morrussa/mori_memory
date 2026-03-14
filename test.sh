@@ -19,5 +19,5 @@
   --topic-temporal-query-mix 0.76 \
   --turns 50000 \
   --report-every 1000 \
-  --output /tmp/topic_temporal_50k_state_only.json \
-  --plot-out /tmp/topic_temporal_50k_state_only.png
+  --output /tmp/normal_50k.json \
+  --plot-out /tmp/normal_50k.png
