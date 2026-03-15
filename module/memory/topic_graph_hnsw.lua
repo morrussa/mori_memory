@@ -1,5 +1,5 @@
 local hnsw = require("module.hnsw")
-local util = require("module.graph.util")
+local util = require("mori_memory.util")
 local persistence = require("module.persistence")
 
 local M = {}

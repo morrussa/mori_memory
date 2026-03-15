@@ -489,6 +489,7 @@ local DEFAULT_SETTINGS = {
         confirm_limit = 0.55, -- 话题无关阈值：断裂发生时，当前轮与头质心相似度低于此值，确认为新话题
         min_topic_length =2,--防止话题被切的太碎
         summary_max_tokens = 192, -- topic 摘要生成的最大输出长度（默认加大，减少截断）。
+        allow_llm_summary = false, -- 允许在运行时调用大模型生成 topic 摘要（会增加延迟）。
         rebuild = true,--当异常退出时，如果rebuild为true，那么就找到文件一开始写的current_turn上一个topic的末尾，然后自己根据history.txt的输出自动重建整个topic。这个过程会阻塞主pipeline，因为如果不阻塞就不安全。
         -- 话题摘要分级配置
         summary_variant_weights = {

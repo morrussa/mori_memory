@@ -12,9 +12,8 @@ function M.flush_all(force)
 
     local memory = require("module.memory.store")
     local history = require("module.memory.history")
-    local checkpoint_store = require("module.graph.checkpoint_store")
 
-    print("[Saver] === 开始原子保存 topic_graph + graph 状态 ===")
+    print("[Saver] === 开始原子保存 memory 状态 ===")
 
     local function run_save(name, fn)
         local ok, err = fn()
@@ -29,23 +28,8 @@ function M.flush_all(force)
     if not run_save("topic_graph", memory.save_to_disk) then return false end
     if not run_save("history.txt", history.save_to_disk) then return false end
 
-    if not run_save("graph_checkpoint", function()
-        return checkpoint_store.flush(force)
-    end) then
-        return false
-    end
-
-    local pack_ok, pack_err = pcall(function()
-        py_pipeline:pack_state()
-    end)
-    if not pack_ok then
-        M.dirty = true
-        print("[Saver][ERROR] pack_state 失败: " .. tostring(pack_err))
-        return false
-    end
-
     M.dirty = false
-    print("[Saver] topic_graph + state.zst + checkpoint 已更新")
+    print("[Saver] topic_graph + history.txt 已更新")
     return true
 end
 
