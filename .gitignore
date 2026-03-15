@@ -5,6 +5,7 @@ memory/
 !module/memory/*.lua
 luajit/
 __pycache__/
+.venv/
 target/
 native/**/target/
 !native/hnsw/rust/
