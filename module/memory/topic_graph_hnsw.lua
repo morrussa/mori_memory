@@ -106,6 +106,10 @@ function Index:_build()
         self.dirty = false
         return true
     end
+    if not hnsw or hnsw.AVAILABLE == false then
+        self.dirty = false
+        return true
+    end
 
     local dim = any_dim(self.centroids)
     local count = 0
@@ -206,6 +210,11 @@ end
 function Index:load(root)
     root = trim(root)
     if root == "" then
+        return true
+    end
+    if not hnsw or hnsw.AVAILABLE == false then
+        self:close()
+        self.dirty = false
         return true
     end
     local meta_path = root .. "/meta.lua"

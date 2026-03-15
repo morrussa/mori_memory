@@ -57,7 +57,53 @@ local M = {
     SPACE_COSINE = 2,
 }
 
-local lib = ffi.load("./module/mori_hnsw.so")
+local function resolve_lib_path()
+    local ok, lua_path = pcall(package.searchpath, "module.hnsw", package.path)
+    if ok and type(lua_path) == "string" then
+        local dir = lua_path:match("(.*/)")
+        if dir then
+            return dir .. "mori_hnsw.so"
+        end
+    end
+
+    local info = debug.getinfo(1, "S")
+    local src = info and info.source
+    if type(src) == "string" and src:sub(1, 1) == "@" then
+        local dir = src:sub(2):match("(.*/)")
+        if dir then
+            return dir .. "mori_hnsw.so"
+        end
+    end
+
+    return "./module/mori_hnsw.so"
+end
+
+local lib_path = resolve_lib_path()
+local ok_load, lib_or_err = pcall(ffi.load, lib_path)
+if not ok_load then
+    M.AVAILABLE = false
+    M.LOAD_ERROR = tostring(lib_or_err)
+
+    local function unavailable_err()
+        return string.format(
+            "mori_hnsw native module unavailable (%s). Build it via scripts/build_hnsw_module.sh",
+            tostring(M.LOAD_ERROR)
+        )
+    end
+
+    function M.new(_opts)
+        return nil, unavailable_err()
+    end
+
+    function M.load(_path, _opts)
+        return nil, unavailable_err()
+    end
+
+    return M
+end
+
+local lib = lib_or_err
+M.AVAILABLE = true
 
 local Index = {}
 Index.__index = Index

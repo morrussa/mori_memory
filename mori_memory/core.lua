@@ -4,7 +4,6 @@ local history = require("module.memory.history")
 local topic = require("module.memory.topic")
 local topic_graph = require("module.memory.topic_graph")
 local saver = require("module.memory.saver")
-local tool = require("module.tool")
 
 local M = {}
 
@@ -102,7 +101,7 @@ function M.ingest_turn(meta)
     if user_input ~= "" then
         local vec = meta.user_vec
         if type(vec) ~= "table" or #vec <= 0 then
-            vec = tool.get_embedding_passage(user_input)
+            return { ok = false, error = "missing_user_vec", turn = turn }
         end
         topic.add_turn(turn, user_input, vec)
     end
@@ -157,12 +156,11 @@ function M.compile_context(meta)
 
     local query_vec = meta.query_vec
     if type(query_vec) ~= "table" or #query_vec <= 0 then
-        if user_input ~= "" then
-            query_vec = tool.get_embedding_passage(user_input)
-        else
-            local rec = topic.get_topic_for_turn and topic.get_topic_for_turn(current_turn) or nil
-            query_vec = (rec and rec.centroid) or {}
-        end
+        query_vec = meta.user_vec
+    end
+    if type(query_vec) ~= "table" or #query_vec <= 0 then
+        local rec = topic.get_topic_for_turn and topic.get_topic_for_turn(current_turn) or nil
+        query_vec = (rec and rec.centroid) or {}
     end
 
     local retrieved = topic_graph.retrieve(query_vec, current_anchor, current_turn, {
@@ -190,4 +188,3 @@ function M.shutdown()
 end
 
 return M
-

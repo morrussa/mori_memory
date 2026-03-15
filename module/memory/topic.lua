@@ -414,102 +414,16 @@ end
 -- ==================== 异常恢复与重建 ====================
 
 local function rebuild_active_topic(current_turn, forced_start_turn)
-    print("[Topic] 触发话题重建...")
-    -- 1. 确定重建起点
-    local start_turn = tonumber(forced_start_turn)
-    if start_turn and start_turn > 0 then
-        start_turn = math.floor(start_turn)
-    else
-        start_turn = 1
-        if #M.topics > 0 then
-            start_turn = (M.topics[#M.topics].end_ or 0) + 1
-        end
-    end
-    
-    -- 2. 重新嵌入并计算
-    M.active_topic = {
-        start = start_turn,
-        vectors = {},
-        tail_window = {},
-        last_vec = nil,
-        summary_cache = "",
-        summary_turn = 0,
-    }
-    
-    print(string.format("[Topic] 正在从 history.txt 重建 Turn %d -> %d 的向量...", start_turn, current_turn))
-    
-    for t = start_turn, current_turn do
-        local user_text = history_module.get_turn_text(t, "user")
-        if user_text then
-            -- local vec = tool.get_embedding(user_text)
-            local vec = tool.get_embedding_passage(user_text)
-            M.turn_vectors[t] = vec
-            table.insert(M.active_topic.vectors, vec)
-            
-            -- 维护尾窗口
-            table.insert(M.active_topic.tail_window, vec)
-            if #M.active_topic.tail_window > MAKE_CLUSTER2 then
-                table.remove(M.active_topic.tail_window, 1)
-            end
-        end
-    end
-    
-    -- 3. 计算头质心
-    local head_vectors = {}
-    for i = 1, math.min(MAKE_CLUSTER1, #M.active_topic.vectors) do
-        table.insert(head_vectors, M.active_topic.vectors[i])
-    end
-    M.active_topic.head_centroid = tool.average_vectors(head_vectors)
-    
-    -- [新增] 设置 last_vec 为最后一个向量
-    if #M.active_topic.vectors > 0 then
-        M.active_topic.last_vec = M.active_topic.vectors[#M.active_topic.vectors]
-    end
-    
-    M._last_processed_turn = current_turn
-    print("[Topic] 话题重建完成")
+    print(string.format(
+        "[Topic][WARN] 已跳过话题重建：memory-core 模式不负责从文本重算 embedding (turn=%s, forced_start=%s)",
+        tostring(current_turn),
+        tostring(forced_start_turn)
+    ))
 end
 
 -- 启动后恢复活跃话题的运行时向量缓存（避免仅恢复 head/tail 导致状态漂移）
 local function hydrate_active_topic_vectors(start_turn, end_turn)
-    if not start_turn or not end_turn or end_turn < start_turn then
-        M.active_topic.vectors = {}
-        M.active_topic.tail_window = {}
-        M.active_topic.last_vec = nil
-        M.active_topic.head_centroid = nil
-        return 0
-    end
-
-    local vectors = {}
-    local tail_window = {}
-
-    for t = start_turn, end_turn do
-        local user_text = history_module.get_turn_text(t, "user")
-        if user_text and user_text ~= "" then
-            local vec = tool.get_embedding_passage(user_text)
-            table.insert(vectors, vec)
-            table.insert(tail_window, vec)
-            if #tail_window > MAKE_CLUSTER2 then
-                table.remove(tail_window, 1)
-            end
-        end
-    end
-
-    M.active_topic.vectors = vectors
-    M.active_topic.tail_window = tail_window
-    M.active_topic.last_vec = vectors[#vectors]
-
-    if #vectors >= MAKE_CLUSTER1 then
-        local head_vecs = {}
-        for i = 1, MAKE_CLUSTER1 do
-            table.insert(head_vecs, vectors[i])
-        end
-        M.active_topic.head_centroid = tool.average_vectors(head_vecs)
-    else
-        M.active_topic.head_centroid = nil
-    end
-
-    return #vectors
+    return 0
 end
 
 -- ==================== 核心逻辑 ====================
@@ -882,11 +796,10 @@ function M.init()
         print("[Topic] 状态不一致 (Bin=" .. M._last_processed_turn .. ", Hist=" .. history_turns .. ")，执行重建...")
         rebuild_active_topic(history_turns)
     elseif M.active_topic.start then
-        local hydrate_end = math.min(M._last_processed_turn, history_turns)
-        local restored = hydrate_active_topic_vectors(M.active_topic.start, hydrate_end)
         print(string.format(
-            "[Topic] 活跃话题向量缓存已恢复: start=%d, end=%d, vectors=%d",
-            M.active_topic.start, hydrate_end, restored
+            "[Topic] 活跃话题已恢复: start=%d, last_turn=%d (未进行 embedding hydrate)",
+            M.active_topic.start,
+            M._last_processed_turn
         ))
     end
     

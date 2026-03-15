@@ -5,15 +5,41 @@ local M = {}
 
 local ffi = require("ffi")
 local simdc
-local status, err = pcall(function()
-    simdc = ffi.load("./module/simdc_math.so")
-end)
-if not status then
-    print("[WARN] AVX 库未加载，启用 LuaJIT fallback: " .. tostring(err))
-    simdc = nil
-else 
-    print("[OK] AVX 向量库加载成功")
+local simdc_load_error
+
+local function resolve_simdc_path()
+    local ok, lua_path = pcall(package.searchpath, "module.tool", package.path)
+    if ok and type(lua_path) == "string" then
+        local dir = lua_path:match("(.*/)")
+        if dir then
+            return dir .. "simdc_math.so"
+        end
+    end
+
+    local info = debug.getinfo(1, "S")
+    local src = info and info.source
+    if type(src) == "string" and src:sub(1, 1) == "@" then
+        local dir = src:sub(2):match("(.*/)")
+        if dir then
+            return dir .. "simdc_math.so"
+        end
+    end
+
+    return "./module/simdc_math.so"
 end
+
+do
+    local ok, lib_or_err = pcall(ffi.load, resolve_simdc_path())
+    if ok then
+        simdc = lib_or_err
+    else
+        simdc = nil
+        simdc_load_error = tostring(lib_or_err)
+    end
+end
+
+M.SIMDC_AVAILABLE = simdc ~= nil
+M.SIMDC_LOAD_ERROR = simdc_load_error
 
 ffi.cdef[[
     float dot_product_avx(const float* v1, const float* v2, size_t n);
