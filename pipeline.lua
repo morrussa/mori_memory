@@ -8,6 +8,7 @@ local recall = require("module.memory.recall")
 local app_config = require("module.config")
 local graph_runtime = require("module.graph.graph_runtime")
 local run_mode = tostring(MORI_RUN_MODE or "cli")
+run_mode = run_mode:lower()
 local graph_cfg = ((app_config.settings or {}).graph or {})
 local cli_boot_demo = false
 
@@ -208,8 +209,8 @@ end
 _G.mori_handle_user_input = process_user_input
 _G.mori_shutdown = shutdown_pipeline
 
-if run_mode == "webui" then
-    print("[Lua] MORI_RUN_MODE=webui，交互式控制台已禁用（等待 HTTP 请求）")
+if run_mode == "lib" or run_mode == "server" or run_mode == "webui" then
+    print(string.format("[Lua] MORI_RUN_MODE=%s，交互式控制台已禁用", run_mode))
 else
     -- ========== 交互式主循环 ==========
     print("\n[Lua] Entering interactive loop. Type 'exit' to quit.")
