@@ -22,6 +22,7 @@ local CHAIN_MIN_SCORE = tonumber(T_CONF.chain_min_score) or 0.20
 local CHAIN_CENTROID_WEIGHT = tonumber(T_CONF.chain_centroid_weight) or 0.55
 local CHAIN_HIST_WEIGHT = tonumber(T_CONF.chain_hist_weight) or 0.45
 local CHAIN_DOMINANT_BONUS = tonumber(T_CONF.chain_dominant_bonus) or 0.05
+local ALLOW_LLM_SUMMARY = (T_CONF.allow_llm_summary == true)
 
 -- 话题摘要分级配置
 local SUMMARY_VARIANT_WEIGHTS = T_CONF.summary_variant_weights or {
@@ -571,6 +572,9 @@ local function ensure_topic_summary(rec, variant)
     if variant ~= "full" and variant ~= "slight" and variant ~= "heavy" and variant ~= "none" then
         variant = "full"
     end
+    if variant == "none" then
+        return ""
+    end
 
     if rec.is_active == true then
         local current_turn = math.max(0, tonumber(M._last_processed_turn) or 0)
@@ -587,6 +591,10 @@ local function ensure_topic_summary(rec, variant)
             end
         end
         
+        if not ALLOW_LLM_SUMMARY then
+            return ""
+        end
+
         -- 生成分级摘要
         local variants = build_topic_summary_variants(rec.start, current_turn)
         
@@ -626,6 +634,9 @@ local function ensure_topic_summary(rec, variant)
     end
     
     -- 如果没有full摘要，先生成full摘要
+    if not ALLOW_LLM_SUMMARY then
+        return ""
+    end
     if trim(topic.summary_variants.full or "") == "" then
         local variants = build_topic_summary_variants(rec.start, rec.end_)
         topic.summary_variants = variants

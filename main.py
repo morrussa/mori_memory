@@ -3189,10 +3189,11 @@ def _py_to_lua_value(lua_runtime: LuaRuntime, value):
 
 def _resolve_run_mode() -> str:
     parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--mode", choices=["cli", "webui"], help="Run mode override.")
+    parser.add_argument("--mode", choices=["cli", "lib"], help="Run mode override.")
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--cli", action="store_true", help="Force CLI mode.")
-    mode_group.add_argument("--webui", action="store_true", help="Force WebUI mode.")
+    mode_group.add_argument("--lib", action="store_true", help="Load pipeline without interactive loop.")
+    mode_group.add_argument("--webui", action="store_true", help=argparse.SUPPRESS)
     args, unknown = parser.parse_known_args()
     if unknown:
         print(f"[Python][WARN] Ignored unknown args: {' '.join(unknown)}")
@@ -3204,9 +3205,12 @@ def _resolve_run_mode() -> str:
     elif args.cli:
         cli_mode = "cli"
         print("[Python] Run mode forced by --cli: cli")
-    elif args.webui:
-        cli_mode = "webui"
-        print("[Python] Run mode forced by --webui: webui")
+    elif args.lib:
+        cli_mode = "lib"
+        print("[Python] Run mode forced by --lib: lib")
+    elif getattr(args, "webui", False):
+        cli_mode = "lib"
+        print("[Python][WARN] --webui 已移除（不再提供内置 WebUI）；回退为 lib 模式。")
 
     if cli_mode is None:
         env_mode = os.environ.get("MORI_RUN_MODE")
@@ -3217,7 +3221,10 @@ def _resolve_run_mode() -> str:
             cli_mode = str(env_mode).strip().lower()
             print(f"[Python] Run mode from MORI_RUN_MODE: {cli_mode}")
 
-    if cli_mode not in {"cli", "webui"}:
+    if cli_mode == "webui":
+        print("[Python][WARN] MORI_RUN_MODE=webui 已移除（不再提供内置 WebUI）；回退为 lib 模式。")
+        cli_mode = "lib"
+    if cli_mode not in {"cli", "lib"}:
         print(f"[Python][WARN] Unknown MORI_RUN_MODE={cli_mode}, fallback to cli")
         cli_mode = "cli"
     return cli_mode
@@ -3233,109 +3240,19 @@ def main():
     lua.globals()['py_pipeline'] = pipeline
     lua.globals()['MORI_RUN_MODE'] = run_mode
 
-    bridge = None
-    bridge_host = os.environ.get("MORI_WEBUI_BRIDGE_HOST", "127.0.0.1")
-    bridge_port = _read_env_int("MORI_WEBUI_BRIDGE_PORT", 8080)
-    frontend_root = str(os.environ.get("MORI_FRONTEND_ROOT", "module/frontend") or "module/frontend")
-
-    # 2) In webui mode, force local no-build UI and avoid port collisions.
-    if run_mode == "webui":
-        pipeline.suppress_large_webui_log = True
-        pipeline.quiet_server_urls = True
-        pipeline.large_server_webui = False
-        if not pipeline.large_server_api_key:
-            pipeline.large_server_api_key = uuid.uuid4().hex + uuid.uuid4().hex
-
-        deprecated_vars = [
-            "MORI_WEBUI_PRIMARY_SESSION",
-            "MORI_WEBUI_NON_PRIMARY_POLICY",
-            "MORI_WEBUI_SESSION_HEADER",
-            "MORI_WEBUI_THREAD_HEADER",
-            "MORI_WEBUI_PRIMARY_IDLE_TTL_SEC",
-            "MORI_WEBUI_SESSION_DEBUG",
-        ]
-        for name in deprecated_vars:
-            if os.environ.get(name) is not None:
-                print(f"[Python][WARN] {name} is deprecated in local webui mode and will be ignored.")
-
-        if (
-            pipeline.large_server_port is not None
-            and int(pipeline.large_server_port) == bridge_port
-            and str(pipeline.large_server_host) == str(bridge_host)
-        ):
-            print(
-                "[Python][WARN] MORI_LARGE_SERVER_PORT 与 MORI_WEBUI_BRIDGE_PORT 冲突，"
-                "主模型端口改为自动分配。"
-            )
-            pipeline.large_server_port = None
-
-    # 3) Restore persisted state, execute Lua pipeline, then optionally start local WebUI bridge.
+    # 2) Restore persisted state, execute Lua pipeline.
     pipeline.unpack_state()
 
     lua_shutdown = None
-    should_save_state = False
     try:
         print("[Python] Executing pipeline.lua...")
         with open("pipeline.lua", "r", encoding="utf-8") as f:
             lua.execute(f.read())
 
         lua_shutdown = lua.globals().mori_shutdown
-
-        if run_mode == "webui":
-            lua_handler = lua.globals().mori_handle_user_input
-            if lua_handler is None:
-                raise RuntimeError("Lua function mori_handle_user_input is not available.")
-            if pipeline.llm_large is None:
-                raise RuntimeError("Large model server is not loaded.")
-
-            bridge = None
-
-            def bridge_chat(user_text, on_piece=None, _ignored=None, read_only=False, uploads=None):
-                uploads_lua = _py_to_lua_value(lua, uploads or [])
-                assistant_text = str(lua_handler(user_text, on_piece, "", read_only, uploads_lua) or "")
-                run_id = str(lua.globals().mori_last_run_id or "")
-                trace = AIPipeline._coerce_lua_value(lua.globals().mori_last_trace_summary)
-                if not isinstance(trace, dict):
-                    trace = {}
-                meta = AIPipeline._coerce_lua_value(lua.globals().mori_last_response_meta)
-                if not isinstance(meta, dict):
-                    meta = {}
-                session_status = AIPipeline._coerce_lua_value(lua.globals().mori_session_status)
-                if isinstance(session_status, dict) and bridge is not None:
-                    bridge.last_session_status = session_status
-                if bridge is not None:
-                    bridge.last_response_meta = meta
-                return assistant_text, run_id, trace, meta
-
-            bridge = MoriLocalWebUIBridge(
-                host=bridge_host,
-                port=bridge_port,
-                frontend_root=frontend_root,
-                chat_handler=bridge_chat,
-                model_name=pipeline.llm_large.model_name,
-                agent_files_root=pipeline.agent_files_root,
-            )
-            print(f"[Python] Local no-build WebUI ready at http://{bridge_host}:{bridge_port}")
-            print(f"[Python] Frontend root: {os.path.abspath(frontend_root)}")
-            print(f"[Python] Uploaded files dir: {bridge._display_path(bridge.upload_download_root)}")
-            print("[Python] Stream mode: SSE event protocol enabled.")
-            print("[Python] /v1/chat/completions is deprecated in webui mode; use /mori/chat or /mori/chat/stream.")
-            print("[Python] Press Ctrl+C to stop.")
-
-            should_save_state = True
-            try:
-                bridge.serve_forever()
-            except KeyboardInterrupt:
-                print("\n[Python] KeyboardInterrupt received, stopping local WebUI bridge...")
     finally:
-        # 4) Graceful teardown order: bridge -> Lua state flush -> model servers.
-        if bridge is not None:
-            try:
-                bridge.shutdown()
-            except Exception as e:
-                print(f"[Python][WARN] Stop WebUI bridge failed: {e}")
-
-        if should_save_state and lua_shutdown is not None:
+        # 3) Graceful teardown order: Lua state flush -> model servers.
+        if lua_shutdown is not None:
             try:
                 lua_shutdown()
             except Exception as e:
