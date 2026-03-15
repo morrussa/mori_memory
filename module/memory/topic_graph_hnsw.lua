@@ -157,6 +157,9 @@ function Index:search(query_vec, k)
     if not self.index then
         return {}
     end
+    if type(query_vec) ~= "table" or #query_vec ~= tonumber(self.index.dim or 0) then
+        return {}
+    end
     local hits = self.index:search(query_vec or {}, math.max(1, math.floor(tonumber(k) or 1)))
     local out = {}
     for _, hit in ipairs(hits or {}) do

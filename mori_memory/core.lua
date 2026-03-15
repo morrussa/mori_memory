@@ -8,6 +8,53 @@ local saver = require("module.memory.saver")
 local M = {}
 
 local _initialized = false
+local _embedder = nil
+
+local function default_embedder(text, mode)
+    local ok_tool, tool = pcall(require, "module.tool")
+    if not ok_tool or not tool then
+        return nil, "module.tool unavailable"
+    end
+
+    local fn = nil
+    if mode == "query" and type(tool.get_embedding_query) == "function" then
+        fn = tool.get_embedding_query
+    elseif mode == "passage" and type(tool.get_embedding_passage) == "function" then
+        fn = tool.get_embedding_passage
+    elseif type(tool.get_embedding) == "function" then
+        fn = function(payload)
+            return tool.get_embedding(payload, mode)
+        end
+    end
+
+    if type(fn) ~= "function" then
+        return nil, "no embedding function available"
+    end
+
+    local ok, vec_or_err = pcall(fn, text)
+    if not ok then
+        return nil, tostring(vec_or_err)
+    end
+    if type(vec_or_err) ~= "table" or #vec_or_err <= 0 then
+        return nil, "empty embedding"
+    end
+    return vec_or_err
+end
+
+local function embed_text(meta, text, mode)
+    local fn = (type(meta) == "table" and meta.embedder) or _embedder
+    if type(fn) == "function" then
+        local ok, vec_or_err = pcall(fn, text, mode)
+        if not ok then
+            return nil, tostring(vec_or_err)
+        end
+        if type(vec_or_err) ~= "table" or #vec_or_err <= 0 then
+            return nil, "empty embedding"
+        end
+        return vec_or_err
+    end
+    return default_embedder(text, mode)
+end
 
 local function trim(s)
     return util.trim(s)
@@ -101,7 +148,11 @@ function M.ingest_turn(meta)
     if user_input ~= "" then
         local vec = meta.user_vec
         if type(vec) ~= "table" or #vec <= 0 then
-            return { ok = false, error = "missing_user_vec", turn = turn }
+            local embedded, embed_err = embed_text(meta, user_input, "passage")
+            if not embedded then
+                return { ok = false, error = "missing_user_vec", detail = embed_err, turn = turn }
+            end
+            vec = embedded
         end
         topic.add_turn(turn, user_input, vec)
     end
@@ -158,6 +209,12 @@ function M.compile_context(meta)
     if type(query_vec) ~= "table" or #query_vec <= 0 then
         query_vec = meta.user_vec
     end
+    if (type(query_vec) ~= "table" or #query_vec <= 0) and user_input ~= "" then
+        local embedded = embed_text(meta, user_input, "query")
+        if type(embedded) == "table" and #embedded > 0 then
+            query_vec = embedded
+        end
+    end
     if type(query_vec) ~= "table" or #query_vec <= 0 then
         local rec = topic.get_topic_for_turn and topic.get_topic_for_turn(current_turn) or nil
         query_vec = (rec and rec.centroid) or {}
@@ -185,6 +242,13 @@ function M.shutdown()
     if saver and saver.on_exit then
         saver.on_exit()
     end
+end
+
+function M.set_embedder(fn)
+    if fn ~= nil and type(fn) ~= "function" then
+        error("embedder must be a function or nil")
+    end
+    _embedder = fn
 end
 
 return M

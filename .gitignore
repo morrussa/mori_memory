@@ -13,6 +13,7 @@ native/**/target/
 !native/hnsw/rust/src/
 !native/hnsw/rust/src/*.rs
 module/mori_hnsw.so
+module/simdc_math.so
 readme.txt
 simu/
 workspace/
