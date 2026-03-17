@@ -53,6 +53,7 @@ M.active_topic = {
     vectors = {},         -- 当前话题累积的向量 (用于最后生成 overall centroid)
     tail_window = {},     -- 尾部滑动窗口
     last_vec = nil,       -- [新增] 记录上一轮的向量，用于计算话语对相似度
+    scope_key = "",       -- [新增] 作用域标记（用于多人/多源隔离）
     summary_cache = "",
     summary_turn = 0,
     summary_variants = { full = "", slight = "", heavy = "", none = "" }  -- 分级摘要缓存
@@ -593,6 +594,7 @@ local function close_current_topic(end_turn)
         vectors = {},
         tail_window = {},
         last_vec = nil,
+        scope_key = "",
         summary_cache = "",
         summary_turn = 0,
         summary_variants = { full = "", slight = "", heavy = "", none = "" }
@@ -603,7 +605,18 @@ local function close_current_topic(end_turn)
     end
 end
 
-function M.add_turn(turn, user_text, vector)
+function M.add_turn(turn, user_text, vector, meta)
+    meta = type(meta) == "table" and meta or {}
+    local scope_key = trim(meta.scope_key or meta.scope or meta.scope_id or "")
+    local isolate_by_scope = (config.get("guard.topic_scope_isolation", true) ~= false)
+
+    if isolate_by_scope and scope_key ~= "" and M.active_topic.start and trim(M.active_topic.scope_key or "") ~= "" then
+        if trim(M.active_topic.scope_key or "") ~= scope_key then
+            -- Force a split on scope boundary to reduce multi-user/topic pollution.
+            close_current_topic(turn - 1)
+        end
+    end
+
     -- 1. 存储基础数据
     M.turn_vectors[turn] = vector
     M.dialogues[turn] = M.dialogues[turn] or {}
@@ -619,6 +632,7 @@ function M.add_turn(turn, user_text, vector)
         M.active_topic.tail_window = {vector}
         M.active_topic.last_vec = vector
         M.active_topic.head_centroid = nil
+        M.active_topic.scope_key = scope_key
         M.active_topic.summary_cache = ""
         M.active_topic.summary_turn = 0
         print("[Topic] 开启新话题: 第" .. turn .. "轮")

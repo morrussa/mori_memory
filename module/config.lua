@@ -106,6 +106,43 @@ local DEFAULT_SETTINGS = {
     storage_v3 = {
         root = "memory/v3",
     },
+
+    -- Anti-poisoning / multi-user robustness (optional).
+    -- These are best-effort heuristics: they only take effect if caller passes
+    -- event identity fields (e.g. source/user_id/nickname/room_id) into meta.
+    guard = {
+        enabled = true,
+        -- File stores a Lua table literal (no code execution).
+        grudge_path = "memory/grudge.lua",
+        scope_strategy = "source_room",
+        -- Prefix topic anchors with scope key for non-default sources.
+        anchor_scope_prefix = true,
+        default_credit = 1.0,
+        default_credit_by_source = {
+            stdin = 1.0,
+            bilibili = 0.35,
+            system = 1.0,
+        },
+        max_users = 2048,
+        note_once = true,
+        note_threshold = 0.65,
+        -- When credit drops below this threshold, the user is temporarily blocked
+        -- from writing into memory/topic/history. Unblock happens only after the
+        -- cooldown window passes.
+        block_threshold = 0.25,
+        block_duration_s = 3600,
+        restore_threshold = 0.75,
+        credit_decay = 0.985,
+        credit_bonus = 0.02,
+        credit_penalty = 0.40,
+        -- Thresholds that influence memory/topic behaviors.
+        allow_recall_threshold = 0.70,
+        allow_history_threshold = 0.70,
+        allow_topic_threshold = 0.60,
+        allow_memory_write_threshold = 0.75,
+        -- When enabled, topic boundaries can be forced on scope changes.
+        topic_scope_isolation = true,
+    },
 }
 
 local function deep_copy(value, seen)
@@ -169,4 +206,3 @@ function M.get_default(path, fallback)
 end
 
 return M
-

@@ -2000,6 +2000,15 @@ function M.add_memory(vec, turn, opts)
         if text ~= "" and trim(mem.text) == "" then
             mem.text = text
         end
+        if trim(mem.source or "") == "" and trim(opts.source or "") ~= "" then
+            mem.source = tostring(opts.source or "")
+        end
+        if trim(mem.actor_key or "") == "" and trim(opts.actor_key or "") ~= "" then
+            mem.actor_key = tostring(opts.actor_key or "")
+        end
+        if trim(mem.scope_key or "") == "" and trim(opts.scope_key or "") ~= "" then
+            mem.scope_key = tostring(opts.scope_key or "")
+        end
         mem.facets = merge_facet_rows(mem.facets or {}, facets)
         if anchor ~= "" then
             bind_memory_to_topic(best_line, anchor, mem.vec, turn, 1.0, { preserve_cluster_id = true })
@@ -2018,6 +2027,9 @@ function M.add_memory(vec, turn, opts)
         text = text,
         facets = facets,
         type = tostring(opts.kind or "fact"),
+        source = tostring(opts.source or ""),
+        actor_key = tostring(opts.actor_key or ""),
+        scope_key = tostring(opts.scope_key or ""),
         vec = vec,
     }
     if anchor ~= "" then
@@ -2058,7 +2070,13 @@ function M.observe_turn(turn, current_anchor)
     local prev_anchor = trim((((M.state or {}).runtime or {}).last_anchor))
     local prev_turn = tonumber((((M.state or {}).runtime or {}).last_turn)) or 0
     if prev_anchor ~= "" and prev_anchor ~= current_anchor and prev_turn > 0 then
-        boost_edge(prev_anchor, current_anchor, "transition", tonumber(tg_cfg().transition_lr) or 0.12, turn)
+        local prev_scope = prev_anchor:match("^(.-)|") or ""
+        local cur_scope = current_anchor:match("^(.-)|") or ""
+        if prev_scope ~= cur_scope and (prev_scope ~= "" or cur_scope ~= "") then
+            -- scope boundary: do not learn cross-scope transitions
+        else
+            boost_edge(prev_anchor, current_anchor, "transition", tonumber(tg_cfg().transition_lr) or 0.12, turn)
+        end
     end
     return true
 end
