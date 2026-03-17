@@ -9,6 +9,31 @@ local M = {}
 
 local _initialized = false
 local _embedder = nil
+local _recall_state_by_turn = {}
+local _recall_turn_order = {}
+
+local function cache_recall_state(turn, state)
+    turn = math.max(0, math.floor(tonumber(turn) or 0))
+    if turn <= 0 or type(state) ~= "table" then
+        return
+    end
+    _recall_state_by_turn[turn] = state
+    _recall_turn_order[#_recall_turn_order + 1] = turn
+    while #_recall_turn_order > 12 do
+        local old_turn = table.remove(_recall_turn_order, 1)
+        _recall_state_by_turn[old_turn] = nil
+    end
+end
+
+local function pop_recall_state(turn)
+    turn = math.max(0, math.floor(tonumber(turn) or 0))
+    if turn <= 0 then
+        return nil
+    end
+    local state = _recall_state_by_turn[turn]
+    _recall_state_by_turn[turn] = nil
+    return state
+end
 
 local function default_embedder(text, mode)
     local ok_tool, tool = pcall(require, "module.tool")
@@ -130,6 +155,128 @@ local function build_selected_turn_transcript(turns, opts)
     return "【相关对话片段】\n" .. table.concat(parts, "\n\n")
 end
 
+local function utf8_len(s)
+    local n = 0
+    for _ in tostring(s or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        n = n + 1
+    end
+    return n
+end
+
+local function normalize_sentence_separators(text)
+    local t = tostring(text or "")
+    t = t:gsub("\r\n", "\n")
+    t = t:gsub("\r", "\n")
+    local seps = { "\n", "。", "！", "？", "!", "?", "；", ";", "…" }
+    for _, sep in ipairs(seps) do
+        t = t:gsub(sep, "\n")
+    end
+    return t
+end
+
+local function split_sentence_candidates(text)
+    local out = {}
+    local t = trim(normalize_sentence_separators(text))
+    if t == "" then
+        return out
+    end
+    for part in t:gmatch("[^\n]+") do
+        part = trim(part)
+        if part ~= "" then
+            out[#out + 1] = part
+        end
+    end
+    return out
+end
+
+local function is_noise_fact(fact, min_chars)
+    fact = trim(fact)
+    min_chars = math.max(1, math.floor(tonumber(min_chars) or 12))
+    if fact == "" then
+        return true
+    end
+    if fact:find("```", 1, true) then
+        return true
+    end
+    if utf8_len(fact) < min_chars then
+        return true
+    end
+    if not fact:match("[%w]") and not fact:match("[\128-\255]") then
+        return true
+    end
+    local compact = fact:gsub("%s+", "")
+    local noise = {
+        ["好的"] = true,
+        ["嗯"] = true,
+        ["哦"] = true,
+        ["明白了"] = true,
+        ["知道了"] = true,
+        ["收到"] = true,
+        ["谢谢"] = true,
+        ["谢谢你"] = true,
+    }
+    if noise[compact] then
+        return true
+    end
+    return false
+end
+
+local function extract_atomic_facts(meta, user_input, assistant_text)
+    meta = type(meta) == "table" and meta or {}
+    user_input = trim(user_input)
+    assistant_text = trim(assistant_text)
+
+    local provided = meta.atomic_facts or meta.facts
+    if type(provided) == "table" and #provided > 0 then
+        local out = {}
+        for _, item in ipairs(provided) do
+            local s = trim(item)
+            if s ~= "" then
+                out[#out + 1] = s
+            end
+        end
+        return out
+    end
+
+    local min_chars = math.max(1, math.floor(tonumber(meta.atomic_min_chars) or 12))
+    local max_items = math.max(1, math.floor(tonumber(meta.atomic_max_items) or 6))
+    local include_user = meta.atomic_include_user ~= false
+    local include_assistant = meta.atomic_include_assistant == true
+
+    local candidates = {}
+    if include_user and user_input ~= "" then
+        for _, part in ipairs(split_sentence_candidates(user_input)) do
+            candidates[#candidates + 1] = part
+        end
+    end
+    if include_assistant and assistant_text ~= "" then
+        for _, part in ipairs(split_sentence_candidates(assistant_text)) do
+            candidates[#candidates + 1] = part
+        end
+    end
+
+    local out = {}
+    local seen = {}
+    for _, cand in ipairs(candidates) do
+        local fact = trim(cand)
+        if not is_noise_fact(fact, min_chars) then
+            local key = fact:lower():gsub("%s+", "")
+            if key ~= "" and not seen[key] then
+                seen[key] = true
+                out[#out + 1] = fact
+            end
+        end
+        if #out >= max_items then
+            break
+        end
+    end
+
+    if #out <= 0 and include_user and not is_noise_fact(user_input, min_chars) then
+        out[1] = user_input
+    end
+    return out
+end
+
 function M.ingest_turn(meta)
     ensure_init()
     meta = type(meta) == "table" and meta or {}
@@ -145,16 +292,17 @@ function M.ingest_turn(meta)
     end
     turn = math.floor(turn)
 
+    local user_vec = nil
     if user_input ~= "" then
-        local vec = meta.user_vec
-        if type(vec) ~= "table" or #vec <= 0 then
+        user_vec = meta.user_vec
+        if type(user_vec) ~= "table" or #user_vec <= 0 then
             local embedded, embed_err = embed_text(meta, user_input, "passage")
             if not embedded then
                 return { ok = false, error = "missing_user_vec", detail = embed_err, turn = turn }
             end
-            vec = embedded
+            user_vec = embedded
         end
-        topic.add_turn(turn, user_input, vec)
+        topic.add_turn(turn, user_input, user_vec)
     end
 
     history.add_history(user_input, assistant_text)
@@ -173,6 +321,39 @@ function M.ingest_turn(meta)
         topic_graph.observe_turn(turn, anchor)
     end
 
+    local adopted_memories = {}
+    if anchor ~= "" then
+        for _, fact in ipairs(extract_atomic_facts(meta, user_input, assistant_text)) do
+            local vec = nil
+            if user_vec and fact == user_input then
+                vec = user_vec
+            else
+                local embedded = nil
+                embedded = embed_text(meta, fact, "passage")
+                if type(embedded) == "table" and #embedded > 0 then
+                    vec = embedded
+                end
+            end
+            if vec then
+                local line = topic_graph.add_memory(vec, turn, {
+                    topic_anchor = anchor,
+                    text = fact,
+                    kind = "fact",
+                })
+                if line then
+                    adopted_memories[#adopted_memories + 1] = line
+                end
+            end
+        end
+    end
+
+    local recall_state = pop_recall_state(turn)
+    if anchor ~= "" and type(topic_graph.observe_feedback) == "function" then
+        pcall(function()
+            topic_graph.observe_feedback(anchor, recall_state or {}, adopted_memories, turn)
+        end)
+    end
+
     if saver and saver.mark_dirty then
         saver.mark_dirty()
     end
@@ -181,6 +362,7 @@ function M.ingest_turn(meta)
         ok = true,
         turn = turn,
         topic_anchor = anchor,
+        adopted_memories = adopted_memories,
     }
 end
 
@@ -223,6 +405,7 @@ function M.compile_context(meta)
     local retrieved = topic_graph.retrieve(query_vec, current_anchor, current_turn, {
         user_input = user_input,
     })
+    cache_recall_state(current_turn, retrieved)
 
     local blocks = {}
     local ctx = trim((retrieved or {}).context or "")
