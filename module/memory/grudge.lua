@@ -163,8 +163,15 @@ function M.get_scope_key(meta)
         return explicit
     end
 
-    local strategy = trim(config.get("guard.scope_strategy", "source_room") or "source_room")
     local source = trim(meta.source or "")
+    local strategy = trim(config.get("guard.scope_strategy", "source_room") or "source_room")
+    local by_source = config.get("guard.scope_strategy_by_source", nil)
+    if type(by_source) == "table" and source ~= "" and by_source[source] ~= nil then
+        local picked = trim(by_source[source] or "")
+        if picked ~= "" then
+            strategy = picked
+        end
+    end
     local room_id = trim(meta.room_id or meta.room or "")
     local user_id = trim(meta.user_id or meta.uid or "")
 

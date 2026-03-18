@@ -50,6 +50,8 @@ local DEFAULT_SETTINGS = {
         next_cap = 32,
         recent_weight = 0.55,
         topic_prior_weight = 1.00,
+        flow_runtime_ttl = 128,
+        flow_runtime_cap = 256,
         deep_artmap = {
             category_vigilance = 0.88,
             category_beta = 0.28,
@@ -115,6 +117,8 @@ local DEFAULT_SETTINGS = {
         -- File stores a Lua table literal (no code execution).
         grudge_path = "memory/grudge.lua",
         scope_strategy = "source_room",
+        -- Optional per-source override, e.g. { bilibili = "source_room_user" }.
+        scope_strategy_by_source = {},
         -- Prefix topic anchors with scope key for non-default sources.
         anchor_scope_prefix = true,
         default_credit = 1.0,
@@ -142,6 +146,47 @@ local DEFAULT_SETTINGS = {
         allow_memory_write_threshold = 0.75,
         -- When enabled, topic boundaries can be forced on scope changes.
         topic_scope_isolation = true,
+    },
+
+    -- Multi-stream conversation disentanglement (optional).
+    -- This helps when inputs are noisy / interleaved (e.g., live chat) and the
+    -- single active topic anchor becomes unstable, harming recall & writes.
+    disentangle = {
+        -- Master switch. Keep this enabled and restrict by `enable_sources`.
+        enabled = true,
+        -- If set, only run disentanglement for these sources.
+        -- Accepts either an array {"bilibili"} or a map {bilibili=true}.
+        enable_sources = { "bilibili" },
+
+        -- Max parallel streams per scope (upper bound).
+        max_streams = 3,
+        -- When streams are full and the new turn cannot match any stream
+        -- (below assign_threshold), it will be dropped from memory writes.
+        -- Rolling window size for stream centroid.
+        window_size = 4,
+
+        -- Stream assignment thresholds (cosine similarity-ish).
+        assign_threshold = 0.80,
+
+        -- Heuristics.
+        same_user_bonus = 0.06,
+        age_penalty = 0.01,
+        stale_turns = 60,
+        -- In split/local-sequence mode, keep the newest turn in each segment
+        -- pending until another turn confirms it or it idles out.
+        commit_idle_turns = 2,
+        pending_context_turns = 2,
+
+        -- If set, assign-but-reset the stream topic when centroid similarity
+        -- drops below this threshold (big reset).
+        reset_threshold = 0.62,
+
+        -- Merge back to single stream when one stream dominates for
+        -- `merge_streak_turns` consecutive turns and other streams have been
+        -- idle for `merge_idle_turns`.
+        merge_idle_turns = 8,
+        merge_streak_turns = 4,
+        reset_on_merge = true,
     },
 }
 

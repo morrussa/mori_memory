@@ -5,6 +5,7 @@ local history = require("module.memory.history")
 local topic = require("module.memory.topic")
 local topic_graph = require("module.memory.topic_graph")
 local grudge = require("module.memory.grudge")
+local disentangle = require("module.memory.disentangle")
 local saver = require("module.memory.saver")
 
 local M = {}
@@ -374,6 +375,73 @@ local function extract_atomic_facts(meta, user_input, assistant_text)
     return out
 end
 
+local function build_fact_entries(meta, embed_input, assistant_text, user_vec)
+    local out = {}
+    for _, fact in ipairs(extract_atomic_facts(meta, embed_input, assistant_text)) do
+        local vec = nil
+        if user_vec and fact == embed_input then
+            vec = user_vec
+        else
+            local embedded = embed_text(meta, fact, "passage")
+            if type(embedded) == "table" and #embedded > 0 then
+                vec = embedded
+            end
+        end
+        if type(vec) == "table" and #vec > 0 then
+            out[#out + 1] = {
+                text = fact,
+                vec = vec,
+            }
+        end
+    end
+    return out
+end
+
+local function commit_turn_event(event)
+    event = type(event) == "table" and event or {}
+    local anchor = trim(event.anchor or "")
+    if anchor == "" then
+        return {}
+    end
+    local turn = math.max(0, math.floor(tonumber(event.turn) or 0))
+    local flow_key = trim(event.sequence_key or "")
+    local adopted_memories = {}
+
+    topic_graph.observe_turn(turn, anchor, { flow_key = flow_key })
+    for _, fact in ipairs(event.facts or {}) do
+        local vec = type(fact) == "table" and fact.vec or nil
+        if type(vec) == "table" and #vec > 0 then
+            local line = topic_graph.add_memory(vec, turn, {
+                topic_anchor = anchor,
+                text = tostring((fact or {}).text or ""),
+                kind = "fact",
+                source = tostring(event.source or ""),
+                actor_key = tostring(event.actor_key or ""),
+                scope_key = tostring(event.scope_key or ""),
+            })
+            if line then
+                adopted_memories[#adopted_memories + 1] = line
+            end
+        end
+    end
+    topic_graph.observe_feedback(anchor, event.recall_state or {}, adopted_memories, turn, {
+        flow_key = flow_key,
+    })
+    event.adopted_memories = adopted_memories
+    return adopted_memories
+end
+
+local function commit_turn_events(events, current_turn)
+    local adopted_for_current = {}
+    for _, event in ipairs(events or {}) do
+        local adopted = commit_turn_event(event)
+        if math.floor(tonumber((event or {}).turn) or 0) == math.floor(tonumber(current_turn) or -1) then
+            adopted_for_current = adopted
+        end
+    end
+    return adopted_for_current
+end
+
 function M.ingest_turn(meta)
     ensure_init()
     meta = type(meta) == "table" and meta or {}
@@ -419,6 +487,7 @@ function M.ingest_turn(meta)
         return {
             ok = true,
             skipped = true,
+            turn = turn,
             credit = credit,
             actor_key = actor_key,
             scope_key = scope_key,
@@ -433,8 +502,14 @@ function M.ingest_turn(meta)
     end
     turn = math.floor(turn)
 
+    local recall_state = pop_recall_state(turn)
+    local flow_sel = type(recall_state) == "table" and type(recall_state.disentangle) == "table" and recall_state.disentangle or nil
+    local dropped = flow_sel and flow_sel.dropped == true
+    local flow_key = flow_sel and trim(flow_sel.sequence_key or "") or ""
+    local allow_global_topic = not (flow_sel and flow_sel.use_local_sequence == true)
+
     local user_vec = nil
-    if allow_topic and embed_input ~= "" then
+    if not dropped and allow_topic and embed_input ~= "" then
         user_vec = meta.user_vec
         if type(user_vec) ~= "table" or #user_vec <= 0 then
             local embedded, embed_err = embed_text(meta, embed_input, "passage")
@@ -443,68 +518,81 @@ function M.ingest_turn(meta)
             end
             user_vec = embedded
         end
-        topic.add_turn(turn, embed_input, user_vec, {
-            scope_key = scope_key,
-            actor_key = actor_key,
-            credit = credit,
-            source = meta.source,
-            user_id = meta.user_id,
-            nickname = meta.nickname,
-        })
+        if allow_global_topic then
+            topic.add_turn(turn, embed_input, user_vec, {
+                scope_key = scope_key,
+                actor_key = actor_key,
+                credit = credit,
+                source = meta.source,
+                user_id = meta.user_id,
+                nickname = meta.nickname,
+            })
+        end
     end
 
     history.add_history(user_input, assistant_text)
-    if allow_topic and assistant_text ~= "" then
+    if allow_global_topic and not dropped and allow_topic and assistant_text ~= "" then
         topic.update_assistant(turn, assistant_text)
     end
 
     local anchor = ""
-    if allow_topic and topic.get_stable_anchor then
+    if dropped then
+        allow_write = false
+    elseif flow_sel and trim(flow_sel.anchor or "") ~= "" then
+        anchor = tostring(flow_sel.anchor or "")
+    elseif allow_topic and topic.get_stable_anchor then
         anchor = tostring(topic.get_stable_anchor(turn) or "")
-    end
-    if allow_topic and anchor == "" and topic.get_topic_anchor then
+    elseif allow_topic and topic.get_topic_anchor then
         anchor = tostring(topic.get_topic_anchor(turn) or "")
     end
     if anchor ~= "" then
         anchor = scope_anchor(scope_key, anchor)
-        if allow_write then
-            topic_graph.observe_turn(turn, anchor)
-        end
+    end
+
+    if flow_sel and user_vec and type(disentangle) == "table" and type(disentangle.observe) == "function" then
+        pcall(function()
+            disentangle.observe(scope_key, flow_sel, user_vec, meta, turn)
+        end)
     end
 
     local adopted_memories = {}
     if allow_write and anchor ~= "" then
-        for _, fact in ipairs(extract_atomic_facts(meta, embed_input, assistant_text)) do
-            local vec = nil
-            if user_vec and fact == embed_input then
-                vec = user_vec
-            else
-                local embedded = nil
-                embedded = embed_text(meta, fact, "passage")
-                if type(embedded) == "table" and #embedded > 0 then
-                    vec = embedded
-                end
-            end
-            if vec then
-                local line = topic_graph.add_memory(vec, turn, {
-                    topic_anchor = anchor,
-                    text = fact,
-                    kind = "fact",
+        local facts = build_fact_entries(meta, embed_input, assistant_text, user_vec)
+        if flow_sel and type(disentangle) == "table" and type(disentangle.stage) == "function" then
+            local ok_stage, staged = pcall(function()
+                return disentangle.stage(scope_key, flow_sel, {
+                    turn = turn,
+                    anchor = anchor,
+                    sequence_key = flow_key,
+                    recall_state = recall_state or {},
+                    facts = facts,
+                    user_input = user_input,
+                    embed_input = embed_input,
+                    assistant_text = assistant_text,
                     source = meta.source,
                     actor_key = actor_key,
                     scope_key = scope_key,
-                })
-                if line then
-                    adopted_memories[#adopted_memories + 1] = line
-                end
+                }, turn)
+            end)
+            if ok_stage and type(staged) == "table" then
+                adopted_memories = commit_turn_events(staged, turn)
             end
+        else
+            adopted_memories = commit_turn_event({
+                turn = turn,
+                anchor = anchor,
+                sequence_key = flow_key,
+                recall_state = recall_state or {},
+                facts = facts,
+                source = meta.source,
+                actor_key = actor_key,
+                scope_key = scope_key,
+            })
         end
-    end
-
-    local recall_state = pop_recall_state(turn)
-    if allow_write and anchor ~= "" and type(topic_graph.observe_feedback) == "function" then
+    elseif flow_sel and type(disentangle) == "table" and type(disentangle.stage) == "function" then
         pcall(function()
-            topic_graph.observe_feedback(anchor, recall_state or {}, adopted_memories, turn)
+            local staged = disentangle.stage(scope_key, flow_sel, nil, turn)
+            commit_turn_events(staged, turn)
         end)
     end
 
@@ -523,6 +611,7 @@ function M.ingest_turn(meta)
         credit = credit,
         actor_key = actor_key,
         scope_key = scope_key,
+        disentangle = flow_sel,
         blocked = blocked,
         blocked_until = blocked_until,
     }
@@ -548,24 +637,13 @@ function M.compile_context(meta)
     end
 
     local user_input = trim(meta.user_input or meta.user or meta.text or "")
+    local raw_user_input = trim(meta.raw_user_input or "")
+    local embed_input = raw_user_input ~= "" and raw_user_input or user_input
     local current_turn = tonumber(meta.turn)
     if not current_turn or current_turn <= 0 then
         current_turn = (history.get_turn() or 0) + 1
     end
     current_turn = math.floor(current_turn)
-
-    local current_anchor = trim(meta.topic_anchor or "")
-    if current_anchor == "" then
-        if topic.get_stable_anchor then
-            current_anchor = trim(topic.get_stable_anchor(current_turn) or "")
-        end
-        if current_anchor == "" and topic.get_topic_anchor then
-            current_anchor = trim(topic.get_topic_anchor(current_turn) or "")
-        end
-    end
-    if current_anchor ~= "" and scope_key ~= "" then
-        current_anchor = scope_anchor(scope_key, current_anchor)
-    end
 
     local blocks = {}
     local label = format_source_label(meta, credit, scope_key, actor_key)
@@ -598,8 +676,8 @@ function M.compile_context(meta)
     if type(query_vec) ~= "table" or #query_vec <= 0 then
         query_vec = meta.user_vec
     end
-    if (type(query_vec) ~= "table" or #query_vec <= 0) and user_input ~= "" then
-        local embedded = embed_text(meta, user_input, "query")
+    if (type(query_vec) ~= "table" or #query_vec <= 0) and embed_input ~= "" then
+        local embedded = embed_text(meta, embed_input, "query")
         if type(embedded) == "table" and #embedded > 0 then
             query_vec = embedded
         end
@@ -609,9 +687,60 @@ function M.compile_context(meta)
         query_vec = (rec and rec.centroid) or {}
     end
 
+    local flow_sel = nil
+
+    local current_anchor = trim(meta.topic_anchor or "")
+    if current_anchor == "" and type(disentangle) == "table" and type(disentangle.select) == "function" and disentangle.enabled_for(meta) then
+        local ok_sel, sel_or_err = pcall(function()
+            return disentangle.select(scope_key, query_vec, meta, current_turn)
+        end)
+        if ok_sel and type(sel_or_err) == "table" then
+            flow_sel = sel_or_err
+            current_anchor = flow_sel.dropped == true and "" or trim(flow_sel.anchor or "")
+        end
+    end
+    if flow_sel and flow_sel.dropped == true then
+        local empty_recall = {
+            context = "",
+            topic_anchor = "",
+            predicted_topics = {},
+            predicted_memories = {},
+            predicted_nodes = {},
+            selected_turns = {},
+            selected_memories = {},
+            memory_anchors = {},
+            fragments = {},
+            adopted_memories = {},
+            bridge_topics = {},
+            candidate_topics = {},
+            local_signals = {},
+            topic_debug = {},
+            disentangle = flow_sel,
+        }
+        cache_recall_state(current_turn, empty_recall)
+        return blocks
+    end
+    if current_anchor == "" then
+        if topic.get_stable_anchor then
+            current_anchor = trim(topic.get_stable_anchor(current_turn) or "")
+        end
+        if current_anchor == "" and topic.get_topic_anchor then
+            current_anchor = trim(topic.get_topic_anchor(current_turn) or "")
+        end
+    end
+    if current_anchor ~= "" and scope_key ~= "" then
+        current_anchor = scope_anchor(scope_key, current_anchor)
+    end
+
+    local flow_key = flow_sel and trim(flow_sel.sequence_key or "") or ""
+
     local retrieved = topic_graph.retrieve(query_vec, current_anchor, current_turn, {
-        user_input = user_input,
+        user_input = embed_input,
+        flow_key = flow_key,
     })
+    if type(retrieved) == "table" and flow_sel then
+        retrieved.disentangle = flow_sel
+    end
     cache_recall_state(current_turn, retrieved)
 
     local ctx = trim((retrieved or {}).context or "")
@@ -624,10 +753,25 @@ function M.compile_context(meta)
         blocks[#blocks + 1] = { role = "system", content = transcript }
     end
 
+    if flow_sel and type(disentangle) == "table" and type(disentangle.pending_context) == "function" then
+        local ok_pending, pending_ctx = pcall(function()
+            return disentangle.pending_context(scope_key, flow_sel, meta)
+        end)
+        pending_ctx = trim(ok_pending and pending_ctx or "")
+        if pending_ctx ~= "" then
+            blocks[#blocks + 1] = { role = "system", content = pending_ctx }
+        end
+    end
+
     return blocks
 end
 
 function M.shutdown()
+    if type(disentangle) == "table" and type(disentangle.flush_all) == "function" then
+        pcall(function()
+            commit_turn_events(disentangle.flush_all(), -1)
+        end)
+    end
     if guard_enabled() then
         pcall(function()
             grudge.save()

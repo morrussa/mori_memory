@@ -151,6 +151,81 @@ local function unique_sorted_numbers(items)
     return out
 end
 
+local function flow_key_from_opts(opts)
+    opts = type(opts) == "table" and opts or {}
+    return trim(opts.flow_key or opts.flow or "")
+end
+
+local function ensure_runtime_state(flow_key)
+    flow_key = trim(flow_key)
+    if flow_key == "" then
+        local rt = (M.state or {}).runtime
+        if type(rt) ~= "table" then
+            rt = { last_anchor = "", last_selected = {}, last_turn = 0 }
+            if type(M.state) == "table" then
+                M.state.runtime = rt
+            end
+        end
+        rt.last_anchor = trim(rt.last_anchor or "")
+        rt.last_selected = unique_sorted_numbers(rt.last_selected or {})
+        rt.last_turn = tonumber(rt.last_turn) or 0
+        return rt
+    end
+
+    M.runtime = type(M.runtime) == "table" and M.runtime or {}
+    M.runtime.flow_runtime = type(M.runtime.flow_runtime) == "table" and M.runtime.flow_runtime or {}
+    local bucket = M.runtime.flow_runtime
+    local rt = bucket[flow_key]
+    if type(rt) ~= "table" then
+        rt = { last_anchor = "", last_selected = {}, last_turn = 0 }
+        bucket[flow_key] = rt
+    end
+    rt.last_anchor = trim(rt.last_anchor or "")
+    rt.last_selected = unique_sorted_numbers(rt.last_selected or {})
+    rt.last_turn = tonumber(rt.last_turn) or 0
+    return rt
+end
+
+local function gc_flow_runtime(current_turn)
+    M.runtime = type(M.runtime) == "table" and M.runtime or {}
+    M.runtime.flow_runtime = type(M.runtime.flow_runtime) == "table" and M.runtime.flow_runtime or {}
+    M.runtime.flow_memory_next = type(M.runtime.flow_memory_next) == "table" and M.runtime.flow_memory_next or {}
+
+    local ttl = math.max(8, math.floor(tonumber(tg_cfg().flow_runtime_ttl) or 128))
+    local cap = math.max(16, math.floor(tonumber(tg_cfg().flow_runtime_cap) or 256))
+    local cur_turn = math.max(0, math.floor(tonumber(current_turn) or 0))
+    local rows = {}
+
+    for flow_key, rt in pairs(M.runtime.flow_runtime) do
+        local last_turn = math.max(0, math.floor(tonumber((rt or {}).last_turn) or 0))
+        if cur_turn > 0 and last_turn > 0 and (cur_turn - last_turn) > ttl then
+            M.runtime.flow_runtime[flow_key] = nil
+            M.runtime.flow_memory_next[flow_key] = nil
+        else
+            rows[#rows + 1] = {
+                key = flow_key,
+                last_turn = last_turn,
+            }
+        end
+    end
+
+    if #rows <= cap then
+        return
+    end
+
+    table.sort(rows, function(a, b)
+        if (a.last_turn or 0) ~= (b.last_turn or 0) then
+            return (a.last_turn or 0) < (b.last_turn or 0)
+        end
+        return tostring(a.key) < tostring(b.key)
+    end)
+    for i = 1, #rows - cap do
+        local flow_key = rows[i].key
+        M.runtime.flow_runtime[flow_key] = nil
+        M.runtime.flow_memory_next[flow_key] = nil
+    end
+end
+
 local FACET_PUNCT = {
     [" "] = true, ["\t"] = true, ["\r"] = true, ["\n"] = true,
     [","] = true, ["."] = true, ["!"] = true, ["?"] = true, [":"] = true, [";"] = true,
@@ -426,6 +501,8 @@ local function default_runtime()
         loaded_order = {},
         hnsw = topic_hnsw_mod.new(hnsw_cfg()),
         last_decay_turn = 0,
+        flow_runtime = {},
+        flow_memory_next = {},
     }
 end
 
@@ -584,6 +661,8 @@ local function bind_memory_to_topic(mem_id, anchor, vec, turn, amount, opts)
     end
     opts = type(opts) == "table" and opts or {}
     local node = ensure_topic_node(anchor)
+    local existing_topic_weight = tonumber((type(mem.origin_topics) == "table" and mem.origin_topics[anchor]) or 0.0) or 0.0
+    local already_bound = node.memory_set[mem_id] == true or existing_topic_weight > 0.0
     if not node.memory_set[mem_id] then
         node.memory_set[mem_id] = true
         node.memory_ids[#node.memory_ids + 1] = mem_id
@@ -597,14 +676,25 @@ local function bind_memory_to_topic(mem_id, anchor, vec, turn, amount, opts)
     update_memory_topic_anchor(mem)
     if type(vec) == "table" and #vec > 0 then
         local local_cfg = tg_cfg().deep_artmap or {}
-        local inserted = deep_artmap.add_memory(node.local_state, vec, mem_id, turn, {
-            category_vigilance = tonumber(local_cfg.category_vigilance) or 0.88,
-            category_beta = tonumber(local_cfg.category_beta) or 0.28,
-            bundle_vigilance = tonumber(local_cfg.bundle_vigilance) or 0.82,
-            bundle_beta = tonumber(local_cfg.bundle_beta) or 0.18,
-            temporal_link_window = tonumber(local_cfg.temporal_link_window) or 8,
-            exemplars = tonumber(local_cfg.exemplars) or 12,
-        })
+        local inserted = nil
+        local reinforced = false
+        if already_bound then
+            reinforced = deep_artmap.reinforce_memory(node.local_state, mem_id, "adopt", turn, {
+                recall_lr = tonumber(tg_cfg().recall_lr) or 0.10,
+                adopt_lr = tonumber(tg_cfg().adopt_lr) or 0.18,
+            })
+        end
+        if not reinforced then
+            local art_turn = math.max(0, math.floor(tonumber((node.local_state or {}).last_bundle_turn) or 0)) + 1
+            inserted = deep_artmap.add_memory(node.local_state, vec, mem_id, art_turn, {
+                category_vigilance = tonumber(local_cfg.category_vigilance) or 0.88,
+                category_beta = tonumber(local_cfg.category_beta) or 0.28,
+                bundle_vigilance = tonumber(local_cfg.bundle_vigilance) or 0.82,
+                bundle_beta = tonumber(local_cfg.bundle_beta) or 0.18,
+                temporal_link_window = tonumber(local_cfg.temporal_link_window) or 8,
+                exemplars = tonumber(local_cfg.exemplars) or 12,
+            })
+        end
         if inserted and tonumber(inserted.category_id) then
             mem.cluster_id = tonumber(inserted.category_id) or tonumber(mem.cluster_id) or -1
         elseif opts.preserve_cluster_id and tonumber(mem.cluster_id) then
@@ -1414,23 +1504,52 @@ local function select_topics_for_context(topic_rows, query_map)
     return fallback
 end
 
-local function one_turn_momentum_scores(query_vec, current_anchor, current_turn)
+local function one_turn_momentum_scores(query_vec, current_anchor, current_turn, opts)
     local scores = {}
-    if tonumber((((M.state or {}).runtime or {}).last_turn)) ~= (math.floor(tonumber(current_turn) or 0) - 1) then
+
+    opts = type(opts) == "table" and opts or {}
+    local flow_key = flow_key_from_opts(opts)
+    local rt = ensure_runtime_state(flow_key)
+    local memory_next = M.state.memory_next
+    if flow_key ~= "" then
+        M.runtime = type(M.runtime) == "table" and M.runtime or {}
+        M.runtime.flow_memory_next = type(M.runtime.flow_memory_next) == "table" and M.runtime.flow_memory_next or {}
+        memory_next = M.runtime.flow_memory_next[flow_key]
+        if type(memory_next) ~= "table" then
+            memory_next = {}
+            M.runtime.flow_memory_next[flow_key] = memory_next
+        end
+    end
+    local cur_turn = math.floor(tonumber(current_turn) or 0)
+    local gap = cur_turn - (tonumber(rt.last_turn) or 0)
+
+    if flow_key == "" then
+        if gap ~= 1 then
+            return scores
+        end
+    else
+        if gap <= 0 then
+            return scores
+        end
+    end
+
+    if trim(rt.last_anchor) ~= trim(current_anchor) then
         return scores
     end
-    if trim((((M.state or {}).runtime or {}).last_anchor)) ~= trim(current_anchor) then
-        return scores
-    end
+
     local recent_weight = math.max(0.0, tonumber(tg_cfg().recent_weight) or 0.55)
-    for _, prev_mem in ipairs((((M.state or {}).runtime or {}).last_selected) or {}) do
-        local bucket = M.state.memory_next[tonumber(prev_mem)] or {}
+    local gap_factor = 1.0
+    if flow_key ~= "" and gap > 1 then
+        gap_factor = 1.0 / math.sqrt(gap)
+    end
+    for _, prev_mem in ipairs(rt.last_selected or {}) do
+        local bucket = memory_next[tonumber(prev_mem)] or {}
         for mem_id, weight in pairs(bucket) do
             local mem = M.state.memories[tonumber(mem_id)]
             if mem and type(mem.vec) == "table" and #mem.vec > 0 then
                 scores[tonumber(mem_id)] = math.max(
                     tonumber(scores[tonumber(mem_id)]) or -1e9,
-                    safe_similarity(query_vec, mem.vec) + recent_weight * (tonumber(weight) or 0.0)
+                    safe_similarity(query_vec, mem.vec) + recent_weight * gap_factor * (tonumber(weight) or 0.0)
                 )
             end
         end
@@ -1438,11 +1557,11 @@ local function one_turn_momentum_scores(query_vec, current_anchor, current_turn)
     return scores
 end
 
-local function retrieve_topic_evidence(query_vec, candidate_scores, available_topics, current_anchor, current_turn, query_map)
+local function retrieve_topic_evidence(query_vec, candidate_scores, available_topics, current_anchor, current_turn, query_map, opts)
     local per_topic_evidence = math.max(1, tonumber(tg_cfg().per_topic_evidence) or 3)
     local local_cfg = tg_cfg().deep_artmap or {}
     local family_of = get_topic_families(available_topics)
-    local momentum_scores = one_turn_momentum_scores(query_vec, current_anchor, current_turn)
+    local momentum_scores = one_turn_momentum_scores(query_vec, current_anchor, current_turn, opts)
     local evidence_topics = {}
     local evidence_memories = {}
     local evidence_by_topic = {}
@@ -1858,6 +1977,7 @@ end
 
 function M.begin_turn(turn)
     turn = math.max(0, math.floor(tonumber(turn) or 0))
+    gc_flow_runtime(turn)
     if turn > (tonumber(M.state.current_turn) or 0) then
         M.state.current_turn = turn
         apply_decay(turn)
@@ -1933,8 +2053,20 @@ function M.store_vector(line, cluster_id, vec)
     end
     mem.vec = normalize(vec)
     mem.cluster_id = tonumber(cluster_id) or tonumber(mem.cluster_id) or -1
-    if trim(mem.topic_anchor) ~= "" then
-        recompute_topic_centroid(mem.topic_anchor)
+    local anchors = {}
+    if type(mem.origin_topics) == "table" then
+        for anchor in pairs(mem.origin_topics) do
+            anchor = trim(anchor)
+            if anchor ~= "" then
+                anchors[#anchors + 1] = anchor
+            end
+        end
+    end
+    if #anchors <= 0 and trim(mem.topic_anchor) ~= "" then
+        anchors[1] = trim(mem.topic_anchor)
+    end
+    for _, anchor in ipairs(anchors) do
+        recompute_topic_centroid(anchor)
     end
     mark_dirty()
     return true
@@ -2059,17 +2191,36 @@ function M.update_topic_anchor(line, new_anchor)
     return true
 end
 
-function M.observe_turn(turn, current_anchor)
+function M.reset_flow(flow_key)
+    flow_key = trim(flow_key)
+    if flow_key == "" then
+        local rt = ensure_runtime_state("")
+        rt.last_anchor = ""
+        rt.last_selected = {}
+        rt.last_turn = 0
+        return true
+    end
+    M.runtime = type(M.runtime) == "table" and M.runtime or {}
+    M.runtime.flow_runtime = type(M.runtime.flow_runtime) == "table" and M.runtime.flow_runtime or {}
+    M.runtime.flow_memory_next = type(M.runtime.flow_memory_next) == "table" and M.runtime.flow_memory_next or {}
+    M.runtime.flow_runtime[flow_key] = nil
+    M.runtime.flow_memory_next[flow_key] = nil
+    return true
+end
+
+function M.observe_turn(turn, current_anchor, opts)
+    opts = type(opts) == "table" and opts or {}
+    local flow_key = flow_key_from_opts(opts)
     turn = math.max(0, math.floor(tonumber(turn) or 0))
     current_anchor = trim(current_anchor)
     if current_anchor == "" then
         return false
     end
     M.begin_turn(turn)
-    ensure_topic_node(current_anchor)
-    local prev_anchor = trim((((M.state or {}).runtime or {}).last_anchor))
-    local prev_turn = tonumber((((M.state or {}).runtime or {}).last_turn)) or 0
-    if prev_anchor ~= "" and prev_anchor ~= current_anchor and prev_turn > 0 then
+    local rt = ensure_runtime_state(flow_key)
+    local prev_anchor = trim(rt.last_anchor or "")
+    local prev_turn = tonumber(rt.last_turn) or 0
+    if flow_key == "" and prev_anchor ~= "" and prev_anchor ~= current_anchor and prev_turn > 0 then
         local prev_scope = prev_anchor:match("^(.-)|") or ""
         local cur_scope = current_anchor:match("^(.-)|") or ""
         if prev_scope ~= cur_scope and (prev_scope ~= "" or cur_scope ~= "") then
@@ -2083,6 +2234,7 @@ end
 
 function M.retrieve(query_vec, current_anchor, current_turn, opts)
     opts = type(opts) == "table" and opts or {}
+    local flow_key = flow_key_from_opts(opts)
     query_vec = normalize(query_vec or {})
     current_anchor = trim(current_anchor)
     current_turn = math.max(0, math.floor(tonumber(current_turn) or 0))
@@ -2108,7 +2260,13 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
 
     local query_map = build_query_facet_map(opts.user_input or "")
     local seed_scores = semantic_topic_scores(query_vec, current_anchor)
-    local expanded_scores, bridge_topics = expand_topic_candidates(seed_scores)
+    local expanded_scores, bridge_topics
+    if flow_key ~= "" then
+        expanded_scores = seed_scores
+        bridge_topics = {}
+    else
+        expanded_scores, bridge_topics = expand_topic_candidates(seed_scores)
+    end
     local available_topics = preload_topics(expanded_scores, current_turn)
     local selected_topics, topic_debug, evidence_rows = retrieve_topic_evidence(
         query_vec,
@@ -2116,7 +2274,8 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
         available_topics,
         current_anchor,
         current_turn,
-        query_map
+        query_map,
+        opts
     )
     local ranked_memories = ranked_memories_from_evidence(selected_topics, evidence_rows)
     local max_memories = math.max(1, tonumber(tg_cfg().retrieve_max_memories) or tonumber(ai_cfg().max_memory) or 8)
@@ -2129,6 +2288,17 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
         selected_memories[#selected_memories + 1] = tonumber(item.mem_idx)
     end
     selected_memories = unique_sorted_numbers(selected_memories)
+
+    local memory_anchors = {}
+    for _, item in ipairs(ranked_memories) do
+        local mem_id = tonumber((item or {}).mem_idx) or 0
+        if mem_id > 0 then
+            local anchor = trim((item or {}).anchor)
+            if anchor ~= "" then
+                memory_anchors[mem_id] = anchor
+            end
+        end
+    end
 
     local selected_turns, fragments, memory_fallback_context = turns_from_memories(ranked_memories)
     local context = topic_context_from_selection(selected_topics, evidence_rows)
@@ -2143,6 +2313,7 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
         predicted_nodes = {},
         selected_turns = shallow_copy_array(selected_turns),
         selected_memories = shallow_copy_array(selected_memories),
+        memory_anchors = memory_anchors,
         fragments = fragments,
         adopted_memories = {},
         local_signals = type((topic_debug or {}).local_signals) == "table" and (topic_debug or {}).local_signals or {},
@@ -2152,9 +2323,12 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
     }
 end
 
-function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn)
+function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn, opts)
+    opts = type(opts) == "table" and opts or {}
+    local flow_key = flow_key_from_opts(opts)
     current_anchor = trim(current_anchor)
     recall_state = type(recall_state) == "table" and recall_state or {}
+    local memory_anchors = type(recall_state.memory_anchors) == "table" and recall_state.memory_anchors or {}
     adopted_memories = unique_sorted_numbers(adopted_memories)
     local retrieved = unique_sorted_numbers(recall_state.selected_memories)
     local observed = unique_sorted_numbers((function()
@@ -2164,6 +2338,8 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
         return tmp
     end)())
     turn = math.max(0, math.floor(tonumber(turn) or 0))
+    M.begin_turn(turn)
+    local rt = ensure_runtime_state(flow_key)
 
     local topic_cap = math.max(16, tonumber(tg_cfg().topic_cap) or 64)
     local next_cap = math.max(8, tonumber(tg_cfg().next_cap) or 32)
@@ -2175,21 +2351,34 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
     local bundle_edge_feedback = math.max(0.0, tonumber(local_cfg.bundle_edge_feedback) or 0.14)
 
     if current_anchor ~= "" then
-        local node = ensure_topic_node(current_anchor)
-        for _, mem_id in ipairs(retrieved) do
-            node.memory_prior[mem_id] = (tonumber(node.memory_prior[mem_id]) or 0.0) + recall_lr
+        local node = M.state.topic_nodes[current_anchor]
+        if node or #adopted_memories > 0 then
+            node = ensure_topic_node(current_anchor)
+            for _, mem_id in ipairs(retrieved) do
+                node.memory_prior[mem_id] = (tonumber(node.memory_prior[mem_id]) or 0.0) + recall_lr
+            end
+            for _, mem_id in ipairs(adopted_memories) do
+                node.memory_prior[mem_id] = (tonumber(node.memory_prior[mem_id]) or 0.0) + adopt_lr
+            end
+            node.memory_prior = prune_weight_map(node.memory_prior, topic_cap)
         end
-        for _, mem_id in ipairs(adopted_memories) do
-            node.memory_prior[mem_id] = (tonumber(node.memory_prior[mem_id]) or 0.0) + adopt_lr
-        end
-        node.memory_prior = prune_weight_map(node.memory_prior, topic_cap)
     end
 
-    local prev_selected = unique_sorted_numbers((((M.state or {}).runtime or {}).last_selected) or {})
-    local prev_anchor = trim((((M.state or {}).runtime or {}).last_anchor))
+    local prev_selected = unique_sorted_numbers(rt.last_selected or {})
+    local prev_anchor = trim(rt.last_anchor or "")
+    local memory_next = M.state.memory_next
+    if flow_key ~= "" then
+        M.runtime = type(M.runtime) == "table" and M.runtime or {}
+        M.runtime.flow_memory_next = type(M.runtime.flow_memory_next) == "table" and M.runtime.flow_memory_next or {}
+        memory_next = M.runtime.flow_memory_next[flow_key]
+        if type(memory_next) ~= "table" then
+            memory_next = {}
+            M.runtime.flow_memory_next[flow_key] = memory_next
+        end
+    end
     if #prev_selected > 0 and #observed > 0 then
         for _, src in ipairs(prev_selected) do
-            local bucket = M.state.memory_next[src] or {}
+            local bucket = memory_next[src] or {}
             for _, dst in ipairs(retrieved) do
                 if src ~= dst then
                     bucket[dst] = (tonumber(bucket[dst]) or 0.0) + recall_lr
@@ -2200,7 +2389,7 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
                     bucket[dst] = (tonumber(bucket[dst]) or 0.0) + adopt_lr
                 end
             end
-            M.state.memory_next[src] = prune_weight_map(bucket, next_cap)
+            memory_next[src] = prune_weight_map(bucket, next_cap)
         end
     end
 
@@ -2214,7 +2403,7 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
     if #predicted_topics <= 0 then
         local seen = {}
         for _, mem_id in ipairs(observed) do
-            local anchor = trim(M.get_topic_anchor(mem_id))
+            local anchor = trim(memory_anchors[mem_id] or M.get_topic_anchor(mem_id))
             if anchor ~= "" and not seen[anchor] then
                 seen[anchor] = true
                 predicted_topics[#predicted_topics + 1] = anchor
@@ -2226,20 +2415,23 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
     local current_signal = type(local_signals[current_anchor]) == "table" and local_signals[current_anchor] or {}
     local signal_bundle_ids = unique_sorted_numbers((current_signal or {}).bundle_ids)
 
-    if current_anchor ~= "" then
+    if current_anchor ~= "" and flow_key == "" then
         for _, anchor in ipairs(predicted_topics) do
             if anchor ~= current_anchor then
                 boost_edge(current_anchor, anchor, "recall", recall_lr, turn)
             end
         end
         for _, mem_id in ipairs(adopted_memories) do
-            local mem_anchor = trim(M.get_topic_anchor(mem_id))
+            local mem_anchor = ""
+            if flow_key == "" then
+                mem_anchor = trim(M.get_topic_anchor(mem_id))
+            else
+                mem_anchor = current_anchor
+            end
             if mem_anchor ~= "" and mem_anchor ~= current_anchor then
                 boost_edge(current_anchor, mem_anchor, "adopt", adopt_lr, turn)
             end
         end
-    elseif prev_anchor ~= "" and current_anchor ~= "" and prev_anchor ~= current_anchor then
-        boost_edge(prev_anchor, current_anchor, "transition", tonumber(tg_cfg().transition_lr) or 0.12, turn)
     end
 
     if current_anchor ~= "" and #signal_bundle_ids > 0 then
@@ -2283,7 +2475,7 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
     end
 
     for _, mem_id in ipairs(retrieved) do
-        local anchor = trim(M.get_topic_anchor(mem_id))
+        local anchor = trim(memory_anchors[mem_id] or M.get_topic_anchor(mem_id))
         local node = ensure_topic_node(anchor)
         if node then
             deep_artmap.reinforce_memory(node.local_state, mem_id, "recall", turn, {
@@ -2293,7 +2485,7 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
         end
     end
     for _, mem_id in ipairs(adopted_memories) do
-        local anchor = trim(M.get_topic_anchor(mem_id))
+        local anchor = current_anchor
         local node = ensure_topic_node(anchor)
         if node then
             deep_artmap.reinforce_memory(node.local_state, mem_id, "adopt", turn, {
@@ -2303,9 +2495,9 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
         end
     end
 
-    M.state.runtime.last_anchor = current_anchor
-    M.state.runtime.last_selected = observed
-    M.state.runtime.last_turn = turn
+    rt.last_anchor = current_anchor
+    rt.last_selected = observed
+    rt.last_turn = turn
     mark_dirty()
     return true
 end
