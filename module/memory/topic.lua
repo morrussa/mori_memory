@@ -168,8 +168,22 @@ local function stable_topic_key_from_record(rec)
     return "S:" .. tostring(math.floor(start))
 end
 
-local function normalize_topic_key(topic_key)
+local function split_scoped_topic_key(topic_key)
     local key = tostring(topic_key or ""):match("^%s*(.-)%s*$")
+    if key == "" then
+        return "", ""
+    end
+
+    local scope_key, anchor_key = key:match("^(.-)|([ASC]:%d+)$")
+    if scope_key and anchor_key then
+        return trim(scope_key), trim(anchor_key)
+    end
+    return "", key
+end
+
+local function normalize_topic_key(topic_key)
+    local _, raw_key = split_scoped_topic_key(topic_key)
+    local key = tostring(raw_key or ""):match("^%s*(.-)%s*$")
     if key == "" then
         return nil
     end
@@ -201,14 +215,17 @@ local function normalize_topic_key(topic_key)
 end
 
 local function resolve_topic_key(topic_key)
-    local stable_key = normalize_topic_key(topic_key)
+    local scope_key, raw_key = split_scoped_topic_key(topic_key)
+    local stable_key = normalize_topic_key(raw_key)
     if not stable_key then
         return nil
     end
 
+    local scoped_key = scope_key ~= "" and (scope_key .. "|" .. stable_key) or stable_key
+
     local start_turn = tonumber(stable_key:match("^S:(%d+)$"))
     if not start_turn then
-        return stable_key
+        return stable_key, nil, scoped_key, scope_key
     end
 
     if M.active_topic.start and tonumber(M.active_topic.start) == start_turn then
@@ -220,7 +237,7 @@ local function resolve_topic_key(topic_key)
             centroid = M.active_topic.head_centroid or tool.average_vectors(M.active_topic.vectors),
             is_active = true,
             topic_idx = nil,
-        }
+        }, scoped_key, scope_key
     end
 
     for idx, rec in ipairs(M.topics) do
@@ -233,11 +250,11 @@ local function resolve_topic_key(topic_key)
                 centroid = rec.centroid,
                 is_active = false,
                 topic_idx = idx,
-            }
+            }, scoped_key, scope_key
         end
     end
 
-    return stable_key
+    return stable_key, nil, scoped_key, scope_key
 end
 
 local function histogram_overlap(a, b)
@@ -865,10 +882,12 @@ function M.get_stable_anchor(turn)
 end
 
 function M.get_topic_fingerprint(topic_key)
-    local stable_key, rec = resolve_topic_key(topic_key)
+    local stable_key, rec, scoped_key, scope_key = resolve_topic_key(topic_key)
     if not stable_key then
         return {
             key = nil,
+            base_key = nil,
+            scope_key = "",
             memory_count = 0,
             cluster_count = 0,
             dominant_cluster = nil,
@@ -883,10 +902,15 @@ function M.get_topic_fingerprint(topic_key)
         }
     end
 
+    local inferred_start = tonumber(stable_key:match("^S:(%d+)$"))
+
     local ok_store, store = pcall(require, "module.memory.store")
     local lines = {}
     if ok_store and store and store.iter_topic_lines then
-        lines = store.iter_topic_lines(stable_key) or {}
+        lines = store.iter_topic_lines(scoped_key) or {}
+        if #lines <= 0 and scoped_key ~= stable_key then
+            lines = store.iter_topic_lines(stable_key) or {}
+        end
     end
 
     local histogram = {}
@@ -934,7 +958,9 @@ function M.get_topic_fingerprint(topic_key)
     local summary = ensure_topic_summary(rec)
 
     return {
-        key = stable_key,
+        key = scoped_key,
+        base_key = stable_key,
+        scope_key = scope_key,
         memory_count = memory_count,
         cluster_count = #cluster_items,
         dominant_cluster = top_clusters[1] and top_clusters[1].cluster_id or nil,
@@ -943,7 +969,7 @@ function M.get_topic_fingerprint(topic_key)
         weights = weights,
         centroid = rec and rec.centroid or nil,
         summary = summary,
-        start = rec and rec.start or nil,
+        start = rec and rec.start or inferred_start,
         topic_idx = rec and rec.topic_idx or nil,
         is_active = rec and (rec.is_active == true) or false,
         lines = shallow_copy_array(lines),
@@ -956,6 +982,8 @@ function M.get_topic_chain(topic_key, opts)
     if not base_fp.key then
         return {}
     end
+    local base_key = trim(base_fp.base_key or base_fp.key)
+    local scope_key = trim(base_fp.scope_key or "")
 
     local centroid_weight = tonumber(opts.centroid_weight) or CHAIN_CENTROID_WEIGHT
     local hist_weight = tonumber(opts.hist_weight) or CHAIN_HIST_WEIGHT
@@ -965,14 +993,16 @@ function M.get_topic_chain(topic_key, opts)
 
     local candidates = {}
     for _, rec in ipairs(M.topics) do
-        local key = stable_topic_key_from_record(rec)
-        if key and key ~= base_fp.key then
+        local bare_key = stable_topic_key_from_record(rec)
+        if bare_key and bare_key ~= base_key then
+            local key = scope_key ~= "" and (scope_key .. "|" .. bare_key) or bare_key
             candidates[#candidates + 1] = key
         end
     end
     if M.active_topic.start then
-        local active_key = "S:" .. tostring(M.active_topic.start)
-        if active_key ~= base_fp.key then
+        local bare_active_key = "S:" .. tostring(M.active_topic.start)
+        if bare_active_key ~= base_key then
+            local active_key = scope_key ~= "" and (scope_key .. "|" .. bare_active_key) or bare_active_key
             candidates[#candidates + 1] = active_key
         end
     end

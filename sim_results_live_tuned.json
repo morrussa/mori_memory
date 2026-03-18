@@ -1,0 +1,775 @@
+{
+  "config": {
+    "turns": 240,
+    "seed": 42,
+    "repeats": 3,
+    "rooms": 3,
+    "users_per_room": 4,
+    "dim": 64,
+    "topics": [
+      "anime",
+      "food",
+      "travel",
+      "tech",
+      "pet",
+      "fitness"
+    ],
+    "max_streams": 8,
+    "assign_threshold": 0.74,
+    "reset_threshold": 0.62,
+    "commit_idle_turns": 3,
+    "pending_context_turns": 3,
+    "stale_turns": 80
+  },
+  "aggregate": {
+    "runs": 3,
+    "hit_rate": 0.882,
+    "shared_hit_rate": 0.8747,
+    "personal_hit_rate": 0.8877,
+    "fragmented_hit_rate": 0.9566,
+    "empty_context_rate": 0.0915,
+    "cross_room_intrusion_rate": 0.0,
+    "cross_user_personal_intrusion_rate": 0.0,
+    "avg_query_precision": 0.2418,
+    "fingerprint_nonempty_rate": 0.8904,
+    "local_sequence_fingerprint_nonempty_rate": 0.8889,
+    "memory_total": 18.0,
+    "cross_scope_origin_count": 0.0,
+    "compile_p95_ms": 4.137,
+    "ingest_p95_ms": 1.699
+  },
+  "runs": [
+    {
+      "summary": {
+        "seed": 42,
+        "turns": 240,
+        "queries": 89,
+        "shared_queries": 44,
+        "personal_queries": 45,
+        "fragmented_queries": 14,
+        "hit_rate": 0.8764,
+        "shared_hit_rate": 0.9318,
+        "personal_hit_rate": 0.8222,
+        "fragmented_hit_rate": 0.9286,
+        "empty_context_rate": 0.0899,
+        "cross_room_intrusion_rate": 0.0,
+        "cross_user_personal_intrusion_rate": 0.0,
+        "avg_query_precision": 0.2505,
+        "compile_timing": {
+          "count": 240,
+          "p50_ms": 2.143,
+          "p95_ms": 3.938,
+          "max_ms": 6.498
+        },
+        "ingest_timing": {
+          "count": 240,
+          "p50_ms": 0.853,
+          "p95_ms": 1.719,
+          "max_ms": 3.114
+        },
+        "disentangle": {
+          "drop_rate": 0.0667,
+          "reset_rate": 0.0,
+          "merge_rate": 0.0,
+          "new_stream_rate": 0.2125
+        },
+        "fingerprint_nonempty_rate": 0.8431,
+        "local_sequence_fingerprint_nonempty_rate": 0.84,
+        "anchors": 51,
+        "local_sequence_anchors": 50,
+        "memory_total": 18,
+        "cross_scope_origin_count": 0,
+        "scope_counts": {
+          "bilibili:room1": 6,
+          "bilibili:room2": 6,
+          "bilibili:room3": 6
+        },
+        "workdir": "/tmp/mori-memory-live-runs-ms8-tuned/seed_42"
+      },
+      "failure_examples": [
+        {
+          "hit": false,
+          "empty": false,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 71,
+          "mode": "shared_query",
+          "room_id": "room2",
+          "user_id": "room2_u4",
+          "topic_id": "tech",
+          "expected_turns": [
+            1,
+            7
+          ],
+          "retrieved_turns": [
+            22,
+            23,
+            26,
+            37,
+            43,
+            46,
+            47
+          ],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u4 nick=room2_nick_4 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u4 credit=1.00",
+            "【相关主题】\n相关主题1（起始轮次=1，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第22轮：用户提到还是我刚才 user=room2_u2 topic=tech tool_pref；助手回应ack turn=22 room=room2 user=room2_u2 topic=tech personal_context_kept\n\n相关主题2（起始轮次=43，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第43轮：用户提到fact:F00043 room=room2 topic=anime mode=shared shared_label=seasonal_anime turn_；助手回应ack turn=43 room=room2 user=room2_u1 topic=anime shared_context_kept\n\n相关主题3（起始轮次=23，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第47轮：用户提到fact:F00047 room=room2 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=47 room=room2 user=room2_u2 topic=food shared_context_kept\n\n相关主题4（起始轮次=37，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第37轮：用户提到fact:F00037 room=room2 user=room2_u1 topic=travel mode=personal personal_label=r；助手回应ack turn=37 room=room2 user=room2_u1 topic=travel personal_context_kept",
+            "【相关对话片段】\n第23轮\n用户：fact:F00023 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=23 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=23 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第26轮\n用户：fact:F00026 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=26 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=26 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第37轮\n用户：fact:F00037 room=room2 user=room2_u1 topic=travel mode=personal personal_label=route_pref turn_note=37 profile_hint=keep_actor_identity stab\n助手：ack turn=37 room=room2 user=room2_u1 topic=travel personal_context_kept\n\n第43轮\n用户：fact:F00043 room=room2 topic=anime mode=shared shared_label=seasonal_anime turn_note=43 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=43 room=room2 user=room2_u1 topic=anime shared_context_kept\n\n第46轮\n用户：fact:F00046 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=46 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=46 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第47轮\n用户：fact:F00047 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=47 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=47 room=room2 user=room2_u2 topic=food shared_context_kept"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": false,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 73,
+          "mode": "personal_query",
+          "room_id": "room2",
+          "user_id": "room2_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            2
+          ],
+          "retrieved_turns": [
+            22,
+            23,
+            26,
+            37,
+            43,
+            46,
+            47,
+            71
+          ],
+          "fragmented": true,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u2 nick=room2_nick_2 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u2 credit=0.99",
+            "【相关主题】\n相关主题1（起始轮次=1，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第22轮：用户提到还是我刚才 user=room2_u2 topic=tech tool_pref；助手回应ack turn=22 room=room2 user=room2_u2 topic=tech personal_context_kept\n\n相关主题2（起始轮次=43，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第43轮：用户提到fact:F00043 room=room2 topic=anime mode=shared shared_label=seasonal_anime turn_；助手回应ack turn=43 room=room2 user=room2_u1 topic=anime shared_context_kept\n\n相关主题3（起始轮次=37，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第37轮：用户提到fact:F00037 room=room2 user=room2_u1 topic=travel mode=personal personal_label=r；助手回应ack turn=37 room=room2 user=room2_u1 topic=travel personal_context_kept\n\n相关主题4（起始轮次=23，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第47轮：用户提到fact:F00047 room=room2 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=47 room=room2 user=room2_u2 topic=food shared_context_kept",
+            "【相关对话片段】\n第23轮\n用户：fact:F00023 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=23 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=23 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第26轮\n用户：fact:F00026 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=26 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=26 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第37轮\n用户：fact:F00037 room=room2 user=room2_u1 topic=travel mode=personal personal_label=route_pref turn_note=37 profile_hint=keep_actor_identity stab\n助手：ack turn=37 room=room2 user=room2_u1 topic=travel personal_context_kept\n\n第43轮\n用户：fact:F00043 room=room2 topic=anime mode=shared shared_label=seasonal_anime turn_note=43 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=43 room=room2 user=room2_u1 topic=anime shared_context_kept\n\n第46轮\n用户：fact:F00046 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=46 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=46 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第47轮\n用户：fact:F00047 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=47 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=47 room=room2 user=room2_u2 topic=food shared_context_kept"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": false,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 76,
+          "mode": "personal_query",
+          "room_id": "room2",
+          "user_id": "room2_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            2
+          ],
+          "retrieved_turns": [
+            22,
+            26,
+            37,
+            43,
+            46,
+            47,
+            72,
+            73
+          ],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u2 nick=room2_nick_2 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u2 credit=0.99",
+            "【相关主题】\n相关主题1（起始轮次=1，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第22轮：用户提到还是我刚才 user=room2_u2 topic=tech tool_pref；助手回应ack turn=22 room=room2 user=room2_u2 topic=tech personal_context_kept\n\n相关主题2（起始轮次=43，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第72轮：用户提到fact:F00072 room=room2 topic=anime mode=shared shared_label=seasonal_anime turn_；助手回应ack turn=72 room=room2 user=room2_u1 topic=anime shared_context_kept\n\n相关主题3（起始轮次=37，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第37轮：用户提到fact:F00037 room=room2 user=room2_u1 topic=travel mode=personal personal_label=r；助手回应ack turn=37 room=room2 user=room2_u1 topic=travel personal_context_kept\n\n相关主题4（起始轮次=23，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第47轮：用户提到fact:F00047 room=room2 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=47 room=room2 user=room2_u2 topic=food shared_context_kept",
+            "【相关对话片段】\n第26轮\n用户：fact:F00026 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=26 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=26 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第37轮\n用户：fact:F00037 room=room2 user=room2_u1 topic=travel mode=personal personal_label=route_pref turn_note=37 profile_hint=keep_actor_identity stab\n助手：ack turn=37 room=room2 user=room2_u1 topic=travel personal_context_kept\n\n第43轮\n用户：fact:F00043 room=room2 topic=anime mode=shared shared_label=seasonal_anime turn_note=43 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=43 room=room2 user=room2_u1 topic=anime shared_context_kept\n\n第46轮\n用户：fact:F00046 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=46 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=46 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第47轮\n用户：fact:F00047 room=room2 topic=food mode=shared shared_label=late_night_food turn_note=47 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=47 room=room2 user=room2_u2 topic=food shared_context_kept\n\n第72轮\n用户：fact:F00072 room=room2 topic=anime mode=shared shared_label=seasonal_anime turn_note=72 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=72 room=room2 user=room2_u1 topic=anime shared_context_kept"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 117,
+          "mode": "personal_query",
+          "room_id": "room3",
+          "user_id": "room3_u4",
+          "topic_id": "fitness",
+          "expected_turns": [
+            12,
+            59,
+            100
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u4 nick=room3_nick_4 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u4 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 159,
+          "mode": "personal_query",
+          "room_id": "room2",
+          "user_id": "room2_u4",
+          "topic_id": "fitness",
+          "expected_turns": [
+            36,
+            62
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u4 nick=room2_nick_4 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u4 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 191,
+          "mode": "personal_query",
+          "room_id": "room3",
+          "user_id": "room3_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            68,
+            148,
+            156
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u2 nick=room3_nick_2 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u2 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 194,
+          "mode": "shared_query",
+          "room_id": "room1",
+          "user_id": "room1_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            118,
+            129,
+            144
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room1 user=room1_u2 nick=room1_nick_2 scope=bilibili:room1 actor=bilibili/room:room1/uid:room1_u2 credit=0.98"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 196,
+          "mode": "personal_query",
+          "room_id": "room1",
+          "user_id": "room1_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            142,
+            157,
+            195
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room1 user=room1_u2 nick=room1_nick_2 scope=bilibili:room1 actor=bilibili/room:room1/uid:room1_u2 credit=0.98"
+          ]
+        }
+      ]
+    },
+    {
+      "summary": {
+        "seed": 43,
+        "turns": 240,
+        "queries": 97,
+        "shared_queries": 53,
+        "personal_queries": 44,
+        "fragmented_queries": 17,
+        "hit_rate": 0.9072,
+        "shared_hit_rate": 0.8868,
+        "personal_hit_rate": 0.9318,
+        "fragmented_hit_rate": 0.9412,
+        "empty_context_rate": 0.0722,
+        "cross_room_intrusion_rate": 0.0,
+        "cross_user_personal_intrusion_rate": 0.0,
+        "avg_query_precision": 0.2504,
+        "compile_timing": {
+          "count": 240,
+          "p50_ms": 2.21,
+          "p95_ms": 4.204,
+          "max_ms": 6.341
+        },
+        "ingest_timing": {
+          "count": 240,
+          "p50_ms": 0.805,
+          "p95_ms": 1.618,
+          "max_ms": 2.598
+        },
+        "disentangle": {
+          "drop_rate": 0.0458,
+          "reset_rate": 0.0,
+          "merge_rate": 0.0083,
+          "new_stream_rate": 0.2125
+        },
+        "fingerprint_nonempty_rate": 0.8868,
+        "local_sequence_fingerprint_nonempty_rate": 0.8868,
+        "anchors": 53,
+        "local_sequence_anchors": 53,
+        "memory_total": 18,
+        "cross_scope_origin_count": 0,
+        "scope_counts": {
+          "bilibili:room1": 6,
+          "bilibili:room2": 6,
+          "bilibili:room3": 6
+        },
+        "workdir": "/tmp/mori-memory-live-runs-ms8-tuned/seed_43"
+      },
+      "failure_examples": [
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 115,
+          "mode": "personal_query",
+          "room_id": "room3",
+          "user_id": "room3_u3",
+          "topic_id": "pet",
+          "expected_turns": [
+            29,
+            31,
+            44
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u3 nick=room3_nick_3 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u3 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 120,
+          "mode": "shared_query",
+          "room_id": "room2",
+          "user_id": "room2_u3",
+          "topic_id": "travel",
+          "expected_turns": [
+            55,
+            87
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u3 nick=room2_nick_3 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u3 credit=0.98"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 129,
+          "mode": "shared_query",
+          "room_id": "room3",
+          "user_id": "room3_u4",
+          "topic_id": "tech",
+          "expected_turns": [
+            63
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u4 nick=room3_nick_4 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u4 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": false,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 158,
+          "mode": "personal_query",
+          "room_id": "room2",
+          "user_id": "room2_u4",
+          "topic_id": "fitness",
+          "expected_turns": [
+            33,
+            47,
+            49
+          ],
+          "retrieved_turns": [
+            64,
+            87,
+            88,
+            93,
+            101,
+            102,
+            116,
+            118
+          ],
+          "fragmented": true,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u4 nick=room2_nick_4 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u4 credit=0.99",
+            "【相关主题】\n相关主题1（起始轮次=33，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第64轮：用户提到还是我刚才 user=room2_u4 topic=fitness recovery_pref；助手回应ack turn=64 room=room2 user=room2_u4 topic=fitness personal_context_kept\n\n相关主题2（起始轮次=116，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第116轮：用户提到fact:F00116 room=room2 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=116 room=room2 user=room2_u2 topic=food shared_context_kept\n\n相关主题3（起始轮次=55，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第87轮：用户提到fact:F00087 room=room2 topic=travel mode=shared shared_label=weekend_trip turn_n；助手回应ack turn=87 room=room2 user=room2_u3 topic=travel shared_context_kept\n\n相关主题4（起始轮次=19，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第118轮：用户提到fact:F00118 room=room2 user=room2_u3 topic=pet mode=personal personal_label=snac；助手回应ack turn=118 room=room2 user=room2_u3 topic=pet personal_context_kept",
+            "【相关对话片段】\n第64轮\n用户：还是我刚才 user=room2_u4 topic=fitness recovery_pref\n助手：ack turn=64 room=room2 user=room2_u4 topic=fitness personal_context_kept\n\n第88轮\n用户：fact:F00088 room=room2 user=room2_u3 topic=pet mode=personal personal_label=snack_pref turn_note=88 profile_hint=keep_actor_identity stable_\n助手：ack turn=88 room=room2 user=room2_u3 topic=pet personal_context_kept\n\n第93轮\n用户：还是我刚才 user=room2_u3 topic=pet snack_pref\n助手：ack turn=93 room=room2 user=room2_u3 topic=pet personal_context_kept\n\n第101轮\n用户：fact:F00101 room=room2 user=room2_u3 topic=pet mode=personal personal_label=snack_pref turn_note=101 profile_hint=keep_actor_identity stable\n助手：ack turn=101 room=room2 user=room2_u3 topic=pet personal_context_kept\n\n第102轮\n用户：fact:F00102 room=room2 user=room2_u3 topic=pet mode=personal personal_label=snack_pref turn_note=102 profile_hint=keep_actor_identity stable\n助手：ack turn=102 room=room2 user=room2_u3 topic=pet personal_context_kept\n\n第118轮\n用户：fact:F00118 room=room2 user=room2_u3 topic=pet mode=personal personal_label=snack_pref turn_note=118 profile_hint=keep_actor_identity stable\n助手：ack turn=118 room=room2 user=room2_u3 topic=pet personal_context_kept"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": false,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 192,
+          "mode": "shared_query",
+          "room_id": "room3",
+          "user_id": "room3_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            63,
+            145
+          ],
+          "retrieved_turns": [
+            146,
+            149,
+            163,
+            166,
+            167,
+            183,
+            184,
+            185
+          ],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u2 nick=room3_nick_2 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u2 credit=0.98",
+            "【相关主题】\n相关主题1（起始轮次=141，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第167轮：用户提到fact:F00167 room=room3 user=room3_u2 topic=tech mode=personal personal_label=too；助手回应ack turn=167 room=room3 user=room3_u2 topic=tech personal_context_kept；第185轮：用户提到fact:F00185 room=room3 topic=travel mode=shared shared_label=weekend_trip turn_n；助手回应ack turn=185 room=room3 user=room3_u3 topic=travel shared_context_kept\n\n相关主题2（起始轮次=128，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第185轮：用户提到fact:F00185 room=room3 topic=travel mode=shared shared_label=weekend_trip turn_n；助手回应ack turn=185 room=room3 user=room3_u3 topic=travel shared_context_kept\n\n相关主题3（起始轮次=125，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第149轮：用户提到继续刚才 room=room3 topic=anime seasonal_anime；助手回应ack turn=149 room=room3 user=room3_u2 topic=anime shared_context_kept\n\n相关主题4（起始轮次=126，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第184轮：用户提到fact:F00184 room=room3 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=184 room=room3 user=room3_u2 topic=food shared_context_kept",
+            "【相关对话片段】\n第146轮\n用户：fact:F00146 room=room3 user=room3_u2 topic=tech mode=personal personal_label=tool_pref turn_note=146 profile_hint=keep_actor_identity stable\n助手：ack turn=146 room=room3 user=room3_u2 topic=tech personal_context_kept\n\n第163轮\n用户：fact:F00163 room=room3 user=room3_u2 topic=tech mode=personal personal_label=tool_pref turn_note=163 profile_hint=keep_actor_identity stable\n助手：ack turn=163 room=room3 user=room3_u2 topic=tech personal_context_kept\n\n第166轮\n用户：fact:F00166 room=room3 user=room3_u2 topic=tech mode=personal personal_label=tool_pref turn_note=166 profile_hint=keep_actor_identity stable\n助手：ack turn=166 room=room3 user=room3_u2 topic=tech personal_context_kept\n\n第167轮\n用户：fact:F00167 room=room3 user=room3_u2 topic=tech mode=personal personal_label=tool_pref turn_note=167 profile_hint=keep_actor_identity stable\n助手：ack turn=167 room=room3 user=room3_u2 topic=tech personal_context_kept\n\n第183轮\n用户：fact:F00183 room=room3 user=room3_u1 topic=travel mode=personal personal_label=route_pref turn_note=183 profile_hint=keep_actor_identity sta\n助手：ack turn=183 room=room3 user=room3_u1 topic=travel personal_context_kept\n\n第185轮\n用户：fact:F00185 room=room3 topic=travel mode=shared shared_label=weekend_trip turn_note=185 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=185 room=room3 user=room3_u3 topic=travel shared_context_kept"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 207,
+          "mode": "shared_query",
+          "room_id": "room1",
+          "user_id": "room1_u3",
+          "topic_id": "travel",
+          "expected_turns": [
+            78,
+            133,
+            138
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room1 user=room1_u3 nick=room1_nick_3 scope=bilibili:room1 actor=bilibili/room:room1/uid:room1_u3 credit=0.98"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 208,
+          "mode": "shared_query",
+          "room_id": "room1",
+          "user_id": "room1_u3",
+          "topic_id": "tech",
+          "expected_turns": [
+            98,
+            139,
+            182
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room1 user=room1_u3 nick=room1_nick_3 scope=bilibili:room1 actor=bilibili/room:room1/uid:room1_u3 credit=0.98"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 209,
+          "mode": "personal_query",
+          "room_id": "room1",
+          "user_id": "room1_u1",
+          "topic_id": "travel",
+          "expected_turns": [
+            94,
+            131,
+            161
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room1 user=room1_u1 nick=room1_nick_1 scope=bilibili:room1 actor=bilibili/room:room1/uid:room1_u1 credit=0.98"
+          ]
+        }
+      ]
+    },
+    {
+      "summary": {
+        "seed": 44,
+        "turns": 240,
+        "queries": 80,
+        "shared_queries": 36,
+        "personal_queries": 44,
+        "fragmented_queries": 12,
+        "hit_rate": 0.8625,
+        "shared_hit_rate": 0.8056,
+        "personal_hit_rate": 0.9091,
+        "fragmented_hit_rate": 1.0,
+        "empty_context_rate": 0.1125,
+        "cross_room_intrusion_rate": 0.0,
+        "cross_user_personal_intrusion_rate": 0.0,
+        "avg_query_precision": 0.2245,
+        "compile_timing": {
+          "count": 240,
+          "p50_ms": 2.193,
+          "p95_ms": 4.27,
+          "max_ms": 6.593
+        },
+        "ingest_timing": {
+          "count": 240,
+          "p50_ms": 0.839,
+          "p95_ms": 1.76,
+          "max_ms": 2.485
+        },
+        "disentangle": {
+          "drop_rate": 0.0833,
+          "reset_rate": 0.0,
+          "merge_rate": 0.0083,
+          "new_stream_rate": 0.2042
+        },
+        "fingerprint_nonempty_rate": 0.9412,
+        "local_sequence_fingerprint_nonempty_rate": 0.94,
+        "anchors": 51,
+        "local_sequence_anchors": 50,
+        "memory_total": 18,
+        "cross_scope_origin_count": 0,
+        "scope_counts": {
+          "bilibili:room1": 6,
+          "bilibili:room2": 6,
+          "bilibili:room3": 6
+        },
+        "workdir": "/tmp/mori-memory-live-runs-ms8-tuned/seed_44"
+      },
+      "failure_examples": [
+        {
+          "hit": false,
+          "empty": false,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 65,
+          "mode": "shared_query",
+          "room_id": "room1",
+          "user_id": "room1_u3",
+          "topic_id": "travel",
+          "expected_turns": [
+            2
+          ],
+          "retrieved_turns": [
+            8,
+            9,
+            29,
+            44,
+            45,
+            46,
+            53
+          ],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room1 user=room1_u3 nick=room1_nick_3 scope=bilibili:room1 actor=bilibili/room:room1/uid:room1_u3 credit=1.00",
+            "【相关主题】\n相关主题1（起始轮次=2，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第53轮：用户提到fact:F00053 room=room1 user=room1_u1 topic=travel mode=personal personal_label=r；助手回应ack turn=53 room=room1 user=room1_u1 topic=travel personal_context_kept；第45轮：用户提到fact:F00045 room=room1 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=45 room=room1 user=room1_u2 topic=food shared_context_kept\n\n相关主题2（起始轮次=44，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第46轮：用户提到还是我刚才 user=room1_u3 topic=pet snack_pref；助手回应ack turn=46 room=room1 user=room1_u3 topic=pet personal_context_kept\n\n相关主题3（起始轮次=5，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第45轮：用户提到fact:F00045 room=room1 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=45 room=room1 user=room1_u2 topic=food shared_context_kept\n\n相关主题4（起始轮次=1，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第8轮：用户提到fact:F00008 room=room1 user=room1_u2 topic=tech mode=personal personal_label=too；助手回应ack turn=8 room=room1 user=room1_u2 topic=tech personal_context_kept",
+            "【相关对话片段】\n第9轮\n用户：fact:F00009 room=room1 user=room1_u1 topic=travel mode=personal personal_label=route_pref turn_note=9 profile_hint=keep_actor_identity stabl\n助手：ack turn=9 room=room1 user=room1_u1 topic=travel personal_context_kept\n\n第29轮\n用户：fact:F00029 room=room1 topic=food mode=shared shared_label=late_night_food turn_note=29 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=29 room=room1 user=room1_u2 topic=food shared_context_kept\n\n第44轮\n用户：fact:F00044 room=room1 user=room1_u3 topic=pet mode=personal personal_label=snack_pref turn_note=44 profile_hint=keep_actor_identity stable_\n助手：ack turn=44 room=room1 user=room1_u3 topic=pet personal_context_kept\n\n第45轮\n用户：fact:F00045 room=room1 topic=food mode=shared shared_label=late_night_food turn_note=45 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=45 room=room1 user=room1_u2 topic=food shared_context_kept\n\n第46轮\n用户：还是我刚才 user=room1_u3 topic=pet snack_pref\n助手：ack turn=46 room=room1 user=room1_u3 topic=pet personal_context_kept\n\n第53轮\n用户：fact:F00053 room=room1 user=room1_u1 topic=travel mode=personal personal_label=route_pref turn_note=53 profile_hint=keep_actor_identity stab\n助手：ack turn=53 room=room1 user=room1_u1 topic=travel personal_context_kept"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 92,
+          "mode": "personal_query",
+          "room_id": "room2",
+          "user_id": "room2_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            17
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u2 nick=room2_nick_2 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u2 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 113,
+          "mode": "shared_query",
+          "room_id": "room2",
+          "user_id": "room2_u1",
+          "topic_id": "anime",
+          "expected_turns": [
+            39,
+            87,
+            90
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room2 user=room2_u1 nick=room2_nick_1 scope=bilibili:room2 actor=bilibili/room:room2/uid:room2_u1 credit=0.98"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 142,
+          "mode": "personal_query",
+          "room_id": "room3",
+          "user_id": "room3_u4",
+          "topic_id": "fitness",
+          "expected_turns": [
+            34,
+            63
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u4 nick=room3_nick_4 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u4 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": false,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 143,
+          "mode": "shared_query",
+          "room_id": "room3",
+          "user_id": "room3_u2",
+          "topic_id": "tech",
+          "expected_turns": [
+            55
+          ],
+          "retrieved_turns": [
+            75,
+            77,
+            93,
+            95,
+            98,
+            130,
+            141
+          ],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u2 nick=room3_nick_2 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u2 credit=0.99",
+            "【相关主题】\n当前主题1（起始轮次=27，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第75轮：用户提到fact:F00075 room=room3 user=room3_u2 topic=tech mode=personal personal_label=too；助手回应ack turn=75 room=room3 user=room3_u2 topic=tech personal_context_kept\n\n相关主题2（起始轮次=77，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第95轮：用户提到fact:F00095 room=room3 topic=food mode=shared shared_label=late_night_food turn_；助手回应ack turn=95 room=room3 user=room3_u2 topic=food shared_context_kept\n\n相关主题3（起始轮次=130，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第130轮：用户提到fact:F00130 room=room3 user=room3_u3 topic=pet mode=personal personal_label=snac；助手回应ack turn=130 room=room3 user=room3_u3 topic=pet personal_context_kept\n\n相关主题4（起始轮次=93，memory=1）\n概况：当前活跃 topic 尚未生成闭环摘要。代表片段：第98轮：用户提到fact:F00098 room=room3 topic=anime mode=shared shared_label=seasonal_anime turn_；助手回应ack turn=98 room=room3 user=room3_u1 topic=anime shared_context_kept",
+            "【相关对话片段】\n第75轮\n用户：fact:F00075 room=room3 user=room3_u2 topic=tech mode=personal personal_label=tool_pref turn_note=75 profile_hint=keep_actor_identity stable_\n助手：ack turn=75 room=room3 user=room3_u2 topic=tech personal_context_kept\n\n第77轮\n用户：fact:F00077 room=room3 topic=food mode=shared shared_label=late_night_food turn_note=77 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=77 room=room3 user=room3_u2 topic=food shared_context_kept\n\n第93轮\n用户：fact:F00093 room=room3 topic=anime mode=shared shared_label=seasonal_anime turn_note=93 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=93 room=room3 user=room3_u1 topic=anime shared_context_kept\n\n第95轮\n用户：fact:F00095 room=room3 topic=food mode=shared shared_label=late_night_food turn_note=95 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=95 room=room3 user=room3_u2 topic=food shared_context_kept\n\n第98轮\n用户：fact:F00098 room=room3 topic=anime mode=shared shared_label=seasonal_anime turn_note=98 focus=room_discussion stable_hint=keep_room_scope\n助手：ack turn=98 room=room3 user=room3_u1 topic=anime shared_context_kept\n\n第130轮\n用户：fact:F00130 room=room3 user=room3_u3 topic=pet mode=personal personal_label=snack_pref turn_note=130 profile_hint=keep_actor_identity stable\n助手：ack turn=130 room=room3 user=room3_u3 topic=pet personal_context_kept"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 152,
+          "mode": "shared_query",
+          "room_id": "room3",
+          "user_id": "room3_u3",
+          "topic_id": "anime",
+          "expected_turns": [
+            93,
+            98
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u3 nick=room3_nick_3 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u3 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 159,
+          "mode": "shared_query",
+          "room_id": "room3",
+          "user_id": "room3_u2",
+          "topic_id": "food",
+          "expected_turns": [
+            77,
+            95
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u2 nick=room3_nick_2 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u2 credit=0.99"
+          ]
+        },
+        {
+          "hit": false,
+          "empty": true,
+          "precision": 0.0,
+          "cross_room": false,
+          "cross_user_personal": false,
+          "turn": 171,
+          "mode": "shared_query",
+          "room_id": "room3",
+          "user_id": "room3_u4",
+          "topic_id": "food",
+          "expected_turns": [
+            77,
+            95
+          ],
+          "retrieved_turns": [],
+          "fragmented": false,
+          "blocks_preview": [
+            "【事件来源】source=bilibili room=room3 user=room3_u4 nick=room3_nick_4 scope=bilibili:room3 actor=bilibili/room:room3/uid:room3_u4 credit=0.99"
+          ]
+        }
+      ]
+    }
+  ]
+}

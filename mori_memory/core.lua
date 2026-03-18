@@ -737,6 +737,7 @@ function M.compile_context(meta)
     local retrieved = topic_graph.retrieve(query_vec, current_anchor, current_turn, {
         user_input = embed_input,
         flow_key = flow_key,
+        scope_key = scope_key,
     })
     if type(retrieved) == "table" and flow_sel then
         retrieved.disentangle = flow_sel

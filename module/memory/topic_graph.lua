@@ -13,6 +13,7 @@ local M = {}
 
 local STATE_VERSION = "TG1"
 local VECTOR_MAGIC = "TGV1"
+local EMPTY_SCOPE_BUCKET = "__scope_empty__"
 
 local function tg_cfg()
     return ((config.settings or {}).topic_graph or {})
@@ -503,6 +504,7 @@ local function default_runtime()
         last_decay_turn = 0,
         flow_runtime = {},
         flow_memory_next = {},
+        scope_index = {},
     }
 end
 
@@ -510,6 +512,112 @@ local function reset_state()
     M.state = default_state()
     M.runtime = default_runtime()
     M.dirty = false
+end
+
+local function scope_bucket_key(scope_key)
+    scope_key = trim(scope_key)
+    if scope_key == "" then
+        return EMPTY_SCOPE_BUCKET
+    end
+    return scope_key
+end
+
+local function anchor_scope_key(anchor)
+    anchor = trim(anchor)
+    if anchor == "" then
+        return ""
+    end
+    local scope_key = anchor:match("^(.-)|[ASC]:%d+$")
+    return trim(scope_key or "")
+end
+
+local function topic_scope_matches(anchor, scope_key)
+    local anchor_scope = anchor_scope_key(anchor)
+    scope_key = trim(scope_key)
+    if anchor_scope == "" or scope_key == "" then
+        return anchor_scope == scope_key
+    end
+    return anchor_scope == scope_key
+end
+
+local function retrieve_scope_key(current_anchor, opts)
+    opts = type(opts) == "table" and opts or {}
+    local explicit_scope = trim(opts.scope_key or "")
+    if explicit_scope ~= "" then
+        return explicit_scope
+    end
+    local anchor_scope = anchor_scope_key(current_anchor)
+    if anchor_scope ~= "" then
+        return anchor_scope
+    end
+    local flow_key = trim(flow_key_from_opts(opts))
+    local flow_scope = flow_key:match("^(.-)%$seg:%d+$")
+    return trim(flow_scope or "")
+end
+
+local function ensure_scope_index_bucket(scope_key)
+    M.runtime = type(M.runtime) == "table" and M.runtime or default_runtime()
+    M.runtime.scope_index = type(M.runtime.scope_index) == "table" and M.runtime.scope_index or {}
+
+    local bucket_key = scope_bucket_key(scope_key)
+    local bucket = M.runtime.scope_index[bucket_key]
+    if type(bucket) ~= "table" then
+        bucket = {
+            ids = {},
+            set = {},
+        }
+        M.runtime.scope_index[bucket_key] = bucket
+    else
+        bucket.ids = type(bucket.ids) == "table" and bucket.ids or {}
+        bucket.set = type(bucket.set) == "table" and bucket.set or {}
+        for _, mem_id in ipairs(bucket.ids) do
+            local n = tonumber(mem_id)
+            if n and n > 0 then
+                bucket.set[n] = true
+            end
+        end
+    end
+    return bucket
+end
+
+local function index_memory_scope(mem_id, scope_key)
+    mem_id = tonumber(mem_id)
+    if not mem_id or mem_id <= 0 then
+        return false
+    end
+    local bucket = ensure_scope_index_bucket(scope_key)
+    if bucket.set[mem_id] then
+        return false
+    end
+    bucket.ids[#bucket.ids + 1] = mem_id
+    bucket.set[mem_id] = true
+    return true
+end
+
+local function rebuild_scope_index()
+    M.runtime = type(M.runtime) == "table" and M.runtime or default_runtime()
+    M.runtime.scope_index = {}
+    for line = 1, math.max(0, tonumber(M.state.next_line) or 1) - 1 do
+        local mem = M.state.memories[line]
+        if mem then
+            index_memory_scope(line, (mem or {}).scope_key)
+        end
+    end
+end
+
+local function merge_scope_matches(mem, incoming_scope_key)
+    local mem_scope_key = trim((mem or {}).scope_key)
+    incoming_scope_key = trim(incoming_scope_key)
+
+    if mem_scope_key == "" or incoming_scope_key == "" then
+        return mem_scope_key == incoming_scope_key
+    end
+    return mem_scope_key == incoming_scope_key
+end
+
+local function candidate_memory_ids_for_merge(scope_key)
+    local bucket = ensure_scope_index_bucket(scope_key)
+    return bucket.ids or {}
 end
 
 local function ensure_topic_node(anchor)
@@ -709,6 +817,7 @@ end
 local function rebuild_runtime_views()
     M.runtime = default_runtime()
     M.runtime.last_decay_turn = tonumber(M.state.current_turn) or 0
+    rebuild_scope_index()
     local centroids = {}
     for anchor in pairs(M.state.topic_nodes or {}) do
         local node = ensure_topic_node(anchor)
@@ -749,6 +858,9 @@ local function export_state()
                 text = tostring(mem.text or ""),
                 facets = normalize_facet_rows(mem.facets or {}, facet_slot_cap()),
                 type = tostring(mem.type or "fact"),
+                source = tostring(mem.source or ""),
+                actor_key = tostring(mem.actor_key or ""),
+                scope_key = tostring(mem.scope_key or ""),
             }
         end
     end
@@ -927,6 +1039,9 @@ local function adopt_loaded_state(parsed)
                 text = tostring((meta or {}).text or ""),
                 facets = normalize_facet_rows((meta or {}).facets or {}, facet_slot_cap()),
                 type = tostring((meta or {}).type or "fact"),
+                source = tostring((meta or {}).source or ""),
+                actor_key = tostring((meta or {}).actor_key or ""),
+                scope_key = tostring((meta or {}).scope_key or ""),
                 vec = vectors[line] or {},
             }
             update_memory_topic_anchor(M.state.memories[line])
@@ -1127,13 +1242,13 @@ local function is_topic_loaded(anchor)
     return M.runtime.loaded_topics[trim(anchor)] ~= nil
 end
 
-local function semantic_topic_scores(query_vec, current_anchor)
+local function semantic_topic_scores(query_vec, current_anchor, scope_key)
     local scores = {}
     local seen = {}
     local hcfg = hnsw_cfg()
     for _, hit in ipairs(M.runtime.hnsw:search(query_vec, math.max(hcfg.k, tonumber(tg_cfg().seed_topics) or 2)) or {}) do
         local anchor = trim(hit.anchor)
-        if anchor ~= "" then
+        if anchor ~= "" and topic_scope_matches(anchor, scope_key) then
             local score = (tonumber(tg_cfg().query_semantic_weight) or 1.0) * (tonumber(hit.similarity) or 0.0)
             if anchor == current_anchor then
                 score = score + (tonumber(tg_cfg().current_topic_bonus) or 0.12)
@@ -1143,7 +1258,7 @@ local function semantic_topic_scores(query_vec, current_anchor)
         end
     end
     for anchor, node in pairs(M.state.topic_nodes or {}) do
-        if not seen[anchor] then
+        if not seen[anchor] and topic_scope_matches(anchor, scope_key) then
             local score = (tonumber(tg_cfg().query_semantic_weight) or 1.0) * safe_similarity(query_vec, node.centroid)
             if anchor == current_anchor then
                 score = score + (tonumber(tg_cfg().current_topic_bonus) or 0.12)
@@ -1154,7 +1269,7 @@ local function semantic_topic_scores(query_vec, current_anchor)
     return scores
 end
 
-local function expand_topic_candidates(seed_scores)
+local function expand_topic_candidates(seed_scores, scope_key)
     local bridge_topk = math.max(1, tonumber(tg_cfg().bridge_topk) or 8)
     local max_hops = math.max(0, tonumber(tg_cfg().max_bridge_hops) or 2)
     local min_bridge = math.max(0.0, tonumber(tg_cfg().min_bridge_score) or 0.08)
@@ -1165,8 +1280,11 @@ local function expand_topic_candidates(seed_scores)
     local frontier = {}
     local via_bridge = {}
     for anchor, score in pairs(seed_scores or {}) do
-        scores[anchor] = tonumber(score) or 0.0
-        frontier[#frontier + 1] = { anchor = anchor, score = tonumber(score) or 0.0 }
+        anchor = trim(anchor)
+        if anchor ~= "" and topic_scope_matches(anchor, scope_key) then
+            scores[anchor] = tonumber(score) or 0.0
+            frontier[#frontier + 1] = { anchor = anchor, score = tonumber(score) or 0.0 }
+        end
     end
 
     for _ = 1, max_hops do
@@ -1184,7 +1302,7 @@ local function expand_topic_candidates(seed_scores)
                     tonumber((edge or {}).recall) or 0.0,
                     tonumber((edge or {}).adopt) or 0.0
                 )
-                if edge_score >= min_bridge then
+                if edge_score >= min_bridge and topic_scope_matches(dst, scope_key) then
                     ranked[#ranked + 1] = {
                         anchor = trim(dst),
                         score = edge_score,
@@ -1218,12 +1336,12 @@ local function expand_topic_candidates(seed_scores)
     return scores, sort_string_keys(via_bridge)
 end
 
-local function preload_topics(candidate_scores, turn)
+local function preload_topics(candidate_scores, turn, scope_key)
     local ranked = {}
     local load_budget = math.max(0, math.floor(tonumber(tg_cfg().load_budget) or 4))
     for anchor, score in pairs(candidate_scores or {}) do
         anchor = trim(anchor)
-        if anchor ~= "" then
+        if anchor ~= "" and topic_scope_matches(anchor, scope_key) then
             ranked[#ranked + 1] = {
                 anchor = anchor,
                 score = tonumber(score) or 0.0,
@@ -2106,15 +2224,16 @@ function M.add_memory(vec, turn, opts)
     local anchor = trim(opts.topic_anchor or current_anchor_for_turn(turn))
     local text = tostring(opts.text or opts.fact or "")
     local facets = normalize_facet_rows(opts.facets or {}, facet_slot_cap())
+    local scope_key = trim(opts.scope_key or "")
     if #facets <= 0 and text ~= "" then
         facets = build_facet_rows_from_text(text, true)
     end
     local merge_limit = tonumber(config.settings.merge_limit) or 0.95
 
     local best_line, best_sim = nil, -1.0
-    for line = 1, M.get_total_lines() do
+    for _, line in ipairs(candidate_memory_ids_for_merge(scope_key)) do
         local mem = M.state.memories[line]
-        if mem and type(mem.vec) == "table" and #mem.vec > 0 then
+        if mem and merge_scope_matches(mem, scope_key) and type(mem.vec) == "table" and #mem.vec > 0 then
             local sim = safe_similarity(vec, mem.vec)
             if sim > best_sim then
                 best_line = line
@@ -2161,9 +2280,10 @@ function M.add_memory(vec, turn, opts)
         type = tostring(opts.kind or "fact"),
         source = tostring(opts.source or ""),
         actor_key = tostring(opts.actor_key or ""),
-        scope_key = tostring(opts.scope_key or ""),
+        scope_key = scope_key,
         vec = vec,
     }
+    index_memory_scope(line, scope_key)
     if anchor ~= "" then
         bind_memory_to_topic(line, anchor, vec, turn, 1.0)
     end
@@ -2235,6 +2355,7 @@ end
 function M.retrieve(query_vec, current_anchor, current_turn, opts)
     opts = type(opts) == "table" and opts or {}
     local flow_key = flow_key_from_opts(opts)
+    local scope_key = retrieve_scope_key(current_anchor, opts)
     query_vec = normalize(query_vec or {})
     current_anchor = trim(current_anchor)
     current_turn = math.max(0, math.floor(tonumber(current_turn) or 0))
@@ -2259,15 +2380,15 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
     end
 
     local query_map = build_query_facet_map(opts.user_input or "")
-    local seed_scores = semantic_topic_scores(query_vec, current_anchor)
+    local seed_scores = semantic_topic_scores(query_vec, current_anchor, scope_key)
     local expanded_scores, bridge_topics
     if flow_key ~= "" then
         expanded_scores = seed_scores
         bridge_topics = {}
     else
-        expanded_scores, bridge_topics = expand_topic_candidates(seed_scores)
+        expanded_scores, bridge_topics = expand_topic_candidates(seed_scores, scope_key)
     end
-    local available_topics = preload_topics(expanded_scores, current_turn)
+    local available_topics = preload_topics(expanded_scores, current_turn, scope_key)
     local selected_topics, topic_debug, evidence_rows = retrieve_topic_evidence(
         query_vec,
         expanded_scores,
