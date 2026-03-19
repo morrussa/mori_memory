@@ -1,11 +1,14 @@
 local util = require("mori_memory.util")
 
 local config = require("module.config")
+local tool = require("module.tool")
 local history = require("module.memory.history")
 local topic = require("module.memory.topic")
 local topic_graph = require("module.memory.topic_graph")
 local grudge = require("module.memory.grudge")
 local disentangle = require("module.memory.disentangle")
+local recovery_log = require("module.memory.recovery_log")
+local thread_checkpoint = require("module.memory.thread_checkpoint")
 local saver = require("module.memory.saver")
 
 local M = {}
@@ -14,6 +17,8 @@ local _initialized = false
 local _embedder = nil
 local _recall_state_by_turn = {}
 local _recall_turn_order = {}
+local _thread_runtime_last_seq = 0
+local _thread_runtime_last_checkpoint_turn = 0
 
 local function cache_recall_state(turn, state)
     turn = math.max(0, math.floor(tonumber(turn) or 0))
@@ -196,7 +201,113 @@ local function ensure_init()
     if topic_graph and topic_graph.load then
         topic_graph.load()
     end
+    if type(disentangle) == "table" and type(disentangle.import_state) == "function" then
+        local checkpoint = nil
+        local ok_cp, cp_or_err = pcall(function()
+            return thread_checkpoint.load()
+        end)
+        if ok_cp and type(cp_or_err) == "table" then
+            checkpoint = cp_or_err
+            _thread_runtime_last_seq = math.max(0, math.floor(tonumber(checkpoint.last_seq) or 0))
+            _thread_runtime_last_checkpoint_turn = math.max(0, math.floor(tonumber(checkpoint.saved_turn) or 0))
+            pcall(function()
+                disentangle.import_state(checkpoint.state or {})
+            end)
+        else
+            _thread_runtime_last_seq = 0
+            _thread_runtime_last_checkpoint_turn = 0
+            pcall(function()
+                disentangle.reset_runtime()
+            end)
+        end
+
+        pcall(function()
+            recovery_log.set_next_seq(_thread_runtime_last_seq)
+            for _, record in ipairs(recovery_log.load_after(_thread_runtime_last_seq) or {}) do
+                if type(record) == "table"
+                    and trim(record.kind or "") == "scope_state"
+                    and type(record.scope_state) == "table"
+                    and type(disentangle.import_scope_state) == "function"
+                then
+                    disentangle.import_scope_state(record.scope_key, record.scope_state)
+                    _thread_runtime_last_seq = math.max(_thread_runtime_last_seq, math.floor(tonumber(record.seq) or 0))
+                    _thread_runtime_last_checkpoint_turn = math.max(_thread_runtime_last_checkpoint_turn, math.floor(tonumber(record.turn) or 0))
+                end
+            end
+            recovery_log.set_next_seq(_thread_runtime_last_seq)
+        end)
+    end
     _initialized = true
+end
+
+local function thread_checkpoint_interval_turns()
+    return math.max(1, math.floor(tonumber(config.get("disentangle.runtime.checkpoint_interval_turns", 24)) or 24))
+end
+
+local function append_thread_runtime_wal(turn, scope_key, reason, flow_sel)
+    if type(disentangle) ~= "table"
+        or type(disentangle.export_scope_state) ~= "function"
+        or type(flow_sel) ~= "table"
+    then
+        return false
+    end
+    local scope = trim(scope_key or "")
+    if scope == "" then
+        return false
+    end
+    local ok_append, seq_value, append_err = pcall(function()
+        return recovery_log.append({
+            turn = math.max(0, math.floor(tonumber(turn) or 0)),
+            kind = "scope_state",
+            scope_key = scope,
+            reason = trim(reason or ""),
+            scope_state = disentangle.export_scope_state(scope),
+        })
+    end)
+    if not ok_append or not seq_value then
+        print(string.format("[ThreadRuntime][WARN] append wal failed: %s", tostring(append_err or seq_value)))
+        return false
+    end
+    _thread_runtime_last_seq = math.max(_thread_runtime_last_seq, math.floor(tonumber(seq_value) or 0))
+    return true
+end
+
+local function save_thread_runtime_checkpoint(turn, force)
+    if type(disentangle) ~= "table" or type(disentangle.export_state) ~= "function" then
+        return true
+    end
+    turn = math.max(0, math.floor(tonumber(turn) or 0))
+    force = force == true
+    if not force and (turn - _thread_runtime_last_checkpoint_turn) < thread_checkpoint_interval_turns() then
+        return true
+    end
+
+    if saver and type(saver.flush_all) == "function" then
+        local ok_flush = saver.flush_all(force)
+        if ok_flush ~= true then
+            print("[ThreadRuntime][WARN] saver.flush_all failed; skip runtime checkpoint")
+            return false
+        end
+    end
+
+    local ok_save, save_ok, save_err = pcall(function()
+        return thread_checkpoint.save(disentangle.export_state(), _thread_runtime_last_seq, { turn = turn })
+    end)
+    if not ok_save or save_ok ~= true then
+        print(string.format("[ThreadRuntime][WARN] checkpoint save failed: %s", tostring(save_err or save_ok)))
+        return false
+    end
+
+    local ok_reset, reset_ok, reset_err = pcall(function()
+        return recovery_log.reset(_thread_runtime_last_seq)
+    end)
+    if not ok_reset or reset_ok ~= true then
+        print(string.format("[ThreadRuntime][WARN] wal reset failed: %s", tostring(reset_err or reset_ok)))
+        return false
+    end
+
+    _thread_runtime_last_checkpoint_turn = turn
+    return true
 end
 
 local function unique_sorted_numbers(arr)
@@ -397,49 +508,269 @@ local function build_fact_entries(meta, embed_input, assistant_text, user_vec)
     return out
 end
 
-local function commit_turn_event(event)
-    event = type(event) == "table" and event or {}
-    local anchor = trim(event.anchor or "")
-    if anchor == "" then
-        return {}
-    end
-    local turn = math.max(0, math.floor(tonumber(event.turn) or 0))
-    local flow_key = trim(event.sequence_key or "")
-    local adopted_memories = {}
+local commit_turn_events
 
-    topic_graph.observe_turn(turn, anchor, { flow_key = flow_key })
-    for _, fact in ipairs(event.facts or {}) do
-        local vec = type(fact) == "table" and fact.vec or nil
-        if type(vec) == "table" and #vec > 0 then
-            local line = topic_graph.add_memory(vec, turn, {
-                topic_anchor = anchor,
-                text = tostring((fact or {}).text or ""),
-                kind = "fact",
-                source = tostring(event.source or ""),
-                actor_key = tostring(event.actor_key or ""),
-                scope_key = tostring(event.scope_key or ""),
-            })
-            if line then
-                adopted_memories[#adopted_memories + 1] = line
+local function normalize_fact_key(text)
+    local key = trim(text):lower()
+    key = key:gsub("%s+", "")
+    return key
+end
+
+local function count_map_keys(map)
+    local n = 0
+    for key, value in pairs(map or {}) do
+        if value and trim(key) ~= "" then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function single_actor_key(actor_set)
+    local keys = {}
+    for actor_key, value in pairs(actor_set or {}) do
+        actor_key = trim(actor_key)
+        if value and actor_key ~= "" then
+            keys[#keys + 1] = actor_key
+        end
+    end
+    table.sort(keys)
+    if #keys == 1 then
+        return keys[1], 1
+    end
+    return "", #keys
+end
+
+local function build_chunk_summary(group)
+    group = type(group) == "table" and group or {}
+    local turns = unique_sorted_numbers(group.turns or {})
+    local first_turn = turns[1] or 0
+    local last_turn = turns[#turns] or first_turn
+    local fact_count = #(group.fact_order or {})
+    local actor_count = math.max(1, count_map_keys(group.actor_set))
+    if first_turn > 0 and last_turn > 0 then
+        if first_turn == last_turn then
+            return string.format("线程片段：第%d轮，%d条事实，%d位参与者。", first_turn, fact_count, actor_count)
+        end
+        return string.format("线程片段：第%d至%d轮，%d条事实，%d位参与者。", first_turn, last_turn, fact_count, actor_count)
+    end
+    return string.format("线程片段：%d条事实，%d位参与者。", fact_count, actor_count)
+end
+
+local function build_chunk_groups(events)
+    local groups_by_key = {}
+    local ordered_groups = {}
+
+    for _, raw_event in ipairs(events or {}) do
+        local event = type(raw_event) == "table" and raw_event or {}
+        local anchor = trim(event.anchor or "")
+        local turn = math.max(0, math.floor(tonumber(event.turn) or 0))
+        if anchor ~= "" and turn > 0 then
+            local scope_key = trim(event.scope_key or "")
+            local thread_key = trim(event.thread_key or "")
+            local segment_key = trim(event.segment_key or "")
+            local group_key = table.concat({
+                scope_key,
+                thread_key,
+                segment_key,
+                anchor,
+            }, "\31")
+            local group = groups_by_key[group_key]
+            if type(group) ~= "table" then
+                group = {
+                    key = group_key,
+                    anchor = anchor,
+                    scope_key = scope_key,
+                    thread_key = thread_key,
+                    segment_key = segment_key,
+                    source = tostring(event.source or ""),
+                    events = {},
+                    turns = {},
+                    actor_set = {},
+                    facts_by_key = {},
+                    fact_order = {},
+                }
+                groups_by_key[group_key] = group
+                ordered_groups[#ordered_groups + 1] = group
+            elseif trim(group.source or "") == "" and trim(event.source or "") ~= "" then
+                group.source = tostring(event.source or "")
+            end
+
+            group.events[#group.events + 1] = event
+            group.turns[#group.turns + 1] = turn
+
+            local event_actor_key = trim(event.actor_key or "")
+            if event_actor_key ~= "" then
+                group.actor_set[event_actor_key] = true
+            end
+
+            for idx, fact in ipairs(event.facts or {}) do
+                local fact_text = trim((fact or {}).text or "")
+                local fact_vec = type(fact) == "table" and fact.vec or nil
+                if type(fact_vec) == "table" and #fact_vec > 0 then
+                    local fact_key = normalize_fact_key(fact_text)
+                    if fact_key == "" then
+                        fact_key = string.format("turn:%d#%d", turn, idx)
+                    end
+                    local fact_bucket = group.facts_by_key[fact_key]
+                    if type(fact_bucket) ~= "table" then
+                        fact_bucket = {
+                            key = fact_key,
+                            text = fact_text,
+                            vectors = {},
+                            turns = {},
+                            actor_set = {},
+                            events = {},
+                        }
+                        group.facts_by_key[fact_key] = fact_bucket
+                        group.fact_order[#group.fact_order + 1] = fact_bucket
+                    end
+                    if utf8_len(fact_text) > utf8_len(fact_bucket.text or "") then
+                        fact_bucket.text = fact_text
+                    end
+                    fact_bucket.vectors[#fact_bucket.vectors + 1] = fact_vec
+                    fact_bucket.turns[#fact_bucket.turns + 1] = turn
+                    fact_bucket.events[event] = true
+                    if event_actor_key ~= "" then
+                        fact_bucket.actor_set[event_actor_key] = true
+                    end
+                end
             end
         end
     end
-    topic_graph.observe_feedback(anchor, event.recall_state or {}, adopted_memories, turn, {
-        flow_key = flow_key,
-    })
-    event.adopted_memories = adopted_memories
-    return adopted_memories
-end
 
-local function commit_turn_events(events, current_turn)
-    local adopted_for_current = {}
-    for _, event in ipairs(events or {}) do
-        local adopted = commit_turn_event(event)
-        if math.floor(tonumber((event or {}).turn) or 0) == math.floor(tonumber(current_turn) or -1) then
-            adopted_for_current = adopted
+    for _, group in ipairs(ordered_groups) do
+        group.turns = unique_sorted_numbers(group.turns)
+        for _, fact_bucket in ipairs(group.fact_order or {}) do
+            fact_bucket.turns = unique_sorted_numbers(fact_bucket.turns)
         end
     end
-    return adopted_for_current
+    return ordered_groups
+end
+
+local function commit_chunk_group(group)
+    group = type(group) == "table" and group or {}
+    local adopted_by_event = {}
+    local adopted_all = {}
+    local turns = unique_sorted_numbers(group.turns or {})
+    local latest_turn = turns[#turns] or 0
+    local anchor = trim(group.anchor or "")
+    local scope_key = trim(group.scope_key or "")
+    local thread_key = trim(group.thread_key or "")
+    local segment_key = trim(group.segment_key or "")
+    local source = tostring(group.source or "")
+
+    local chunk_vectors = {}
+    for _, fact_bucket in ipairs(group.fact_order or {}) do
+        local fact_vec = tool.average_vectors(fact_bucket.vectors or {})
+        if type(fact_vec) == "table" and #fact_vec > 0 then
+            chunk_vectors[#chunk_vectors + 1] = fact_vec
+        end
+    end
+
+    local chunk_memory_id = nil
+    if anchor ~= "" and latest_turn > 0 and #chunk_vectors > 0 then
+        chunk_memory_id = topic_graph.add_memory(tool.average_vectors(chunk_vectors), latest_turn, {
+            topic_anchor = anchor,
+            text = build_chunk_summary(group),
+            kind = "chunk",
+            source = source,
+            scope_key = scope_key,
+            thread_key = thread_key,
+            segment_key = segment_key,
+            memory_scope = "thread",
+            turns = turns,
+            allow_merge = false,
+        })
+        if chunk_memory_id then
+            adopted_all[#adopted_all + 1] = chunk_memory_id
+        end
+    end
+
+    for _, event in ipairs(group.events or {}) do
+        adopted_by_event[event] = {}
+        if chunk_memory_id then
+            adopted_by_event[event][#adopted_by_event[event] + 1] = chunk_memory_id
+        end
+    end
+
+    for _, fact_bucket in ipairs(group.fact_order or {}) do
+        local fact_vec = tool.average_vectors(fact_bucket.vectors or {})
+        if type(fact_vec) == "table" and #fact_vec > 0 then
+            local actor_key, actor_count = single_actor_key(fact_bucket.actor_set)
+            local memory_scope = (actor_count == 1 and actor_key ~= "") and "actor" or "scope"
+            local memory_id = topic_graph.add_memory(fact_vec, latest_turn, {
+                topic_anchor = anchor,
+                text = tostring(fact_bucket.text or ""),
+                kind = "fact",
+                source = source,
+                actor_key = memory_scope == "actor" and actor_key or "",
+                scope_key = scope_key,
+                thread_key = thread_key,
+                segment_key = segment_key,
+                memory_scope = memory_scope,
+                turns = fact_bucket.turns,
+            })
+            if memory_id then
+                adopted_all[#adopted_all + 1] = memory_id
+                for event in pairs(fact_bucket.events or {}) do
+                    local event_rows = adopted_by_event[event]
+                    if type(event_rows) ~= "table" then
+                        event_rows = {}
+                        adopted_by_event[event] = event_rows
+                    end
+                    event_rows[#event_rows + 1] = memory_id
+                end
+            end
+        end
+    end
+
+    for _, event in ipairs(group.events or {}) do
+        local event_turn = math.max(0, math.floor(tonumber(event.turn) or latest_turn))
+        local flow_key = trim(event.sequence_key or "")
+        local event_anchor = trim(event.anchor or anchor)
+        local event_adopted = unique_sorted_numbers(adopted_by_event[event] or {})
+        event.adopted_memories = event_adopted
+        topic_graph.observe_feedback(event_anchor, event.recall_state or {}, event_adopted, event_turn, {
+            flow_key = flow_key,
+        })
+    end
+
+    return unique_sorted_numbers(adopted_all), adopted_by_event
+end
+
+local function commit_turn_event(event)
+    event = type(event) == "table" and event or {}
+    return commit_turn_events({ event }, math.floor(tonumber(event.turn) or -1))
+end
+
+commit_turn_events = function(events, current_turn)
+    local adopted_for_current = {}
+    local current_turn_floor = math.floor(tonumber(current_turn) or -1)
+
+    for _, event in ipairs(events or {}) do
+        local anchor = trim((event or {}).anchor or "")
+        local turn = math.max(0, math.floor(tonumber((event or {}).turn) or 0))
+        if anchor ~= "" and turn > 0 then
+            topic_graph.observe_turn(turn, anchor, {
+                flow_key = trim((event or {}).sequence_key or ""),
+            })
+        end
+    end
+
+    for _, group in ipairs(build_chunk_groups(events)) do
+        local _, adopted_by_event = commit_chunk_group(group)
+        for event, adopted in pairs(adopted_by_event or {}) do
+            local event_turn = math.floor(tonumber((event or {}).turn) or -1)
+            if event_turn == current_turn_floor then
+                for _, mem_id in ipairs(adopted or {}) do
+                    adopted_for_current[#adopted_for_current + 1] = mem_id
+                end
+            end
+        end
+    end
+
+    return unique_sorted_numbers(adopted_for_current)
 end
 
 function M.ingest_turn(meta)
@@ -506,6 +837,7 @@ function M.ingest_turn(meta)
     local flow_sel = type(recall_state) == "table" and type(recall_state.disentangle) == "table" and recall_state.disentangle or nil
     local dropped = flow_sel and flow_sel.dropped == true
     local flow_key = flow_sel and trim(flow_sel.sequence_key or "") or ""
+    local allow_local_pending = flow_sel and flow_sel.pending_only == true and allow_write == true
     local allow_global_topic = not (flow_sel and flow_sel.use_local_sequence == true)
 
     local user_vec = nil
@@ -556,7 +888,7 @@ function M.ingest_turn(meta)
     end
 
     local adopted_memories = {}
-    if allow_write and anchor ~= "" then
+    if ((allow_write and anchor ~= "") or (allow_local_pending and anchor ~= "")) then
         local facts = build_fact_entries(meta, embed_input, assistant_text, user_vec)
         if flow_sel and type(disentangle) == "table" and type(disentangle.stage) == "function" then
             local ok_stage, staged = pcall(function()
@@ -577,7 +909,7 @@ function M.ingest_turn(meta)
             if ok_stage and type(staged) == "table" then
                 adopted_memories = commit_turn_events(staged, turn)
             end
-        else
+        elseif allow_write then
             adopted_memories = commit_turn_event({
                 turn = turn,
                 anchor = anchor,
@@ -598,6 +930,10 @@ function M.ingest_turn(meta)
 
     if saver and saver.mark_dirty then
         saver.mark_dirty()
+    end
+    if flow_sel then
+        append_thread_runtime_wal(turn, scope_key, flow_sel.reason or "", flow_sel)
+        save_thread_runtime_checkpoint(turn, false)
     end
     if guard_enabled() then
         grudge.save()
@@ -720,7 +1056,7 @@ function M.compile_context(meta)
         cache_recall_state(current_turn, empty_recall)
         return blocks
     end
-    if current_anchor == "" then
+    if current_anchor == "" and not (flow_sel and flow_sel.local_only == true) then
         if topic.get_stable_anchor then
             current_anchor = trim(topic.get_stable_anchor(current_turn) or "")
         end
@@ -733,14 +1069,36 @@ function M.compile_context(meta)
     end
 
     local flow_key = flow_sel and trim(flow_sel.sequence_key or "") or ""
-
-    local retrieved = topic_graph.retrieve(query_vec, current_anchor, current_turn, {
-        user_input = embed_input,
-        flow_key = flow_key,
-        scope_key = scope_key,
-    })
-    if type(retrieved) == "table" and flow_sel then
-        retrieved.disentangle = flow_sel
+    local retrieved = nil
+    if flow_sel and flow_sel.local_only == true then
+        retrieved = {
+            context = "",
+            topic_anchor = current_anchor,
+            predicted_topics = {},
+            predicted_memories = {},
+            predicted_nodes = {},
+            selected_turns = {},
+            selected_memories = {},
+            memory_anchors = {},
+            fragments = {},
+            adopted_memories = {},
+            bridge_topics = {},
+            candidate_topics = {},
+            local_signals = {},
+            topic_debug = {},
+            disentangle = flow_sel,
+        }
+    else
+        retrieved = topic_graph.retrieve(query_vec, current_anchor, current_turn, {
+            user_input = embed_input,
+            flow_key = flow_key,
+            scope_key = scope_key,
+            actor_key = actor_key,
+            thread_key = flow_sel and trim(flow_sel.thread_key or "") or "",
+        })
+        if type(retrieved) == "table" and flow_sel then
+            retrieved.disentangle = flow_sel
+        end
     end
     cache_recall_state(current_turn, retrieved)
 
@@ -768,7 +1126,14 @@ function M.compile_context(meta)
 end
 
 function M.shutdown()
-    if type(disentangle) == "table" and type(disentangle.flush_all) == "function" then
+    local runtime_persist_enabled = type(disentangle) == "table"
+        and type(disentangle.export_state) == "function"
+        and type(thread_checkpoint) == "table"
+        and type(thread_checkpoint.save) == "function"
+    if (not runtime_persist_enabled)
+        and type(disentangle) == "table"
+        and type(disentangle.flush_all) == "function"
+    then
         pcall(function()
             commit_turn_events(disentangle.flush_all(), -1)
         end)
@@ -778,8 +1143,12 @@ function M.shutdown()
             grudge.save()
         end)
     end
+    local exit_ok = true
     if saver and saver.on_exit then
-        saver.on_exit()
+        exit_ok = saver.on_exit() == true
+    end
+    if exit_ok then
+        save_thread_runtime_checkpoint(history.get_turn and history.get_turn() or 0, true)
     end
 end
 

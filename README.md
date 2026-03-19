@@ -69,3 +69,7 @@ local blocks = memory.compile_context({
 - `memory/history.txt`
 - `memory/topic.bin`
 - `memory/v4/topic_graph/`
+
+## 设计文档
+
+- [Thread-First Memory Design](docs/thread_first_memory_design.md)

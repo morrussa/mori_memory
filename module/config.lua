@@ -159,22 +159,51 @@ local DEFAULT_SETTINGS = {
         enable_sources = { "bilibili" },
 
         -- Max parallel streams per scope (upper bound).
-        max_streams = 3,
-        -- When streams are full and the new turn cannot match any stream
-        -- (below assign_threshold), it will be dropped from memory writes.
+        max_streams = 6,
         -- Rolling window size for stream centroid.
         window_size = 4,
 
         -- Stream assignment thresholds (cosine similarity-ish).
         assign_threshold = 0.80,
+        -- Below `assign_threshold` but above this threshold, ambiguous turns
+        -- stay in local pending instead of immediately opening/committing.
+        pending_threshold = 0.72,
+        -- If best-vs-second-best margin is smaller than this, prefer
+        -- `keep_pending` over eager routing.
+        pending_margin = 0.06,
 
         -- Heuristics.
         same_user_bonus = 0.06,
+        participant_bonus = 0.03,
+        mention_bonus = 0.05,
+        addressee_hint_bonus = 0.04,
+        reply_cue_bonus = 0.05,
+        reply_recent_turns = 6,
+        centroid_weight = 0.42,
+        tail_weight = 0.38,
+        head_weight = 0.20,
+        stability_bonus = 0.04,
+        stability_turns = 4,
         age_penalty = 0.01,
         stale_turns = 60,
+        orphan_stale_turns = 20,
+        local_pending_cap = 4,
+        -- Real live rooms contain many short reaction-like messages. When they
+        -- are recent and low-information, prefer attaching them to a recent
+        -- stable stream instead of spawning endless orphan threads.
+        reaction_fallback_enabled = true,
+        reaction_short_chars = 6,
+        reaction_max_chars = 10,
+        reaction_attach_score = 0.46,
+        reaction_dominant_score = 0.36,
+        reaction_recent_turns = 3,
+        reaction_stability_min = 0.18,
+        ambient_enabled = true,
+        ambient_local_pending_cap = 12,
         -- In split/local-sequence mode, keep the newest turn in each segment
         -- pending until another turn confirms it or it idles out.
         commit_idle_turns = 2,
+        commit_chunk_turns = 2,
         pending_context_turns = 2,
 
         -- If set, assign-but-reset the stream topic when centroid similarity
@@ -187,6 +216,10 @@ local DEFAULT_SETTINGS = {
         merge_idle_turns = 8,
         merge_streak_turns = 4,
         reset_on_merge = true,
+        runtime = {
+            root = "memory/v4/runtime",
+            checkpoint_interval_turns = 24,
+        },
     },
 }
 

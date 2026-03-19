@@ -157,6 +157,24 @@ local function flow_key_from_opts(opts)
     return trim(opts.flow_key or opts.flow or "")
 end
 
+local function actor_key_from_opts(opts)
+    opts = type(opts) == "table" and opts or {}
+    return trim(opts.actor_key or "")
+end
+
+local function thread_key_from_opts(opts)
+    opts = type(opts) == "table" and opts or {}
+    return trim(opts.thread_key or "")
+end
+
+local function normalize_memory_scope(memory_scope)
+    memory_scope = trim(memory_scope):lower()
+    if memory_scope == "thread" or memory_scope == "actor" then
+        return memory_scope
+    end
+    return "scope"
+end
+
 local function ensure_runtime_state(flow_key)
     flow_key = trim(flow_key)
     if flow_key == "" then
@@ -615,6 +633,56 @@ local function merge_scope_matches(mem, incoming_scope_key)
     return mem_scope_key == incoming_scope_key
 end
 
+local function memory_scope_of(mem)
+    return normalize_memory_scope((mem or {}).memory_scope)
+end
+
+local function memory_visible_for_keys(mem, scope_key, actor_key, thread_key)
+    if type(mem) ~= "table" then
+        return false
+    end
+    if not merge_scope_matches(mem, scope_key) then
+        return false
+    end
+
+    local memory_scope = memory_scope_of(mem)
+    if memory_scope == "thread" then
+        local mem_thread_key = trim((mem or {}).thread_key or "")
+        thread_key = trim(thread_key or "")
+        return mem_thread_key ~= "" and thread_key ~= "" and mem_thread_key == thread_key
+    end
+    if memory_scope == "actor" then
+        local mem_actor_key = trim((mem or {}).actor_key or "")
+        actor_key = trim(actor_key or "")
+        return mem_actor_key ~= "" and actor_key ~= "" and mem_actor_key == actor_key
+    end
+    return true
+end
+
+local function merge_memory_matches(mem, incoming_scope_key, incoming_actor_key, incoming_thread_key, incoming_memory_scope)
+    if not merge_scope_matches(mem, incoming_scope_key) then
+        return false
+    end
+
+    local existing_scope = memory_scope_of(mem)
+    local target_scope = normalize_memory_scope(incoming_memory_scope)
+    if existing_scope ~= target_scope then
+        return false
+    end
+
+    if target_scope == "thread" then
+        local mem_thread_key = trim((mem or {}).thread_key or "")
+        incoming_thread_key = trim(incoming_thread_key or "")
+        return mem_thread_key ~= "" and incoming_thread_key ~= "" and mem_thread_key == incoming_thread_key
+    end
+    if target_scope == "actor" then
+        local mem_actor_key = trim((mem or {}).actor_key or "")
+        incoming_actor_key = trim(incoming_actor_key or "")
+        return mem_actor_key ~= "" and incoming_actor_key ~= "" and mem_actor_key == incoming_actor_key
+    end
+    return true
+end
+
 local function candidate_memory_ids_for_merge(scope_key)
     local bucket = ensure_scope_index_bucket(scope_key)
     return bucket.ids or {}
@@ -861,6 +929,9 @@ local function export_state()
                 source = tostring(mem.source or ""),
                 actor_key = tostring(mem.actor_key or ""),
                 scope_key = tostring(mem.scope_key or ""),
+                thread_key = tostring(mem.thread_key or ""),
+                segment_key = tostring(mem.segment_key or ""),
+                memory_scope = normalize_memory_scope(mem.memory_scope),
             }
         end
     end
@@ -1042,6 +1113,9 @@ local function adopt_loaded_state(parsed)
                 source = tostring((meta or {}).source or ""),
                 actor_key = tostring((meta or {}).actor_key or ""),
                 scope_key = tostring((meta or {}).scope_key or ""),
+                thread_key = tostring((meta or {}).thread_key or ""),
+                segment_key = tostring((meta or {}).segment_key or ""),
+                memory_scope = normalize_memory_scope((meta or {}).memory_scope),
                 vec = vectors[line] or {},
             }
             update_memory_topic_anchor(M.state.memories[line])
@@ -1627,6 +1701,9 @@ local function one_turn_momentum_scores(query_vec, current_anchor, current_turn,
 
     opts = type(opts) == "table" and opts or {}
     local flow_key = flow_key_from_opts(opts)
+    local scope_key = retrieve_scope_key(current_anchor, opts)
+    local actor_key = actor_key_from_opts(opts)
+    local thread_key = thread_key_from_opts(opts)
     local rt = ensure_runtime_state(flow_key)
     local memory_next = M.state.memory_next
     if flow_key ~= "" then
@@ -1664,7 +1741,11 @@ local function one_turn_momentum_scores(query_vec, current_anchor, current_turn,
         local bucket = memory_next[tonumber(prev_mem)] or {}
         for mem_id, weight in pairs(bucket) do
             local mem = M.state.memories[tonumber(mem_id)]
-            if mem and type(mem.vec) == "table" and #mem.vec > 0 then
+            if mem
+                and memory_visible_for_keys(mem, scope_key, actor_key, thread_key)
+                and type(mem.vec) == "table"
+                and #mem.vec > 0
+            then
                 scores[tonumber(mem_id)] = math.max(
                     tonumber(scores[tonumber(mem_id)]) or -1e9,
                     safe_similarity(query_vec, mem.vec) + recent_weight * gap_factor * (tonumber(weight) or 0.0)
@@ -1680,12 +1761,23 @@ local function retrieve_topic_evidence(query_vec, candidate_scores, available_to
     local local_cfg = tg_cfg().deep_artmap or {}
     local family_of = get_topic_families(available_topics)
     local momentum_scores = one_turn_momentum_scores(query_vec, current_anchor, current_turn, opts)
+    local scope_key = retrieve_scope_key(current_anchor, opts)
+    local actor_key = actor_key_from_opts(opts)
+    local thread_key = thread_key_from_opts(opts)
     local evidence_topics = {}
     local evidence_memories = {}
     local evidence_by_topic = {}
     local evidence_rows = {}
     local local_signals = {}
     local topic_rows = {}
+
+    local function visible_memory(mem_id)
+        local mem = M.state.memories[tonumber(mem_id)]
+        if memory_visible_for_keys(mem, scope_key, actor_key, thread_key) then
+            return mem
+        end
+        return nil
+    end
 
     for _, anchor in ipairs(available_topics or {}) do
         local node = ensure_topic_node(anchor)
@@ -1694,11 +1786,11 @@ local function retrieve_topic_evidence(query_vec, candidate_scores, available_to
                 node.local_state,
                 query_vec,
                 function(mem_id)
-                    local mem = M.state.memories[tonumber(mem_id)]
+                    local mem = visible_memory(mem_id)
                     return mem and mem.vec or nil
                 end,
                 function(mem_id)
-                    local mem = M.state.memories[tonumber(mem_id)]
+                    local mem = visible_memory(mem_id)
                     return memory_facet_rows(mem)
                 end,
                 {
@@ -1723,7 +1815,8 @@ local function retrieve_topic_evidence(query_vec, candidate_scores, available_to
             local seen_ids = {}
             for _, item in ipairs(candidates or {}) do
                 local mem_id = tonumber((item or {}).mem_idx)
-                if mem_id and mem_id > 0 then
+                local mem = visible_memory(mem_id)
+                if mem_id and mem_id > 0 and mem then
                     if not seen_ids[mem_id] then
                         seen_ids[mem_id] = true
                         candidate_ids[#candidate_ids + 1] = mem_id
@@ -1751,20 +1844,23 @@ local function retrieve_topic_evidence(query_vec, candidate_scores, available_to
             if #candidate_ids <= 0 then
                 for _, mem_id in ipairs(node.memory_ids or {}) do
                     mem_id = tonumber(mem_id)
-                    if mem_id and mem_id > 0 and not seen_ids[mem_id] then
+                    local mem = visible_memory(mem_id)
+                    if mem_id and mem_id > 0 and mem and not seen_ids[mem_id] then
                         seen_ids[mem_id] = true
                         candidate_ids[#candidate_ids + 1] = mem_id
                     end
-                    local_score_map[mem_id] = safe_similarity(query_vec, ((M.state.memories[mem_id] or {}).vec))
-                    local_group_map[mem_id] = tonumber(((M.state.memories[mem_id] or {}).cluster_id)) or 0
-                    local_category_map[mem_id] = tonumber(((M.state.memories[mem_id] or {}).cluster_id)) or 0
-                    local_bundle_map[mem_id] = 0
+                    if mem then
+                        local_score_map[mem_id] = safe_similarity(query_vec, mem.vec)
+                        local_group_map[mem_id] = tonumber(mem.cluster_id) or 0
+                        local_category_map[mem_id] = tonumber(mem.cluster_id) or 0
+                        local_bundle_map[mem_id] = 0
+                    end
                 end
             end
 
             local semantic_map = {}
             for _, mem_id in ipairs(candidate_ids) do
-                local mem = M.state.memories[tonumber(mem_id)]
+                local mem = visible_memory(mem_id)
                 semantic_map[mem_id] = safe_similarity(query_vec, mem and mem.vec)
             end
 
@@ -2224,7 +2320,15 @@ function M.add_memory(vec, turn, opts)
     local anchor = trim(opts.topic_anchor or current_anchor_for_turn(turn))
     local text = tostring(opts.text or opts.fact or "")
     local facets = normalize_facet_rows(opts.facets or {}, facet_slot_cap())
+    local actor_key = trim(opts.actor_key or "")
     local scope_key = trim(opts.scope_key or "")
+    local thread_key = trim(opts.thread_key or "")
+    local segment_key = trim(opts.segment_key or "")
+    local memory_scope = normalize_memory_scope(opts.memory_scope)
+    local turns = unique_sorted_numbers(opts.turns or { turn })
+    if #turns <= 0 then
+        turns = { turn }
+    end
     if #facets <= 0 and text ~= "" then
         facets = build_facet_rows_from_text(text, true)
     end
@@ -2233,7 +2337,11 @@ function M.add_memory(vec, turn, opts)
     local best_line, best_sim = nil, -1.0
     for _, line in ipairs(candidate_memory_ids_for_merge(scope_key)) do
         local mem = M.state.memories[line]
-        if mem and merge_scope_matches(mem, scope_key) and type(mem.vec) == "table" and #mem.vec > 0 then
+        if mem
+            and merge_memory_matches(mem, scope_key, actor_key, thread_key, memory_scope)
+            and type(mem.vec) == "table"
+            and #mem.vec > 0
+        then
             local sim = safe_similarity(vec, mem.vec)
             if sim > best_sim then
                 best_line = line
@@ -2244,9 +2352,18 @@ function M.add_memory(vec, turn, opts)
 
     if best_line and best_sim >= merge_limit and opts.allow_merge ~= false then
         local mem = M.state.memories[best_line]
-        local last_turn = tonumber((mem.turns or {})[#(mem.turns or {})]) or -1
-        if last_turn ~= turn then
-            mem.turns[#mem.turns + 1] = turn
+        mem.turns = unique_sorted_numbers((function()
+            local merged_turns = {}
+            for _, existing_turn in ipairs(mem.turns or {}) do
+                merged_turns[#merged_turns + 1] = existing_turn
+            end
+            for _, incoming_turn in ipairs(turns) do
+                merged_turns[#merged_turns + 1] = incoming_turn
+            end
+            return merged_turns
+        end)())
+        if #mem.turns <= 0 then
+            mem.turns = shallow_copy_array(turns)
         end
         if text ~= "" and trim(mem.text) == "" then
             mem.text = text
@@ -2254,12 +2371,19 @@ function M.add_memory(vec, turn, opts)
         if trim(mem.source or "") == "" and trim(opts.source or "") ~= "" then
             mem.source = tostring(opts.source or "")
         end
-        if trim(mem.actor_key or "") == "" and trim(opts.actor_key or "") ~= "" then
-            mem.actor_key = tostring(opts.actor_key or "")
+        if trim(mem.actor_key or "") == "" and actor_key ~= "" then
+            mem.actor_key = actor_key
         end
-        if trim(mem.scope_key or "") == "" and trim(opts.scope_key or "") ~= "" then
-            mem.scope_key = tostring(opts.scope_key or "")
+        if trim(mem.scope_key or "") == "" and scope_key ~= "" then
+            mem.scope_key = scope_key
         end
+        if trim(mem.thread_key or "") == "" and thread_key ~= "" then
+            mem.thread_key = thread_key
+        end
+        if trim(mem.segment_key or "") == "" and segment_key ~= "" then
+            mem.segment_key = segment_key
+        end
+        mem.memory_scope = memory_scope_of(mem)
         mem.facets = merge_facet_rows(mem.facets or {}, facets)
         if anchor ~= "" then
             bind_memory_to_topic(best_line, anchor, mem.vec, turn, 1.0, { preserve_cluster_id = true })
@@ -2271,7 +2395,7 @@ function M.add_memory(vec, turn, opts)
     local line = math.max(1, tonumber(M.state.next_line) or 1)
     M.state.next_line = line + 1
     M.state.memories[line] = {
-        turns = { turn },
+        turns = turns,
         topic_anchor = anchor,
         cluster_id = -1,
         origin_topics = {},
@@ -2279,8 +2403,11 @@ function M.add_memory(vec, turn, opts)
         facets = facets,
         type = tostring(opts.kind or "fact"),
         source = tostring(opts.source or ""),
-        actor_key = tostring(opts.actor_key or ""),
+        actor_key = actor_key,
         scope_key = scope_key,
+        thread_key = thread_key,
+        segment_key = segment_key,
+        memory_scope = memory_scope,
         vec = vec,
     }
     index_memory_scope(line, scope_key)

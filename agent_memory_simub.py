@@ -514,10 +514,24 @@ class MemoryHarness:
             config.settings.disentangle.enable_sources = {{ "bilibili" }}
             config.settings.disentangle.max_streams = {int(self.args.max_streams)}
             config.settings.disentangle.assign_threshold = {float(self.args.assign_threshold)}
+            config.settings.disentangle.pending_threshold = {float(self.args.pending_threshold)}
+            config.settings.disentangle.pending_margin = {float(self.args.pending_margin)}
             config.settings.disentangle.reset_threshold = {float(self.args.reset_threshold)}
+            config.settings.disentangle.participant_bonus = {float(self.args.participant_bonus)}
+            config.settings.disentangle.mention_bonus = {float(self.args.mention_bonus)}
+            config.settings.disentangle.addressee_hint_bonus = {float(self.args.addressee_hint_bonus)}
+            config.settings.disentangle.reply_cue_bonus = {float(self.args.reply_cue_bonus)}
+            config.settings.disentangle.reply_recent_turns = {int(self.args.reply_recent_turns)}
+            config.settings.disentangle.centroid_weight = {float(self.args.centroid_weight)}
+            config.settings.disentangle.tail_weight = {float(self.args.tail_weight)}
+            config.settings.disentangle.head_weight = {float(self.args.head_weight)}
+            config.settings.disentangle.stability_bonus = {float(self.args.stability_bonus)}
+            config.settings.disentangle.stability_turns = {int(self.args.stability_turns)}
             config.settings.disentangle.commit_idle_turns = {int(self.args.commit_idle_turns)}
             config.settings.disentangle.pending_context_turns = {int(self.args.pending_context_turns)}
             config.settings.disentangle.stale_turns = {int(self.args.stale_turns)}
+            config.settings.disentangle.orphan_stale_turns = {int(self.args.orphan_stale_turns)}
+            config.settings.disentangle.local_pending_cap = {int(self.args.local_pending_cap)}
             """
         )
 
@@ -540,8 +554,12 @@ class MemoryHarness:
                 "is_new": bool(disentangle["is_new"]) if disentangle else False,
                 "merged": bool(disentangle["merged"]) if disentangle else False,
                 "dropped": bool(disentangle["dropped"]) if disentangle else False,
+                "pending_only": bool(disentangle["pending_only"]) if disentangle else False,
+                "local_only": bool(disentangle["local_only"]) if disentangle else False,
+                "orphaned": bool(disentangle["orphaned"]) if disentangle else False,
                 "use_local_sequence": bool(disentangle["use_local_sequence"]) if disentangle else False,
                 "sequence_key": str(disentangle["sequence_key"] or "") if disentangle else "",
+                "thread_key": str(disentangle["thread_key"] or "") if disentangle else "",
                 "mode": str(disentangle["mode"] or "") if disentangle else "",
             },
         }
@@ -589,12 +607,23 @@ def evaluate_query(
     room_id = turn_meta["room_id"]
     user_id = turn_meta["user_id"]
     topic_id = turn_meta["topic_id"]
+    broad_key = str(turn_meta.get("broad_key") or "")
+    strict_key = str(turn_meta.get("strict_key") or "")
     cross_room = False
+    cross_thread_pollution = False
     cross_user_personal = False
+    cross_actor_personal_leak = False
     for retrieved_turn in retrieved:
         meta = scenario.turn_meta[retrieved_turn]
         if meta["room_id"] != room_id:
             cross_room = True
+        if (
+            broad_key
+            and str(meta.get("broad_key") or "") == broad_key
+            and strict_key
+            and str(meta.get("strict_key") or "") != strict_key
+        ):
+            cross_thread_pollution = True
         if (
             turn_meta["eval_scope"] == "personal"
             and meta["room_id"] == room_id
@@ -603,13 +632,22 @@ def evaluate_query(
             and meta["mode"].startswith("personal")
         ):
             cross_user_personal = True
+        if (
+            turn_meta["eval_scope"] == "personal"
+            and meta["room_id"] == room_id
+            and meta["user_id"] != user_id
+            and meta["mode"].startswith("personal")
+        ):
+            cross_actor_personal_leak = True
 
     return {
         "hit": hit,
         "empty": empty,
         "precision": precision,
         "cross_room": cross_room,
+        "cross_thread_pollution": cross_thread_pollution,
         "cross_user_personal": cross_user_personal,
+        "cross_actor_personal_leak": cross_actor_personal_leak,
     }
 
 
@@ -632,6 +670,8 @@ def run_single(seed: int, args: argparse.Namespace, workdir: Path) -> dict[str, 
     failure_examples: list[dict[str, Any]] = []
     disentangle_stats = {
         "dropped": 0,
+        "pending_only": 0,
+        "orphaned": 0,
         "reset_topic": 0,
         "merged": 0,
         "is_new": 0,
@@ -676,6 +716,8 @@ def run_single(seed: int, args: argparse.Namespace, workdir: Path) -> dict[str, 
                         "room_id": spec["room_id"],
                         "user_id": spec["user_id"],
                         "topic_id": spec["topic_id"],
+                        "broad_key": spec["broad_key"],
+                        "strict_key": spec["strict_key"],
                         "expected_turns": spec["expected_turns"],
                         "retrieved_turns": sorted(retrieved_turns),
                         "fragmented": bool(spec["fragmented"]),
@@ -683,9 +725,12 @@ def run_single(seed: int, args: argparse.Namespace, workdir: Path) -> dict[str, 
                     }
                 )
                 query_records.append(record)
-                if (not record["hit"] or record["cross_room"] or record["cross_user_personal"]) and len(
-                    failure_examples
-                ) < 8:
+                if (
+                    not record["hit"]
+                    or record["cross_room"]
+                    or record["cross_thread_pollution"]
+                    or record["cross_actor_personal_leak"]
+                ) and len(failure_examples) < 8:
                     failure_examples.append(record)
 
             ingest_meta = dict(request_meta)
@@ -703,6 +748,10 @@ def run_single(seed: int, args: argparse.Namespace, workdir: Path) -> dict[str, 
             reason = ingest_result["disentangle"]["reason"]
             if ingest_result["disentangle"]["dropped"]:
                 disentangle_stats["dropped"] += 1
+            if ingest_result["disentangle"]["pending_only"]:
+                disentangle_stats["pending_only"] += 1
+            if ingest_result["disentangle"]["orphaned"]:
+                disentangle_stats["orphaned"] += 1
             if reason == "reset_topic":
                 disentangle_stats["reset_topic"] += 1
             if ingest_result["disentangle"]["merged"]:
@@ -743,12 +792,16 @@ def run_single(seed: int, args: argparse.Namespace, workdir: Path) -> dict[str, 
             "fragmented_hit_rate": round(hit_rate(fragmented_queries), 4),
             "empty_context_rate": round(rate(query_records, "empty"), 4),
             "cross_room_intrusion_rate": round(rate(query_records, "cross_room"), 4),
+            "cross_thread_pollution_rate": round(rate(query_records, "cross_thread_pollution"), 4),
             "cross_user_personal_intrusion_rate": round(rate(personal_queries, "cross_user_personal"), 4),
+            "cross_actor_personal_leak_rate": round(rate(personal_queries, "cross_actor_personal_leak"), 4),
             "avg_query_precision": round(mean_or_zero([r["precision"] for r in query_records]), 4),
             "compile_timing": summarize_ms(compile_ms),
             "ingest_timing": summarize_ms(ingest_ms),
             "disentangle": {
                 "drop_rate": round(disentangle_stats["dropped"] / float(args.turns or 1), 4),
+                "pending_rate": round(disentangle_stats["pending_only"] / float(args.turns or 1), 4),
+                "orphan_rate": round(disentangle_stats["orphaned"] / float(args.turns or 1), 4),
                 "reset_rate": round(disentangle_stats["reset_topic"] / float(args.turns or 1), 4),
                 "merge_rate": round(disentangle_stats["merged"] / float(args.turns or 1), 4),
                 "new_stream_rate": round(disentangle_stats["is_new"] / float(args.turns or 1), 4),
@@ -782,7 +835,9 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "fragmented_hit_rate",
         "empty_context_rate",
         "cross_room_intrusion_rate",
+        "cross_thread_pollution_rate",
         "cross_user_personal_intrusion_rate",
+        "cross_actor_personal_leak_rate",
         "avg_query_precision",
         "fingerprint_nonempty_rate",
         "local_sequence_fingerprint_nonempty_rate",
@@ -829,10 +884,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-selected-turns", type=int, default=6)
     parser.add_argument("--max-streams", type=int, default=4)
     parser.add_argument("--assign-threshold", type=float, default=0.80)
+    parser.add_argument("--pending-threshold", type=float, default=0.72)
+    parser.add_argument("--pending-margin", type=float, default=0.06)
     parser.add_argument("--reset-threshold", type=float, default=0.62)
+    parser.add_argument("--participant-bonus", type=float, default=0.03)
+    parser.add_argument("--mention-bonus", type=float, default=0.05)
+    parser.add_argument("--addressee-hint-bonus", type=float, default=0.04)
+    parser.add_argument("--reply-cue-bonus", type=float, default=0.05)
+    parser.add_argument("--reply-recent-turns", type=int, default=6)
+    parser.add_argument("--centroid-weight", type=float, default=0.42)
+    parser.add_argument("--tail-weight", type=float, default=0.38)
+    parser.add_argument("--head-weight", type=float, default=0.20)
+    parser.add_argument("--stability-bonus", type=float, default=0.04)
+    parser.add_argument("--stability-turns", type=int, default=4)
     parser.add_argument("--commit-idle-turns", type=int, default=2)
     parser.add_argument("--pending-context-turns", type=int, default=2)
     parser.add_argument("--stale-turns", type=int, default=80)
+    parser.add_argument("--orphan-stale-turns", type=int, default=20)
+    parser.add_argument("--local-pending-cap", type=int, default=4)
     parser.add_argument("--workdir", type=str, default="", help="Keep run artifacts under this directory")
     parser.add_argument("--output", type=str, default="sim_results_live.json")
     return parser.parse_args()
@@ -862,7 +931,8 @@ def main() -> int:
             summary = result["summary"]
             print(
                 "seed={seed} hit={hit:.4f} shared={shared:.4f} personal={personal:.4f} "
-                "frag={frag:.4f} cross_room={cross:.4f} cross_user={cross_user:.4f} "
+                "frag={frag:.4f} cross_room={cross:.4f} cross_thread={cross_thread:.4f} "
+                "actor_leak={actor_leak:.4f} "
                 "compile_p95={compile_p95:.3f}ms ingest_p95={ingest_p95:.3f}ms memories={mem}".format(
                     seed=seed,
                     hit=summary["hit_rate"],
@@ -870,7 +940,8 @@ def main() -> int:
                     personal=summary["personal_hit_rate"],
                     frag=summary["fragmented_hit_rate"],
                     cross=summary["cross_room_intrusion_rate"],
-                    cross_user=summary["cross_user_personal_intrusion_rate"],
+                    cross_thread=summary["cross_thread_pollution_rate"],
+                    actor_leak=summary["cross_actor_personal_leak_rate"],
                     compile_p95=summary["compile_timing"]["p95_ms"],
                     ingest_p95=summary["ingest_timing"]["p95_ms"],
                     mem=summary["memory_total"],
@@ -889,6 +960,16 @@ def main() -> int:
                 "max_streams": args.max_streams,
                 "assign_threshold": args.assign_threshold,
                 "reset_threshold": args.reset_threshold,
+                "participant_bonus": args.participant_bonus,
+                "mention_bonus": args.mention_bonus,
+                "addressee_hint_bonus": args.addressee_hint_bonus,
+                "reply_cue_bonus": args.reply_cue_bonus,
+                "reply_recent_turns": args.reply_recent_turns,
+                "centroid_weight": args.centroid_weight,
+                "tail_weight": args.tail_weight,
+                "head_weight": args.head_weight,
+                "stability_bonus": args.stability_bonus,
+                "stability_turns": args.stability_turns,
                 "commit_idle_turns": args.commit_idle_turns,
                 "pending_context_turns": args.pending_context_turns,
                 "stale_turns": args.stale_turns,
@@ -902,14 +983,16 @@ def main() -> int:
         agg = payload["aggregate"]
         print(
             "aggregate hit={hit:.4f} shared={shared:.4f} personal={personal:.4f} "
-            "frag={frag:.4f} cross_room={cross:.4f} cross_user={cross_user:.4f} "
+            "frag={frag:.4f} cross_room={cross:.4f} cross_thread={cross_thread:.4f} "
+            "actor_leak={actor_leak:.4f} "
             "compile_p95={compile_p95:.3f}ms ingest_p95={ingest_p95:.3f}ms output={output}".format(
                 hit=agg.get("hit_rate", 0.0),
                 shared=agg.get("shared_hit_rate", 0.0),
                 personal=agg.get("personal_hit_rate", 0.0),
                 frag=agg.get("fragmented_hit_rate", 0.0),
                 cross=agg.get("cross_room_intrusion_rate", 0.0),
-                cross_user=agg.get("cross_user_personal_intrusion_rate", 0.0),
+                cross_thread=agg.get("cross_thread_pollution_rate", 0.0),
+                actor_leak=agg.get("cross_actor_personal_leak_rate", 0.0),
                 compile_p95=agg.get("compile_p95_ms", 0.0),
                 ingest_p95=agg.get("ingest_p95_ms", 0.0),
                 output=str(output_path),
