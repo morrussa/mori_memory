@@ -52,6 +52,25 @@ local DEFAULT_SETTINGS = {
         topic_prior_weight = 1.00,
         flow_runtime_ttl = 128,
         flow_runtime_cap = 256,
+        activation = {
+            -- Topic activation is a non-exclusive temporal signal layer.
+            -- It does not change primary memory->topic ownership.
+            decay = 0.985,
+            max_strength = 8.0,
+            bind_inject = 1.0,
+            recall_inject = 0.10,
+            adopt_inject = 0.18,
+            open_threshold = 0.25,
+            active_threshold = 0.25,
+            close_threshold = 0.12,
+            windows_cap = 128,
+            -- Conservative retrieval prior from topic activation.
+            prior_weight = 0.08,
+            prior_max_bonus = 0.10,
+            prior_semantic_gate = 0.35,
+            prior_recency_turns = 64,
+            prior_closed_window_factor = 0.60,
+        },
         deep_artmap = {
             category_vigilance = 0.88,
             category_beta = 0.28,

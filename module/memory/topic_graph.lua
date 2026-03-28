@@ -532,6 +532,68 @@ local function reset_state()
     M.dirty = false
 end
 
+local function topic_activation_cfg()
+    local cfg = tg_cfg().activation or {}
+    return {
+        decay = clamp(tonumber(cfg.decay) or 0.985, 0.0, 1.0),
+        max_strength = math.max(0.10, tonumber(cfg.max_strength) or 8.0),
+        bind_inject = math.max(0.0, tonumber(cfg.bind_inject) or 1.0),
+        recall_inject = math.max(0.0, tonumber(cfg.recall_inject) or 0.10),
+        adopt_inject = math.max(0.0, tonumber(cfg.adopt_inject) or 0.18),
+        open_threshold = math.max(0.0, tonumber(cfg.open_threshold) or 0.25),
+        active_threshold = math.max(0.0, tonumber(cfg.active_threshold) or 0.25),
+        close_threshold = math.max(0.0, tonumber(cfg.close_threshold) or 0.12),
+        windows_cap = math.max(8, math.floor(tonumber(cfg.windows_cap) or 128)),
+        prior_weight = math.max(0.0, tonumber(cfg.prior_weight) or 0.08),
+        prior_max_bonus = math.max(0.0, tonumber(cfg.prior_max_bonus) or 0.10),
+        prior_semantic_gate = clamp(tonumber(cfg.prior_semantic_gate) or 0.35, -1.0, 1.0),
+        prior_recency_turns = math.max(1, math.floor(tonumber(cfg.prior_recency_turns) or 64)),
+        prior_closed_window_factor = clamp(tonumber(cfg.prior_closed_window_factor) or 0.60, 0.0, 1.0),
+    }
+end
+
+local function normalize_activation_window(row)
+    row = type(row) == "table" and row or {}
+    local start_turn = math.max(0, math.floor(tonumber(row.start_turn) or 0))
+    local end_turn = math.max(0, math.floor(tonumber(row.end_turn) or 0))
+    local last_turn = math.max(0, math.floor(tonumber(row.last_turn) or 0))
+    if start_turn > 0 and last_turn < start_turn then
+        last_turn = start_turn
+    end
+    if start_turn > 0 and end_turn > 0 and end_turn < start_turn then
+        end_turn = start_turn
+    end
+    local peak_strength = math.max(0.0, tonumber(row.peak_strength) or 0.0)
+    local peak_turn = math.max(0, math.floor(tonumber(row.peak_turn) or last_turn))
+    if start_turn > 0 and peak_turn < start_turn then
+        peak_turn = start_turn
+    end
+    return {
+        start_turn = start_turn,
+        end_turn = end_turn,
+        last_turn = last_turn,
+        peak_strength = peak_strength,
+        peak_turn = peak_turn,
+        touches = math.max(0, math.floor(tonumber(row.touches) or 0)),
+        close_reason = trim(row.close_reason or ""),
+        open_reason = trim(row.open_reason or ""),
+    }
+end
+
+local function copy_activation_window(row)
+    local norm = normalize_activation_window(row)
+    return {
+        start_turn = norm.start_turn,
+        end_turn = norm.end_turn,
+        last_turn = norm.last_turn,
+        peak_strength = norm.peak_strength,
+        peak_turn = norm.peak_turn,
+        touches = norm.touches,
+        close_reason = norm.close_reason,
+        open_reason = norm.open_reason,
+    }
+end
+
 local function scope_bucket_key(scope_key)
     scope_key = trim(scope_key)
     if scope_key == "" then
@@ -688,7 +750,236 @@ local function candidate_memory_ids_for_merge(scope_key)
     return bucket.ids or {}
 end
 
-local function ensure_topic_node(anchor)
+local ensure_topic_node
+
+local function ensure_topic_activation(node)
+    node = type(node) == "table" and node or {}
+    local cfg = topic_activation_cfg()
+    local act = type(node.topic_activation) == "table" and node.topic_activation or {}
+    act.strength = clamp(math.max(0.0, tonumber(act.strength) or 0.0), 0.0, cfg.max_strength)
+    act.last_turn = math.max(0, math.floor(tonumber(act.last_turn) or 0))
+    act.last_inject_turn = math.max(0, math.floor(tonumber(act.last_inject_turn) or 0))
+    act.last_active_turn = math.max(0, math.floor(tonumber(act.last_active_turn) or 0))
+    act.windows = type(act.windows) == "table" and act.windows or {}
+
+    local windows = {}
+    for _, row in ipairs(act.windows or {}) do
+        local normalized = normalize_activation_window(row)
+        if normalized.start_turn > 0 then
+            windows[#windows + 1] = normalized
+        end
+    end
+    table.sort(windows, function(a, b)
+        if (a.start_turn or 0) ~= (b.start_turn or 0) then
+            return (a.start_turn or 0) < (b.start_turn or 0)
+        end
+        return (a.end_turn or 0) < (b.end_turn or 0)
+    end)
+    while #windows > cfg.windows_cap do
+        table.remove(windows, 1)
+    end
+    act.windows = windows
+
+    if type(act.open_window) == "table" then
+        local open_window = normalize_activation_window(act.open_window)
+        if open_window.start_turn > 0 then
+            open_window.end_turn = 0
+            open_window.close_reason = ""
+            act.open_window = open_window
+        else
+            act.open_window = nil
+        end
+    else
+        act.open_window = nil
+    end
+
+    node.topic_activation = act
+    return act
+end
+
+local function close_topic_activation_window(node, turn, reason)
+    node = type(node) == "table" and node or {}
+    local act = ensure_topic_activation(node)
+    local open_window = type(act.open_window) == "table" and act.open_window or nil
+    if not open_window then
+        return false
+    end
+
+    local close_turn = math.max(0, math.floor(tonumber(turn) or 0))
+    if open_window.start_turn > 0 and close_turn < open_window.start_turn then
+        close_turn = open_window.start_turn
+    end
+    open_window.last_turn = math.max(open_window.last_turn or 0, close_turn)
+    open_window.end_turn = close_turn
+    open_window.close_reason = trim(reason or "inactive")
+
+    local cfg = topic_activation_cfg()
+    act.windows[#act.windows + 1] = normalize_activation_window(open_window)
+    while #act.windows > cfg.windows_cap do
+        table.remove(act.windows, 1)
+    end
+    act.open_window = nil
+    return true
+end
+
+local function decay_topic_activation(node, turn, delta, cfg)
+    node = type(node) == "table" and node or {}
+    cfg = type(cfg) == "table" and cfg or topic_activation_cfg()
+    local act = ensure_topic_activation(node)
+    turn = math.max(0, math.floor(tonumber(turn) or 0))
+    delta = math.max(0, math.floor(tonumber(delta) or 0))
+    local changed = false
+
+    if delta > 0 and cfg.decay < 0.999999 then
+        local factor = cfg.decay ^ delta
+        local prev_strength = act.strength
+        act.strength = clamp(math.max(0.0, prev_strength * factor), 0.0, cfg.max_strength)
+        if math.abs(act.strength - prev_strength) > 1e-9 then
+            changed = true
+        end
+    end
+    if turn > act.last_turn then
+        act.last_turn = turn
+    end
+    if act.strength >= cfg.active_threshold then
+        act.last_active_turn = math.max(act.last_active_turn or 0, turn)
+    end
+
+    if type(act.open_window) == "table" and act.strength < cfg.close_threshold then
+        if close_topic_activation_window(node, turn, "decay") then
+            changed = true
+        end
+    end
+    if act.strength < 1e-6 then
+        act.strength = 0.0
+    end
+    return changed
+end
+
+local function inject_topic_activation(anchor, turn, amount, reason)
+    anchor = trim(anchor)
+    if anchor == "" then
+        return false
+    end
+    local node = ensure_topic_node(anchor)
+    if not node then
+        return false
+    end
+    local cfg = topic_activation_cfg()
+    local act = ensure_topic_activation(node)
+    turn = math.max(0, math.floor(tonumber(turn) or tonumber(M.state.current_turn) or 0))
+
+    if turn > act.last_turn then
+        decay_topic_activation(node, turn, turn - act.last_turn, cfg)
+        act = ensure_topic_activation(node)
+    end
+
+    local boost = math.max(0.0, tonumber(amount) or 0.0)
+    if boost <= 0.0 then
+        return false
+    end
+
+    act.strength = clamp(act.strength + boost, 0.0, cfg.max_strength)
+    act.last_turn = math.max(act.last_turn or 0, turn)
+    act.last_inject_turn = math.max(act.last_inject_turn or 0, turn)
+    if act.strength >= cfg.active_threshold then
+        act.last_active_turn = math.max(act.last_active_turn or 0, turn)
+    end
+
+    if type(act.open_window) ~= "table" then
+        if act.strength >= cfg.open_threshold then
+            act.open_window = normalize_activation_window({
+                start_turn = turn,
+                end_turn = 0,
+                last_turn = turn,
+                peak_strength = act.strength,
+                peak_turn = turn,
+                touches = 1,
+                open_reason = trim(reason or ""),
+            })
+            act.open_window.end_turn = 0
+        end
+    else
+        local open_window = act.open_window
+        open_window.last_turn = math.max(math.floor(tonumber(open_window.last_turn) or 0), turn)
+        open_window.touches = math.max(0, math.floor(tonumber(open_window.touches) or 0)) + 1
+        if act.strength >= math.max(0.0, tonumber(open_window.peak_strength) or 0.0) then
+            open_window.peak_strength = act.strength
+            open_window.peak_turn = turn
+        end
+    end
+    return true
+end
+
+local function topic_activation_prior(anchor, current_turn, semantic_similarity, cfg)
+    anchor = trim(anchor)
+    if anchor == "" then
+        return 0.0, nil
+    end
+
+    cfg = type(cfg) == "table" and cfg or topic_activation_cfg()
+    local semantic = tonumber(semantic_similarity) or 0.0
+    if semantic < cfg.prior_semantic_gate then
+        return 0.0, {
+            semantic_similarity = semantic,
+            semantic_gated = true,
+            gate = cfg.prior_semantic_gate,
+        }
+    end
+
+    local node = M.state.topic_nodes[anchor]
+    if type(node) ~= "table" then
+        return 0.0, nil
+    end
+    local act = ensure_topic_activation(node)
+    local strength = math.max(0.0, tonumber(act.strength) or 0.0)
+    if strength <= 1e-6 then
+        return 0.0, {
+            semantic_similarity = semantic,
+            semantic_gated = false,
+            strength = 0.0,
+        }
+    end
+
+    local max_strength = math.max(1e-6, tonumber(cfg.max_strength) or 1.0)
+    local normalized_strength = clamp(strength / max_strength, 0.0, 1.0)
+    local semantic_factor = 1.0
+    if cfg.prior_semantic_gate < 0.999 then
+        semantic_factor = clamp((semantic - cfg.prior_semantic_gate) / (1.0 - cfg.prior_semantic_gate), 0.0, 1.0)
+    end
+
+    current_turn = math.max(0, math.floor(tonumber(current_turn) or 0))
+    local last_signal_turn = math.max(
+        math.floor(tonumber(act.last_inject_turn) or 0),
+        math.floor(tonumber(act.last_active_turn) or 0),
+        math.floor(tonumber(act.last_turn) or 0)
+    )
+    local age = math.max(0, current_turn - last_signal_turn)
+    local recency = math.exp(-age / math.max(1, cfg.prior_recency_turns))
+    local open_factor = (type(act.open_window) == "table") and 1.0 or cfg.prior_closed_window_factor
+    local raw = normalized_strength * semantic_factor * recency * open_factor
+    local bonus = clamp(cfg.prior_weight * raw, 0.0, cfg.prior_max_bonus)
+    if bonus < 1e-6 then
+        bonus = 0.0
+    end
+
+    return bonus, {
+        semantic_similarity = semantic,
+        semantic_gated = false,
+        gate = cfg.prior_semantic_gate,
+        strength = strength,
+        strength_norm = normalized_strength,
+        recency = recency,
+        age = age,
+        open_window = type(act.open_window) == "table",
+        open_factor = open_factor,
+        semantic_factor = semantic_factor,
+        raw = raw,
+        bonus = bonus,
+    }
+end
+
+ensure_topic_node = function(anchor)
     anchor = trim(anchor)
     if anchor == "" then
         return nil
@@ -703,6 +994,14 @@ local function ensure_topic_node(anchor)
             memory_prior = {},
             local_state = deep_artmap.new_state(),
             last_turn = 0,
+            topic_activation = {
+                strength = 0.0,
+                last_turn = 0,
+                last_inject_turn = 0,
+                last_active_turn = 0,
+                windows = {},
+                open_window = nil,
+            },
         }
         M.state.topic_nodes[anchor] = node
     else
@@ -716,6 +1015,7 @@ local function ensure_topic_node(anchor)
         node.local_state = deep_artmap.ensure_state(node.local_state)
         node.last_turn = math.max(0, math.floor(tonumber(node.last_turn) or 0))
     end
+    ensure_topic_activation(node)
     return node
 end
 
@@ -850,6 +1150,8 @@ local function bind_memory_to_topic(mem_id, anchor, vec, turn, amount, opts)
     mem.origin_topics = type(mem.origin_topics) == "table" and mem.origin_topics or {}
     mem.origin_topics[anchor] = (tonumber(mem.origin_topics[anchor]) or 0.0) + amount
     update_memory_topic_anchor(mem)
+    local activation = topic_activation_cfg()
+    inject_topic_activation(anchor, turn, activation.bind_inject * math.max(0.25, amount), "bind")
     if type(vec) == "table" and #vec > 0 then
         local local_cfg = tg_cfg().deep_artmap or {}
         local inserted = nil
@@ -889,6 +1191,7 @@ local function rebuild_runtime_views()
     local centroids = {}
     for anchor in pairs(M.state.topic_nodes or {}) do
         local node = ensure_topic_node(anchor)
+        ensure_topic_activation(node)
         if type(node.centroid) ~= "table" or #node.centroid <= 0 then
             recompute_topic_centroid(anchor)
         end
@@ -911,6 +1214,30 @@ local function current_anchor_for_turn(turn)
         return trim(topic.get_topic_anchor(turn))
     end
     return ""
+end
+
+local function export_topic_activation(act)
+    act = type(act) == "table" and act or {}
+    local out = {
+        strength = math.max(0.0, tonumber(act.strength) or 0.0),
+        last_turn = math.max(0, math.floor(tonumber(act.last_turn) or 0)),
+        last_inject_turn = math.max(0, math.floor(tonumber(act.last_inject_turn) or 0)),
+        last_active_turn = math.max(0, math.floor(tonumber(act.last_active_turn) or 0)),
+        windows = {},
+        open_window = nil,
+    }
+    for _, row in ipairs(act.windows or {}) do
+        local normalized = normalize_activation_window(row)
+        if normalized.start_turn > 0 then
+            out.windows[#out.windows + 1] = copy_activation_window(normalized)
+        end
+    end
+    if type(act.open_window) == "table" then
+        local open_window = copy_activation_window(act.open_window)
+        open_window.end_turn = 0
+        out.open_window = open_window
+    end
+    return out
 end
 
 local function export_state()
@@ -954,6 +1281,7 @@ local function export_state()
                 last_bundle_turn = tonumber(node.local_state.last_bundle_turn) or 0,
             },
             last_turn = tonumber(node.last_turn) or 0,
+            topic_activation = export_topic_activation(node.topic_activation),
         }
     end
 
@@ -1133,6 +1461,8 @@ local function adopt_loaded_state(parsed)
         ensured.memory_prior = type((node or {}).memory_prior) == "table" and (node or {}).memory_prior or {}
         ensured.local_state = deep_artmap.ensure_state((node or {}).local_state)
         ensured.last_turn = tonumber((node or {}).last_turn) or 0
+        ensured.topic_activation = type((node or {}).topic_activation) == "table" and (node or {}).topic_activation or {}
+        ensure_topic_activation(ensured)
     end
 
     for src, bucket in pairs(parsed.topic_edges or {}) do
@@ -1316,31 +1646,62 @@ local function is_topic_loaded(anchor)
     return M.runtime.loaded_topics[trim(anchor)] ~= nil
 end
 
-local function semantic_topic_scores(query_vec, current_anchor, scope_key)
+local function semantic_topic_scores(query_vec, current_anchor, scope_key, current_turn)
     local scores = {}
+    local base_scores = {}
+    local activation_bonus = {}
+    local activation_prior = {}
     local seen = {}
+    local act_cfg = topic_activation_cfg()
+    current_turn = math.max(0, math.floor(tonumber(current_turn) or tonumber(M.state.current_turn) or 0))
     local hcfg = hnsw_cfg()
     for _, hit in ipairs(M.runtime.hnsw:search(query_vec, math.max(hcfg.k, tonumber(tg_cfg().seed_topics) or 2)) or {}) do
         local anchor = trim(hit.anchor)
         if anchor ~= "" and topic_scope_matches(anchor, scope_key) then
-            local score = (tonumber(tg_cfg().query_semantic_weight) or 1.0) * (tonumber(hit.similarity) or 0.0)
+            local semantic = tonumber(hit.similarity) or 0.0
+            local score = (tonumber(tg_cfg().query_semantic_weight) or 1.0) * semantic
             if anchor == current_anchor then
                 score = score + (tonumber(tg_cfg().current_topic_bonus) or 0.12)
             end
-            scores[anchor] = math.max(tonumber(scores[anchor]) or -1e9, score)
+            local prior_bonus, prior_detail = topic_activation_prior(anchor, current_turn, semantic, act_cfg)
+            local final_score = score + prior_bonus
+            base_scores[anchor] = math.max(tonumber(base_scores[anchor]) or -1e9, score)
+            activation_bonus[anchor] = math.max(tonumber(activation_bonus[anchor]) or 0.0, prior_bonus)
+            if type(prior_detail) == "table" then
+                local old = activation_prior[anchor]
+                if type(old) ~= "table" or (tonumber(prior_detail.bonus) or 0.0) >= (tonumber(old.bonus) or -1e9) then
+                    activation_prior[anchor] = prior_detail
+                end
+            end
+            scores[anchor] = math.max(tonumber(scores[anchor]) or -1e9, final_score)
             seen[anchor] = true
         end
     end
     for anchor, node in pairs(M.state.topic_nodes or {}) do
         if not seen[anchor] and topic_scope_matches(anchor, scope_key) then
-            local score = (tonumber(tg_cfg().query_semantic_weight) or 1.0) * safe_similarity(query_vec, node.centroid)
+            local semantic = safe_similarity(query_vec, node.centroid)
+            local score = (tonumber(tg_cfg().query_semantic_weight) or 1.0) * semantic
             if anchor == current_anchor then
                 score = score + (tonumber(tg_cfg().current_topic_bonus) or 0.12)
             end
-            scores[anchor] = math.max(tonumber(scores[anchor]) or -1e9, score)
+            local prior_bonus, prior_detail = topic_activation_prior(anchor, current_turn, semantic, act_cfg)
+            local final_score = score + prior_bonus
+            base_scores[anchor] = math.max(tonumber(base_scores[anchor]) or -1e9, score)
+            activation_bonus[anchor] = math.max(tonumber(activation_bonus[anchor]) or 0.0, prior_bonus)
+            if type(prior_detail) == "table" then
+                local old = activation_prior[anchor]
+                if type(old) ~= "table" or (tonumber(prior_detail.bonus) or 0.0) >= (tonumber(old.bonus) or -1e9) then
+                    activation_prior[anchor] = prior_detail
+                end
+            end
+            scores[anchor] = math.max(tonumber(scores[anchor]) or -1e9, final_score)
         end
     end
-    return scores
+    return scores, {
+        base_scores = base_scores,
+        activation_bonus = activation_bonus,
+        activation_prior = activation_prior,
+    }
 end
 
 local function expand_topic_candidates(seed_scores, scope_key)
@@ -1756,7 +2117,7 @@ local function one_turn_momentum_scores(query_vec, current_anchor, current_turn,
     return scores
 end
 
-local function retrieve_topic_evidence(query_vec, candidate_scores, available_topics, current_anchor, current_turn, query_map, opts)
+local function retrieve_topic_evidence(query_vec, candidate_scores, available_topics, current_anchor, current_turn, query_map, opts, seed_debug)
     local per_topic_evidence = math.max(1, tonumber(tg_cfg().per_topic_evidence) or 3)
     local local_cfg = tg_cfg().deep_artmap or {}
     local family_of = get_topic_families(available_topics)
@@ -1912,6 +2273,8 @@ local function retrieve_topic_evidence(query_vec, candidate_scores, available_to
                 anchor = anchor,
                 total_score = total_score,
                 route_score = tonumber(candidate_scores[anchor]) or 0.0,
+                route_base_score = tonumber((((seed_debug or {}).base_scores or {})[anchor])) or 0.0,
+                activation_bonus = tonumber((((seed_debug or {}).activation_bonus or {})[anchor])) or 0.0,
                 peak_sim = peak_sim,
                 mean_sim = mean_sim,
                 topic_cover = topic_facet_cover(best_memories),
@@ -1932,6 +2295,9 @@ local function retrieve_topic_evidence(query_vec, candidate_scores, available_to
         ranked_topics = ranked_topics,
         local_signals = local_signals,
         topic_rows = topic_rows,
+        seed_base_scores = type((seed_debug or {}).base_scores) == "table" and (seed_debug or {}).base_scores or {},
+        seed_activation_bonus = type((seed_debug or {}).activation_bonus) == "table" and (seed_debug or {}).activation_bonus or {},
+        seed_activation_prior = type((seed_debug or {}).activation_prior) == "table" and (seed_debug or {}).activation_prior or {},
     }, evidence_rows
 end
 
@@ -2135,42 +2501,46 @@ local function apply_decay(turn)
     if turn <= 0 or turn <= last then
         return
     end
-    local decay = clamp(tonumber(tg_cfg().decay) or 0.995, 0.0, 1.0)
     local delta = turn - last
-    if delta <= 0 or decay >= 0.999999 then
+    if delta <= 0 then
         M.runtime.last_decay_turn = turn
         return
     end
-    local factor = decay ^ delta
+    local decay = clamp(tonumber(tg_cfg().decay) or 0.995, 0.0, 1.0)
+    local factor = decay >= 0.999999 and 1.0 or (decay ^ delta)
     local bundle_decay = clamp(tonumber((((tg_cfg().deep_artmap) or {}).bundle_decay)) or decay, 0.0, 1.0)
-    local bundle_factor = bundle_decay ^ delta
-    for src, bucket in pairs(M.state.topic_edges or {}) do
-        for dst, edge in pairs(bucket or {}) do
-            edge.transition = (tonumber(edge.transition) or 0.0) * factor
-            edge.recall = (tonumber(edge.recall) or 0.0) * factor
-            edge.adopt = (tonumber(edge.adopt) or 0.0) * factor
-            if (edge.transition + edge.recall + edge.adopt) < 1e-4 then
-                bucket[dst] = nil
+    local bundle_factor = bundle_decay >= 0.999999 and 1.0 or (bundle_decay ^ delta)
+    if factor < 0.999999 then
+        for src, bucket in pairs(M.state.topic_edges or {}) do
+            for dst, edge in pairs(bucket or {}) do
+                edge.transition = (tonumber(edge.transition) or 0.0) * factor
+                edge.recall = (tonumber(edge.recall) or 0.0) * factor
+                edge.adopt = (tonumber(edge.adopt) or 0.0) * factor
+                if (edge.transition + edge.recall + edge.adopt) < 1e-4 then
+                    bucket[dst] = nil
+                end
+            end
+            if not next(bucket) then
+                M.state.topic_edges[src] = nil
             end
         end
-        if not next(bucket) then
-            M.state.topic_edges[src] = nil
-        end
-    end
-    for src, bucket in pairs(M.state.memory_next or {}) do
-        for dst, weight in pairs(bucket or {}) do
-            local v = (tonumber(weight) or 0.0) * factor
-            if v < 1e-4 then
-                bucket[dst] = nil
-            else
-                bucket[dst] = v
+        for src, bucket in pairs(M.state.memory_next or {}) do
+            for dst, weight in pairs(bucket or {}) do
+                local v = (tonumber(weight) or 0.0) * factor
+                if v < 1e-4 then
+                    bucket[dst] = nil
+                else
+                    bucket[dst] = v
+                end
+            end
+            if not next(bucket) then
+                M.state.memory_next[src] = nil
             end
         end
-        if not next(bucket) then
-            M.state.memory_next[src] = nil
-        end
     end
+    local activation_cfg = topic_activation_cfg()
     for _, node in pairs(M.state.topic_nodes or {}) do
+        decay_topic_activation(node, turn, delta, activation_cfg)
         deep_artmap.decay(node.local_state, bundle_factor)
     end
     M.runtime.last_decay_turn = turn
@@ -2215,6 +2585,125 @@ end
 
 function M.get_cluster_id(line)
     return tonumber(((M.state.memories[tonumber(line)] or {}).cluster_id)) or -1
+end
+
+function M.get_topic_activation(anchor, opts)
+    opts = type(opts) == "table" and opts or {}
+    local target_turn = math.max(0, math.floor(tonumber(opts.turn) or 0))
+    if target_turn > (tonumber(M.state.current_turn) or 0) then
+        M.begin_turn(target_turn)
+    end
+
+    anchor = trim(anchor)
+    if anchor == "" then
+        return {
+            anchor = "",
+            strength = 0.0,
+            last_turn = 0,
+            last_inject_turn = 0,
+            last_active_turn = 0,
+            is_active = false,
+            windows_count = 0,
+            open_window = nil,
+        }
+    end
+    local node = ensure_topic_node(anchor)
+    local act = ensure_topic_activation(node)
+    local cfg = topic_activation_cfg()
+    return {
+        anchor = anchor,
+        strength = math.max(0.0, tonumber(act.strength) or 0.0),
+        last_turn = math.max(0, math.floor(tonumber(act.last_turn) or 0)),
+        last_inject_turn = math.max(0, math.floor(tonumber(act.last_inject_turn) or 0)),
+        last_active_turn = math.max(0, math.floor(tonumber(act.last_active_turn) or 0)),
+        is_active = (tonumber(act.strength) or 0.0) >= cfg.active_threshold
+            and type(act.open_window) == "table",
+        windows_count = #(act.windows or {}),
+        open_window = type(act.open_window) == "table" and copy_activation_window(act.open_window) or nil,
+    }
+end
+
+function M.get_topic_activation_windows(anchor, opts)
+    opts = type(opts) == "table" and opts or {}
+    local target_turn = math.max(0, math.floor(tonumber(opts.turn) or 0))
+    if target_turn > (tonumber(M.state.current_turn) or 0) then
+        M.begin_turn(target_turn)
+    end
+
+    local node = ensure_topic_node(anchor)
+    if not node then
+        return {}
+    end
+    local act = ensure_topic_activation(node)
+    local out = {}
+    for _, row in ipairs(act.windows or {}) do
+        out[#out + 1] = copy_activation_window(row)
+    end
+    if opts.include_open ~= false and type(act.open_window) == "table" then
+        local open_window = copy_activation_window(act.open_window)
+        open_window.end_turn = 0
+        open_window.is_open = true
+        out[#out + 1] = open_window
+    end
+    table.sort(out, function(a, b)
+        if (a.start_turn or 0) ~= (b.start_turn or 0) then
+            return (a.start_turn or 0) < (b.start_turn or 0)
+        end
+        return (a.last_turn or 0) < (b.last_turn or 0)
+    end)
+    local limit = math.max(0, math.floor(tonumber(opts.limit) or 0))
+    if limit > 0 and #out > limit then
+        local keep = {}
+        for i = #out - limit + 1, #out do
+            keep[#keep + 1] = out[i]
+        end
+        out = keep
+    end
+    return out
+end
+
+function M.list_active_topics(turn, opts)
+    if type(turn) == "table" and opts == nil then
+        opts = turn
+        turn = nil
+    end
+    opts = type(opts) == "table" and opts or {}
+    local target_turn = math.max(0, math.floor(tonumber(turn) or tonumber(opts.turn) or 0))
+    if target_turn > (tonumber(M.state.current_turn) or 0) then
+        M.begin_turn(target_turn)
+    end
+
+    local cfg = topic_activation_cfg()
+    local threshold = math.max(0.0, tonumber(opts.threshold) or cfg.active_threshold)
+    local out = {}
+    for _, anchor in ipairs(sort_string_keys(M.state.topic_nodes or {})) do
+        local node = ensure_topic_node(anchor)
+        local act = ensure_topic_activation(node)
+        if (tonumber(act.strength) or 0.0) >= threshold and type(act.open_window) == "table" then
+            out[#out + 1] = {
+                anchor = anchor,
+                strength = math.max(0.0, tonumber(act.strength) or 0.0),
+                last_turn = math.max(0, math.floor(tonumber(act.last_turn) or 0)),
+                last_inject_turn = math.max(0, math.floor(tonumber(act.last_inject_turn) or 0)),
+                last_active_turn = math.max(0, math.floor(tonumber(act.last_active_turn) or 0)),
+                window_start = math.max(0, math.floor(tonumber((act.open_window or {}).start_turn) or 0)),
+                peak_strength = math.max(0.0, tonumber((act.open_window or {}).peak_strength) or 0.0),
+            }
+        end
+    end
+    table.sort(out, function(a, b)
+        if (a.strength or 0.0) ~= (b.strength or 0.0) then
+            return (a.strength or 0.0) > (b.strength or 0.0)
+        end
+        return tostring(a.anchor) < tostring(b.anchor)
+    end)
+    local limit = math.max(0, math.floor(tonumber(opts.limit) or 0))
+    if limit > 0 and #out > limit then
+        while #out > limit do
+            table.remove(out)
+        end
+    end
+    return out
 end
 
 function M.return_mem_vec(line)
@@ -2507,7 +2996,7 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
     end
 
     local query_map = build_query_facet_map(opts.user_input or "")
-    local seed_scores = semantic_topic_scores(query_vec, current_anchor, scope_key)
+    local seed_scores, seed_debug = semantic_topic_scores(query_vec, current_anchor, scope_key, current_turn)
     local expanded_scores, bridge_topics
     if flow_key ~= "" then
         expanded_scores = seed_scores
@@ -2523,7 +3012,8 @@ function M.retrieve(query_vec, current_anchor, current_turn, opts)
         current_anchor,
         current_turn,
         query_map,
-        opts
+        opts,
+        seed_debug
     )
     local ranked_memories = ranked_memories_from_evidence(selected_topics, evidence_rows)
     local max_memories = math.max(1, tonumber(tg_cfg().retrieve_max_memories) or tonumber(ai_cfg().max_memory) or 8)
@@ -2597,6 +3087,7 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
     local bundle_recall_lr = math.max(0.0, tonumber(local_cfg.bundle_recall_lr) or recall_lr)
     local bundle_adopt_lr = math.max(0.0, tonumber(local_cfg.bundle_adopt_lr) or adopt_lr)
     local bundle_edge_feedback = math.max(0.0, tonumber(local_cfg.bundle_edge_feedback) or 0.14)
+    local activation_cfg = topic_activation_cfg()
 
     if current_anchor ~= "" then
         local node = M.state.topic_nodes[current_anchor]
@@ -2656,6 +3147,19 @@ function M.observe_feedback(current_anchor, recall_state, adopted_memories, turn
                 seen[anchor] = true
                 predicted_topics[#predicted_topics + 1] = anchor
             end
+        end
+    end
+
+    if current_anchor ~= "" then
+        inject_topic_activation(current_anchor, turn, activation_cfg.recall_inject, "feedback_current")
+    end
+    for _, anchor in ipairs(predicted_topics) do
+        inject_topic_activation(anchor, turn, activation_cfg.recall_inject, "feedback_recall")
+    end
+    for _, mem_id in ipairs(adopted_memories) do
+        local adopted_anchor = trim(memory_anchors[mem_id] or M.get_topic_anchor(mem_id) or current_anchor)
+        if adopted_anchor ~= "" then
+            inject_topic_activation(adopted_anchor, turn, activation_cfg.adopt_inject, "feedback_adopt")
         end
     end
 
