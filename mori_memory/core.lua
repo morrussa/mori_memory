@@ -6,7 +6,7 @@ local history = require("module.memory.history")
 local topic = require("module.memory.topic")
 local topic_graph = require("module.memory.topic_graph")
 local grudge = require("module.memory.grudge")
-local disentangle = require("module.memory.disentangle")
+local dag_router = require("module.memory.dag_router")
 local recovery_log = require("module.memory.recovery_log")
 local thread_checkpoint = require("module.memory.thread_checkpoint")
 local saver = require("module.memory.saver")
@@ -124,6 +124,9 @@ local function scope_anchor(scope_key, anchor)
     if scope_key == "stdin" or scope_key == "system" or scope_key == "unknown" or scope_key == "global" then
         return anchor
     end
+    if anchor:sub(1, #scope_key + 1) == (scope_key .. "|") then
+        return anchor
+    end
     return scope_key .. "|" .. anchor
 end
 
@@ -201,7 +204,7 @@ local function ensure_init()
     if topic_graph and topic_graph.load then
         topic_graph.load()
     end
-    if type(disentangle) == "table" and type(disentangle.import_state) == "function" then
+    if type(dag_router) == "table" and type(dag_router.import_state) == "function" then
         local checkpoint = nil
         local ok_cp, cp_or_err = pcall(function()
             return thread_checkpoint.load()
@@ -211,13 +214,13 @@ local function ensure_init()
             _thread_runtime_last_seq = math.max(0, math.floor(tonumber(checkpoint.last_seq) or 0))
             _thread_runtime_last_checkpoint_turn = math.max(0, math.floor(tonumber(checkpoint.saved_turn) or 0))
             pcall(function()
-                disentangle.import_state(checkpoint.state or {})
+                dag_router.import_state(checkpoint.state or {})
             end)
         else
             _thread_runtime_last_seq = 0
             _thread_runtime_last_checkpoint_turn = 0
             pcall(function()
-                disentangle.reset_runtime()
+                dag_router.reset_runtime()
             end)
         end
 
@@ -227,9 +230,9 @@ local function ensure_init()
                 if type(record) == "table"
                     and trim(record.kind or "") == "scope_state"
                     and type(record.scope_state) == "table"
-                    and type(disentangle.import_scope_state) == "function"
+                    and type(dag_router.import_scope_state) == "function"
                 then
-                    disentangle.import_scope_state(record.scope_key, record.scope_state)
+                    dag_router.import_scope_state(record.scope_key, record.scope_state)
                     _thread_runtime_last_seq = math.max(_thread_runtime_last_seq, math.floor(tonumber(record.seq) or 0))
                     _thread_runtime_last_checkpoint_turn = math.max(_thread_runtime_last_checkpoint_turn, math.floor(tonumber(record.turn) or 0))
                 end
@@ -245,8 +248,8 @@ local function thread_checkpoint_interval_turns()
 end
 
 local function append_thread_runtime_wal(turn, scope_key, reason, flow_sel)
-    if type(disentangle) ~= "table"
-        or type(disentangle.export_scope_state) ~= "function"
+    if type(dag_router) ~= "table"
+        or type(dag_router.export_scope_state) ~= "function"
         or type(flow_sel) ~= "table"
     then
         return false
@@ -261,7 +264,7 @@ local function append_thread_runtime_wal(turn, scope_key, reason, flow_sel)
             kind = "scope_state",
             scope_key = scope,
             reason = trim(reason or ""),
-            scope_state = disentangle.export_scope_state(scope),
+            scope_state = dag_router.export_scope_state(scope),
         })
     end)
     if not ok_append or not seq_value then
@@ -273,7 +276,7 @@ local function append_thread_runtime_wal(turn, scope_key, reason, flow_sel)
 end
 
 local function save_thread_runtime_checkpoint(turn, force)
-    if type(disentangle) ~= "table" or type(disentangle.export_state) ~= "function" then
+    if type(dag_router) ~= "table" or type(dag_router.export_state) ~= "function" then
         return true
     end
     turn = math.max(0, math.floor(tonumber(turn) or 0))
@@ -291,7 +294,7 @@ local function save_thread_runtime_checkpoint(turn, force)
     end
 
     local ok_save, save_ok, save_err = pcall(function()
-        return thread_checkpoint.save(disentangle.export_state(), _thread_runtime_last_seq, { turn = turn })
+        return thread_checkpoint.save(dag_router.export_state(), _thread_runtime_last_seq, { turn = turn })
     end)
     if not ok_save or save_ok ~= true then
         print(string.format("[ThreadRuntime][WARN] checkpoint save failed: %s", tostring(save_err or save_ok)))
@@ -583,6 +586,7 @@ local function build_chunk_groups(events)
                     scope_key = scope_key,
                     thread_key = thread_key,
                     segment_key = segment_key,
+                    memory_scope = trim(event.memory_scope or ""),
                     source = tostring(event.source or ""),
                     events = {},
                     turns = {},
@@ -594,6 +598,8 @@ local function build_chunk_groups(events)
                 ordered_groups[#ordered_groups + 1] = group
             elseif trim(group.source or "") == "" and trim(event.source or "") ~= "" then
                 group.source = tostring(event.source or "")
+            elseif trim(group.memory_scope or "") == "" and trim(event.memory_scope or "") ~= "" then
+                group.memory_scope = trim(event.memory_scope or "")
             end
 
             group.events[#group.events + 1] = event
@@ -658,6 +664,7 @@ local function commit_chunk_group(group)
     local scope_key = trim(group.scope_key or "")
     local thread_key = trim(group.thread_key or "")
     local segment_key = trim(group.segment_key or "")
+    local preferred_memory_scope = trim(group.memory_scope or "")
     local source = tostring(group.source or "")
 
     local chunk_vectors = {}
@@ -698,7 +705,10 @@ local function commit_chunk_group(group)
         local fact_vec = tool.average_vectors(fact_bucket.vectors or {})
         if type(fact_vec) == "table" and #fact_vec > 0 then
             local actor_key, actor_count = single_actor_key(fact_bucket.actor_set)
-            local memory_scope = (actor_count == 1 and actor_key ~= "") and "actor" or "scope"
+            local memory_scope = preferred_memory_scope
+            if memory_scope ~= "thread" then
+                memory_scope = (actor_count == 1 and actor_key ~= "") and "actor" or "scope"
+            end
             local memory_id = topic_graph.add_memory(fact_vec, latest_turn, {
                 topic_anchor = anchor,
                 text = tostring(fact_bucket.text or ""),
@@ -838,7 +848,7 @@ function M.ingest_turn(meta)
     local dropped = flow_sel and flow_sel.dropped == true
     local flow_key = flow_sel and trim(flow_sel.sequence_key or "") or ""
     local allow_local_pending = flow_sel and flow_sel.pending_only == true and allow_write == true
-    local allow_global_topic = not (flow_sel and flow_sel.use_local_sequence == true)
+    local allow_global_topic = true
 
     local user_vec = nil
     if not dropped and allow_topic and embed_input ~= "" then
@@ -850,16 +860,27 @@ function M.ingest_turn(meta)
             end
             user_vec = embedded
         end
-        if allow_global_topic then
-            topic.add_turn(turn, embed_input, user_vec, {
-                scope_key = scope_key,
-                actor_key = actor_key,
-                credit = credit,
-                source = meta.source,
-                user_id = meta.user_id,
-                nickname = meta.nickname,
-            })
-        end
+    end
+
+    if flow_sel and user_vec and type(dag_router) == "table" and type(dag_router.observe) == "function" then
+        pcall(function()
+            dag_router.observe(scope_key, flow_sel, user_vec, meta, turn)
+        end)
+    end
+
+    flow_key = flow_sel and trim(flow_sel.sequence_key or "") or ""
+    allow_local_pending = flow_sel and flow_sel.pending_only == true and allow_write == true
+    allow_global_topic = not (flow_sel and flow_sel.use_local_sequence == true)
+
+    if not dropped and allow_topic and user_vec and allow_global_topic then
+        topic.add_turn(turn, embed_input, user_vec, {
+            scope_key = scope_key,
+            actor_key = actor_key,
+            credit = credit,
+            source = meta.source,
+            user_id = meta.user_id,
+            nickname = meta.nickname,
+        })
     end
 
     history.add_history(user_input, assistant_text)
@@ -881,18 +902,12 @@ function M.ingest_turn(meta)
         anchor = scope_anchor(scope_key, anchor)
     end
 
-    if flow_sel and user_vec and type(disentangle) == "table" and type(disentangle.observe) == "function" then
-        pcall(function()
-            disentangle.observe(scope_key, flow_sel, user_vec, meta, turn)
-        end)
-    end
-
     local adopted_memories = {}
     if ((allow_write and anchor ~= "") or (allow_local_pending and anchor ~= "")) then
         local facts = build_fact_entries(meta, embed_input, assistant_text, user_vec)
-        if flow_sel and type(disentangle) == "table" and type(disentangle.stage) == "function" then
+        if flow_sel and type(dag_router) == "table" and type(dag_router.stage) == "function" then
             local ok_stage, staged = pcall(function()
-                return disentangle.stage(scope_key, flow_sel, {
+                return dag_router.stage(scope_key, flow_sel, {
                     turn = turn,
                     anchor = anchor,
                     sequence_key = flow_key,
@@ -904,6 +919,7 @@ function M.ingest_turn(meta)
                     source = meta.source,
                     actor_key = actor_key,
                     scope_key = scope_key,
+                    memory_scope = "thread",
                 }, turn)
             end)
             if ok_stage and type(staged) == "table" then
@@ -921,9 +937,9 @@ function M.ingest_turn(meta)
                 scope_key = scope_key,
             })
         end
-    elseif flow_sel and type(disentangle) == "table" and type(disentangle.stage) == "function" then
+    elseif flow_sel and type(dag_router) == "table" and type(dag_router.stage) == "function" then
         pcall(function()
-            local staged = disentangle.stage(scope_key, flow_sel, nil, turn)
+            local staged = dag_router.stage(scope_key, flow_sel, nil, turn)
             commit_turn_events(staged, turn)
         end)
     end
@@ -1026,9 +1042,9 @@ function M.compile_context(meta)
     local flow_sel = nil
 
     local current_anchor = trim(meta.topic_anchor or "")
-    if current_anchor == "" and type(disentangle) == "table" and type(disentangle.select) == "function" and disentangle.enabled_for(meta) then
+    if current_anchor == "" and type(dag_router) == "table" and type(dag_router.select) == "function" and dag_router.enabled_for(meta) then
         local ok_sel, sel_or_err = pcall(function()
-            return disentangle.select(scope_key, query_vec, meta, current_turn)
+            return dag_router.select(scope_key, query_vec, meta, current_turn)
         end)
         if ok_sel and type(sel_or_err) == "table" then
             flow_sel = sel_or_err
@@ -1068,6 +1084,7 @@ function M.compile_context(meta)
         current_anchor = scope_anchor(scope_key, current_anchor)
     end
 
+    local local_selected_turns = flow_sel and unique_sorted_numbers(flow_sel.selected_turns or {}) or {}
     local flow_key = flow_sel and trim(flow_sel.sequence_key or "") or ""
     local retrieved = nil
     if flow_sel and flow_sel.local_only == true then
@@ -1077,7 +1094,7 @@ function M.compile_context(meta)
             predicted_topics = {},
             predicted_memories = {},
             predicted_nodes = {},
-            selected_turns = {},
+            selected_turns = local_selected_turns,
             selected_memories = {},
             memory_anchors = {},
             fragments = {},
@@ -1098,6 +1115,7 @@ function M.compile_context(meta)
         })
         if type(retrieved) == "table" and flow_sel then
             retrieved.disentangle = flow_sel
+            retrieved.local_selected_turns = local_selected_turns
         end
     end
     cache_recall_state(current_turn, retrieved)
@@ -1107,14 +1125,15 @@ function M.compile_context(meta)
         blocks[#blocks + 1] = { role = "system", content = ctx }
     end
 
-    local transcript = build_selected_turn_transcript((retrieved or {}).selected_turns, meta)
+    local transcript_turns = (#local_selected_turns > 0 and local_selected_turns) or (retrieved or {}).selected_turns
+    local transcript = build_selected_turn_transcript(transcript_turns, meta)
     if transcript ~= "" then
         blocks[#blocks + 1] = { role = "system", content = transcript }
     end
 
-    if flow_sel and type(disentangle) == "table" and type(disentangle.pending_context) == "function" then
+    if flow_sel and type(dag_router) == "table" and type(dag_router.pending_context) == "function" then
         local ok_pending, pending_ctx = pcall(function()
-            return disentangle.pending_context(scope_key, flow_sel, meta)
+            return dag_router.pending_context(scope_key, flow_sel, meta)
         end)
         pending_ctx = trim(ok_pending and pending_ctx or "")
         if pending_ctx ~= "" then
@@ -1126,16 +1145,16 @@ function M.compile_context(meta)
 end
 
 function M.shutdown()
-    local runtime_persist_enabled = type(disentangle) == "table"
-        and type(disentangle.export_state) == "function"
+    local runtime_persist_enabled = type(dag_router) == "table"
+        and type(dag_router.export_state) == "function"
         and type(thread_checkpoint) == "table"
         and type(thread_checkpoint.save) == "function"
     if (not runtime_persist_enabled)
-        and type(disentangle) == "table"
-        and type(disentangle.flush_all) == "function"
+        and type(dag_router) == "table"
+        and type(dag_router.flush_all) == "function"
     then
         pcall(function()
-            commit_turn_events(disentangle.flush_all(), -1)
+            commit_turn_events(dag_router.flush_all(), -1)
         end)
     end
     if guard_enabled() then
