@@ -158,20 +158,6 @@ local DEFAULT_SETTINGS = {
         -- Accepts either an array {"bilibili"} or a map {bilibili=true}.
         enable_sources = { "bilibili" },
 
-        -- DAG router runtime. Every turn enters a fixed recent window and
-        -- links against recent nodes instead of competing for stream slots.
-        recent_window_size = 64,
-        top_k = 1,
-        local_bfs_turns = 6,
-        semantic_weight = 0.42,
-        same_user_bonus = 0.06,
-        mention_bonus = 0.15,
-        age_penalty = 0.01,
-        strong_edge_score = 0.12,
-        read_anchor_score = 0.12,
-        read_traverse_score = 0.12,
-        noise_outgoing_score = 0.06,
-
         -- Max parallel streams per scope (upper bound).
         max_streams = 6,
         -- Rolling window size for stream centroid.
@@ -189,7 +175,7 @@ local DEFAULT_SETTINGS = {
         -- Heuristics.
         same_user_bonus = 0.06,
         participant_bonus = 0.03,
-        mention_bonus = 0.15,
+        mention_bonus = 0.05,
         addressee_hint_bonus = 0.04,
         reply_cue_bonus = 0.05,
         reply_recent_turns = 6,
